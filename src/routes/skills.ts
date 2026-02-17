@@ -298,11 +298,14 @@ function parseSearchOutput(output: string): SearchResult[] {
     const pkgMatch = line.match(/^([\w\-]+\/[\w\-.]+(?:@[\w\-.]+)?)$/);
     if (pkgMatch) {
       const pkg = pkgMatch[1];
-      // Next line might be the URL
+      // Next line might be the URL (possibly prefixed with └ or similar chars)
       let url = '';
-      if (i + 1 < lines.length && lines[i + 1].startsWith('http')) {
-        url = lines[i + 1];
-        i++;
+      if (i + 1 < lines.length) {
+        const nextLine = lines[i + 1].replace(/^[└├│─\s]+/, '');
+        if (nextLine.startsWith('http')) {
+          url = nextLine;
+          i++;
+        }
       }
       results.push({ package: pkg, url });
     }
@@ -409,12 +412,17 @@ skillsRoutes.get('/search', authMiddleware, async (c) => {
 
 skillsRoutes.get('/search/detail', authMiddleware, async (c) => {
   const url = c.req.query('url')?.trim();
-  if (!url || !url.startsWith('https://skills.sh/')) {
+  try {
+    const parsed = new URL(url || '');
+    if (parsed.hostname !== 'skills.sh' || parsed.protocol !== 'https:') {
+      return c.json({ error: 'Invalid skills.sh URL' }, 400);
+    }
+  } catch {
     return c.json({ error: 'Invalid skills.sh URL' }, 400);
   }
 
   try {
-    const resp = await fetch(url, {
+    const resp = await fetch(url!, {
       headers: { 'Accept': 'text/html' },
       signal: AbortSignal.timeout(10_000),
     });
@@ -423,54 +431,19 @@ skillsRoutes.get('/search/detail', authMiddleware, async (c) => {
     }
     const html = await resp.text();
 
-    // Extract description from meta tag
-    const descMatch = html.match(/<meta\s+name="description"\s+content="([^"]*?)"/i)
-      || html.match(/<meta\s+content="([^"]*?)"\s+name="description"/i);
-    const description = descMatch?.[1]?.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&#39;/g, "'").replace(/&quot;/g, '"') || '';
-
-    // Extract text content between skill-related sections
-    // Strip HTML tags for a simple text extraction
-    const bodyMatch = html.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
-    const bodyHtml = bodyMatch?.[1] || html;
-
-    // Extract visible text, collapsing whitespace
-    const textContent = bodyHtml
-      .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
-      .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
-      .replace(/<[^>]+>/g, '\n')
-      .replace(/&nbsp;/g, ' ')
-      .replace(/&amp;/g, '&')
-      .replace(/&lt;/g, '<')
-      .replace(/&gt;/g, '>')
-      .replace(/&#39;/g, "'")
-      .replace(/&quot;/g, '"')
-      .split('\n')
-      .map((l) => l.trim())
-      .filter(Boolean);
-
-    // Extract weekly installs
-    const installsLine = textContent.find((l) => /weekly installs?/i.test(l));
-    const installs = installsLine?.match(/([\d,.]+[kKmM]?)\s*weekly/i)?.[1] || '';
-
-    // Extract "first seen" / age
-    const ageLine = textContent.find((l) => /first seen|ago/i.test(l));
-    const age = ageLine || '';
-
-    // Extract bullet points (lines starting with common patterns that look like features)
-    const features: string[] = [];
-    for (const line of textContent) {
-      // Lines that look like feature descriptions (contain a dash or start with a quote)
-      if (/^[""\u201c]/.test(line) || (/^[-\u2022\u2013]/.test(line) && line.length > 10)) {
-        features.push(line.replace(/^[-\u2022\u2013""\u201c\u201d]\s*/, '').replace(/[""\u201d]$/, ''));
-      }
-    }
+    // 从页面 <h1> 提取 skill 标题作为描述
+    const h1Match = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
+    const description = h1Match?.[1]
+      ?.replace(/<[^>]+>/g, '')
+      .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&#39;/g, "'").replace(/&quot;/g, '"').replace(/&#x26;/g, '&')
+      .trim() || '';
 
     return c.json({
       detail: {
-        description: description || features.slice(0, 3).join('; ') || '',
-        installs,
-        age,
-        features: features.slice(0, 6),
+        description,
+        installs: '',
+        age: '',
+        features: [],
       },
     });
   } catch {
@@ -545,8 +518,8 @@ skillsRoutes.post(
     const globalDir = getGlobalSkillsDir();
     fs.mkdirSync(globalDir, { recursive: true });
 
-    // Record timestamp before install to detect new/modified dirs
-    const beforeTime = Date.now();
+    // 记录安装前时间戳，用于检测新增/修改的目录（减 1s 避免文件系统时间精度问题）
+    const beforeTime = Date.now() - 1000;
 
     try {
       await execFileAsync(

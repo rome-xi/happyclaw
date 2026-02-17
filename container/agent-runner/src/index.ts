@@ -862,6 +862,7 @@ async function runQuery(
               const skillMatch = pending.inputJson.match(/"skill"\s*:\s*"([^"]+)"/);
               if (skillMatch) {
                 pending.resolved = true;
+                pendingSkillInput.delete(blockIndex);
                 emit({
                   status: 'stream',
                   result: null,
@@ -1005,6 +1006,8 @@ async function runQuery(
           }
         }
       }
+      // assistant 消息处理完毕，清空残留的 pendingSkillInput 避免内存泄漏
+      pendingSkillInput.clear();
     }
 
     if (message.type === 'system' && message.subtype === 'init') {
