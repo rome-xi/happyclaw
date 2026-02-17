@@ -566,15 +566,16 @@ export async function runContainerAgent(
         const exitLabel =
           code === null ? `signal ${signal || 'unknown'}` : `code ${code}`;
 
-        // Graceful shutdown: agent already produced a successful result and was
-        // killed by SIGTERM/SIGKILL (e.g. session reset / clear-history).
-        // Treat as normal completion instead of an error.
+        // Graceful shutdown: agent was killed by SIGTERM/SIGKILL (e.g. user
+        // clicked stop, session reset, clear-history). Treat as normal
+        // completion instead of an error — regardless of whether the agent
+        // had already produced a success output.
         // docker kill sends SIGKILL → exit code 137, signal=null.
         const isForceKilled = signal === 'SIGTERM' || signal === 'SIGKILL' || code === 137;
-        if (isForceKilled && hasSuccessOutput && onOutput) {
+        if (isForceKilled && onOutput) {
           logger.info(
             { group: group.name, signal, code, duration, newSessionId },
-            'Container terminated after successful output (graceful shutdown)',
+            'Container terminated by signal (user stop / graceful shutdown)',
           );
           const OUTPUT_CHAIN_TIMEOUT = 30_000;
           let chainTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1290,14 +1291,15 @@ export async function runHostAgent(
         const exitLabel =
           code === null ? `signal ${signal || 'unknown'}` : `code ${code}`;
 
-        // Graceful shutdown: agent already produced a successful result and was
-        // killed by SIGTERM/SIGKILL (e.g. session reset / clear-history).
-        // Treat as normal completion instead of an error.
+        // Graceful shutdown: agent was killed by SIGTERM/SIGKILL (e.g. user
+        // clicked stop, session reset, clear-history). Treat as normal
+        // completion instead of an error — regardless of whether the agent
+        // had already produced a success output.
         const isForceKilled = signal === 'SIGTERM' || signal === 'SIGKILL' || code === 137;
-        if (isForceKilled && hasSuccessOutput && onOutput) {
+        if (isForceKilled && onOutput) {
           logger.info(
             { group: group.name, signal, code, duration, newSessionId },
-            'Host agent terminated after successful output (graceful shutdown)',
+            'Host agent terminated by signal (user stop / graceful shutdown)',
           );
           const OUTPUT_CHAIN_TIMEOUT = 30_000;
           let chainTimer: ReturnType<typeof setTimeout> | null = null;
