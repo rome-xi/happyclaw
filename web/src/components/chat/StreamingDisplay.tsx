@@ -262,12 +262,13 @@ export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNamePr
 
             {/* Partial text with Markdown rendering */}
             {streaming.partialText && (
-              <div className="prose prose-sm max-w-none prose-headings:text-slate-900 prose-p:text-slate-800 prose-p:leading-relaxed overflow-hidden">
+              <div className="max-w-none overflow-hidden">
                 <MarkdownRenderer
                   content={streaming.partialText.length > 5000
                     ? '...' + streaming.partialText.slice(-4000)
                     : streaming.partialText}
                   groupJid={groupJid}
+                  variant="chat"
                 />
               </div>
             )}

@@ -239,8 +239,8 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
             )}
 
             {/* Content */}
-            <div className="prose prose-sm max-w-none prose-headings:text-slate-900 prose-p:text-slate-800 prose-p:leading-relaxed overflow-hidden">
-              <MarkdownRenderer content={message.content} groupJid={message.chat_jid} />
+            <div className="max-w-none overflow-hidden">
+              <MarkdownRenderer content={message.content} groupJid={message.chat_jid} variant="chat" />
             </div>
           </div>
         </div>

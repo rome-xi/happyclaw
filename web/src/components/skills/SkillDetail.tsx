@@ -132,8 +132,8 @@ export function SkillDetail({ skillId }: SkillDetailProps) {
       {/* SKILL.md 内容 */}
       <div className="p-6 border-b border-slate-200">
         <h3 className="text-sm font-semibold text-slate-700 mb-3">技能说明</h3>
-        <div className="prose prose-sm max-w-none">
-          <MarkdownRenderer content={detail.content} />
+        <div className="max-w-none">
+          <MarkdownRenderer content={detail.content} variant="docs" />
         </div>
       </div>
 

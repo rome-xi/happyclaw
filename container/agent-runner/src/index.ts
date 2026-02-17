@@ -694,6 +694,10 @@ async function runQuery(
     '`![描述](filename.png)`',
     '',
     '**禁止使用绝对路径**（如 `/workspace/group/filename.png`）。Web 界面会自动将相对路径解析为正确的文件下载地址。',
+    '',
+    '### 技术图表',
+    '需要输出技术图表（流程图、时序图、架构图、ER 图、类图、状态图、甘特图等）时，**使用 Mermaid 语法**，用 ```mermaid 代码块包裹。',
+    'Web 界面会自动将 Mermaid 代码渲染为可视化图表。',
   ].join('\n');
 
   const webFetchGuidelines = [
