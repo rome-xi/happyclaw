@@ -696,10 +696,20 @@ async function runQuery(
     '**禁止使用绝对路径**（如 `/workspace/group/filename.png`）。Web 界面会自动将相对路径解析为正确的文件下载地址。',
   ].join('\n');
 
+  const webFetchGuidelines = [
+    '',
+    '## 网页访问策略',
+    '',
+    '访问外部网页时优先使用 WebFetch（速度快）。',
+    '如果 WebFetch 失败（403、被拦截、内容为空或需要 JavaScript 渲染），',
+    '且 agent-browser 可用，立即改用 agent-browser 通过真实浏览器访问。不要反复重试 WebFetch。',
+  ].join('\n');
+
   const systemPromptAppend = [
     globalClaudeMd,
     memoryRecall,
     outputGuidelines,
+    webFetchGuidelines,
   ].filter(Boolean).join('\n');
 
   // 追踪顶层工具执行状态（用于精确发送 tool_use_end）
