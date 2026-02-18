@@ -181,7 +181,10 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, groupJ
             </a>
           ),
           table: ({ children }) => (
-            <div className="my-4 overflow-x-auto overflow-y-hidden overscroll-x-contain [-webkit-overflow-scrolling:touch]">
+            <div
+              className="my-4 max-w-full overflow-x-auto overflow-y-hidden overscroll-x-contain [-webkit-overflow-scrolling:touch] [touch-action:pan-x]"
+              data-swipe-back-ignore="true"
+            >
               <table className="w-max min-w-full border-collapse border border-slate-200">
                 {children}
               </table>

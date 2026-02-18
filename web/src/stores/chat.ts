@@ -133,6 +133,7 @@ interface ChatState {
   refreshMessages: (jid: string) => Promise<void>;
   sendMessage: (jid: string, content: string, attachments?: Array<{ data: string; mimeType: string }>) => Promise<void>;
   stopGroup: (jid: string) => Promise<boolean>;
+  interruptQuery: (jid: string) => Promise<boolean>;
   resetSession: (jid: string) => Promise<boolean>;
   clearHistory: (jid: string) => Promise<boolean>;
   createFlow: (name: string, options?: { execution_mode?: 'container' | 'host'; custom_cwd?: string; init_source_path?: string; init_git_url?: string }) => Promise<{ jid: string; folder: string } | null>;
@@ -213,14 +214,30 @@ export const useChatStore = create<ChatState>((set, get) => ({
       );
       // Messages come in DESC order from API, reverse to chronological for display
       const sorted = [...data.messages].reverse();
-      set((s) => ({
-        messages: {
-          ...s.messages,
-          [jid]: mergeMessagesChronologically(s.messages[jid] || [], sorted),
-        },
-        hasMore: { ...s.hasMore, [jid]: data.hasMore },
-        error: null,
-      }));
+      set((s) => {
+        const merged = mergeMessagesChronologically(s.messages[jid] || [], sorted);
+        const latest = merged.length > 0 ? merged[merged.length - 1] : null;
+        const shouldWait =
+          !!latest &&
+          latest.sender !== '__system__' &&
+          latest.is_from_me === false;
+        const nextWaiting = { ...s.waiting };
+        if (shouldWait) {
+          nextWaiting[jid] = true;
+        } else {
+          delete nextWaiting[jid];
+        }
+
+        return {
+          messages: {
+            ...s.messages,
+            [jid]: merged,
+          },
+          waiting: nextWaiting,
+          hasMore: { ...s.hasMore, [jid]: data.hasMore },
+          error: null,
+        };
+      });
     } catch (err) {
       set({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -351,6 +368,29 @@ export const useChatStore = create<ChatState>((set, get) => ({
       await api.post<{ success: boolean }>(
         `/api/groups/${encodeURIComponent(jid)}/stop`,
       );
+      get().clearStreaming(jid, { preserveThinking: false });
+      set((s) => {
+        const next = { ...s.waiting };
+        delete next[jid];
+        return { waiting: next };
+      });
+      return true;
+    } catch (err) {
+      set({ error: err instanceof Error ? err.message : String(err) });
+      return false;
+    }
+  },
+
+  interruptQuery: async (jid: string) => {
+    try {
+      const data = await api.post<{ success: boolean; interrupted: boolean }>(
+        `/api/groups/${encodeURIComponent(jid)}/interrupt`,
+      );
+      if (!data.interrupted) {
+        set({ error: 'No active query to interrupt' });
+        return false;
+      }
+
       get().clearStreaming(jid, { preserveThinking: false });
       set((s) => {
         const next = { ...s.waiting };
@@ -527,6 +567,24 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // Skip while clearHistory is in-flight
     if (get().clearing[chatJid]) return;
 
+    // 中断事件需要在所有客户端显式收尾，避免 waiting 残留。
+    if (event.eventType === 'status' && event.statusText === 'interrupted') {
+      set((s) => {
+        const nextStreaming = { ...s.streaming };
+        delete nextStreaming[chatJid];
+        const nextPendingThinking = { ...s.pendingThinking };
+        delete nextPendingThinking[chatJid];
+        const nextWaiting = { ...s.waiting };
+        delete nextWaiting[chatJid];
+        return {
+          waiting: nextWaiting,
+          streaming: nextStreaming,
+          pendingThinking: nextPendingThinking,
+        };
+      });
+      return;
+    }
+
     set((s) => {
       const MAX_STREAMING_TEXT = 8000; // 限制内存中保留的流式文本长度
       const MAX_EVENT_LOG = 30; // 最近事件条数上限
@@ -681,7 +739,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
         }
       }
 
-      return { streaming: { ...s.streaming, [chatJid]: next } };
+      return {
+        waiting: { ...s.waiting, [chatJid]: true },
+        streaming: { ...s.streaming, [chatJid]: next },
+      };
     });
   },
 
@@ -746,16 +807,25 @@ export const useChatStore = create<ChatState>((set, get) => ({
   // 刷新/重连时恢复正在运行的 agent 状态
   restoreActiveState: async () => {
     try {
-      const data = await api.get<{ groups: Array<{ jid: string; active: boolean }> }>('/api/status');
-      const activeSet = new Set(data.groups.filter(g => g.active).map(g => g.jid));
-      const allJids = data.groups.map(g => g.jid);
+      const data = await api.get<{ groups: Array<{ jid: string; active: boolean; pendingMessages?: boolean }> }>('/api/status');
       set((s) => {
         const nextWaiting = { ...s.waiting };
-        for (const jid of allJids) {
-          if (activeSet.has(jid)) {
-            nextWaiting[jid] = true;
+        for (const g of data.groups) {
+          if (g.pendingMessages) {
+            nextWaiting[g.jid] = true;
+            continue;
+          }
+          // active 可能仅表示 runner 空闲存活，这里回退到消息语义推断。
+          const msgs = s.messages[g.jid] || [];
+          const latest = msgs.length > 0 ? msgs[msgs.length - 1] : null;
+          const inferredWaiting =
+            !!latest &&
+            latest.sender !== '__system__' &&
+            latest.is_from_me === false;
+          if (inferredWaiting) {
+            nextWaiting[g.jid] = true;
           } else {
-            delete nextWaiting[jid];
+            delete nextWaiting[g.jid];
           }
         }
         return { waiting: nextWaiting };
@@ -771,13 +841,17 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const next = { ...s.streaming };
       const thinkingText = next[chatJid]?.thinkingText;
       const preserveThinking = options?.preserveThinking !== false;
+      const nextPendingThinking = { ...s.pendingThinking };
       delete next[chatJid];
+      if (preserveThinking && thinkingText) {
+        nextPendingThinking[chatJid] = thinkingText;
+      } else {
+        delete nextPendingThinking[chatJid];
+      }
       return {
         waiting: { ...s.waiting, [chatJid]: false },
         streaming: next,
-        ...(preserveThinking && thinkingText
-          ? { pendingThinking: { ...s.pendingThinking, [chatJid]: thinkingText } }
-          : {}),
+        pendingThinking: nextPendingThinking,
       };
     });
   },

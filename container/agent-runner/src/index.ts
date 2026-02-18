@@ -403,6 +403,19 @@ function shouldClose(): boolean {
   return false;
 }
 
+const IPC_INPUT_INTERRUPT_SENTINEL = path.join(IPC_INPUT_DIR, '_interrupt');
+
+/**
+ * Check for _interrupt sentinel (graceful query interruption).
+ */
+function shouldInterrupt(): boolean {
+  if (fs.existsSync(IPC_INPUT_INTERRUPT_SENTINEL)) {
+    try { fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL); } catch { /* ignore */ }
+    return true;
+  }
+  return false;
+}
+
 /**
  * Drain all pending IPC input messages.
  * Returns messages found (with optional images), or empty array.
@@ -541,21 +554,32 @@ async function runQuery(
   allowedTools: string[] = DEFAULT_ALLOWED_TOOLS,
   disallowedTools?: string[],
   images?: Array<{ data: string; mimeType?: string }>,
-): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean; contextOverflow?: boolean }> {
+): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean; contextOverflow?: boolean; interruptedDuringQuery: boolean }> {
   const stream = new MessageStream();
   stream.push(prompt, images);
   const emit = (output: ContainerOutput): void => {
     if (emitOutput) writeOutput(output);
   };
 
-  // Poll IPC for follow-up messages and _close sentinel during the query
+  // Poll IPC for follow-up messages and _close/_interrupt sentinel during the query
   let ipcPolling = true;
   let closedDuringQuery = false;
+  let interruptedDuringQuery = false;
+  // queryRef is set just before the for-await loop so pollIpcDuringQuery can call interrupt()
+  let queryRef: { interrupt(): Promise<void> } | null = null;
   const pollIpcDuringQuery = () => {
     if (!ipcPolling) return;
     if (shouldClose()) {
       log('Close sentinel detected during query, ending stream');
       closedDuringQuery = true;
+      stream.end();
+      ipcPolling = false;
+      return;
+    }
+    if (shouldInterrupt()) {
+      log('Interrupt sentinel detected, interrupting current query');
+      interruptedDuringQuery = true;
+      queryRef?.interrupt().catch((err: unknown) => log(`Interrupt call failed: ${err}`));
       stream.end();
       ipcPolling = false;
       return;
@@ -734,7 +758,7 @@ async function runQuery(
     : [WORKSPACE_MEMORY];
 
   try {
-    for await (const message of query({
+    const q = query({
     prompt: stream,
     options: {
       cwd: WORKSPACE_GROUP,
@@ -770,7 +794,9 @@ async function runQuery(
         PreCompact: [{ hooks: [createPreCompactHook(isHome, isAdminHome)] }]
       },
     }
-  })) {
+  });
+    queryRef = q;
+    for await (const message of q) {
     // 流式事件处理
     if (message.type === 'stream_event') {
       const partial = message;
@@ -1046,8 +1072,8 @@ async function runQuery(
   }
 
   ipcPolling = false;
-  log(`Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}`);
-  return { newSessionId, lastAssistantUuid, closedDuringQuery };
+  log(`Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}, interruptedDuringQuery: ${interruptedDuringQuery}`);
+  return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery };
   } catch (err) {
     ipcPolling = false;
     const errorMessage = err instanceof Error ? err.message : String(err);
@@ -1055,7 +1081,7 @@ async function runQuery(
     // 检测上下文溢出错误
     if (isContextOverflowError(errorMessage)) {
       log(`Context overflow detected: ${errorMessage}`);
-      return { newSessionId, lastAssistantUuid, closedDuringQuery, contextOverflow: true };
+      return { newSessionId, lastAssistantUuid, closedDuringQuery, contextOverflow: true, interruptedDuringQuery };
     }
 
     // 其他错误继续抛出
@@ -1087,8 +1113,9 @@ async function main(): Promise<void> {
   const memoryRecallPrompt = buildMemoryRecallPrompt(isHome, isAdminHome);
   fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
 
-  // Clean up stale _close sentinel from previous container runs
+  // Clean up stale sentinels from previous container runs
   try { fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL); } catch { /* ignore */ }
+  try { fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL); } catch { /* ignore */ }
 
   // Build initial prompt (drain any pending IPC messages too)
   let prompt = containerInput.prompt;
@@ -1112,6 +1139,9 @@ async function main(): Promise<void> {
   const MAX_OVERFLOW_RETRIES = 3;
   try {
     while (true) {
+      // 清理残留的 _interrupt sentinel，防止空闲期间写入的中断信号影响下一次 query
+      try { fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL); } catch { /* ignore */ }
+
       log(`Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`);
 
       const queryResult = await runQuery(
@@ -1165,6 +1195,27 @@ async function main(): Promise<void> {
       if (queryResult.closedDuringQuery) {
         log('Close sentinel consumed during query, exiting');
         break;
+      }
+
+      // 中断后：跳过 memory flush 和 session update，等待下一条消息
+      if (queryResult.interruptedDuringQuery) {
+        log('Query interrupted by user, waiting for next message');
+        writeOutput({
+          status: 'stream',
+          result: null,
+          streamEvent: { eventType: 'status', statusText: 'interrupted' },
+        });
+        // 清理可能残留的 _interrupt 文件
+        try { fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL); } catch { /* ignore */ }
+        // 不 break，等待下一条消息
+        const nextMessage = await waitForIpcMessage();
+        if (nextMessage === null) {
+          log('Close sentinel received after interrupt, exiting');
+          break;
+        }
+        prompt = nextMessage.text;
+        promptImages = nextMessage.images;
+        continue;
       }
 
       // Memory Flush: run an extra query to let agent save durable memories (admin home only)

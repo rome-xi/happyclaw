@@ -704,6 +704,23 @@ groupRoutes.post('/:jid/stop', authMiddleware, async (c) => {
   }
 });
 
+// POST /api/groups/:jid/interrupt - 中断当前查询（不杀容器）
+groupRoutes.post('/:jid/interrupt', authMiddleware, async (c) => {
+  const deps = getWebDeps();
+  if (!deps) return c.json({ error: 'Server not initialized' }, 500);
+
+  const jid = c.req.param('jid');
+  const group = getRegisteredGroup(jid);
+  if (!group) return c.json({ error: 'Group not found' }, 404);
+  const authUser = c.get('user') as AuthUser;
+  if (!canAccessGroup({ id: authUser.id, role: authUser.role }, group)) {
+    return c.json({ error: 'Group not found' }, 404);
+  }
+
+  const interrupted = deps.queue.interruptQuery(jid);
+  return c.json({ success: true, interrupted });
+});
+
 // POST /api/groups/:jid/reset-session - 重置会话上下文
 groupRoutes.post('/:jid/reset-session', authMiddleware, async (c) => {
   const deps = getWebDeps();

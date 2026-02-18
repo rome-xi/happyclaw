@@ -61,7 +61,7 @@ export function ChatView({ groupJid, onBack }: ChatViewProps) {
   const loadMessages = useChatStore(s => s.loadMessages);
   const refreshMessages = useChatStore(s => s.refreshMessages);
   const sendMessage = useChatStore(s => s.sendMessage);
-  const stopGroup = useChatStore(s => s.stopGroup);
+  const interruptQuery = useChatStore(s => s.interruptQuery);
   const resetSession = useChatStore(s => s.resetSession);
   const handleStreamEvent = useChatStore(s => s.handleStreamEvent);
   const handleWsNewMessage = useChatStore(s => s.handleWsNewMessage);
@@ -382,7 +382,7 @@ export function ChatView({ groupJid, onBack }: ChatViewProps) {
       {/* Main Content: Messages + Sidebar */}
       <div className="flex-1 flex overflow-hidden min-h-0">
         {/* Messages Area */}
-        <div className="flex-1 flex flex-col min-w-0">
+        <div className="flex-1 flex flex-col min-w-0 overflow-x-hidden">
           <MessageList
             messages={groupMessages || []}
             loading={loading}
@@ -395,7 +395,7 @@ export function ChatView({ groupJid, onBack }: ChatViewProps) {
             <div className="flex justify-center py-1">
               <button
                 type="button"
-                onClick={() => stopGroup(groupJid)}
+                onClick={() => interruptQuery(groupJid)}
                 className="inline-flex items-center gap-1.5 px-3 py-1 text-xs text-slate-500 hover:text-red-600 bg-slate-100 hover:bg-red-50 rounded-full transition-colors cursor-pointer"
               >
                 <Square className="w-3 h-3" />

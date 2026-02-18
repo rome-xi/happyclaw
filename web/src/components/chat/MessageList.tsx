@@ -155,12 +155,12 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
   const showScrollButtons = messages.length > 0;
 
   return (
-    <div className="relative flex-1 overflow-hidden">
+    <div className="relative flex-1 overflow-hidden overflow-x-hidden">
       <div
         ref={parentRef}
-        className="h-full overflow-y-auto py-6 bg-background"
+        className="h-full overflow-y-auto overflow-x-hidden py-6 bg-background"
       >
-        <div className="max-w-3xl mx-auto px-4">
+        <div className="max-w-3xl mx-auto px-4 min-w-0">
         {loading && hasMore && (
           <div className="flex justify-center py-4">
             <Loader2 className="animate-spin text-primary" size={24} />

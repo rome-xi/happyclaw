@@ -274,6 +274,27 @@ export class GroupQueue {
   }
 
   /**
+   * Interrupt the current query for the same chat only (do not cross-interrupt
+   * sibling chats that share a serialized runner/folder).
+   *
+   * Writes a _interrupt sentinel that agent-runner detects and calls
+   * query.interrupt(). The container stays alive and accepts new messages.
+   */
+  interruptQuery(groupJid: string): boolean {
+    const own = this.groups.get(groupJid);
+    if (!own || !own.active || !own.groupFolder) return false;
+
+    const inputDir = path.join(DATA_DIR, 'ipc', own.groupFolder, 'input');
+    try {
+      fs.mkdirSync(inputDir, { recursive: true });
+      fs.writeFileSync(path.join(inputDir, '_interrupt'), '');
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * Force-stop a group's active container and clear queued work.
    * Returns a promise that resolves when the container has fully exited
    * (state.active becomes false), not just when docker stop completes.
