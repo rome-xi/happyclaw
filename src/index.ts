@@ -112,6 +112,7 @@ const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const execFileAsync = promisify(execFile);
 const DEFAULT_MAIN_JID = 'web:main';
 const DEFAULT_MAIN_NAME = 'Main';
+const SAFE_REQUEST_ID_RE = /^[A-Za-z0-9_-]+$/;
 
 let globalMessageCursor: MessageCursor = { timestamp: '', id: '' };
 let sessions: Record<string, string> = {};
@@ -1042,8 +1043,14 @@ function startIpcWatcher(): void {
       try {
         if (fs.existsSync(tasksDir)) {
           const taskFiles = fs
-            .readdirSync(tasksDir)
-            .filter((f) => f.endsWith('.json'));
+            .readdirSync(tasksDir, { withFileTypes: true })
+            .filter((entry) =>
+              entry.isFile() &&
+              entry.name.endsWith('.json') &&
+              !entry.name.startsWith('install_skill_result_') &&
+              !entry.name.startsWith('uninstall_skill_result_')
+            )
+            .map((entry) => entry.name);
           for (const file of taskFiles) {
             const filePath = path.join(tasksDir, file);
             try {
@@ -1312,8 +1319,21 @@ async function processTaskIpc(
       if (data.package && data.requestId) {
         const pkg = data.package;
         const requestId = data.requestId;
+        if (!SAFE_REQUEST_ID_RE.test(requestId)) {
+          logger.warn({ sourceGroup, requestId }, 'Rejected install_skill request with invalid requestId');
+          break;
+        }
+        const tasksDir = path.join(DATA_DIR, 'ipc', sourceGroup, 'tasks');
+        const tasksDirResolved = path.resolve(tasksDir);
         const resultFileName = `install_skill_result_${requestId}.json`;
-        const resultFilePath = path.join(DATA_DIR, 'ipc', sourceGroup, 'tasks', resultFileName);
+        const resultFilePath = path.resolve(tasksDir, resultFileName);
+        if (!resultFilePath.startsWith(`${tasksDirResolved}${path.sep}`)) {
+          logger.warn(
+            { sourceGroup, requestId, resultFilePath },
+            'Rejected install_skill request with unsafe result file path',
+          );
+          break;
+        }
 
         // Find the user who owns this group
         const sourceGroupForSkill = Object.values(registeredGroups).find(
@@ -1361,8 +1381,21 @@ async function processTaskIpc(
       if (data.skillId && data.requestId) {
         const skillId = data.skillId;
         const requestId = data.requestId;
+        if (!SAFE_REQUEST_ID_RE.test(requestId)) {
+          logger.warn({ sourceGroup, requestId }, 'Rejected uninstall_skill request with invalid requestId');
+          break;
+        }
+        const tasksDir = path.join(DATA_DIR, 'ipc', sourceGroup, 'tasks');
+        const tasksDirResolved = path.resolve(tasksDir);
         const resultFileName = `uninstall_skill_result_${requestId}.json`;
-        const resultFilePath = path.join(DATA_DIR, 'ipc', sourceGroup, 'tasks', resultFileName);
+        const resultFilePath = path.resolve(tasksDir, resultFileName);
+        if (!resultFilePath.startsWith(`${tasksDirResolved}${path.sep}`)) {
+          logger.warn(
+            { sourceGroup, requestId, resultFilePath },
+            'Rejected uninstall_skill request with unsafe result file path',
+          );
+          break;
+        }
 
         const sourceGroupForUninstall = Object.values(registeredGroups).find(
           (g) => g.folder === sourceGroup,

@@ -345,7 +345,7 @@ Example packages: "anthropic/memory", "anthropic/think", "owner/repo", "owner/re
 server.tool(
   'uninstall_skill',
   `Uninstall a user-level skill by its ID. Project-level skills cannot be uninstalled.
-Use list_skills or check the skills available in the system to find the skill ID.`,
+Use the skills panel in the UI to find the skill ID (directory name, e.g. "memory", "think").`,
   {
     skill_id: z.string().describe('The skill ID to uninstall (the directory name, e.g. "memory", "think")'),
   },

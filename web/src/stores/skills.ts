@@ -86,6 +86,7 @@ export const useSkillsStore = create<SkillsState>((set, get) => ({
       await get().loadSkills();
     } catch (err) {
       set({ error: err instanceof Error ? err.message : String(err) });
+      throw err;
     }
   },
 

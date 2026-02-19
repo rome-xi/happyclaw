@@ -12,6 +12,7 @@ import { authMiddleware } from '../middleware/auth.js';
 import { DATA_DIR } from '../config.js';
 
 const execFileAsync = promisify(execFile);
+let skillInstallLock: Promise<void> = Promise.resolve();
 
 const skillsRoutes = new Hono<{ Variables: Variables }>();
 
@@ -376,6 +377,21 @@ function copySkillToUser(src: string, dest: string): void {
   fs.cpSync(realSrc, dest, { recursive: true });
 }
 
+async function withSkillInstallLock<T>(fn: () => Promise<T>): Promise<T> {
+  const previous = skillInstallLock.catch(() => undefined);
+  let release: () => void = () => undefined;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  skillInstallLock = previous.then(() => current);
+  await previous;
+  try {
+    return await fn();
+  } finally {
+    release();
+  }
+}
+
 // --- Routes ---
 
 skillsRoutes.get('/', authMiddleware, (c) => {
@@ -529,53 +545,55 @@ async function installSkillForUser(
     return { success: false, error: 'Invalid package name format' };
   }
 
-  const globalDir = getGlobalSkillsDir();
-  fs.mkdirSync(globalDir, { recursive: true });
+  return withSkillInstallLock(async () => {
+    const globalDir = getGlobalSkillsDir();
+    fs.mkdirSync(globalDir, { recursive: true });
 
-  // 记录安装前时间戳，用于检测新增/修改的目录（减 1s 避免文件系统时间精度问题）
-  const beforeTime = Date.now() - 1000;
+    // 记录安装前时间戳，用于检测新增/修改的目录（减 1s 避免文件系统时间精度问题）
+    const beforeTime = Date.now() - 1000;
 
-  try {
-    await execFileAsync(
-      'npx',
-      ['-y', 'skills', 'add', pkg, '--global', '--yes', '-a', 'claude-code'],
-      { timeout: 60_000 },
-    );
-
-    // Find entries modified during install (handles symlinks and real dirs)
-    const modifiedEntries = findModifiedEntries(globalDir, beforeTime);
-
-    // Copy resolved skill content to per-user directory
-    const userDir = getUserSkillsDir(userId);
-    fs.mkdirSync(userDir, { recursive: true });
-
-    for (const name of modifiedEntries) {
-      const src = path.join(globalDir, name);
-      const dest = path.join(userDir, name);
-      // Remove existing if present (reinstall)
-      if (fs.existsSync(dest)) {
-        fs.rmSync(dest, { recursive: true, force: true });
-      }
-      copySkillToUser(src, dest);
-    }
-
-    return { success: true, installed: modifiedEntries };
-  } catch (error) {
-    // Even on error, clean up any modified entries from global
     try {
-      const modifiedEntries = findModifiedEntries(globalDir, beforeTime);
-      for (const name of modifiedEntries) {
-        fs.rmSync(path.join(globalDir, name), { recursive: true, force: true });
-      }
-    } catch {
-      // ignore cleanup errors
-    }
+      await execFileAsync(
+        'npx',
+        ['-y', 'skills', 'add', pkg, '--global', '--yes', '-a', 'claude-code'],
+        { timeout: 60_000 },
+      );
 
-    return {
-      success: false,
-      error: error instanceof Error ? error.message : 'Unknown error',
-    };
-  }
+      // Find entries modified during install (handles symlinks and real dirs)
+      const modifiedEntries = findModifiedEntries(globalDir, beforeTime);
+
+      // Copy resolved skill content to per-user directory
+      const userDir = getUserSkillsDir(userId);
+      fs.mkdirSync(userDir, { recursive: true });
+
+      for (const name of modifiedEntries) {
+        const src = path.join(globalDir, name);
+        const dest = path.join(userDir, name);
+        // Remove existing if present (reinstall)
+        if (fs.existsSync(dest)) {
+          fs.rmSync(dest, { recursive: true, force: true });
+        }
+        copySkillToUser(src, dest);
+      }
+
+      return { success: true, installed: modifiedEntries };
+    } catch (error) {
+      // Even on error, clean up any modified entries from global
+      try {
+        const modifiedEntries = findModifiedEntries(globalDir, beforeTime);
+        for (const name of modifiedEntries) {
+          fs.rmSync(path.join(globalDir, name), { recursive: true, force: true });
+        }
+      } catch {
+        // ignore cleanup errors
+      }
+
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Unknown error',
+      };
+    }
+  });
 }
 
 skillsRoutes.post(
