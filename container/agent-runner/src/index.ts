@@ -598,6 +598,10 @@ async function runQuery(
   let flushTimer: ReturnType<typeof setTimeout> | null = null;
   let seenTextualResult = false;
   const FLUSH_MS = 100, FLUSH_CHARS = 200;
+  // 完整文本累积器 - SDK 的 result.result 仅包含最后一个文本块，
+  // 当 agent 在工具调用前后都有文本输出时，前面的文本会丢失。
+  // 用此累积器拼接所有 text_delta，作为最终消息的完整内容。
+  let fullTextAccumulator = '';
 
   function flushBuffers() {
     if (textBuf) {
@@ -873,6 +877,7 @@ async function runQuery(
         const delta = event.delta;
         if (delta?.type === 'text_delta' && delta.text) {
           textBuf += delta.text;
+          fullTextAccumulator += delta.text;
           scheduleFlush();
         } else if (delta?.type === 'thinking_delta' && delta.thinking) {
           thinkBuf += delta.thinking;
@@ -1058,11 +1063,18 @@ async function runQuery(
         flushBuffers();
         seenTextualResult = true;
       }
+      // SDK 的 result.result 仅包含最后一个文本块。当 agent 在工具调用前后
+      // 都有文本输出时，使用 fullTextAccumulator 作为完整内容。
+      const effectiveResult = fullTextAccumulator.length > (textResult?.length || 0)
+        ? fullTextAccumulator
+        : textResult;
       emit({
         status: 'success',
-        result: textResult || null,
+        result: effectiveResult || null,
         newSessionId
       });
+      // 重置累积器，为下一个 query 循环做准备
+      fullTextAccumulator = '';
     }
   }
 

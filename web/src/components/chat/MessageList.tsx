@@ -2,7 +2,8 @@ import { useEffect, useRef, useState, useMemo, useCallback } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { Message, useChatStore } from '../../stores/chat';
 import { MessageBubble } from './MessageBubble';
-import { Loader2, ChevronUp, ChevronDown, AlertTriangle } from 'lucide-react';
+import { StreamingDisplay } from './StreamingDisplay';
+import { Loader2, ChevronUp, ChevronDown, AlertTriangle, Square } from 'lucide-react';
 
 interface MessageListProps {
   messages: Message[];
@@ -13,6 +14,10 @@ interface MessageListProps {
   scrollTrigger?: number;
   /** Current group JID — used to save/restore scroll position across group switches */
   groupJid?: string;
+  /** Whether the agent is currently processing */
+  isWaiting?: boolean;
+  /** Callback to interrupt the current agent query */
+  onInterrupt?: () => void;
 }
 
 type FlatItem =
@@ -24,7 +29,7 @@ type FlatItem =
 // Module-level map: groupJid → scrollTop (persists across re-renders/unmounts)
 const scrollPositionCache = new Map<string, number>();
 
-export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrigger, groupJid }: MessageListProps) {
+export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrigger, groupJid, isWaiting, onInterrupt }: MessageListProps) {
   const thinkingCache = useChatStore(s => s.thinkingCache ?? {});
   const parentRef = useRef<HTMLDivElement>(null);
   const [autoScroll, setAutoScroll] = useState(true);
@@ -172,6 +177,14 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
     }
   }, [messages.length, groupJid]);
 
+  // Auto-scroll when streaming content updates
+  const streaming = useChatStore(s => s.streaming[groupJid ?? '']);
+  useEffect(() => {
+    if (autoScroll && streaming) {
+      parentRef.current?.scrollTo({ top: parentRef.current.scrollHeight });
+    }
+  }, [streaming, autoScroll]);
+
   const scrollToTop = useCallback(() => {
     parentRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
   }, []);
@@ -308,6 +321,22 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
           <div className="flex flex-col items-center justify-center h-full text-slate-400">
             <p className="text-sm">暂无消息</p>
             <p className="text-xs mt-2">发送消息开始对话</p>
+          </div>
+        )}
+
+        {groupJid && (
+          <StreamingDisplay groupJid={groupJid} isWaiting={!!isWaiting} />
+        )}
+        {isWaiting && onInterrupt && (
+          <div className="flex justify-center py-1">
+            <button
+              type="button"
+              onClick={onInterrupt}
+              className="inline-flex items-center gap-1.5 px-3 py-1 text-xs text-slate-500 hover:text-red-600 bg-slate-100 hover:bg-red-50 rounded-full transition-colors cursor-pointer"
+            >
+              <Square className="w-3 h-3" />
+              中断
+            </button>
           </div>
         )}
         </div>
