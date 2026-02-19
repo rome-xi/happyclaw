@@ -469,35 +469,114 @@ skillsRoutes.patch('/:id', authMiddleware, (c) => {
   return c.json({ error: 'Skills are read-only and cannot be toggled from the Web UI' }, 403);
 });
 
-skillsRoutes.delete('/:id', authMiddleware, async (c) => {
-  const id = c.req.param('id');
-  const authUser = c.get('user') as AuthUser;
-
-  if (!validateSkillId(id)) {
-    return c.json({ error: 'Invalid skill ID' }, 400);
+/**
+ * Delete a user-level skill by ID.
+ * Reusable by both the HTTP route and IPC handler.
+ */
+function deleteSkillForUser(
+  userId: string,
+  skillId: string,
+): { success: boolean; error?: string } {
+  if (!validateSkillId(skillId)) {
+    return { success: false, error: 'Invalid skill ID' };
   }
 
-  const userDir = getUserSkillsDir(authUser.id);
-  const skillDir = path.join(userDir, id);
+  const userDir = getUserSkillsDir(userId);
+  const skillDir = path.join(userDir, skillId);
 
   if (!fs.existsSync(skillDir)) {
-    return c.json({ error: 'Skill not found or is a project-level skill' }, 404);
+    return { success: false, error: 'Skill not found or is a project-level skill' };
   }
 
   if (!validateSkillPath(userDir, skillDir)) {
-    return c.json({ error: 'Invalid skill path' }, 400);
+    return { success: false, error: 'Invalid skill path' };
   }
 
   try {
     fs.rmSync(skillDir, { recursive: true, force: true });
-    return c.json({ success: true });
+    return { success: true };
   } catch (error) {
-    return c.json(
-      { error: 'Failed to delete skill', details: error instanceof Error ? error.message : 'Unknown error' },
-      500,
-    );
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Unknown error',
+    };
   }
+}
+
+skillsRoutes.delete('/:id', authMiddleware, async (c) => {
+  const id = c.req.param('id');
+  const authUser = c.get('user') as AuthUser;
+  const result = deleteSkillForUser(authUser.id, id);
+
+  if (!result.success) {
+    const status = result.error === 'Invalid skill ID' || result.error === 'Invalid skill path' ? 400
+      : result.error?.includes('not found') ? 404 : 500;
+    return c.json({ error: result.error }, status);
+  }
+
+  return c.json({ success: true });
 });
+
+/**
+ * Install a skill package for a specific user.
+ * Reusable by both the HTTP route and IPC handler.
+ */
+async function installSkillForUser(
+  userId: string,
+  pkg: string,
+): Promise<{ success: boolean; installed?: string[]; error?: string }> {
+  if (!/^[\w\-]+\/[\w\-.]+(?:[@#][\w\-.\/]+)?$/.test(pkg)) {
+    return { success: false, error: 'Invalid package name format' };
+  }
+
+  const globalDir = getGlobalSkillsDir();
+  fs.mkdirSync(globalDir, { recursive: true });
+
+  // 记录安装前时间戳，用于检测新增/修改的目录（减 1s 避免文件系统时间精度问题）
+  const beforeTime = Date.now() - 1000;
+
+  try {
+    await execFileAsync(
+      'npx',
+      ['-y', 'skills', 'add', pkg, '--global', '--yes', '-a', 'claude-code'],
+      { timeout: 60_000 },
+    );
+
+    // Find entries modified during install (handles symlinks and real dirs)
+    const modifiedEntries = findModifiedEntries(globalDir, beforeTime);
+
+    // Copy resolved skill content to per-user directory
+    const userDir = getUserSkillsDir(userId);
+    fs.mkdirSync(userDir, { recursive: true });
+
+    for (const name of modifiedEntries) {
+      const src = path.join(globalDir, name);
+      const dest = path.join(userDir, name);
+      // Remove existing if present (reinstall)
+      if (fs.existsSync(dest)) {
+        fs.rmSync(dest, { recursive: true, force: true });
+      }
+      copySkillToUser(src, dest);
+    }
+
+    return { success: true, installed: modifiedEntries };
+  } catch (error) {
+    // Even on error, clean up any modified entries from global
+    try {
+      const modifiedEntries = findModifiedEntries(globalDir, beforeTime);
+      for (const name of modifiedEntries) {
+        fs.rmSync(path.join(globalDir, name), { recursive: true, force: true });
+      }
+    } catch {
+      // ignore cleanup errors
+    }
+
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Unknown error',
+    };
+  }
+}
 
 skillsRoutes.post(
   '/install',
@@ -511,62 +590,18 @@ skillsRoutes.post(
     }
 
     const pkg = body.package.trim();
-    if (!/^[\w\-]+\/[\w\-.]+(?:[@#][\w\-.\/]+)?$/.test(pkg)) {
-      return c.json({ error: 'Invalid package name format' }, 400);
-    }
+    const result = await installSkillForUser(authUser.id, pkg);
 
-    const globalDir = getGlobalSkillsDir();
-    fs.mkdirSync(globalDir, { recursive: true });
-
-    // 记录安装前时间戳，用于检测新增/修改的目录（减 1s 避免文件系统时间精度问题）
-    const beforeTime = Date.now() - 1000;
-
-    try {
-      await execFileAsync(
-        'npx',
-        ['-y', 'skills', 'add', pkg, '--global', '--yes', '-a', 'claude-code'],
-        { timeout: 60_000 },
-      );
-
-      // Find entries modified during install (handles symlinks and real dirs)
-      const modifiedEntries = findModifiedEntries(globalDir, beforeTime);
-
-      // Copy resolved skill content to per-user directory
-      const userDir = getUserSkillsDir(authUser.id);
-      fs.mkdirSync(userDir, { recursive: true });
-
-      for (const name of modifiedEntries) {
-        const src = path.join(globalDir, name);
-        const dest = path.join(userDir, name);
-        // Remove existing if present (reinstall)
-        if (fs.existsSync(dest)) {
-          fs.rmSync(dest, { recursive: true, force: true });
-        }
-        copySkillToUser(src, dest);
-      }
-
-      return c.json({ success: true, installed: modifiedEntries });
-    } catch (error) {
-      // Even on error, clean up any modified entries from global
-      try {
-        const modifiedEntries = findModifiedEntries(globalDir, beforeTime);
-        for (const name of modifiedEntries) {
-          fs.rmSync(path.join(globalDir, name), { recursive: true, force: true });
-        }
-      } catch {
-        // ignore cleanup errors
-      }
-
+    if (!result.success) {
       return c.json(
-        {
-          error: 'Failed to install skill',
-          details: error instanceof Error ? error.message : 'Unknown error',
-        },
-        500,
+        { error: 'Failed to install skill', details: result.error },
+        result.error === 'Invalid package name format' ? 400 : 500,
       );
     }
+
+    return c.json({ success: true, installed: result.installed });
   },
 );
 
-export { getUserSkillsDir };
+export { getUserSkillsDir, installSkillForUser, deleteSkillForUser };
 export default skillsRoutes;

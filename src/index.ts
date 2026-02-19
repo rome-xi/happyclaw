@@ -106,6 +106,7 @@ import {
   shutdownTerminals,
   shutdownWebServer,
 } from './web.js';
+import { installSkillForUser, deleteSkillForUser } from './routes/skills.js';
 
 const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const execFileAsync = promisify(execFile);
@@ -1104,6 +1105,10 @@ async function processTaskIpc(
     name?: string;
     folder?: string;
     containerConfig?: RegisteredGroup['containerConfig'];
+    // For install_skill / uninstall_skill
+    package?: string;
+    requestId?: string;
+    skillId?: string;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isAdminHome: boolean, // Whether source is admin home container
@@ -1300,6 +1305,91 @@ async function processTaskIpc(
           { data },
           'Invalid register_group request - missing required fields',
         );
+      }
+      break;
+
+    case 'install_skill':
+      if (data.package && data.requestId) {
+        const pkg = data.package;
+        const requestId = data.requestId;
+        const resultFileName = `install_skill_result_${requestId}.json`;
+        const resultFilePath = path.join(DATA_DIR, 'ipc', sourceGroup, 'tasks', resultFileName);
+
+        // Find the user who owns this group
+        const sourceGroupForSkill = Object.values(registeredGroups).find(
+          (g) => g.folder === sourceGroup,
+        );
+        const userId = sourceGroupForSkill?.created_by;
+
+        if (!userId) {
+          logger.warn({ sourceGroup }, 'Cannot install skill: no user associated with group');
+          const errorResult = JSON.stringify({ success: false, error: 'No user associated with this group' });
+          const tmpPath = `${resultFilePath}.tmp`;
+          fs.mkdirSync(path.dirname(resultFilePath), { recursive: true });
+          fs.writeFileSync(tmpPath, errorResult);
+          fs.renameSync(tmpPath, resultFilePath);
+          break;
+        }
+
+        try {
+          const result = await installSkillForUser(userId, pkg);
+          const tmpPath = `${resultFilePath}.tmp`;
+          fs.mkdirSync(path.dirname(resultFilePath), { recursive: true });
+          fs.writeFileSync(tmpPath, JSON.stringify(result));
+          fs.renameSync(tmpPath, resultFilePath);
+          logger.info(
+            { sourceGroup, userId, pkg, success: result.success },
+            'Skill installation via IPC completed',
+          );
+        } catch (err) {
+          const errorResult = JSON.stringify({
+            success: false,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          const tmpPath = `${resultFilePath}.tmp`;
+          fs.mkdirSync(path.dirname(resultFilePath), { recursive: true });
+          fs.writeFileSync(tmpPath, errorResult);
+          fs.renameSync(tmpPath, resultFilePath);
+          logger.error({ sourceGroup, userId, pkg, err }, 'Skill installation via IPC failed');
+        }
+      } else {
+        logger.warn({ data }, 'Invalid install_skill request - missing required fields');
+      }
+      break;
+
+    case 'uninstall_skill':
+      if (data.skillId && data.requestId) {
+        const skillId = data.skillId;
+        const requestId = data.requestId;
+        const resultFileName = `uninstall_skill_result_${requestId}.json`;
+        const resultFilePath = path.join(DATA_DIR, 'ipc', sourceGroup, 'tasks', resultFileName);
+
+        const sourceGroupForUninstall = Object.values(registeredGroups).find(
+          (g) => g.folder === sourceGroup,
+        );
+        const userId = sourceGroupForUninstall?.created_by;
+
+        if (!userId) {
+          logger.warn({ sourceGroup }, 'Cannot uninstall skill: no user associated with group');
+          const errorResult = JSON.stringify({ success: false, error: 'No user associated with this group' });
+          const tmpPath = `${resultFilePath}.tmp`;
+          fs.mkdirSync(path.dirname(resultFilePath), { recursive: true });
+          fs.writeFileSync(tmpPath, errorResult);
+          fs.renameSync(tmpPath, resultFilePath);
+          break;
+        }
+
+        const result = deleteSkillForUser(userId, skillId);
+        const tmpPath = `${resultFilePath}.tmp`;
+        fs.mkdirSync(path.dirname(resultFilePath), { recursive: true });
+        fs.writeFileSync(tmpPath, JSON.stringify(result));
+        fs.renameSync(tmpPath, resultFilePath);
+        logger.info(
+          { sourceGroup, userId, skillId, success: result.success },
+          'Skill uninstall via IPC completed',
+        );
+      } else {
+        logger.warn({ data }, 'Invalid uninstall_skill request - missing required fields');
       }
       break;
 
