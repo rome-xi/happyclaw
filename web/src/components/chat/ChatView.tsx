@@ -4,12 +4,12 @@ import { useChatStore } from '../../stores/chat';
 import { useAuthStore } from '../../stores/auth';
 import { MessageList } from './MessageList';
 import { MessageInput } from './MessageInput';
-import { StreamingDisplay } from './StreamingDisplay';
+
 import { FilePanel } from './FilePanel';
 import { ContainerEnvPanel } from './ContainerEnvPanel';
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { ConfirmDialog } from '@/components/common/ConfirmDialog';
-import { ArrowLeft, Link, MoreHorizontal, PanelRightClose, PanelRightOpen, Square, X } from 'lucide-react';
+import { ArrowLeft, Link, MoreHorizontal, PanelRightClose, PanelRightOpen, X } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { wsManager } from '../../api/ws';
 import { api } from '../../api/client';
@@ -68,7 +68,6 @@ export function ChatView({ groupJid, onBack }: ChatViewProps) {
   const clearStreaming = useChatStore(s => s.clearStreaming);
 
   const currentUser = useAuthStore(s => s.user);
-  const appearance = useAuthStore(s => s.appearance);
   const canUseTerminal = group?.execution_mode !== 'host';
   const pollRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
@@ -390,20 +389,9 @@ export function ChatView({ groupJid, onBack }: ChatViewProps) {
             onLoadMore={handleLoadMore}
             scrollTrigger={scrollTrigger}
             groupJid={groupJid}
+            isWaiting={isWaiting}
+            onInterrupt={() => interruptQuery(groupJid)}
           />
-          <StreamingDisplay groupJid={groupJid} isWaiting={isWaiting} senderName={currentUser?.ai_name || appearance?.aiName || group?.name || 'AI'} />
-          {isWaiting && (
-            <div className="flex justify-center py-1">
-              <button
-                type="button"
-                onClick={() => interruptQuery(groupJid)}
-                className="inline-flex items-center gap-1.5 px-3 py-1 text-xs text-slate-500 hover:text-red-600 bg-slate-100 hover:bg-red-50 rounded-full transition-colors cursor-pointer"
-              >
-                <Square className="w-3 h-3" />
-                中断
-              </button>
-            </div>
-          )}
           <MessageInput
             onSend={handleSend}
             groupJid={groupJid}
