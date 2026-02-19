@@ -148,7 +148,7 @@ export function GroupSkillsPanel({ groupJid }: GroupSkillsPanelProps) {
       <div className="flex-1 overflow-y-auto">
         {allSkills.length === 0 ? (
           <div className="px-4 py-8 text-center text-sm text-muted-foreground">
-            暂无可用 Skills
+            暂无可用技能
           </div>
         ) : (
           <div className="divide-y divide-border">

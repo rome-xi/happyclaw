@@ -389,6 +389,7 @@ export function ChatView({ groupJid, onBack }: ChatViewProps) {
             hasMore={hasMoreMessages}
             onLoadMore={handleLoadMore}
             scrollTrigger={scrollTrigger}
+            groupJid={groupJid}
           />
           <StreamingDisplay groupJid={groupJid} isWaiting={isWaiting} senderName={currentUser?.ai_name || appearance?.aiName || group?.name || 'AI'} />
           {isWaiting && (
@@ -446,7 +447,7 @@ export function ChatView({ groupJid, onBack }: ChatViewProps) {
                   : 'text-slate-400 hover:text-slate-600'
               }`}
             >
-              Skills
+              技能
             </button>
           </div>
 
@@ -530,7 +531,7 @@ export function ChatView({ groupJid, onBack }: ChatViewProps) {
       <Sheet open={mobilePanel === 'skills'} onOpenChange={(v) => !v && setMobilePanel(null)}>
         <SheetContent side="bottom" className="h-[80dvh] p-0">
           <SheetHeader className="px-4 pt-4 pb-2">
-            <SheetTitle>Skills 管理</SheetTitle>
+            <SheetTitle>技能管理</SheetTitle>
           </SheetHeader>
           <div className="flex-1 overflow-hidden h-[calc(80dvh-56px)]">
             <GroupSkillsPanel

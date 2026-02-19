@@ -11,6 +11,8 @@ interface MessageListProps {
   onLoadMore: () => void;
   /** Increment to force scroll to bottom (e.g. after sending a message) */
   scrollTrigger?: number;
+  /** Current group JID — used to save/restore scroll position across group switches */
+  groupJid?: string;
 }
 
 type FlatItem =
@@ -19,12 +21,16 @@ type FlatItem =
   | { type: 'error'; content: string }
   | { type: 'message'; content: Message };
 
-export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrigger }: MessageListProps) {
+// Module-level map: groupJid → scrollTop (persists across re-renders/unmounts)
+const scrollPositionCache = new Map<string, number>();
+
+export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrigger, groupJid }: MessageListProps) {
   const thinkingCache = useChatStore(s => s.thinkingCache ?? {});
   const parentRef = useRef<HTMLDivElement>(null);
   const [autoScroll, setAutoScroll] = useState(true);
   const [atTop, setAtTop] = useState(false);
   const prevMessageCount = useRef(messages.length);
+  const currentGroupRef = useRef(groupJid);
 
   // Compute flatMessages (with date headers) before virtualizer
   const flatMessages = useMemo<FlatItem[]>(() => {
@@ -92,7 +98,12 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
     overscan: 8,
   });
 
-  // 检测向上滚动触发 loadMore
+  // Save scroll position when switching away from a group
+  useEffect(() => {
+    currentGroupRef.current = groupJid;
+  }, [groupJid]);
+
+  // 检测向上滚动触发 loadMore + 保存滚动位置
   useEffect(() => {
     const parent = parentRef.current;
     if (!parent) return;
@@ -102,6 +113,11 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
       const atBottom = scrollHeight - scrollTop - clientHeight < 100;
       setAutoScroll(atBottom);
       setAtTop(scrollTop < 50);
+
+      // Save scroll position for current group
+      if (currentGroupRef.current) {
+        scrollPositionCache.set(currentGroupRef.current, atBottom ? -1 : scrollTop);
+      }
 
       if (scrollTop < 100 && hasMore && !loading) {
         onLoadMore();
@@ -133,14 +149,28 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
     }
   }, [scrollTrigger]);
 
-  // 初始滚到底部（首次加载完消息后触发）
+  // 初始滚动：恢复保存的位置，或滚到底部（首次加载完消息后触发）
   const initialScrollDone = useRef(false);
+  const lastGroupJidRef = useRef(groupJid);
   useEffect(() => {
+    // Reset when groupJid changes
+    if (lastGroupJidRef.current !== groupJid) {
+      initialScrollDone.current = false;
+      lastGroupJidRef.current = groupJid;
+    }
     if (!initialScrollDone.current && parentRef.current && messages.length > 0) {
-      parentRef.current.scrollTop = parentRef.current.scrollHeight;
+      const saved = groupJid ? scrollPositionCache.get(groupJid) : undefined;
+      if (saved !== undefined && saved !== -1) {
+        // Restore saved scroll position
+        parentRef.current.scrollTop = saved;
+        setAutoScroll(false);
+      } else {
+        // First visit or was at bottom — scroll to bottom
+        parentRef.current.scrollTop = parentRef.current.scrollHeight;
+      }
       initialScrollDone.current = true;
     }
-  }, [messages.length]);
+  }, [messages.length, groupJid]);
 
   const scrollToTop = useCallback(() => {
     parentRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
@@ -217,7 +247,7 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
                 >
                   <div className="flex items-center gap-3 my-6 px-4">
                     <div className="flex-1 border-t border-amber-300" />
-                    <span className="text-xs text-amber-600 whitespace-nowrap">
+                    <span className="text-xs text-amber-600 whitespace-pre-wrap">
                       {item.content}
                     </span>
                     <div className="flex-1 border-t border-amber-300" />
@@ -242,7 +272,7 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
                 >
                   <div className="flex items-center gap-3 my-6 px-4">
                     <div className="flex-1 border-t border-red-300" />
-                    <span className="text-xs text-red-600 whitespace-nowrap flex items-center gap-1">
+                    <span className="text-xs text-red-600 whitespace-pre-wrap flex items-center gap-1">
                       <AlertTriangle size={14} />
                       {item.content}
                     </span>
