@@ -42,6 +42,7 @@ import {
   getGroupMemberRole,
   getUserById,
   getAgent,
+  listUsers,
 } from '../db.js';
 import { logger } from '../logger.js';
 import {
@@ -63,7 +64,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import net from 'node:net';
 import { z } from 'zod';
-import { broadcastNewMessage } from '../web.js';
+import { broadcastNewMessage, invalidateAllowedUserCache } from '../web.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -582,6 +583,9 @@ groupRoutes.post('/', authMiddleware, async (c) => {
       deletable: true,
       lastMessage: undefined,
       lastMessageTime: now,
+      member_role: 'owner',
+      member_count: 1,
+      is_shared: false,
     },
   });
 });
@@ -1172,6 +1176,29 @@ groupRoutes.get('/:jid/members', authMiddleware, (c) => {
   return c.json({ members });
 });
 
+// GET /api/groups/:jid/members/search?q=... - 搜索可添加的用户（owner/admin 权限）
+groupRoutes.get('/:jid/members/search', authMiddleware, (c) => {
+  const jid = c.req.param('jid');
+  const group = getRegisteredGroup(jid);
+  if (!group) return c.json({ error: 'Group not found' }, 404);
+
+  const authUser = c.get('user') as AuthUser;
+  if (!canManageGroupMembers({ id: authUser.id, role: authUser.role }, { ...group, jid })) {
+    return c.json({ error: 'Forbidden' }, 403);
+  }
+
+  const q = c.req.query('q') || '';
+  if (!q.trim()) return c.json({ users: [] });
+
+  const result = listUsers({ query: q.trim(), status: 'active', pageSize: 10 });
+  const existingIds = new Set(getGroupMembers(group.folder).map((m) => m.user_id));
+  const users = result.users
+    .filter((u) => !existingIds.has(u.id))
+    .map((u) => ({ id: u.id, username: u.username, display_name: u.display_name }));
+
+  return c.json({ users });
+});
+
 // POST /api/groups/:jid/members - 添加成员
 groupRoutes.post('/:jid/members', authMiddleware, async (c) => {
   const jid = c.req.param('jid');
@@ -1208,6 +1235,7 @@ groupRoutes.post('/:jid/members', authMiddleware, async (c) => {
   }
 
   addGroupMember(group.folder, targetUserId, 'member', authUser.id);
+  invalidateAllowedUserCache(jid);
   logger.info(
     { jid, folder: group.folder, targetUserId, addedBy: authUser.id },
     'Group member added',
@@ -1246,6 +1274,7 @@ groupRoutes.delete('/:jid/members/:userId', authMiddleware, (c) => {
   }
 
   removeGroupMember(group.folder, targetUserId);
+  invalidateAllowedUserCache(jid);
   logger.info(
     { jid, folder: group.folder, targetUserId, removedBy: authUser.id, isSelfRemoval },
     'Group member removed',

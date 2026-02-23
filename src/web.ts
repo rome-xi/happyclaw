@@ -774,7 +774,25 @@ function safeBroadcast(msg: WsMessageOut, adminOnly = false, allowedUserIds?: Se
  * - Set<string>: allowed user IDs (owner + shared members)
  * - null: ownership unresolvable → default-deny (admin-only)
  */
+const allowedUserIdsCache = new Map<string, { ids: Set<string> | null; expiry: number }>();
+const ALLOWED_CACHE_TTL = 10_000; // 10 seconds
+
 function getGroupAllowedUserIds(chatJid: string): Set<string> | null {
+  const now = Date.now();
+  const cached = allowedUserIdsCache.get(chatJid);
+  if (cached && cached.expiry > now) return cached.ids;
+
+  const result = computeGroupAllowedUserIds(chatJid);
+  allowedUserIdsCache.set(chatJid, { ids: result, expiry: now + ALLOWED_CACHE_TTL });
+  return result;
+}
+
+/** Invalidate the allowed-user cache for a group (call after member changes). */
+export function invalidateAllowedUserCache(chatJid: string): void {
+  allowedUserIdsCache.delete(chatJid);
+}
+
+function computeGroupAllowedUserIds(chatJid: string): Set<string> | null {
   const group = getRegisteredGroup(chatJid);
   if (!group) return null; // Unknown group → deny by default
 

@@ -51,7 +51,7 @@ export function GroupMembersPanel({ groupJid }: GroupMembersPanelProps) {
       setSearching(true);
       try {
         const data = await api.get<{ users: UserOption[] }>(
-          `/api/admin/users?q=${encodeURIComponent(searchQuery.trim())}&status=active&pageSize=10`,
+          `/api/groups/${encodeURIComponent(groupJid)}/members/search?q=${encodeURIComponent(searchQuery.trim())}`,
         );
         // Filter out users already in the group
         const memberIds = new Set(membersList.map(m => m.user_id));

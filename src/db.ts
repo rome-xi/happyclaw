@@ -2201,8 +2201,13 @@ export function addGroupMember(
   addedBy?: string,
 ): void {
   db.prepare(
-    `INSERT OR REPLACE INTO group_members (group_folder, user_id, role, added_at, added_by)
-     VALUES (?, ?, ?, ?, ?)`,
+    `INSERT INTO group_members (group_folder, user_id, role, added_at, added_by)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(group_folder, user_id) DO UPDATE SET
+       role = CASE WHEN excluded.role = 'owner' THEN 'owner'
+                   WHEN group_members.role = 'owner' THEN 'owner'
+                   ELSE excluded.role END,
+       added_by = COALESCE(excluded.added_by, group_members.added_by)`,
   ).run(groupFolder, userId, role, new Date().toISOString(), addedBy ?? null);
 }
 
