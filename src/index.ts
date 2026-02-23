@@ -74,6 +74,7 @@ import {
   getTaskById,
   getUserHomeGroup,
   initDatabase,
+  isGroupShared,
   listUsers,
   setLastGroupSync,
   setRegisteredGroup,
@@ -408,11 +409,11 @@ function escapeXml(s: string): string {
     .replace(/"/g, '&quot;');
 }
 
-function formatMessages(messages: NewMessage[]): string {
-  const lines = messages.map(
-    (m) =>
-      `<message sender="${escapeXml(m.sender_name)}" time="${m.timestamp}">${escapeXml(m.content)}</message>`,
-  );
+function formatMessages(messages: NewMessage[], isShared = false): string {
+  const lines = messages.map((m) => {
+    const content = isShared ? `[${m.sender_name}] ${m.content}` : m.content;
+    return `<message sender="${escapeXml(m.sender_name)}" time="${m.timestamp}">${escapeXml(content)}</message>`;
+  });
   return `<messages>\n${lines.join('\n')}\n</messages>`;
 }
 
@@ -519,7 +520,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // own processGroupMessages call, so JID-based routing is always correct.
   const shouldReplyToFeishu = chatJid.startsWith('feishu:');
 
-  const prompt = formatMessages(missedMessages);
+  const shared = isGroupShared(group.folder);
+  const prompt = formatMessages(missedMessages, shared);
 
   const images = collectMessageImages(chatJid, missedMessages);
   const imagesForAgent = images.length > 0 ? images : undefined;
@@ -530,6 +532,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       messageCount: missedMessages.length,
       shouldReplyToFeishu,
       imageCount: images.length,
+      shared,
     },
     'Processing messages',
   );

@@ -5,6 +5,9 @@ export interface GroupInfo {
   kind?: 'home' | 'main' | 'feishu' | 'web';
   is_home?: boolean;
   is_my_home?: boolean;
+  is_shared?: boolean;
+  member_role?: 'owner' | 'member';
+  member_count?: number;
   editable?: boolean;
   deletable?: boolean;
   lastMessage?: string;
@@ -13,4 +16,13 @@ export interface GroupInfo {
   custom_cwd?: string;
   created_by?: string;
   selected_skills?: string[] | null;
+}
+
+export interface GroupMember {
+  user_id: string;
+  role: 'owner' | 'member';
+  added_at: string;
+  added_by?: string;
+  username: string;
+  display_name: string;
 }

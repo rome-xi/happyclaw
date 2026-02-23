@@ -7,6 +7,7 @@ import {
   AuthAuditLog,
   AuthEventType,
   ExecutionMode,
+  GroupMember,
   InviteCode,
   InviteCodeWithCreator,
   NewMessage,
@@ -63,6 +64,18 @@ function assertSchema(
       `Incompatible DB schema in table "${tableName}". Missing: [${missing.join(', ')}], forbidden: [${forbidden.join(', ')}]. ` +
         'Please remove data/db/messages.db (or legacy store/messages.db) and restart.',
     );
+  }
+}
+
+/** Internal helper — reads router_state before initDatabase exports are available. */
+function getRouterStateInternal(key: string): string | undefined {
+  try {
+    const row = db
+      .prepare('SELECT value FROM router_state WHERE key = ?')
+      .get(key) as { value: string } | undefined;
+    return row?.value;
+  } catch {
+    return undefined; // Table may not exist yet on first run
   }
 }
 
@@ -211,6 +224,19 @@ export function initDatabase(): void {
     CREATE INDEX IF NOT EXISTS idx_users_status_role ON users(status, role);
     CREATE INDEX IF NOT EXISTS idx_users_created_at ON users(created_at);
     CREATE INDEX IF NOT EXISTS idx_invites_created_at ON invite_codes(created_at);
+  `);
+
+  // Group members table for shared workspaces
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS group_members (
+      group_folder TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'member',
+      added_at TEXT NOT NULL,
+      added_by TEXT,
+      PRIMARY KEY (group_folder, user_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_group_members_user ON group_members(user_id);
   `);
 
   // Lightweight migrations for existing DBs
@@ -410,7 +436,26 @@ export function initDatabase(): void {
     WHERE jid = 'web:main' AND folder = 'main' AND is_home = 0
   `);
 
-  const SCHEMA_VERSION = '14';
+  // v15 migration: backfill group_members for existing web groups
+  const currentVersion = getRouterStateInternal('schema_version');
+  if (!currentVersion || parseInt(currentVersion, 10) < 15) {
+    db.transaction(() => {
+      // Backfill owner records for all web groups with created_by set
+      const webGroups = db
+        .prepare(
+          "SELECT DISTINCT folder, created_by FROM registered_groups WHERE jid LIKE 'web:%' AND created_by IS NOT NULL",
+        )
+        .all() as Array<{ folder: string; created_by: string }>;
+      for (const g of webGroups) {
+        db.prepare(
+          `INSERT OR IGNORE INTO group_members (group_folder, user_id, role, added_at, added_by)
+           VALUES (?, ?, 'owner', ?, ?)`,
+        ).run(g.folder, g.created_by, new Date().toISOString(), g.created_by);
+      }
+    })();
+  }
+
+  const SCHEMA_VERSION = '15';
   db.prepare(
     'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
   ).run('schema_version', SCHEMA_VERSION);
@@ -1065,11 +1110,13 @@ export function deleteGroupData(jid: string, folder: string): void {
       'DELETE FROM task_run_logs WHERE task_id IN (SELECT id FROM scheduled_tasks WHERE group_folder = ?)',
     ).run(folder);
     db.prepare('DELETE FROM scheduled_tasks WHERE group_folder = ?').run(folder);
-    // 2. 删除注册信息
+    // 2. 删除成员记录
+    db.prepare('DELETE FROM group_members WHERE group_folder = ?').run(folder);
+    // 3. 删除注册信息
     db.prepare('DELETE FROM registered_groups WHERE jid = ?').run(jid);
-    // 3. 删除会话
+    // 4. 删除会话
     db.prepare('DELETE FROM sessions WHERE group_folder = ?').run(folder);
-    // 4. 删除聊天记录
+    // 5. 删除聊天记录
     db.prepare('DELETE FROM messages WHERE chat_jid = ?').run(jid);
     db.prepare('DELETE FROM chats WHERE jid = ?').run(jid);
   });
@@ -2083,6 +2130,93 @@ export function checkLoginRateLimitFromAudit(
     Math.ceil((retryAt - Date.now()) / 1000),
   );
   return { allowed: false, retryAfterSeconds, attempts };
+}
+
+// ===================== Group Members =====================
+
+export function addGroupMember(
+  groupFolder: string,
+  userId: string,
+  role: 'owner' | 'member',
+  addedBy?: string,
+): void {
+  db.prepare(
+    `INSERT OR REPLACE INTO group_members (group_folder, user_id, role, added_at, added_by)
+     VALUES (?, ?, ?, ?, ?)`,
+  ).run(groupFolder, userId, role, new Date().toISOString(), addedBy ?? null);
+}
+
+export function removeGroupMember(
+  groupFolder: string,
+  userId: string,
+): void {
+  db.prepare(
+    'DELETE FROM group_members WHERE group_folder = ? AND user_id = ?',
+  ).run(groupFolder, userId);
+}
+
+export function getGroupMembers(groupFolder: string): GroupMember[] {
+  const rows = db
+    .prepare(
+      `SELECT gm.user_id, gm.role, gm.added_at, gm.added_by,
+              u.username, COALESCE(u.display_name, '') as display_name
+       FROM group_members gm
+       JOIN users u ON gm.user_id = u.id
+       WHERE gm.group_folder = ?
+       ORDER BY gm.role DESC, gm.added_at ASC`,
+    )
+    .all(groupFolder) as Array<{
+    user_id: string;
+    role: string;
+    added_at: string;
+    added_by: string | null;
+    username: string;
+    display_name: string;
+  }>;
+  return rows.map((r) => ({
+    user_id: r.user_id,
+    role: r.role as 'owner' | 'member',
+    added_at: r.added_at,
+    added_by: r.added_by ?? undefined,
+    username: r.username,
+    display_name: r.display_name,
+  }));
+}
+
+export function getGroupMemberRole(
+  groupFolder: string,
+  userId: string,
+): 'owner' | 'member' | null {
+  const row = db
+    .prepare(
+      'SELECT role FROM group_members WHERE group_folder = ? AND user_id = ?',
+    )
+    .get(groupFolder, userId) as { role: string } | undefined;
+  if (!row) return null;
+  return row.role as 'owner' | 'member';
+}
+
+export function getUserMemberFolders(
+  userId: string,
+): Array<{ group_folder: string; role: 'owner' | 'member' }> {
+  const rows = db
+    .prepare(
+      'SELECT group_folder, role FROM group_members WHERE user_id = ?',
+    )
+    .all(userId) as Array<{ group_folder: string; role: string }>;
+  return rows.map((r) => ({
+    group_folder: r.group_folder,
+    role: r.role as 'owner' | 'member',
+  }));
+}
+
+export function isGroupShared(groupFolder: string): boolean {
+  const row = db
+    .prepare(
+      'SELECT COUNT(*) as cnt FROM group_members WHERE group_folder = ?',
+    )
+    .get(groupFolder) as { cnt: number };
+  return row.cnt > 1;
 }
 
 /**

@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { ChevronDown, ChevronUp } from 'lucide-react';
+import { ChevronDown, ChevronUp, Users } from 'lucide-react';
 import { GroupInfo } from '../../stores/groups';
 import { GroupDetail } from './GroupDetail';
 
@@ -31,9 +31,17 @@ export function GroupCard({ group }: GroupCardProps) {
         <div className="flex items-start justify-between">
           <div className="flex-1 min-w-0">
             {/* Group Name */}
-            <h3 className="text-lg font-semibold text-slate-900 mb-1 truncate">
-              {group.name}
-            </h3>
+            <div className="flex items-center gap-2 mb-1">
+              <h3 className="text-lg font-semibold text-slate-900 truncate">
+                {group.name}
+              </h3>
+              {group.is_shared && (
+                <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-brand-100 text-primary text-[10px] font-medium flex-shrink-0">
+                  <Users className="w-3 h-3" />
+                  {group.member_count ?? 0}
+                </span>
+              )}
+            </div>
 
             {/* JID */}
             <p className="text-xs text-slate-500 font-mono mb-2">

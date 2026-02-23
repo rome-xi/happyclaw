@@ -9,19 +9,20 @@ import { FilePanel } from './FilePanel';
 import { ContainerEnvPanel } from './ContainerEnvPanel';
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { ConfirmDialog } from '@/components/common/ConfirmDialog';
-import { ArrowLeft, Link, MoreHorizontal, PanelRightClose, PanelRightOpen, X } from 'lucide-react';
+import { ArrowLeft, Link, MoreHorizontal, PanelRightClose, PanelRightOpen, Users, X } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { wsManager } from '../../api/ws';
 import { api } from '../../api/client';
 import { TerminalPanel } from './TerminalPanel';
 import { GroupSkillsPanel } from './GroupSkillsPanel';
+import { GroupMembersPanel } from './GroupMembersPanel';
 
 const POLL_INTERVAL_MS = 2000;
 const TERMINAL_MIN_HEIGHT = 150;
 const TERMINAL_DEFAULT_HEIGHT = 300;
 const TERMINAL_MAX_RATIO = 0.7;
 
-type SidebarTab = 'files' | 'env' | 'skills';
+type SidebarTab = 'files' | 'env' | 'skills' | 'members';
 
 interface ChatViewProps {
   groupJid: string;
@@ -305,6 +306,15 @@ export function ChatView({ groupJid, onBack }: ChatViewProps) {
           <h2 className="font-semibold text-slate-900 text-[15px] truncate">{group.name}</h2>
           <div className="flex items-center gap-1.5 text-xs text-slate-500">
             <span>{isWaiting ? '正在思考...' : group.is_home ? '主工作区' : '工作区'}</span>
+            {!isWaiting && group.is_shared && (
+              <>
+                <span className="text-slate-300">·</span>
+                <span className="inline-flex items-center gap-0.5">
+                  <Users className="w-3 h-3" />
+                  {group.member_count ?? 0} 人协作
+                </span>
+              </>
+            )}
             {!isWaiting && group.execution_mode && (
               <>
                 <span className="text-slate-300">·</span>
@@ -437,6 +447,18 @@ export function ChatView({ groupJid, onBack }: ChatViewProps) {
             >
               技能
             </button>
+            {(group.is_shared || group.member_role === 'owner') && !group.is_home && (
+              <button
+                onClick={() => setSidebarTab('members')}
+                className={`flex-1 px-3 py-2 text-xs font-medium transition-colors cursor-pointer ${
+                  sidebarTab === 'members'
+                    ? 'text-primary border-b-2 border-primary'
+                    : 'text-slate-400 hover:text-slate-600'
+                }`}
+              >
+                成员
+              </button>
+            )}
           </div>
 
           {/* Tab content */}
@@ -445,6 +467,8 @@ export function ChatView({ groupJid, onBack }: ChatViewProps) {
               <FilePanel groupJid={groupJid} />
             ) : sidebarTab === 'env' ? (
               <ContainerEnvPanel groupJid={groupJid} />
+            ) : sidebarTab === 'members' ? (
+              <GroupMembersPanel groupJid={groupJid} />
             ) : (
               <GroupSkillsPanel groupJid={groupJid} />
             )}
@@ -529,6 +553,18 @@ export function ChatView({ groupJid, onBack }: ChatViewProps) {
         </SheetContent>
       </Sheet>
 
+      {/* Mobile: members sheet */}
+      <Sheet open={mobilePanel === 'members'} onOpenChange={(v) => !v && setMobilePanel(null)}>
+        <SheetContent side="bottom" className="h-[80dvh] p-0">
+          <SheetHeader className="px-4 pt-4 pb-2">
+            <SheetTitle>成员管理</SheetTitle>
+          </SheetHeader>
+          <div className="flex-1 overflow-hidden h-[calc(80dvh-56px)]">
+            <GroupMembersPanel groupJid={groupJid} />
+          </div>
+        </SheetContent>
+      </Sheet>
+
       {/* Mobile: Terminal sheet */}
       <Sheet open={mobileTerminal} onOpenChange={(v) => !v && setMobileTerminal(false)}>
         <SheetContent side="bottom" className="h-[85dvh] p-0">
@@ -571,6 +607,14 @@ export function ChatView({ groupJid, onBack }: ChatViewProps) {
             >
               技能
             </button>
+            {(group.is_shared || group.member_role === 'owner') && !group.is_home && (
+              <button
+                onClick={() => { setMobileActionsOpen(false); setMobilePanel('members'); }}
+                className="w-full text-left px-4 py-3 rounded-lg border border-border hover:bg-accent transition-colors cursor-pointer text-foreground text-sm"
+              >
+                成员管理
+              </button>
+            )}
             {canUseTerminal && (
               <button
                 onClick={() => {

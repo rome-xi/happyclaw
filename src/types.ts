@@ -47,6 +47,15 @@ export interface RegisteredGroup {
   selected_skills?: string[] | null; // null = 全部启用
 }
 
+export interface GroupMember {
+  user_id: string;
+  role: 'owner' | 'member';
+  added_at: string;
+  added_by?: string;
+  username: string;
+  display_name: string;
+}
+
 export interface NewMessage {
   id: string;
   chat_jid: string;

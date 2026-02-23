@@ -31,6 +31,7 @@ const scrollPositionCache = new Map<string, number>();
 
 export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrigger, groupJid, isWaiting, onInterrupt }: MessageListProps) {
   const thinkingCache = useChatStore(s => s.thinkingCache ?? {});
+  const isShared = useChatStore(s => !!s.groups[groupJid ?? '']?.is_shared);
   const parentRef = useRef<HTMLDivElement>(null);
   const [autoScroll, setAutoScroll] = useState(true);
   const [atTop, setAtTop] = useState(false);
@@ -311,7 +312,7 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
                 ref={virtualizer.measureElement}
                 data-index={virtualItem.index}
               >
-                <MessageBubble message={message} showTime={showTime} thinkingContent={thinkingCache[message.id]} />
+                <MessageBubble message={message} showTime={showTime} thinkingContent={thinkingCache[message.id]} isShared={isShared} />
               </div>
             );
           })}

@@ -55,6 +55,7 @@ import {
   storeMessageDirect,
   deleteUserSession,
   updateSessionLastActive,
+  getGroupMembers,
 } from './db.js';
 import { isSessionExpired } from './auth.js';
 import type { NewMessage, WsMessageOut, WsMessageIn, AuthUser, StreamEvent, UserRole } from './types.js';
@@ -226,6 +227,7 @@ async function handleWebUserMessage(
     attachments: attachmentsStr,
   });
 
+  const shared = !group.is_home && getGroupMembers(group.folder).length > 1;
   const formatted = deps.formatMessages([
     {
       id: messageId,
@@ -235,7 +237,7 @@ async function handleWebUserMessage(
       content,
       timestamp,
     },
-  ]);
+  ], shared);
 
   // For home chat, avoid piping into an active Feishu-driven run.
   // Force a new processing pass so reply channel can be decided correctly.
@@ -620,12 +622,12 @@ function setupWebSocket(server: any): WebSocketServer {
  *
  * @param msg - The message to broadcast
  * @param adminOnly - If true, only admin users receive the message
- * @param ownerUserId - Group owner filtering:
+ * @param allowedUserIds - Group access filtering:
  *   - undefined: no user-level filtering (e.g. system-wide admin broadcasts)
  *   - null: ownership unresolvable → default-deny, only admin can see
- *   - string: only this owner + admin can see
+ *   - Set<string>: only these users + admin can see
  */
-function safeBroadcast(msg: WsMessageOut, adminOnly = false, ownerUserId?: string | null): void {
+function safeBroadcast(msg: WsMessageOut, adminOnly = false, allowedUserIds?: Set<string> | null): void {
   const data = JSON.stringify(msg);
   for (const [client, clientInfo] of wsClients) {
     if (client.readyState !== WebSocket.OPEN) {
@@ -668,10 +670,10 @@ function safeBroadcast(msg: WsMessageOut, adminOnly = false, ownerUserId?: strin
       continue;
     }
 
-    // Group isolation: only owner and admins can see this group's events
-    // ownerUserId === null means ownership unresolvable → default-deny (admin-only)
-    if (ownerUserId !== undefined && session.role !== 'admin') {
-      if (ownerUserId === null || session.user_id !== ownerUserId) {
+    // Group isolation: only allowed users and admins can see this group's events
+    // allowedUserIds === null means ownership unresolvable → default-deny (admin-only)
+    if (allowedUserIds !== undefined && session.role !== 'admin') {
+      if (allowedUserIds === null || !allowedUserIds.has(session.user_id)) {
         continue;
       }
     }
@@ -685,37 +687,52 @@ function safeBroadcast(msg: WsMessageOut, adminOnly = false, ownerUserId?: strin
 }
 
 /**
- * Get the owner userId for broadcast filtering.
- * For any group with created_by, return that owner.
- * For legacy IM groups missing created_by, try resolving owner from sibling home group.
+ * Get the set of user IDs allowed to receive broadcasts for a group.
+ * Includes the owner, all shared members, and always admins (handled in safeBroadcast).
  *
  * Returns:
- * - string: resolved owner userId → only owner + admin can see
+ * - Set<string>: allowed user IDs (owner + shared members)
  * - null: ownership unresolvable → default-deny (admin-only)
- * - undefined is NOT returned; callers receive string | null
  */
-function getGroupOwnerUserId(chatJid: string): string | null {
+function getGroupAllowedUserIds(chatJid: string): Set<string> | null {
   const group = getRegisteredGroup(chatJid);
   if (!group) return null; // Unknown group → deny by default
 
-  if (group.created_by) return group.created_by;
+  const allowed = new Set<string>();
+
+  // Add owner
+  let ownerId: string | null = group.created_by ?? null;
 
   // Legacy fallback: IM group without created_by, resolve by sibling home group.
-  if (!chatJid.startsWith('web:')) {
+  if (!ownerId && !chatJid.startsWith('web:')) {
     const siblingJids = getJidsByFolder(group.folder);
     for (const siblingJid of siblingJids) {
       if (!siblingJid.startsWith('web:')) continue;
       const siblingGroup = getRegisteredGroup(siblingJid);
       if (siblingGroup?.is_home && siblingGroup.created_by) {
-        return siblingGroup.created_by;
+        ownerId = siblingGroup.created_by;
+        break;
       }
     }
-    return null; // Unresolvable legacy IM group → deny by default
   }
 
-  if (group.is_home) return group.created_by ?? null;
-  if (group.folder === 'main') return null; // admin's host group, adminOnly handles it
-  return group.created_by ?? null; // Legacy web group without owner → deny by default
+  if (!ownerId) {
+    if (group.is_home) return null;
+    if (group.folder === 'main') return null;
+    return null; // Unresolvable → deny by default
+  }
+
+  allowed.add(ownerId);
+
+  // For non-home groups, include shared members
+  if (!group.is_home) {
+    const members = getGroupMembers(group.folder);
+    for (const m of members) {
+      allowed.add(m.user_id);
+    }
+  }
+
+  return allowed;
 }
 
 /** Check if a chatJid belongs to a host-mode group (for broadcast filtering) */
@@ -747,11 +764,11 @@ function normalizeHomeJid(chatJid: string): string {
 export function broadcastToWebClients(chatJid: string, text: string): void {
   const timestamp = new Date().toISOString();
   const jid = normalizeHomeJid(chatJid);
-  const ownerUserId = getGroupOwnerUserId(chatJid);
+  const allowedUserIds = getGroupAllowedUserIds(chatJid);
   safeBroadcast(
     { type: 'agent_reply', chatJid: jid, text, timestamp },
     isHostGroupJid(chatJid),
-    ownerUserId,
+    allowedUserIds,
   );
 }
 
@@ -760,7 +777,7 @@ export function broadcastNewMessage(
   msg: NewMessage & { is_from_me?: boolean },
 ): void {
   const jid = normalizeHomeJid(chatJid);
-  const ownerUserId = getGroupOwnerUserId(chatJid);
+  const allowedUserIds = getGroupAllowedUserIds(chatJid);
   safeBroadcast(
     {
       type: 'new_message',
@@ -768,24 +785,24 @@ export function broadcastNewMessage(
       message: { ...msg, is_from_me: msg.is_from_me ?? false },
     },
     isHostGroupJid(chatJid),
-    ownerUserId,
+    allowedUserIds,
   );
 }
 
 export function broadcastTyping(chatJid: string, isTyping: boolean): void {
   const jid = normalizeHomeJid(chatJid);
-  const ownerUserId = getGroupOwnerUserId(chatJid);
+  const allowedUserIds = getGroupAllowedUserIds(chatJid);
   safeBroadcast(
     { type: 'typing', chatJid: jid, isTyping },
     isHostGroupJid(chatJid),
-    ownerUserId,
+    allowedUserIds,
   );
 }
 
 export function broadcastStreamEvent(chatJid: string, event: StreamEvent): void {
   const jid = normalizeHomeJid(chatJid);
-  const ownerUserId = getGroupOwnerUserId(chatJid);
-  safeBroadcast({ type: 'stream_event', chatJid: jid, event }, isHostGroupJid(chatJid), ownerUserId);
+  const allowedUserIds = getGroupAllowedUserIds(chatJid);
+  safeBroadcast({ type: 'stream_event', chatJid: jid, event }, isHostGroupJid(chatJid), allowedUserIds);
 }
 
 function broadcastStatus(): void {

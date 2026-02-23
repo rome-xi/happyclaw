@@ -19,6 +19,7 @@ import {
   buildContainerEnvLines,
   getClaudeProviderConfig,
   getContainerEnvConfig,
+  shellQuoteEnvLines,
 } from './runtime-config.js';
 import { RegisteredGroup, StreamEvent } from './types.js';
 
@@ -230,7 +231,8 @@ function buildVolumeMounts(
   const envLines = buildContainerEnvLines(globalConfig, containerOverride);
   if (envLines.length > 0) {
     const envFilePath = path.join(envDir, 'env');
-    fs.writeFileSync(envFilePath, envLines.join('\n') + '\n', { mode: 0o600 });
+    const quotedLines = shellQuoteEnvLines(envLines);
+    fs.writeFileSync(envFilePath, quotedLines.join('\n') + '\n', { mode: 0o600 });
     try {
       fs.chmodSync(envFilePath, 0o600);
     } catch (err) {
