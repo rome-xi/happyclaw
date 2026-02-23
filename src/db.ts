@@ -4,15 +4,19 @@ import path from 'path';
 
 import { STORE_DIR, GROUPS_DIR } from './config.js';
 import {
+  AgentKind,
+  AgentStatus,
   AuthAuditLog,
   AuthEventType,
   ExecutionMode,
+  GroupMember,
   InviteCode,
   InviteCodeWithCreator,
   NewMessage,
   MessageCursor,
   RegisteredGroup,
   ScheduledTask,
+  SubAgent,
   TaskRunLog,
   User,
   UserPublic,
@@ -63,6 +67,18 @@ function assertSchema(
       `Incompatible DB schema in table "${tableName}". Missing: [${missing.join(', ')}], forbidden: [${forbidden.join(', ')}]. ` +
         'Please remove data/db/messages.db (or legacy store/messages.db) and restart.',
     );
+  }
+}
+
+/** Internal helper — reads router_state before initDatabase exports are available. */
+function getRouterStateInternal(key: string): string | undefined {
+  try {
+    const row = db
+      .prepare('SELECT value FROM router_state WHERE key = ?')
+      .get(key) as { value: string } | undefined;
+    return row?.value;
+  } catch {
+    return undefined; // Table may not exist yet on first run
   }
 }
 
@@ -133,8 +149,10 @@ export function initDatabase(): void {
       value TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS sessions (
-      group_folder TEXT PRIMARY KEY,
-      session_id TEXT NOT NULL
+      group_folder TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      agent_id TEXT,
+      PRIMARY KEY (group_folder, COALESCE(agent_id, ''))
     );
     CREATE TABLE IF NOT EXISTS registered_groups (
       jid TEXT PRIMARY KEY,
@@ -213,6 +231,38 @@ export function initDatabase(): void {
     CREATE INDEX IF NOT EXISTS idx_invites_created_at ON invite_codes(created_at);
   `);
 
+  // Group members table for shared workspaces
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS group_members (
+      group_folder TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'member',
+      added_at TEXT NOT NULL,
+      added_by TEXT,
+      PRIMARY KEY (group_folder, user_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_group_members_user ON group_members(user_id);
+  `);
+
+  // Sub-agents table for multi-agent parallel execution
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS agents (
+      id TEXT PRIMARY KEY,
+      group_folder TEXT NOT NULL,
+      chat_jid TEXT NOT NULL,
+      name TEXT NOT NULL,
+      prompt TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'running',
+      created_by TEXT,
+      created_at TEXT NOT NULL,
+      completed_at TEXT,
+      result_summary TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_agents_group ON agents(group_folder);
+    CREATE INDEX IF NOT EXISTS idx_agents_jid ON agents(chat_jid);
+    CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(status);
+  `);
+
   // Lightweight migrations for existing DBs
   ensureColumn('users', 'permissions', "TEXT NOT NULL DEFAULT '[]'");
   ensureColumn('users', 'must_change_password', 'INTEGER NOT NULL DEFAULT 0');
@@ -235,6 +285,8 @@ export function initDatabase(): void {
   ensureColumn('users', 'ai_avatar_color', 'TEXT');
   ensureColumn('scheduled_tasks', 'created_by', 'TEXT');
   ensureColumn('registered_groups', 'selected_skills', 'TEXT');
+  ensureColumn('sessions', 'agent_id', 'TEXT');
+  ensureColumn('agents', 'kind', "TEXT NOT NULL DEFAULT 'task'");
 
   // Migration: remove UNIQUE constraint from registered_groups.folder
   // Multiple groups (web:main + feishu chats) share folder='main' by design.
@@ -410,7 +462,53 @@ export function initDatabase(): void {
     WHERE jid = 'web:main' AND folder = 'main' AND is_home = 0
   `);
 
-  const SCHEMA_VERSION = '14';
+  // v15 migration: backfill group_members for existing web groups
+  const currentVersion = getRouterStateInternal('schema_version');
+  if (!currentVersion || parseInt(currentVersion, 10) < 15) {
+    db.transaction(() => {
+      // Backfill owner records for all web groups with created_by set
+      const webGroups = db
+        .prepare(
+          "SELECT DISTINCT folder, created_by FROM registered_groups WHERE jid LIKE 'web:%' AND created_by IS NOT NULL",
+        )
+        .all() as Array<{ folder: string; created_by: string }>;
+      for (const g of webGroups) {
+        db.prepare(
+          `INSERT OR IGNORE INTO group_members (group_folder, user_id, role, added_at, added_by)
+           VALUES (?, ?, 'owner', ?, ?)`,
+        ).run(g.folder, g.created_by, new Date().toISOString(), g.created_by);
+      }
+    })();
+  }
+
+  // v16→v17 migration: rebuild sessions table with composite primary key
+  // Old PK was (group_folder), which cannot store multiple agent sessions per folder.
+  // New PK is (group_folder, COALESCE(agent_id, '')) to support per-agent sessions.
+  const curVer = getRouterStateInternal('schema_version');
+  if (curVer && parseInt(curVer, 10) < 17) {
+    db.transaction(() => {
+      // Check if the old table has single-column PK by inspecting table_info
+      const pkCols = (db.prepare("PRAGMA table_info('sessions')").all() as Array<{ name: string; pk: number }>)
+        .filter(c => c.pk > 0);
+      // Old schema: single PK column 'group_folder'. New schema: composite PK needs rebuild.
+      if (pkCols.length === 1 && pkCols[0].name === 'group_folder') {
+        db.exec(`
+          CREATE TABLE sessions_new (
+            group_folder TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            agent_id TEXT,
+            PRIMARY KEY (group_folder, COALESCE(agent_id, ''))
+          );
+          INSERT OR IGNORE INTO sessions_new (group_folder, session_id, agent_id)
+            SELECT group_folder, session_id, agent_id FROM sessions;
+          DROP TABLE sessions;
+          ALTER TABLE sessions_new RENAME TO sessions;
+        `);
+      }
+    })();
+  }
+
+  const SCHEMA_VERSION = '17';
   db.prepare(
     'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
   ).run('schema_version', SCHEMA_VERSION);
@@ -757,26 +855,48 @@ export function setRouterState(key: string, value: string): void {
 
 // --- Session accessors ---
 
-export function getSession(groupFolder: string): string | undefined {
+export function getSession(groupFolder: string, agentId?: string | null): string | undefined {
+  if (agentId) {
+    const row = db
+      .prepare('SELECT session_id FROM sessions WHERE group_folder = ? AND agent_id = ?')
+      .get(groupFolder, agentId) as { session_id: string } | undefined;
+    return row?.session_id;
+  }
   const row = db
-    .prepare('SELECT session_id FROM sessions WHERE group_folder = ?')
+    .prepare('SELECT session_id FROM sessions WHERE group_folder = ? AND agent_id IS NULL')
     .get(groupFolder) as { session_id: string } | undefined;
   return row?.session_id;
 }
 
-export function setSession(groupFolder: string, sessionId: string): void {
+export function setSession(groupFolder: string, sessionId: string, agentId?: string | null): void {
+  if (agentId) {
+    db.prepare(
+      `INSERT INTO sessions (group_folder, session_id, agent_id) VALUES (?, ?, ?)
+       ON CONFLICT(group_folder, COALESCE(agent_id, '')) DO UPDATE SET session_id = excluded.session_id`,
+    ).run(groupFolder, sessionId, agentId);
+    return;
+  }
   db.prepare(
-    'INSERT OR REPLACE INTO sessions (group_folder, session_id) VALUES (?, ?)',
+    `INSERT INTO sessions (group_folder, session_id) VALUES (?, ?)
+     ON CONFLICT(group_folder, COALESCE(agent_id, '')) DO UPDATE SET session_id = excluded.session_id`,
   ).run(groupFolder, sessionId);
 }
 
-export function deleteSession(groupFolder: string): void {
+export function deleteSession(groupFolder: string, agentId?: string | null): void {
+  if (agentId) {
+    db.prepare('DELETE FROM sessions WHERE group_folder = ? AND agent_id = ?').run(groupFolder, agentId);
+    return;
+  }
+  db.prepare('DELETE FROM sessions WHERE group_folder = ? AND agent_id IS NULL').run(groupFolder);
+}
+
+export function deleteAllSessionsForFolder(groupFolder: string): void {
   db.prepare('DELETE FROM sessions WHERE group_folder = ?').run(groupFolder);
 }
 
 export function getAllSessions(): Record<string, string> {
   const rows = db
-    .prepare('SELECT group_folder, session_id FROM sessions')
+    .prepare('SELECT group_folder, session_id FROM sessions WHERE agent_id IS NULL')
     .all() as Array<{ group_folder: string; session_id: string }>;
   const result: Record<string, string> = {};
   for (const row of rows) {
@@ -1065,11 +1185,13 @@ export function deleteGroupData(jid: string, folder: string): void {
       'DELETE FROM task_run_logs WHERE task_id IN (SELECT id FROM scheduled_tasks WHERE group_folder = ?)',
     ).run(folder);
     db.prepare('DELETE FROM scheduled_tasks WHERE group_folder = ?').run(folder);
-    // 2. 删除注册信息
+    // 2. 删除成员记录
+    db.prepare('DELETE FROM group_members WHERE group_folder = ?').run(folder);
+    // 3. 删除注册信息
     db.prepare('DELETE FROM registered_groups WHERE jid = ?').run(jid);
-    // 3. 删除会话
+    // 4. 删除会话
     db.prepare('DELETE FROM sessions WHERE group_folder = ?').run(folder);
-    // 4. 删除聊天记录
+    // 5. 删除聊天记录
     db.prepare('DELETE FROM messages WHERE chat_jid = ?').run(jid);
     db.prepare('DELETE FROM chats WHERE jid = ?').run(jid);
   });
@@ -2083,6 +2205,191 @@ export function checkLoginRateLimitFromAudit(
     Math.ceil((retryAt - Date.now()) / 1000),
   );
   return { allowed: false, retryAfterSeconds, attempts };
+}
+
+// ===================== Group Members =====================
+
+export function addGroupMember(
+  groupFolder: string,
+  userId: string,
+  role: 'owner' | 'member',
+  addedBy?: string,
+): void {
+  db.prepare(
+    `INSERT INTO group_members (group_folder, user_id, role, added_at, added_by)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(group_folder, user_id) DO UPDATE SET
+       role = CASE WHEN excluded.role = 'owner' THEN 'owner'
+                   WHEN group_members.role = 'owner' THEN 'owner'
+                   ELSE excluded.role END,
+       added_by = COALESCE(excluded.added_by, group_members.added_by)`,
+  ).run(groupFolder, userId, role, new Date().toISOString(), addedBy ?? null);
+}
+
+export function removeGroupMember(
+  groupFolder: string,
+  userId: string,
+): void {
+  db.prepare(
+    'DELETE FROM group_members WHERE group_folder = ? AND user_id = ?',
+  ).run(groupFolder, userId);
+}
+
+export function getGroupMembers(groupFolder: string): GroupMember[] {
+  const rows = db
+    .prepare(
+      `SELECT gm.user_id, gm.role, gm.added_at, gm.added_by,
+              u.username, COALESCE(u.display_name, '') as display_name
+       FROM group_members gm
+       JOIN users u ON gm.user_id = u.id
+       WHERE gm.group_folder = ?
+       ORDER BY gm.role DESC, gm.added_at ASC`,
+    )
+    .all(groupFolder) as Array<{
+    user_id: string;
+    role: string;
+    added_at: string;
+    added_by: string | null;
+    username: string;
+    display_name: string;
+  }>;
+  return rows.map((r) => ({
+    user_id: r.user_id,
+    role: r.role as 'owner' | 'member',
+    added_at: r.added_at,
+    added_by: r.added_by ?? undefined,
+    username: r.username,
+    display_name: r.display_name,
+  }));
+}
+
+export function getGroupMemberRole(
+  groupFolder: string,
+  userId: string,
+): 'owner' | 'member' | null {
+  const row = db
+    .prepare(
+      'SELECT role FROM group_members WHERE group_folder = ? AND user_id = ?',
+    )
+    .get(groupFolder, userId) as { role: string } | undefined;
+  if (!row) return null;
+  return row.role as 'owner' | 'member';
+}
+
+export function getUserMemberFolders(
+  userId: string,
+): Array<{ group_folder: string; role: 'owner' | 'member' }> {
+  const rows = db
+    .prepare(
+      'SELECT group_folder, role FROM group_members WHERE user_id = ?',
+    )
+    .all(userId) as Array<{ group_folder: string; role: string }>;
+  return rows.map((r) => ({
+    group_folder: r.group_folder,
+    role: r.role as 'owner' | 'member',
+  }));
+}
+
+// ===================== Sub-Agent CRUD =====================
+
+export function createAgent(agent: SubAgent): void {
+  db.prepare(
+    `INSERT INTO agents (id, group_folder, chat_jid, name, prompt, status, kind, created_by, created_at, completed_at, result_summary)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    agent.id,
+    agent.group_folder,
+    agent.chat_jid,
+    agent.name,
+    agent.prompt,
+    agent.status,
+    agent.kind || 'task',
+    agent.created_by ?? null,
+    agent.created_at,
+    agent.completed_at ?? null,
+    agent.result_summary ?? null,
+  );
+}
+
+export function getAgent(id: string): SubAgent | undefined {
+  const row = db.prepare('SELECT * FROM agents WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+  if (!row) return undefined;
+  return mapAgentRow(row);
+}
+
+export function listAgentsByFolder(folder: string): SubAgent[] {
+  const rows = db
+    .prepare('SELECT * FROM agents WHERE group_folder = ? ORDER BY created_at DESC')
+    .all(folder) as Array<Record<string, unknown>>;
+  return rows.map(mapAgentRow);
+}
+
+export function listAgentsByJid(chatJid: string): SubAgent[] {
+  const rows = db
+    .prepare('SELECT * FROM agents WHERE chat_jid = ? ORDER BY created_at DESC')
+    .all(chatJid) as Array<Record<string, unknown>>;
+  return rows.map(mapAgentRow);
+}
+
+export function listRunningAgentsByFolder(folder: string): SubAgent[] {
+  const rows = db
+    .prepare("SELECT * FROM agents WHERE group_folder = ? AND status = 'running' ORDER BY created_at ASC")
+    .all(folder) as Array<Record<string, unknown>>;
+  return rows.map(mapAgentRow);
+}
+
+export function updateAgentStatus(
+  id: string,
+  status: AgentStatus,
+  resultSummary?: string,
+): void {
+  const completedAt = (status !== 'running' && status !== 'idle') ? new Date().toISOString() : null;
+  db.prepare(
+    'UPDATE agents SET status = ?, completed_at = ?, result_summary = ? WHERE id = ?',
+  ).run(status, completedAt, resultSummary ?? null, id);
+}
+
+export function deleteAgent(id: string): void {
+  // Delete associated session
+  db.prepare("DELETE FROM sessions WHERE agent_id = ?").run(id);
+  db.prepare('DELETE FROM agents WHERE id = ?').run(id);
+}
+
+export function deleteAgentsForFolder(folder: string): void {
+  const agents = listAgentsByFolder(folder);
+  for (const agent of agents) {
+    deleteAgent(agent.id);
+  }
+}
+
+function mapAgentRow(row: Record<string, unknown>): SubAgent {
+  return {
+    id: String(row.id),
+    group_folder: String(row.group_folder),
+    chat_jid: String(row.chat_jid),
+    name: String(row.name),
+    prompt: String(row.prompt),
+    status: (row.status as AgentStatus) || 'running',
+    kind: (row.kind as AgentKind) || 'task',
+    created_by: typeof row.created_by === 'string' ? row.created_by : null,
+    created_at: String(row.created_at),
+    completed_at: typeof row.completed_at === 'string' ? row.completed_at : null,
+    result_summary: typeof row.result_summary === 'string' ? row.result_summary : null,
+  };
+}
+
+export function deleteMessagesForChatJid(chatJid: string): void {
+  db.prepare('DELETE FROM messages WHERE chat_jid = ?').run(chatJid);
+  db.prepare('DELETE FROM chats WHERE jid = ?').run(chatJid);
+}
+
+export function isGroupShared(groupFolder: string): boolean {
+  const row = db
+    .prepare(
+      'SELECT COUNT(*) as cnt FROM group_members WHERE group_folder = ?',
+    )
+    .get(groupFolder) as { cnt: number };
+  return row.cnt > 1;
 }
 
 /**

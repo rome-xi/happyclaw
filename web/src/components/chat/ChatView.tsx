@@ -9,19 +9,24 @@ import { FilePanel } from './FilePanel';
 import { ContainerEnvPanel } from './ContainerEnvPanel';
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { ConfirmDialog } from '@/components/common/ConfirmDialog';
-import { ArrowLeft, Link, MoreHorizontal, PanelRightClose, PanelRightOpen, X } from 'lucide-react';
+import { ArrowLeft, Link, MoreHorizontal, PanelRightClose, PanelRightOpen, Users, X } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { wsManager } from '../../api/ws';
 import { api } from '../../api/client';
 import { TerminalPanel } from './TerminalPanel';
 import { GroupSkillsPanel } from './GroupSkillsPanel';
+import { GroupMembersPanel } from './GroupMembersPanel';
+import { AgentTabBar } from './AgentTabBar';
 
 const POLL_INTERVAL_MS = 2000;
 const TERMINAL_MIN_HEIGHT = 150;
 const TERMINAL_DEFAULT_HEIGHT = 300;
 const TERMINAL_MAX_RATIO = 0.7;
 
-type SidebarTab = 'files' | 'env' | 'skills';
+// Stable empty references to avoid infinite re-render loops in Zustand selectors
+const EMPTY_AGENTS: import('../../types').AgentInfo[] = [];
+
+type SidebarTab = 'files' | 'env' | 'skills' | 'members';
 
 interface ChatViewProps {
   groupJid: string;
@@ -65,7 +70,20 @@ export function ChatView({ groupJid, onBack }: ChatViewProps) {
   const resetSession = useChatStore(s => s.resetSession);
   const handleStreamEvent = useChatStore(s => s.handleStreamEvent);
   const handleWsNewMessage = useChatStore(s => s.handleWsNewMessage);
+  const handleAgentStatus = useChatStore(s => s.handleAgentStatus);
   const clearStreaming = useChatStore(s => s.clearStreaming);
+  const agents = useChatStore(s => s.agents[groupJid] ?? EMPTY_AGENTS);
+  const activeAgentTab = useChatStore(s => s.activeAgentTab[groupJid] ?? null);
+  const setActiveAgentTab = useChatStore(s => s.setActiveAgentTab);
+  const loadAgents = useChatStore(s => s.loadAgents);
+  const deleteAgentAction = useChatStore(s => s.deleteAgentAction);
+  const agentStreaming = useChatStore(s => s.agentStreaming);
+  const createConversation = useChatStore(s => s.createConversation);
+  const loadAgentMessages = useChatStore(s => s.loadAgentMessages);
+  const sendAgentMessage = useChatStore(s => s.sendAgentMessage);
+  const agentMessages = useChatStore(s => s.agentMessages);
+  const agentWaiting = useChatStore(s => s.agentWaiting);
+  const agentHasMore = useChatStore(s => s.agentHasMore);
 
   const currentUser = useAuthStore(s => s.user);
   const canUseTerminal = group?.execution_mode !== 'host';
@@ -149,10 +167,29 @@ export function ChatView({ groupJid, onBack }: ChatViewProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Derived: active agent info and kind
+  const activeAgent = activeAgentTab ? agents.find(a => a.id === activeAgentTab) : null;
+  const isConversationTab = activeAgent?.kind === 'conversation';
+
+  // Load sub-agents for this group
+  useEffect(() => {
+    loadAgents(groupJid);
+  }, [groupJid, loadAgents]);
+
+  // Load messages for conversation agent tabs
+  useEffect(() => {
+    if (activeAgentTab && isConversationTab) {
+      const existing = agentMessages[activeAgentTab];
+      if (!existing) {
+        loadAgentMessages(groupJid, activeAgentTab);
+      }
+    }
+  }, [activeAgentTab, isConversationTab, groupJid, loadAgentMessages, agentMessages]);
+
   // 监听 WebSocket 流式事件
   useEffect(() => {
     const unsub1 = wsManager.on('stream_event', (data: any) => {
-      if (data.chatJid === groupJid) handleStreamEvent(groupJid, data.event);
+      if (data.chatJid === groupJid) handleStreamEvent(groupJid, data.event, data.agentId);
     });
     // agent_reply 作为 fallback：如果 new_message 已处理则为 no-op
     const unsub2 = wsManager.on('agent_reply', (data: any) => {
@@ -161,11 +198,17 @@ export function ChatView({ groupJid, onBack }: ChatViewProps) {
     // 通过 new_message 立即添加消息到本地状态（消除轮询延迟导致的消息"丢失"）
     const unsub3 = wsManager.on('new_message', (data: any) => {
       if (data.chatJid === groupJid && data.message) {
-        handleWsNewMessage(groupJid, data.message);
+        handleWsNewMessage(groupJid, data.message, data.agentId);
       }
     });
-    return () => { unsub1(); unsub2(); unsub3(); };
-  }, [groupJid, handleStreamEvent, handleWsNewMessage, clearStreaming]);
+    // 子 Agent 状态变更
+    const unsub4 = wsManager.on('agent_status', (data: any) => {
+      if (data.chatJid === groupJid) {
+        handleAgentStatus(groupJid, data.agentId, data.status, data.name, data.prompt, data.resultSummary, data.kind);
+      }
+    });
+    return () => { unsub1(); unsub2(); unsub3(); unsub4(); };
+  }, [groupJid, handleStreamEvent, handleWsNewMessage, handleAgentStatus, clearStreaming]);
 
   const [scrollTrigger, setScrollTrigger] = useState(0);
 
@@ -305,6 +348,15 @@ export function ChatView({ groupJid, onBack }: ChatViewProps) {
           <h2 className="font-semibold text-slate-900 text-[15px] truncate">{group.name}</h2>
           <div className="flex items-center gap-1.5 text-xs text-slate-500">
             <span>{isWaiting ? '正在思考...' : group.is_home ? '主工作区' : '工作区'}</span>
+            {!isWaiting && group.is_shared && (
+              <>
+                <span className="text-slate-300">·</span>
+                <span className="inline-flex items-center gap-0.5">
+                  <Users className="w-3 h-3" />
+                  {group.member_count ?? 0} 人协作
+                </span>
+              </>
+            )}
             {!isWaiting && group.execution_mode && (
               <>
                 <span className="text-slate-300">·</span>
@@ -378,26 +430,94 @@ export function ChatView({ groupJid, onBack }: ChatViewProps) {
         </div>
       )}
 
+      {/* Agent tab bar */}
+      <AgentTabBar
+        agents={agents}
+        activeTab={activeAgentTab}
+        onSelectTab={(id) => setActiveAgentTab(groupJid, id)}
+        onDeleteAgent={(id) => deleteAgentAction(groupJid, id)}
+        onCreateConversation={() => {
+          const name = prompt('对话名称：');
+          if (name?.trim()) {
+            createConversation(groupJid, name.trim()).then((agent) => {
+              if (agent) setActiveAgentTab(groupJid, agent.id);
+            });
+          }
+        }}
+      />
+
       {/* Main Content: Messages + Sidebar */}
       <div className="flex-1 flex overflow-hidden min-h-0">
         {/* Messages Area */}
         <div className="flex-1 flex flex-col min-w-0 overflow-x-hidden">
-          <MessageList
-            messages={groupMessages || []}
-            loading={loading}
-            hasMore={hasMoreMessages}
-            onLoadMore={handleLoadMore}
-            scrollTrigger={scrollTrigger}
-            groupJid={groupJid}
-            isWaiting={isWaiting}
-            onInterrupt={() => interruptQuery(groupJid)}
-          />
-          <MessageInput
-            onSend={handleSend}
-            groupJid={groupJid}
-            onResetSession={() => setShowResetConfirm(true)}
-            onToggleTerminal={canUseTerminal ? handleTerminalToggle : undefined}
-          />
+          {activeAgentTab && isConversationTab ? (
+            /* Conversation agent tab: interactive — user can send messages */
+            <>
+              <MessageList
+                key={`conv-${activeAgentTab}`}
+                messages={agentMessages[activeAgentTab] || []}
+                loading={false}
+                hasMore={!!agentHasMore[activeAgentTab]}
+                onLoadMore={() => loadAgentMessages(groupJid, activeAgentTab, true)}
+                scrollTrigger={scrollTrigger}
+                groupJid={groupJid}
+                isWaiting={!!agentWaiting[activeAgentTab] || !!agentStreaming[activeAgentTab]}
+                onInterrupt={() => {}}
+                agentId={activeAgentTab}
+              />
+              <MessageInput
+                onSend={async (content) => {
+                  sendAgentMessage(groupJid, activeAgentTab, content);
+                  setScrollTrigger(n => n + 1);
+                }}
+                groupJid={groupJid}
+              />
+            </>
+          ) : activeAgentTab ? (
+            /* Task agent tab: read-only — show agent's messages from main chat */
+            <>
+              <MessageList
+                key={`task-${activeAgentTab}`}
+                messages={(groupMessages || []).filter(
+                  (m) => m.sender === `agent:${activeAgentTab}`,
+                )}
+                loading={false}
+                hasMore={false}
+                onLoadMore={() => {}}
+                scrollTrigger={scrollTrigger}
+                groupJid={groupJid}
+                isWaiting={!!agentStreaming[activeAgentTab]}
+                onInterrupt={() => {}}
+                agentId={activeAgentTab}
+              />
+              <div className="px-4 py-2 text-center text-xs text-slate-400 border-t">
+                子 Agent 独立运行中 — 仅主对话可发送消息
+              </div>
+            </>
+          ) : (
+            /* Main conversation tab */
+            <>
+              <MessageList
+                key={`main-${groupJid}`}
+                messages={groupMessages || []}
+                loading={loading}
+                hasMore={hasMoreMessages}
+                onLoadMore={handleLoadMore}
+                scrollTrigger={scrollTrigger}
+                groupJid={groupJid}
+                isWaiting={isWaiting}
+                onInterrupt={() => interruptQuery(groupJid)}
+                agents={agents}
+                onAgentClick={(agentId) => setActiveAgentTab(groupJid, agentId)}
+              />
+              <MessageInput
+                onSend={handleSend}
+                groupJid={groupJid}
+                onResetSession={() => setShowResetConfirm(true)}
+                onToggleTerminal={canUseTerminal ? handleTerminalToggle : undefined}
+              />
+            </>
+          )}
         </div>
 
         {/* Desktop: sidebar with tabs (collapsible) */}
@@ -437,6 +557,18 @@ export function ChatView({ groupJid, onBack }: ChatViewProps) {
             >
               技能
             </button>
+            {(group.is_shared || group.member_role === 'owner') && !group.is_home && (
+              <button
+                onClick={() => setSidebarTab('members')}
+                className={`flex-1 px-3 py-2 text-xs font-medium transition-colors cursor-pointer ${
+                  sidebarTab === 'members'
+                    ? 'text-primary border-b-2 border-primary'
+                    : 'text-slate-400 hover:text-slate-600'
+                }`}
+              >
+                成员
+              </button>
+            )}
           </div>
 
           {/* Tab content */}
@@ -445,6 +577,8 @@ export function ChatView({ groupJid, onBack }: ChatViewProps) {
               <FilePanel groupJid={groupJid} />
             ) : sidebarTab === 'env' ? (
               <ContainerEnvPanel groupJid={groupJid} />
+            ) : sidebarTab === 'members' ? (
+              <GroupMembersPanel groupJid={groupJid} />
             ) : (
               <GroupSkillsPanel groupJid={groupJid} />
             )}
@@ -529,6 +663,18 @@ export function ChatView({ groupJid, onBack }: ChatViewProps) {
         </SheetContent>
       </Sheet>
 
+      {/* Mobile: members sheet */}
+      <Sheet open={mobilePanel === 'members'} onOpenChange={(v) => !v && setMobilePanel(null)}>
+        <SheetContent side="bottom" className="h-[80dvh] p-0">
+          <SheetHeader className="px-4 pt-4 pb-2">
+            <SheetTitle>成员管理</SheetTitle>
+          </SheetHeader>
+          <div className="flex-1 overflow-hidden h-[calc(80dvh-56px)]">
+            <GroupMembersPanel groupJid={groupJid} />
+          </div>
+        </SheetContent>
+      </Sheet>
+
       {/* Mobile: Terminal sheet */}
       <Sheet open={mobileTerminal} onOpenChange={(v) => !v && setMobileTerminal(false)}>
         <SheetContent side="bottom" className="h-[85dvh] p-0">
@@ -571,6 +717,14 @@ export function ChatView({ groupJid, onBack }: ChatViewProps) {
             >
               技能
             </button>
+            {(group.is_shared || group.member_role === 'owner') && !group.is_home && (
+              <button
+                onClick={() => { setMobileActionsOpen(false); setMobilePanel('members'); }}
+                className="w-full text-left px-4 py-3 rounded-lg border border-border hover:bg-accent transition-colors cursor-pointer text-foreground text-sm"
+              >
+                成员管理
+              </button>
+            )}
             {canUseTerminal && (
               <button
                 onClick={() => {

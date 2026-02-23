@@ -38,6 +38,8 @@ interface ContainerInput {
   isAdminHome?: boolean;
   isScheduledTask?: boolean;
   images?: Array<{ data: string; mimeType?: string }>;
+  agentId?: string;
+  agentName?: string;
 }
 
 /**
@@ -437,6 +439,22 @@ function drainIpcInput(): Array<{ text: string; images?: Array<{ data: string; m
             text: data.text,
             images: data.images,
           });
+        } else if (data.type === 'agent_result') {
+          // Sub-agent completed — format result as a message injection
+          const statusLabel = data.status === 'completed' ? '已完成任务' : '执行出错';
+          const promptSnippet = data.prompt ? data.prompt.slice(0, 200) : '';
+          const lines = [
+            `[子 Agent "${data.agentName || data.agentId}" ${statusLabel}]`,
+            '',
+            promptSnippet ? `任务: ${promptSnippet}` : '',
+            '',
+            '结果:',
+            data.result || '(无结果)',
+          ].filter(Boolean);
+          messages.push({ text: lines.join('\n') });
+        } else if (data.type === 'agent_message' && data.message) {
+          // Message from main agent to sub-agent (via message_agent)
+          messages.push({ text: `[来自主 Agent 的消息]\n${data.message}` });
         }
       } catch (err) {
         log(`Failed to process input file ${file}: ${err instanceof Error ? err.message : String(err)}`);
