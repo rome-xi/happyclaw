@@ -88,6 +88,7 @@ import {
   createAgent,
   getAgent,
   listRunningAgentsByFolder,
+  listAgentsByFolder,
   updateAgentStatus,
   deleteAgent as deleteAgentDb,
   getSession,
@@ -1191,7 +1192,7 @@ function startIpcWatcher(): void {
               logger.error({ err, sourceGroup, agentId: entry.name }, 'Error reading sub-agent tasks dir');
             }
 
-            // agents/ — spawn_agent/message_agent from conversation agents
+            // agents/ — message_agent from conversation agents (spawn_agent blocked to prevent recursion)
             const subAgentsDir = path.join(subAgentIpcDir, 'agents');
             try {
               if (fs.existsSync(subAgentsDir)) {
@@ -1203,8 +1204,9 @@ function startIpcWatcher(): void {
                     const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
                     fs.unlinkSync(filePath);
 
-                    if (data.type === 'spawn_agent' && data.agentId && data.name && data.prompt) {
-                      await processAgentSpawn(sourceGroup, data, sourceGroupEntry);
+                    if (data.type === 'spawn_agent') {
+                      // Sub-agents cannot spawn their own sub-agents (prevent infinite recursion)
+                      logger.warn({ sourceGroup, parentAgentId: entry.name, childAgentId: data.agentId }, 'Blocked recursive spawn_agent from sub-agent');
                     } else if (data.type === 'message_agent' && data.agentId && data.message) {
                       await processAgentMessage(sourceGroup, data);
                     }
@@ -1640,6 +1642,10 @@ function cleanupSubAgent(folder: string, agentId: string, chatJid: string): void
     fs.rmSync(agentSessionDir, { recursive: true, force: true });
   } catch { /* ignore */ }
 
+  // Clean up lastAgentTimestamp to prevent memory/state bloat
+  const virtualJid = `${chatJid}#agent:${agentId}`;
+  delete lastAgentTimestamp[virtualJid];
+
   // Delete DB record
   deleteAgentDb(agentId);
 
@@ -1650,13 +1656,42 @@ function cleanupSubAgent(folder: string, agentId: string, chatJid: string): void
 }
 
 /**
+ * Clean up stale task-type agents from previous process runs.
+ * Called at startup to handle agents whose setTimeout cleanup was lost.
+ */
+function cleanupStaleAgents(): void {
+  const allGroups = getAllRegisteredGroups();
+  for (const [jid, group] of Object.entries(allGroups)) {
+    const agents = listAgentsByFolder(group.folder);
+    for (const agent of agents) {
+      if (agent.kind === 'conversation') continue;
+      if (agent.status === 'completed' || agent.status === 'error') {
+        cleanupSubAgent(group.folder, agent.id, jid);
+      } else if (agent.status === 'running') {
+        // Mark orphaned running agents as error (process restarted while they were running)
+        updateAgentStatus(agent.id, 'error', '进程重启，任务中断');
+        cleanupSubAgent(group.folder, agent.id, jid);
+      }
+    }
+  }
+}
+
+/**
  * Process a spawn_agent IPC request from the main agent.
  */
+const SAFE_AGENT_ID_RE = /^[a-zA-Z0-9_-]+$/;
+
 async function processAgentSpawn(
   sourceFolder: string,
   data: { agentId: string; name: string; prompt: string; chatJid?: string; groupFolder?: string },
   sourceGroupEntry: RegisteredGroup | undefined,
 ): Promise<void> {
+  // Validate agentId to prevent path traversal (agentId is generated inside the container)
+  if (!SAFE_AGENT_ID_RE.test(data.agentId)) {
+    logger.warn({ agentId: data.agentId, sourceFolder }, 'Rejected spawn_agent: invalid agentId format');
+    return;
+  }
+
   const chatJid = data.chatJid || Object.keys(registeredGroups).find(
     (jid) => registeredGroups[jid]?.folder === sourceFolder,
   );
@@ -2067,6 +2102,11 @@ async function processAgentMessage(
   sourceFolder: string,
   data: { agentId: string; message: string },
 ): Promise<void> {
+  if (!SAFE_AGENT_ID_RE.test(data.agentId)) {
+    logger.warn({ agentId: data.agentId, sourceFolder }, 'Rejected message_agent: invalid agentId format');
+    return;
+  }
+
   const agentRecord = getAgent(data.agentId);
   if (!agentRecord || agentRecord.group_folder !== sourceFolder) {
     logger.warn(
@@ -2775,6 +2815,7 @@ async function main(): Promise<void> {
   });
   startIpcWatcher();
   recoverPendingMessages();
+  cleanupStaleAgents();
   startMessageLoop();
 
   // --- IM Connection Pool: connect per-user IM channels ---

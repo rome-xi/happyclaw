@@ -149,8 +149,10 @@ export function initDatabase(): void {
       value TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS sessions (
-      group_folder TEXT PRIMARY KEY,
-      session_id TEXT NOT NULL
+      group_folder TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      agent_id TEXT,
+      PRIMARY KEY (group_folder, COALESCE(agent_id, ''))
     );
     CREATE TABLE IF NOT EXISTS registered_groups (
       jid TEXT PRIMARY KEY,
@@ -479,7 +481,34 @@ export function initDatabase(): void {
     })();
   }
 
-  const SCHEMA_VERSION = '16';
+  // v16→v17 migration: rebuild sessions table with composite primary key
+  // Old PK was (group_folder), which cannot store multiple agent sessions per folder.
+  // New PK is (group_folder, COALESCE(agent_id, '')) to support per-agent sessions.
+  const curVer = getRouterStateInternal('schema_version');
+  if (curVer && parseInt(curVer, 10) < 17) {
+    db.transaction(() => {
+      // Check if the old table has single-column PK by inspecting table_info
+      const pkCols = (db.prepare("PRAGMA table_info('sessions')").all() as Array<{ name: string; pk: number }>)
+        .filter(c => c.pk > 0);
+      // Old schema: single PK column 'group_folder'. New schema: composite PK needs rebuild.
+      if (pkCols.length === 1 && pkCols[0].name === 'group_folder') {
+        db.exec(`
+          CREATE TABLE sessions_new (
+            group_folder TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            agent_id TEXT,
+            PRIMARY KEY (group_folder, COALESCE(agent_id, ''))
+          );
+          INSERT OR IGNORE INTO sessions_new (group_folder, session_id, agent_id)
+            SELECT group_folder, session_id, agent_id FROM sessions;
+          DROP TABLE sessions;
+          ALTER TABLE sessions_new RENAME TO sessions;
+        `);
+      }
+    })();
+  }
+
+  const SCHEMA_VERSION = '17';
   db.prepare(
     'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
   ).run('schema_version', SCHEMA_VERSION);
@@ -841,42 +870,28 @@ export function getSession(groupFolder: string, agentId?: string | null): string
 
 export function setSession(groupFolder: string, sessionId: string, agentId?: string | null): void {
   if (agentId) {
-    // Upsert for agent sessions
     db.prepare(
       `INSERT INTO sessions (group_folder, session_id, agent_id) VALUES (?, ?, ?)
-       ON CONFLICT(group_folder) DO UPDATE SET session_id = excluded.session_id, agent_id = excluded.agent_id
-       WHERE agent_id = excluded.agent_id`,
+       ON CONFLICT(group_folder, COALESCE(agent_id, '')) DO UPDATE SET session_id = excluded.session_id`,
     ).run(groupFolder, sessionId, agentId);
-    // If no rows updated (agent_id mismatch), insert fresh
-    const existing = db.prepare(
-      'SELECT 1 FROM sessions WHERE group_folder = ? AND agent_id = ?',
-    ).get(groupFolder, agentId);
-    if (!existing) {
-      // Use a composite key approach: store agent sessions with folder#agentId
-      db.prepare(
-        'INSERT OR REPLACE INTO sessions (group_folder, session_id, agent_id) VALUES (?, ?, ?)',
-      ).run(`${groupFolder}#${agentId}`, sessionId, agentId);
-    }
     return;
   }
   db.prepare(
-    'INSERT OR REPLACE INTO sessions (group_folder, session_id) VALUES (?, ?)',
+    `INSERT INTO sessions (group_folder, session_id) VALUES (?, ?)
+     ON CONFLICT(group_folder, COALESCE(agent_id, '')) DO UPDATE SET session_id = excluded.session_id`,
   ).run(groupFolder, sessionId);
 }
 
 export function deleteSession(groupFolder: string, agentId?: string | null): void {
   if (agentId) {
     db.prepare('DELETE FROM sessions WHERE group_folder = ? AND agent_id = ?').run(groupFolder, agentId);
-    db.prepare('DELETE FROM sessions WHERE group_folder = ?').run(`${groupFolder}#${agentId}`);
     return;
   }
   db.prepare('DELETE FROM sessions WHERE group_folder = ? AND agent_id IS NULL').run(groupFolder);
 }
 
 export function deleteAllSessionsForFolder(groupFolder: string): void {
-  db.prepare("DELETE FROM sessions WHERE group_folder = ? OR group_folder LIKE ?").run(
-    groupFolder, `${groupFolder}#%`,
-  );
+  db.prepare('DELETE FROM sessions WHERE group_folder = ?').run(groupFolder);
 }
 
 export function getAllSessions(): Record<string, string> {

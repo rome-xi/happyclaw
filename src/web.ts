@@ -58,6 +58,7 @@ import {
   updateSessionLastActive,
   getGroupMembers,
   getAgent,
+  isGroupShared,
 } from './db.js';
 import { isSessionExpired } from './auth.js';
 import type { NewMessage, WsMessageOut, WsMessageIn, AuthUser, StreamEvent, UserRole } from './types.js';
@@ -230,7 +231,7 @@ async function handleWebUserMessage(
     attachments: attachmentsStr,
   });
 
-  const shared = !group.is_home && getGroupMembers(group.folder).length > 1;
+  const shared = !group.is_home && isGroupShared(group.folder);
   const formatted = deps.formatMessages([
     {
       id: messageId,
@@ -787,9 +788,18 @@ function getGroupAllowedUserIds(chatJid: string): Set<string> | null {
   return result;
 }
 
-/** Invalidate the allowed-user cache for a group (call after member changes). */
+/** Invalidate the allowed-user cache for a group and all sibling JIDs sharing the same folder. */
 export function invalidateAllowedUserCache(chatJid: string): void {
   allowedUserIdsCache.delete(chatJid);
+  // Also clear cache for sibling JIDs sharing the same folder,
+  // since membership is per-folder, not per-JID.
+  const group = getRegisteredGroup(chatJid);
+  if (group) {
+    const siblingJids = getJidsByFolder(group.folder);
+    for (const jid of siblingJids) {
+      allowedUserIdsCache.delete(jid);
+    }
+  }
 }
 
 function computeGroupAllowedUserIds(chatJid: string): Set<string> | null {
