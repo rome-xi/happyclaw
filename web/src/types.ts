@@ -18,6 +18,17 @@ export interface GroupInfo {
   selected_skills?: string[] | null;
 }
 
+export interface AgentInfo {
+  id: string;
+  name: string;
+  prompt: string;
+  status: 'idle' | 'running' | 'completed' | 'error';
+  kind: 'task' | 'conversation';
+  created_at: string;
+  completed_at?: string;
+  result_summary?: string;
+}
+
 export interface GroupMember {
   user_id: string;
   role: 'owner' | 'member';

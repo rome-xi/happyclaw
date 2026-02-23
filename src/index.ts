@@ -47,6 +47,7 @@ import {
 } from './config.js';
 import {
   AvailableGroup,
+  ContainerInput,
   ContainerOutput,
   runContainerAgent,
   runHostAgent,
@@ -84,6 +85,13 @@ import {
   storeMessageDirect,
   updateChatName,
   updateTask,
+  createAgent,
+  getAgent,
+  listRunningAgentsByFolder,
+  updateAgentStatus,
+  deleteAgent as deleteAgentDb,
+  getSession,
+  listAgentsByJid,
 } from './db.js';
 // feishu.js deprecated exports are no longer needed; imManager handles all connections
 import { imManager } from './im-manager.js';
@@ -96,7 +104,7 @@ import {
 import type { FeishuConnectConfig, TelegramConnectConfig } from './im-manager.js';
 import { GroupQueue } from './group-queue.js';
 import { startSchedulerLoop } from './task-scheduler.js';
-import { MessageCursor, NewMessage, RegisteredGroup } from './types.js';
+import { AgentStatus, MessageCursor, NewMessage, RegisteredGroup, SubAgent } from './types.js';
 import { logger } from './logger.js';
 import {
   startWebServer,
@@ -104,6 +112,7 @@ import {
   broadcastNewMessage,
   broadcastTyping,
   broadcastStreamEvent,
+  broadcastAgentStatus,
   shutdownTerminals,
   shutdownWebServer,
 } from './web.js';
@@ -1090,6 +1099,129 @@ function startIpcWatcher(): void {
       } catch (err) {
         logger.error({ err, sourceGroup }, 'Error reading IPC tasks directory');
       }
+
+      // Process agent spawn/message requests from this group's IPC directory
+      const agentsDir = path.join(ipcBaseDir, sourceGroup, 'agents');
+      try {
+        if (fs.existsSync(agentsDir)) {
+          const agentEntries = fs.readdirSync(agentsDir, { withFileTypes: true });
+
+          // Process top-level .json files (from main agent)
+          for (const entry of agentEntries) {
+            if (!entry.isFile() || !entry.name.endsWith('.json') || entry.name === 'status.json') continue;
+            const filePath = path.join(agentsDir, entry.name);
+            try {
+              const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+              fs.unlinkSync(filePath);
+
+              if (data.type === 'spawn_agent' && data.agentId && data.name && data.prompt) {
+                await processAgentSpawn(sourceGroup, data, sourceGroupEntry);
+              } else if (data.type === 'message_agent' && data.agentId && data.message) {
+                await processAgentMessage(sourceGroup, data);
+              }
+            } catch (err) {
+              logger.error(
+                { file: entry.name, sourceGroup, err },
+                'Error processing agent IPC',
+              );
+              try { fs.unlinkSync(filePath); } catch { /* ignore */ }
+            }
+          }
+
+          // Process IPC from conversation/sub-agent subdirectories (agents/{agentId}/*)
+          for (const entry of agentEntries) {
+            if (!entry.isDirectory()) continue;
+            const subAgentIpcDir = path.join(agentsDir, entry.name);
+
+            // messages/ — proactive send_message from conversation agents
+            const subMsgDir = path.join(subAgentIpcDir, 'messages');
+            try {
+              if (fs.existsSync(subMsgDir)) {
+                const msgFiles = fs.readdirSync(subMsgDir).filter((f) => f.endsWith('.json'));
+                for (const file of msgFiles) {
+                  const filePath = path.join(subMsgDir, file);
+                  try {
+                    const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+                    if (data.type === 'message' && data.chatJid && data.text) {
+                      const targetGroup = registeredGroups[data.chatJid];
+                      if (canSendCrossGroupMessage(isAdminHome, isHome, sourceGroup, sourceGroupEntry, targetGroup)) {
+                        await sendMessage(data.chatJid, data.text);
+                        logger.info({ chatJid: data.chatJid, sourceGroup, agentId: entry.name }, 'Sub-agent IPC message sent');
+                      } else {
+                        logger.warn({ chatJid: data.chatJid, sourceGroup, agentId: entry.name }, 'Unauthorized sub-agent IPC message blocked');
+                      }
+                    }
+                    fs.unlinkSync(filePath);
+                  } catch (err) {
+                    logger.error({ file, sourceGroup, agentId: entry.name, err }, 'Error processing sub-agent IPC message');
+                    try { fs.unlinkSync(filePath); } catch { /* ignore */ }
+                  }
+                }
+              }
+            } catch (err) {
+              logger.error({ err, sourceGroup, agentId: entry.name }, 'Error reading sub-agent messages dir');
+            }
+
+            // tasks/ — task scheduling from conversation agents
+            const subTasksDir = path.join(subAgentIpcDir, 'tasks');
+            try {
+              if (fs.existsSync(subTasksDir)) {
+                const taskFiles = fs
+                  .readdirSync(subTasksDir, { withFileTypes: true })
+                  .filter((e) =>
+                    e.isFile() &&
+                    e.name.endsWith('.json') &&
+                    !e.name.startsWith('install_skill_result_') &&
+                    !e.name.startsWith('uninstall_skill_result_')
+                  )
+                  .map((e) => e.name);
+                for (const file of taskFiles) {
+                  const filePath = path.join(subTasksDir, file);
+                  try {
+                    const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+                    await processTaskIpc(data, sourceGroup, isAdminHome);
+                    fs.unlinkSync(filePath);
+                  } catch (err) {
+                    logger.error({ file, sourceGroup, agentId: entry.name, err }, 'Error processing sub-agent IPC task');
+                    try { fs.unlinkSync(filePath); } catch { /* ignore */ }
+                  }
+                }
+              }
+            } catch (err) {
+              logger.error({ err, sourceGroup, agentId: entry.name }, 'Error reading sub-agent tasks dir');
+            }
+
+            // agents/ — spawn_agent/message_agent from conversation agents
+            const subAgentsDir = path.join(subAgentIpcDir, 'agents');
+            try {
+              if (fs.existsSync(subAgentsDir)) {
+                const spawnFiles = fs.readdirSync(subAgentsDir).filter((f) => f.endsWith('.json') && f !== 'status.json');
+                for (const file of spawnFiles) {
+                  const filePath = path.join(subAgentsDir, file);
+                  try { if (fs.statSync(filePath).isDirectory()) continue; } catch { continue; }
+                  try {
+                    const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+                    fs.unlinkSync(filePath);
+
+                    if (data.type === 'spawn_agent' && data.agentId && data.name && data.prompt) {
+                      await processAgentSpawn(sourceGroup, data, sourceGroupEntry);
+                    } else if (data.type === 'message_agent' && data.agentId && data.message) {
+                      await processAgentMessage(sourceGroup, data);
+                    }
+                  } catch (err) {
+                    logger.error({ file, sourceGroup, agentId: entry.name, err }, 'Error processing sub-agent spawn IPC');
+                    try { fs.unlinkSync(filePath); } catch { /* ignore */ }
+                  }
+                }
+              }
+            } catch (err) {
+              logger.error({ err, sourceGroup, agentId: entry.name }, 'Error reading sub-agent agents dir');
+            }
+          }
+        }
+      } catch (err) {
+        logger.error({ err, sourceGroup }, 'Error reading agent IPC directory');
+      }
     }
 
     if (!shuttingDown) setTimeout(processIpcFiles, IPC_POLL_INTERVAL);
@@ -1432,6 +1564,545 @@ async function processTaskIpc(
     default:
       logger.warn({ type: data.type }, 'Unknown IPC task type');
   }
+}
+
+// --- Sub-Agent orchestration ---
+
+/**
+ * Write the agents status file for the main agent to read via list_agents MCP tool.
+ */
+function writeAgentStatusFile(folder: string): void {
+  const agents = listRunningAgentsByFolder(folder);
+  // Include recently completed agents (within the last 5 minutes)
+  const allAgents = [...agents];
+  const statusData = allAgents.map((a) => ({
+    id: a.id,
+    name: a.name,
+    status: a.status,
+    prompt: a.prompt.slice(0, 200),
+    created_at: a.created_at,
+    completed_at: a.completed_at,
+    result_summary: a.result_summary,
+  }));
+  const statusJson = JSON.stringify(statusData);
+
+  // Write to main agent's IPC agents dir
+  const statusDir = path.join(DATA_DIR, 'ipc', folder, 'agents');
+  fs.mkdirSync(statusDir, { recursive: true });
+  const statusFile = path.join(statusDir, 'status.json');
+  const tmpFile = `${statusFile}.tmp`;
+  fs.writeFileSync(tmpFile, statusJson);
+  fs.renameSync(tmpFile, statusFile);
+
+  // Also replicate to each conversation/sub-agent's IPC agents dir
+  // so they can read status via list_agents
+  try {
+    const entries = fs.readdirSync(statusDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const subAgentsDir = path.join(statusDir, entry.name, 'agents');
+      if (fs.existsSync(subAgentsDir)) {
+        const subStatusFile = path.join(subAgentsDir, 'status.json');
+        const subTmpFile = `${subStatusFile}.tmp`;
+        try {
+          fs.writeFileSync(subTmpFile, statusJson);
+          fs.renameSync(subTmpFile, subStatusFile);
+        } catch { /* ignore write errors for stale dirs */ }
+      }
+    }
+  } catch { /* ignore */ }
+}
+
+/**
+ * Clean up sub-agent resources after completion.
+ * Removes IPC directories, session directories, and DB record.
+ * Broadcasts removal to frontend so the tab disappears.
+ */
+function cleanupSubAgent(folder: string, agentId: string, chatJid: string): void {
+  const agent = getAgent(agentId);
+  if (!agent) return; // Already cleaned up
+
+  // Never auto-cleanup conversation agents — they persist until user deletes them
+  if (agent.kind === 'conversation') return;
+
+  // Delete agent session
+  deleteSession(folder, agentId);
+
+  // Remove agent IPC directory
+  const agentIpcDir = path.join(DATA_DIR, 'ipc', folder, 'agents', agentId);
+  try {
+    fs.rmSync(agentIpcDir, { recursive: true, force: true });
+  } catch { /* ignore */ }
+
+  // Remove agent session directory
+  const agentSessionDir = path.join(DATA_DIR, 'sessions', folder, 'agents', agentId);
+  try {
+    fs.rmSync(agentSessionDir, { recursive: true, force: true });
+  } catch { /* ignore */ }
+
+  // Delete DB record
+  deleteAgentDb(agentId);
+
+  // Notify frontend to remove the tab
+  broadcastAgentStatus(chatJid, agentId, 'completed', agent.name, agent.prompt, '__removed__');
+
+  logger.info({ folder, agentId }, 'Sub-agent resources cleaned up');
+}
+
+/**
+ * Process a spawn_agent IPC request from the main agent.
+ */
+async function processAgentSpawn(
+  sourceFolder: string,
+  data: { agentId: string; name: string; prompt: string; chatJid?: string; groupFolder?: string },
+  sourceGroupEntry: RegisteredGroup | undefined,
+): Promise<void> {
+  const chatJid = data.chatJid || Object.keys(registeredGroups).find(
+    (jid) => registeredGroups[jid]?.folder === sourceFolder,
+  );
+  if (!chatJid) {
+    logger.warn({ sourceFolder, agentId: data.agentId }, 'Cannot spawn agent: no chat JID found');
+    return;
+  }
+
+  // Create agent record in DB
+  const agent: SubAgent = {
+    id: data.agentId,
+    group_folder: sourceFolder,
+    chat_jid: chatJid,
+    name: data.name,
+    prompt: data.prompt,
+    status: 'running',
+    kind: 'task',
+    created_by: `group:${sourceFolder}`,
+    created_at: new Date().toISOString(),
+    completed_at: null,
+    result_summary: null,
+  };
+  createAgent(agent);
+  logger.info(
+    { agentId: agent.id, name: agent.name, folder: sourceFolder },
+    'Sub-agent spawned',
+  );
+
+  // Create agent-specific IPC directories
+  const agentIpcDir = path.join(DATA_DIR, 'ipc', sourceFolder, 'agents', agent.id);
+  fs.mkdirSync(path.join(agentIpcDir, 'input'), { recursive: true });
+  fs.mkdirSync(path.join(agentIpcDir, 'messages'), { recursive: true });
+  fs.mkdirSync(path.join(agentIpcDir, 'tasks'), { recursive: true });
+
+  // Create agent-specific session directory
+  const agentSessionDir = path.join(DATA_DIR, 'sessions', sourceFolder, 'agents', agent.id, '.claude');
+  fs.mkdirSync(agentSessionDir, { recursive: true });
+
+  // Broadcast agent status via WebSocket
+  broadcastAgentStatus(chatJid, agent.id, 'running', agent.name, agent.prompt);
+
+  // Update status.json
+  writeAgentStatusFile(sourceFolder);
+
+  // Use virtual JID for queue isolation: {chatJid}#agent:{agentId}
+  const virtualJid = `${chatJid}#agent:${agent.id}`;
+
+  // Find the effective group (inherit home-group properties)
+  let effectiveGroup = sourceGroupEntry;
+  if (!effectiveGroup) {
+    effectiveGroup = registeredGroups[chatJid];
+  }
+  if (!effectiveGroup) {
+    logger.warn({ sourceFolder, agentId: agent.id }, 'Cannot spawn agent: group not found');
+    updateAgentStatus(agent.id, 'error', 'Group not found');
+    writeAgentStatusFile(sourceFolder);
+    return;
+  }
+
+  // Enqueue agent execution as a task (like scheduled tasks, but parallel)
+  const taskId = `agent:${agent.id}`;
+  queue.enqueueTask(virtualJid, taskId, async () => {
+    await runSubAgent(effectiveGroup!, agent, chatJid, virtualJid);
+  });
+}
+
+/**
+ * Run a sub-agent in its own container/process.
+ */
+async function runSubAgent(
+  parentGroup: RegisteredGroup,
+  agent: SubAgent,
+  chatJid: string,
+  virtualJid: string,
+): Promise<void> {
+  const isHome = !!parentGroup.is_home;
+  const isAdminHome = isHome && parentGroup.folder === MAIN_GROUP_FOLDER;
+  const sessionId = getSession(parentGroup.folder, agent.id) || undefined;
+
+  const prompt = `你是子 Agent "${agent.name}"。你的任务是：\n\n${agent.prompt}\n\n完成后请输出任务结果摘要。`;
+
+  const wrappedOnOutput = async (output: ContainerOutput) => {
+    // Track session for this sub-agent
+    if (output.newSessionId && output.status !== 'error') {
+      setSession(parentGroup.folder, output.newSessionId, agent.id);
+    }
+
+    // Forward stream events with agentId
+    if (output.status === 'stream' && output.streamEvent) {
+      broadcastStreamEvent(chatJid, output.streamEvent, agent.id);
+      return;
+    }
+
+    // Store agent replies as messages
+    if (output.result) {
+      const raw = typeof output.result === 'string' ? output.result : JSON.stringify(output.result);
+      const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+      if (text) {
+        const msgId = crypto.randomUUID();
+        const timestamp = new Date().toISOString();
+        ensureChatExists(chatJid);
+        storeMessageDirect(
+          msgId,
+          chatJid,
+          `agent:${agent.id}`,
+          agent.name,
+          text,
+          timestamp,
+          true,
+        );
+        broadcastNewMessage(chatJid, {
+          id: msgId,
+          chat_jid: chatJid,
+          sender: `agent:${agent.id}`,
+          sender_name: agent.name,
+          content: text,
+          timestamp,
+          is_from_me: true,
+        });
+      }
+    }
+  };
+
+  try {
+    const executionMode = parentGroup.executionMode || 'container';
+
+    const onProcessCb = (proc: ChildProcess, identifier: string) => {
+      const containerName = executionMode === 'container' ? identifier : null;
+      queue.registerProcess(virtualJid, proc, containerName, parentGroup.folder, identifier, agent.id);
+    };
+
+    let output: ContainerOutput;
+
+    const containerInput: ContainerInput = {
+      prompt,
+      sessionId,
+      groupFolder: parentGroup.folder,
+      chatJid,
+      isMain: isAdminHome,
+      isHome,
+      isAdminHome,
+      agentId: agent.id,
+      agentName: agent.name,
+    };
+
+    if (executionMode === 'host') {
+      output = await runHostAgent(parentGroup, containerInput, onProcessCb, wrappedOnOutput);
+    } else {
+      output = await runContainerAgent(parentGroup, containerInput, onProcessCb, wrappedOnOutput);
+    }
+
+    // Finalize session
+    if (output.newSessionId && output.status !== 'error') {
+      setSession(parentGroup.folder, output.newSessionId, agent.id);
+    }
+
+    // Determine result summary
+    const resultSummary = output.result
+      ? (typeof output.result === 'string' ? output.result : JSON.stringify(output.result))
+          .replace(/<internal>[\s\S]*?<\/internal>/g, '').trim().slice(0, 2000)
+      : undefined;
+
+    if (output.status === 'error') {
+      updateAgentStatus(agent.id, 'error', output.error || '未知错误');
+      broadcastAgentStatus(chatJid, agent.id, 'error', agent.name, agent.prompt, output.error);
+    } else {
+      updateAgentStatus(agent.id, 'completed', resultSummary || '任务已完成');
+      broadcastAgentStatus(chatJid, agent.id, 'completed', agent.name, agent.prompt, resultSummary);
+    }
+
+    // Inject result into main agent's IPC input
+    injectAgentResultToMain(parentGroup.folder, agent, output);
+  } catch (err) {
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    logger.error({ agentId: agent.id, err }, 'Sub-agent execution error');
+    updateAgentStatus(agent.id, 'error', errorMsg);
+    broadcastAgentStatus(chatJid, agent.id, 'error', agent.name, agent.prompt, errorMsg);
+  }
+
+  // Update status.json
+  writeAgentStatusFile(parentGroup.folder);
+
+  // Delay cleanup so the user can review the agent's results in the UI
+  setTimeout(() => {
+    cleanupSubAgent(parentGroup.folder, agent.id, chatJid);
+  }, 5 * 60 * 1000); // 5 minutes
+}
+
+/**
+ * Inject a sub-agent's result into the main agent's IPC input directory.
+ */
+function injectAgentResultToMain(
+  folder: string,
+  agent: SubAgent,
+  output: ContainerOutput,
+): void {
+  const inputDir = path.join(DATA_DIR, 'ipc', folder, 'input');
+  fs.mkdirSync(inputDir, { recursive: true });
+
+  const resultText = output.result
+    ? (typeof output.result === 'string' ? output.result : JSON.stringify(output.result))
+        .replace(/<internal>[\s\S]*?<\/internal>/g, '').trim().slice(0, 2000)
+    : (output.error || '任务已完成');
+
+  const resultMsg = {
+    type: 'agent_result',
+    agentId: agent.id,
+    agentName: agent.name,
+    status: output.status === 'error' ? 'error' : 'completed',
+    prompt: agent.prompt.slice(0, 200),
+    result: resultText,
+  };
+
+  const fileName = `agent-result-${agent.id}-${Date.now()}.json`;
+  const filePath = path.join(inputDir, fileName);
+  const tmpPath = `${filePath}.tmp`;
+  fs.writeFileSync(tmpPath, JSON.stringify(resultMsg));
+  fs.renameSync(tmpPath, filePath);
+  logger.info(
+    { agentId: agent.id, folder, fileName },
+    'Injected agent result to main agent IPC',
+  );
+}
+
+/**
+ * Process messages for a user-created conversation agent.
+ * Similar to processGroupMessages but uses agent-specific session/IPC and virtual JID.
+ * The agent process stays alive for IDLE_TIMEOUT, cycling idle→running.
+ */
+async function processAgentConversation(chatJid: string, agentId: string): Promise<void> {
+  const agent = getAgent(agentId);
+  if (!agent || agent.kind !== 'conversation') {
+    logger.warn({ chatJid, agentId }, 'processAgentConversation: agent not found or not a conversation');
+    return;
+  }
+
+  let group = registeredGroups[chatJid];
+  if (!group) {
+    registeredGroups = getAllRegisteredGroups();
+    group = registeredGroups[chatJid];
+  }
+  if (!group) return;
+
+  // Inherit home group properties (same as processGroupMessages)
+  let effectiveGroup = group;
+  if (!group.is_home) {
+    const siblingJids = getJidsByFolder(group.folder);
+    for (const jid of siblingJids) {
+      const sibling = registeredGroups[jid] ?? getRegisteredGroup(jid);
+      if (sibling && !registeredGroups[jid]) registeredGroups[jid] = sibling;
+      if (sibling?.is_home) {
+        effectiveGroup = {
+          ...group,
+          executionMode: sibling.executionMode,
+          customCwd: sibling.customCwd || group.customCwd,
+          created_by: group.created_by || sibling.created_by,
+          is_home: true,
+        };
+        break;
+      }
+    }
+  }
+
+  const virtualChatJid = `${chatJid}#agent:${agentId}`;
+  const virtualJid = virtualChatJid; // used as queue key
+
+  // Get pending messages
+  const sinceCursor = lastAgentTimestamp[virtualChatJid] || EMPTY_CURSOR;
+  const missedMessages = getMessagesSince(virtualChatJid, sinceCursor);
+  if (missedMessages.length === 0) return;
+
+  const isHome = !!effectiveGroup.is_home;
+  const isAdminHome = isHome && effectiveGroup.folder === MAIN_GROUP_FOLDER;
+
+  // Update agent status → running
+  updateAgentStatus(agentId, 'running');
+  broadcastAgentStatus(chatJid, agentId, 'running', agent.name, agent.prompt);
+
+  const prompt = formatMessages(missedMessages, false);
+  const images = collectMessageImages(virtualChatJid, missedMessages);
+  const imagesForAgent = images.length > 0 ? images : undefined;
+
+  // Track idle timer
+  let idleTimer: ReturnType<typeof setTimeout> | null = null;
+  const resetIdleTimer = () => {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      logger.debug({ agentId, chatJid }, 'Agent conversation idle timeout, closing stdin');
+      queue.closeStdin(virtualJid);
+    }, IDLE_TIMEOUT);
+  };
+
+  let cursorCommitted = false;
+  const lastProcessed = missedMessages[missedMessages.length - 1];
+  const commitCursor = (): void => {
+    if (cursorCommitted) return;
+    lastAgentTimestamp[virtualChatJid] = {
+      timestamp: lastProcessed.timestamp,
+      id: lastProcessed.id,
+    };
+    saveState();
+    cursorCommitted = true;
+  };
+
+  // Get or use agent-specific session
+  const sessionId = getSession(effectiveGroup.folder, agentId) || undefined;
+
+  const wrappedOnOutput = async (output: ContainerOutput) => {
+    // Track session
+    if (output.newSessionId && output.status !== 'error') {
+      setSession(effectiveGroup.folder, output.newSessionId, agentId);
+    }
+
+    // Stream events
+    if (output.status === 'stream' && output.streamEvent) {
+      broadcastStreamEvent(chatJid, output.streamEvent, agentId);
+      return;
+    }
+
+    // Agent reply
+    if (output.result) {
+      const raw = typeof output.result === 'string' ? output.result : JSON.stringify(output.result);
+      const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+      if (text) {
+        const msgId = crypto.randomUUID();
+        const timestamp = new Date().toISOString();
+        ensureChatExists(virtualChatJid);
+        storeMessageDirect(
+          msgId, virtualChatJid, 'happyclaw-agent', ASSISTANT_NAME, text, timestamp, true,
+        );
+        broadcastNewMessage(virtualChatJid, {
+          id: msgId,
+          chat_jid: virtualChatJid,
+          sender: 'happyclaw-agent',
+          sender_name: ASSISTANT_NAME,
+          content: text,
+          timestamp,
+          is_from_me: true,
+        }, agentId);
+        commitCursor();
+        resetIdleTimer();
+      }
+    }
+
+    if (output.status === 'error') {
+      // Error handling
+    }
+  };
+
+  try {
+    const executionMode = effectiveGroup.executionMode || 'container';
+    const onProcessCb = (proc: ChildProcess, identifier: string) => {
+      const containerName = executionMode === 'container' ? identifier : null;
+      queue.registerProcess(virtualJid, proc, containerName, effectiveGroup.folder, identifier, agentId);
+    };
+
+    const containerInput: ContainerInput = {
+      prompt,
+      sessionId,
+      groupFolder: effectiveGroup.folder,
+      chatJid,
+      isMain: isAdminHome,
+      isHome,
+      isAdminHome,
+      agentId,
+      agentName: agent.name,
+      images: imagesForAgent,
+    };
+
+    // Write tasks/groups snapshots
+    const tasks = getAllTasks();
+    writeTasksSnapshot(effectiveGroup.folder, isAdminHome, tasks.map((t) => ({
+      id: t.id, groupFolder: t.group_folder, prompt: t.prompt,
+      schedule_type: t.schedule_type, schedule_value: t.schedule_value,
+      status: t.status, next_run: t.next_run,
+    })));
+    const availableGroups = getAvailableGroups();
+    writeGroupsSnapshot(effectiveGroup.folder, isAdminHome, availableGroups, new Set(Object.keys(registeredGroups)));
+
+    let output: ContainerOutput;
+    if (executionMode === 'host') {
+      output = await runHostAgent(effectiveGroup, containerInput, onProcessCb, wrappedOnOutput);
+    } else {
+      output = await runContainerAgent(effectiveGroup, containerInput, onProcessCb, wrappedOnOutput);
+    }
+
+    // Finalize session
+    if (output.newSessionId && output.status !== 'error') {
+      setSession(effectiveGroup.folder, output.newSessionId, agentId);
+    }
+
+    commitCursor();
+  } catch (err) {
+    logger.error({ agentId, chatJid, err }, 'Agent conversation error');
+  } finally {
+    if (idleTimer) clearTimeout(idleTimer);
+  }
+
+  // Process ended → set status back to idle (conversation agents persist)
+  updateAgentStatus(agentId, 'idle');
+  broadcastAgentStatus(chatJid, agentId, 'idle', agent.name, agent.prompt);
+}
+
+/**
+ * Process a message_agent IPC request — forward message to a running sub-agent.
+ */
+async function processAgentMessage(
+  sourceFolder: string,
+  data: { agentId: string; message: string },
+): Promise<void> {
+  const agentRecord = getAgent(data.agentId);
+  if (!agentRecord || agentRecord.group_folder !== sourceFolder) {
+    logger.warn(
+      { agentId: data.agentId, sourceFolder },
+      'Cannot message agent: not found or wrong folder',
+    );
+    return;
+  }
+
+  if (agentRecord.status !== 'running') {
+    logger.warn(
+      { agentId: data.agentId, status: agentRecord.status },
+      'Cannot message agent: not running',
+    );
+    return;
+  }
+
+  // Write message to the sub-agent's IPC input directory
+  const agentInputDir = path.join(DATA_DIR, 'ipc', sourceFolder, 'agents', data.agentId, 'input');
+  fs.mkdirSync(agentInputDir, { recursive: true });
+
+  const msg = {
+    type: 'agent_message',
+    message: data.message,
+    from: 'main',
+  };
+
+  const fileName = `msg-${Date.now()}.json`;
+  const filePath = path.join(agentInputDir, fileName);
+  const tmpPath = `${filePath}.tmp`;
+  fs.writeFileSync(tmpPath, JSON.stringify(msg));
+  fs.renameSync(tmpPath, filePath);
+  logger.info(
+    { agentId: data.agentId, sourceFolder },
+    'Message forwarded to sub-agent',
+  );
 }
 
 async function startMessageLoop(): Promise<void> {
@@ -2028,6 +2699,7 @@ async function main(): Promise<void> {
     isTelegramConnected: () => imManager.isAnyTelegramConnected(),
     isUserFeishuConnected: (userId: string) => imManager.isFeishuConnected(userId),
     isUserTelegramConnected: (userId: string) => imManager.isTelegramConnected(userId),
+    processAgentConversation,
   });
 
   // Clean expired sessions every hour
@@ -2073,6 +2745,15 @@ async function main(): Promise<void> {
     return group.executionMode === 'host';
   });
   queue.setSerializationKeyResolver((groupJid: string) => {
+    // Agent virtual JIDs: {chatJid}#agent:{agentId} → separate serialization key
+    const agentSep = groupJid.indexOf('#agent:');
+    if (agentSep >= 0) {
+      const baseJid = groupJid.slice(0, agentSep);
+      const agentId = groupJid.slice(agentSep + 7);
+      const group = registeredGroups[baseJid];
+      const folder = group?.folder || baseJid;
+      return `${folder}#${agentId}`;
+    }
     const group = registeredGroups[groupJid];
     return group?.folder || groupJid;
   });

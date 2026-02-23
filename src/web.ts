@@ -45,6 +45,7 @@ import fileRoutes from './routes/files.js';
 import monitorRoutes from './routes/monitor.js';
 import skillsRoutes from './routes/skills.js';
 import browseRoutes from './routes/browse.js';
+import agentRoutes from './routes/agents.js';
 
 // Database and types (only for handleWebUserMessage and broadcast)
 import {
@@ -56,6 +57,7 @@ import {
   deleteUserSession,
   updateSessionLastActive,
   getGroupMembers,
+  getAgent,
 } from './db.js';
 import { isSessionExpired } from './auth.js';
 import type { NewMessage, WsMessageOut, WsMessageIn, AuthUser, StreamEvent, UserRole } from './types.js';
@@ -132,6 +134,7 @@ app.route('/api/tasks', tasksRoutes);
 app.route('/api/skills', skillsRoutes);
 app.route('/api/admin', adminRoutes);
 app.route('/api/browse', browseRoutes);
+app.route('/api/groups', agentRoutes); // Agent routes under /api/groups/:jid/agents
 app.route('/api', monitorRoutes);
 
 // --- POST /api/messages ---
@@ -264,6 +267,72 @@ async function handleWebUserMessage(
   }
   deps.advanceGlobalCursor({ timestamp, id: messageId });
   return { ok: true, messageId, timestamp };
+}
+
+// --- Agent Conversation Message Handler ---
+
+async function handleAgentConversationMessage(
+  chatJid: string,
+  agentId: string,
+  content: string,
+  userId: string,
+  displayName: string,
+  attachments?: Array<{ type: 'image'; data: string; mimeType?: string }>,
+): Promise<void> {
+  if (!deps) return;
+
+  const agent = getAgent(agentId);
+  if (!agent || agent.kind !== 'conversation' || agent.chat_jid !== chatJid) {
+    logger.warn({ chatJid, agentId }, 'Agent conversation message rejected: agent not found or not a conversation');
+    return;
+  }
+
+  const virtualChatJid = `${chatJid}#agent:${agentId}`;
+
+  // Store message with virtual chat_jid
+  const messageId = crypto.randomUUID();
+  const timestamp = new Date().toISOString();
+  const attachmentsStr = attachments && attachments.length > 0 ? JSON.stringify(attachments) : undefined;
+
+  ensureChatExists(virtualChatJid);
+  storeMessageDirect(
+    messageId, virtualChatJid, userId, displayName, content, timestamp, false, attachmentsStr,
+  );
+
+  // Broadcast new_message with agentId so frontend routes to agent tab
+  broadcastNewMessage(virtualChatJid, {
+    id: messageId,
+    chat_jid: virtualChatJid,
+    sender: userId,
+    sender_name: displayName,
+    content,
+    timestamp,
+    is_from_me: false,
+    attachments: attachmentsStr,
+  }, agentId);
+
+  // Format for agent
+  const shared = false; // agent conversations are not shared
+  const formatted = deps.formatMessages([{
+    id: messageId,
+    chat_jid: virtualChatJid,
+    sender: userId,
+    sender_name: displayName,
+    content,
+    timestamp,
+  }], shared);
+
+  // Try to pipe into running agent process
+  const sent = deps.queue.sendMessage(virtualChatJid, formatted);
+  if (!sent) {
+    // No running process — start one via processAgentConversation
+    if (deps.processAgentConversation) {
+      const taskId = `agent-conv:${agentId}:${Date.now()}`;
+      deps.queue.enqueueTask(virtualChatJid, taskId, async () => {
+        await deps!.processAgentConversation!(chatJid, agentId);
+      });
+    }
+  }
 }
 
 // --- Static Files ---
@@ -400,6 +469,7 @@ function setupWebSocket(server: any): WebSocketServer {
             return;
           }
           const { chatJid, content, attachments } = wsValidation.data;
+          const agentId = (msg as { agentId?: string }).agentId;
 
           // 群组访问权限检查
           const targetGroup = getRegisteredGroup(chatJid);
@@ -420,6 +490,16 @@ function setupWebSocket(server: any): WebSocketServer {
                 return;
               }
             }
+          }
+
+          // Route to agent conversation handler if agentId is present
+          if (agentId && deps) {
+            await handleAgentConversationMessage(
+              chatJid, agentId, content.trim(),
+              session.user_id, session.display_name || session.username,
+              attachments,
+            );
+            return;
           }
 
           const result = await handleWebUserMessage(chatJid, content.trim(), attachments, session.user_id, session.display_name || session.username);
@@ -775,18 +855,19 @@ export function broadcastToWebClients(chatJid: string, text: string): void {
 export function broadcastNewMessage(
   chatJid: string,
   msg: NewMessage & { is_from_me?: boolean },
+  agentId?: string,
 ): void {
-  const jid = normalizeHomeJid(chatJid);
-  const allowedUserIds = getGroupAllowedUserIds(chatJid);
-  safeBroadcast(
-    {
-      type: 'new_message',
-      chatJid: jid,
-      message: { ...msg, is_from_me: msg.is_from_me ?? false },
-    },
-    isHostGroupJid(chatJid),
-    allowedUserIds,
-  );
+  // For virtual JIDs like "web:xxx#agent:yyy", extract base JID for broadcast
+  const baseChatJid = chatJid.includes('#agent:') ? chatJid.split('#agent:')[0] : chatJid;
+  const jid = normalizeHomeJid(baseChatJid);
+  const allowedUserIds = getGroupAllowedUserIds(baseChatJid);
+  const wsMsg: WsMessageOut = {
+    type: 'new_message',
+    chatJid: jid,
+    message: { ...msg, is_from_me: msg.is_from_me ?? false },
+    ...(agentId ? { agentId } : {}),
+  };
+  safeBroadcast(wsMsg, isHostGroupJid(baseChatJid), allowedUserIds);
 }
 
 export function broadcastTyping(chatJid: string, isTyping: boolean): void {
@@ -799,10 +880,30 @@ export function broadcastTyping(chatJid: string, isTyping: boolean): void {
   );
 }
 
-export function broadcastStreamEvent(chatJid: string, event: StreamEvent): void {
+export function broadcastStreamEvent(chatJid: string, event: StreamEvent, agentId?: string): void {
   const jid = normalizeHomeJid(chatJid);
   const allowedUserIds = getGroupAllowedUserIds(chatJid);
-  safeBroadcast({ type: 'stream_event', chatJid: jid, event }, isHostGroupJid(chatJid), allowedUserIds);
+  const msg: WsMessageOut = agentId
+    ? { type: 'stream_event', chatJid: jid, event, agentId }
+    : { type: 'stream_event', chatJid: jid, event };
+  safeBroadcast(msg, isHostGroupJid(chatJid), allowedUserIds);
+}
+
+export function broadcastAgentStatus(
+  chatJid: string,
+  agentId: string,
+  status: import('./types.js').AgentStatus,
+  name: string,
+  prompt: string,
+  resultSummary?: string,
+  kind?: import('./types.js').AgentKind,
+): void {
+  const jid = normalizeHomeJid(chatJid);
+  const allowedUserIds = getGroupAllowedUserIds(chatJid);
+  // Resolve kind from DB if not provided
+  const resolvedKind = kind || getAgent(agentId)?.kind;
+  const msg: WsMessageOut = { type: 'agent_status', chatJid: jid, agentId, status, kind: resolvedKind, name, prompt, resultSummary };
+  safeBroadcast(msg, isHostGroupJid(chatJid), allowedUserIds);
 }
 
 function broadcastStatus(): void {

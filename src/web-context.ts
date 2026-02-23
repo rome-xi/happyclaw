@@ -29,6 +29,7 @@ export interface WebDeps {
   isTelegramConnected?: () => boolean;
   isUserFeishuConnected?: (userId: string) => boolean;
   isUserTelegramConnected?: (userId: string) => boolean;
+  processAgentConversation?: (chatJid: string, agentId: string) => Promise<void>;
 }
 
 export type Variables = {

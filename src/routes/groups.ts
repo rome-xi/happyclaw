@@ -41,6 +41,7 @@ import {
   getGroupMembers,
   getGroupMemberRole,
   getUserById,
+  getAgent,
 } from '../db.js';
 import { logger } from '../logger.js';
 import {
@@ -965,8 +966,27 @@ groupRoutes.get('/:jid/messages', authMiddleware, async (c) => {
 
   const before = c.req.query('before');
   const after = c.req.query('after');
+  const agentIdParam = c.req.query('agentId');
   const limitRaw = parseInt(c.req.query('limit') || '50', 10);
   const limit = Math.min(Number.isFinite(limitRaw) ? Math.max(1, limitRaw) : 50, 200);
+
+  // Agent conversation: query messages from the virtual chat_jid
+  if (agentIdParam) {
+    const agent = getAgent(agentIdParam);
+    if (!agent || agent.chat_jid !== jid) {
+      return c.json({ error: 'Agent not found' }, 404);
+    }
+
+    const virtualJid = `${jid}#agent:${agentIdParam}`;
+    if (after) {
+      const messages = getMessagesAfter(virtualJid, after, limit);
+      return c.json({ messages });
+    }
+    const rows = getMessagesPage(virtualJid, before, limit + 1);
+    const hasMore = rows.length > limit;
+    const messages = hasMore ? rows.slice(0, limit) : rows;
+    return c.json({ messages, hasMore });
+  }
 
   // is_home 群组合并查询：将同 folder 下所有 JID（web + feishu/telegram IM 通道）的消息合并展示
   // - admin: merge all siblings in the folder (shared admin home)

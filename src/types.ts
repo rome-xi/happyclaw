@@ -239,15 +239,35 @@ export interface AuthAuditLog {
   created_at: string;
 }
 
+// --- Sub-Agent types ---
+
+export type AgentStatus = 'idle' | 'running' | 'completed' | 'error';
+export type AgentKind = 'task' | 'conversation';
+
+export interface SubAgent {
+  id: string;
+  group_folder: string;
+  chat_jid: string;
+  name: string;
+  prompt: string;
+  status: AgentStatus;
+  kind: AgentKind;
+  created_by: string | null;
+  created_at: string;
+  completed_at: string | null;
+  result_summary: string | null;
+}
+
 // WebSocket message types
 export type WsMessageOut =
   | {
       type: 'new_message';
       chatJid: string;
       message: NewMessage & { is_from_me: boolean };
+      agentId?: string;
     }
-  | { type: 'agent_reply'; chatJid: string; text: string; timestamp: string }
-  | { type: 'typing'; chatJid: string; isTyping: boolean }
+  | { type: 'agent_reply'; chatJid: string; text: string; timestamp: string; agentId?: string }
+  | { type: 'typing'; chatJid: string; isTyping: boolean; agentId?: string }
   | {
       type: 'status_update';
       activeContainers: number;
@@ -255,14 +275,24 @@ export type WsMessageOut =
       activeTotal: number;
       queueLength: number;
     }
-  | { type: 'stream_event'; chatJid: string; event: StreamEvent }
+  | { type: 'stream_event'; chatJid: string; event: StreamEvent; agentId?: string }
+  | {
+      type: 'agent_status';
+      chatJid: string;
+      agentId: string;
+      status: AgentStatus;
+      kind?: AgentKind;
+      name: string;
+      prompt: string;
+      resultSummary?: string;
+    }
   | { type: 'terminal_output'; chatJid: string; data: string }
   | { type: 'terminal_started'; chatJid: string }
   | { type: 'terminal_stopped'; chatJid: string; reason?: string }
   | { type: 'terminal_error'; chatJid: string; error: string };
 
 export type WsMessageIn =
-  | { type: 'send_message'; chatJid: string; content: string; attachments?: MessageAttachment[] }
+  | { type: 'send_message'; chatJid: string; content: string; attachments?: MessageAttachment[]; agentId?: string }
   | { type: 'terminal_start'; chatJid: string; cols: number; rows: number }
   | { type: 'terminal_input'; chatJid: string; data: string }
   | { type: 'terminal_resize'; chatJid: string; cols: number; rows: number }

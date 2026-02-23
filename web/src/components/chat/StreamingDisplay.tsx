@@ -9,10 +9,13 @@ interface StreamingDisplayProps {
   groupJid: string;
   isWaiting: boolean;
   senderName?: string;
+  agentId?: string;
 }
 
-export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNameProp = 'AI' }: StreamingDisplayProps) {
-  const streaming = useChatStore(s => s.streaming[groupJid]);
+export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNameProp = 'AI', agentId }: StreamingDisplayProps) {
+  const mainStreaming = useChatStore(s => s.streaming[groupJid]);
+  const agentStreamingState = useChatStore(s => agentId ? s.agentStreaming[agentId] : undefined);
+  const streaming = agentId ? agentStreamingState : mainStreaming;
   const currentUser = useAuthStore(s => s.user);
   const appearance = useAuthStore(s => s.appearance);
   const senderName = currentUser?.ai_name || appearance?.aiName || senderNameProp;

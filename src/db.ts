@@ -4,6 +4,8 @@ import path from 'path';
 
 import { STORE_DIR, GROUPS_DIR } from './config.js';
 import {
+  AgentKind,
+  AgentStatus,
   AuthAuditLog,
   AuthEventType,
   ExecutionMode,
@@ -14,6 +16,7 @@ import {
   MessageCursor,
   RegisteredGroup,
   ScheduledTask,
+  SubAgent,
   TaskRunLog,
   User,
   UserPublic,
@@ -239,6 +242,25 @@ export function initDatabase(): void {
     CREATE INDEX IF NOT EXISTS idx_group_members_user ON group_members(user_id);
   `);
 
+  // Sub-agents table for multi-agent parallel execution
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS agents (
+      id TEXT PRIMARY KEY,
+      group_folder TEXT NOT NULL,
+      chat_jid TEXT NOT NULL,
+      name TEXT NOT NULL,
+      prompt TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'running',
+      created_by TEXT,
+      created_at TEXT NOT NULL,
+      completed_at TEXT,
+      result_summary TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_agents_group ON agents(group_folder);
+    CREATE INDEX IF NOT EXISTS idx_agents_jid ON agents(chat_jid);
+    CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(status);
+  `);
+
   // Lightweight migrations for existing DBs
   ensureColumn('users', 'permissions', "TEXT NOT NULL DEFAULT '[]'");
   ensureColumn('users', 'must_change_password', 'INTEGER NOT NULL DEFAULT 0');
@@ -261,6 +283,8 @@ export function initDatabase(): void {
   ensureColumn('users', 'ai_avatar_color', 'TEXT');
   ensureColumn('scheduled_tasks', 'created_by', 'TEXT');
   ensureColumn('registered_groups', 'selected_skills', 'TEXT');
+  ensureColumn('sessions', 'agent_id', 'TEXT');
+  ensureColumn('agents', 'kind', "TEXT NOT NULL DEFAULT 'task'");
 
   // Migration: remove UNIQUE constraint from registered_groups.folder
   // Multiple groups (web:main + feishu chats) share folder='main' by design.
@@ -455,7 +479,7 @@ export function initDatabase(): void {
     })();
   }
 
-  const SCHEMA_VERSION = '15';
+  const SCHEMA_VERSION = '16';
   db.prepare(
     'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
   ).run('schema_version', SCHEMA_VERSION);
@@ -802,26 +826,62 @@ export function setRouterState(key: string, value: string): void {
 
 // --- Session accessors ---
 
-export function getSession(groupFolder: string): string | undefined {
+export function getSession(groupFolder: string, agentId?: string | null): string | undefined {
+  if (agentId) {
+    const row = db
+      .prepare('SELECT session_id FROM sessions WHERE group_folder = ? AND agent_id = ?')
+      .get(groupFolder, agentId) as { session_id: string } | undefined;
+    return row?.session_id;
+  }
   const row = db
-    .prepare('SELECT session_id FROM sessions WHERE group_folder = ?')
+    .prepare('SELECT session_id FROM sessions WHERE group_folder = ? AND agent_id IS NULL')
     .get(groupFolder) as { session_id: string } | undefined;
   return row?.session_id;
 }
 
-export function setSession(groupFolder: string, sessionId: string): void {
+export function setSession(groupFolder: string, sessionId: string, agentId?: string | null): void {
+  if (agentId) {
+    // Upsert for agent sessions
+    db.prepare(
+      `INSERT INTO sessions (group_folder, session_id, agent_id) VALUES (?, ?, ?)
+       ON CONFLICT(group_folder) DO UPDATE SET session_id = excluded.session_id, agent_id = excluded.agent_id
+       WHERE agent_id = excluded.agent_id`,
+    ).run(groupFolder, sessionId, agentId);
+    // If no rows updated (agent_id mismatch), insert fresh
+    const existing = db.prepare(
+      'SELECT 1 FROM sessions WHERE group_folder = ? AND agent_id = ?',
+    ).get(groupFolder, agentId);
+    if (!existing) {
+      // Use a composite key approach: store agent sessions with folder#agentId
+      db.prepare(
+        'INSERT OR REPLACE INTO sessions (group_folder, session_id, agent_id) VALUES (?, ?, ?)',
+      ).run(`${groupFolder}#${agentId}`, sessionId, agentId);
+    }
+    return;
+  }
   db.prepare(
     'INSERT OR REPLACE INTO sessions (group_folder, session_id) VALUES (?, ?)',
   ).run(groupFolder, sessionId);
 }
 
-export function deleteSession(groupFolder: string): void {
-  db.prepare('DELETE FROM sessions WHERE group_folder = ?').run(groupFolder);
+export function deleteSession(groupFolder: string, agentId?: string | null): void {
+  if (agentId) {
+    db.prepare('DELETE FROM sessions WHERE group_folder = ? AND agent_id = ?').run(groupFolder, agentId);
+    db.prepare('DELETE FROM sessions WHERE group_folder = ?').run(`${groupFolder}#${agentId}`);
+    return;
+  }
+  db.prepare('DELETE FROM sessions WHERE group_folder = ? AND agent_id IS NULL').run(groupFolder);
+}
+
+export function deleteAllSessionsForFolder(groupFolder: string): void {
+  db.prepare("DELETE FROM sessions WHERE group_folder = ? OR group_folder LIKE ?").run(
+    groupFolder, `${groupFolder}#%`,
+  );
 }
 
 export function getAllSessions(): Record<string, string> {
   const rows = db
-    .prepare('SELECT group_folder, session_id FROM sessions')
+    .prepare('SELECT group_folder, session_id FROM sessions WHERE agent_id IS NULL')
     .all() as Array<{ group_folder: string; session_id: string }>;
   const result: Record<string, string> = {};
   for (const row of rows) {
@@ -2208,6 +2268,99 @@ export function getUserMemberFolders(
     group_folder: r.group_folder,
     role: r.role as 'owner' | 'member',
   }));
+}
+
+// ===================== Sub-Agent CRUD =====================
+
+export function createAgent(agent: SubAgent): void {
+  db.prepare(
+    `INSERT INTO agents (id, group_folder, chat_jid, name, prompt, status, kind, created_by, created_at, completed_at, result_summary)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    agent.id,
+    agent.group_folder,
+    agent.chat_jid,
+    agent.name,
+    agent.prompt,
+    agent.status,
+    agent.kind || 'task',
+    agent.created_by ?? null,
+    agent.created_at,
+    agent.completed_at ?? null,
+    agent.result_summary ?? null,
+  );
+}
+
+export function getAgent(id: string): SubAgent | undefined {
+  const row = db.prepare('SELECT * FROM agents WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+  if (!row) return undefined;
+  return mapAgentRow(row);
+}
+
+export function listAgentsByFolder(folder: string): SubAgent[] {
+  const rows = db
+    .prepare('SELECT * FROM agents WHERE group_folder = ? ORDER BY created_at DESC')
+    .all(folder) as Array<Record<string, unknown>>;
+  return rows.map(mapAgentRow);
+}
+
+export function listAgentsByJid(chatJid: string): SubAgent[] {
+  const rows = db
+    .prepare('SELECT * FROM agents WHERE chat_jid = ? ORDER BY created_at DESC')
+    .all(chatJid) as Array<Record<string, unknown>>;
+  return rows.map(mapAgentRow);
+}
+
+export function listRunningAgentsByFolder(folder: string): SubAgent[] {
+  const rows = db
+    .prepare("SELECT * FROM agents WHERE group_folder = ? AND status = 'running' ORDER BY created_at ASC")
+    .all(folder) as Array<Record<string, unknown>>;
+  return rows.map(mapAgentRow);
+}
+
+export function updateAgentStatus(
+  id: string,
+  status: AgentStatus,
+  resultSummary?: string,
+): void {
+  const completedAt = (status !== 'running' && status !== 'idle') ? new Date().toISOString() : null;
+  db.prepare(
+    'UPDATE agents SET status = ?, completed_at = ?, result_summary = ? WHERE id = ?',
+  ).run(status, completedAt, resultSummary ?? null, id);
+}
+
+export function deleteAgent(id: string): void {
+  // Delete associated session
+  db.prepare("DELETE FROM sessions WHERE agent_id = ?").run(id);
+  db.prepare('DELETE FROM agents WHERE id = ?').run(id);
+}
+
+export function deleteAgentsForFolder(folder: string): void {
+  const agents = listAgentsByFolder(folder);
+  for (const agent of agents) {
+    deleteAgent(agent.id);
+  }
+}
+
+function mapAgentRow(row: Record<string, unknown>): SubAgent {
+  return {
+    id: String(row.id),
+    group_folder: String(row.group_folder),
+    chat_jid: String(row.chat_jid),
+    name: String(row.name),
+    prompt: String(row.prompt),
+    status: (row.status as AgentStatus) || 'running',
+    kind: (row.kind as AgentKind) || 'task',
+    created_by: typeof row.created_by === 'string' ? row.created_by : null,
+    created_at: String(row.created_at),
+    completed_at: typeof row.completed_at === 'string' ? row.completed_at : null,
+    result_summary: typeof row.result_summary === 'string' ? row.result_summary : null,
+  };
+}
+
+export function deleteMessagesForChatJid(chatJid: string): void {
+  db.prepare('DELETE FROM messages WHERE chat_jid = ?').run(chatJid);
+  db.prepare('DELETE FROM chats WHERE jid = ?').run(chatJid);
 }
 
 export function isGroupShared(groupFolder: string): boolean {

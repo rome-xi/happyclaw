@@ -16,11 +16,15 @@ import { api } from '../../api/client';
 import { TerminalPanel } from './TerminalPanel';
 import { GroupSkillsPanel } from './GroupSkillsPanel';
 import { GroupMembersPanel } from './GroupMembersPanel';
+import { AgentTabBar } from './AgentTabBar';
 
 const POLL_INTERVAL_MS = 2000;
 const TERMINAL_MIN_HEIGHT = 150;
 const TERMINAL_DEFAULT_HEIGHT = 300;
 const TERMINAL_MAX_RATIO = 0.7;
+
+// Stable empty references to avoid infinite re-render loops in Zustand selectors
+const EMPTY_AGENTS: import('../../types').AgentInfo[] = [];
 
 type SidebarTab = 'files' | 'env' | 'skills' | 'members';
 
@@ -66,7 +70,20 @@ export function ChatView({ groupJid, onBack }: ChatViewProps) {
   const resetSession = useChatStore(s => s.resetSession);
   const handleStreamEvent = useChatStore(s => s.handleStreamEvent);
   const handleWsNewMessage = useChatStore(s => s.handleWsNewMessage);
+  const handleAgentStatus = useChatStore(s => s.handleAgentStatus);
   const clearStreaming = useChatStore(s => s.clearStreaming);
+  const agents = useChatStore(s => s.agents[groupJid] ?? EMPTY_AGENTS);
+  const activeAgentTab = useChatStore(s => s.activeAgentTab[groupJid] ?? null);
+  const setActiveAgentTab = useChatStore(s => s.setActiveAgentTab);
+  const loadAgents = useChatStore(s => s.loadAgents);
+  const deleteAgentAction = useChatStore(s => s.deleteAgentAction);
+  const agentStreaming = useChatStore(s => s.agentStreaming);
+  const createConversation = useChatStore(s => s.createConversation);
+  const loadAgentMessages = useChatStore(s => s.loadAgentMessages);
+  const sendAgentMessage = useChatStore(s => s.sendAgentMessage);
+  const agentMessages = useChatStore(s => s.agentMessages);
+  const agentWaiting = useChatStore(s => s.agentWaiting);
+  const agentHasMore = useChatStore(s => s.agentHasMore);
 
   const currentUser = useAuthStore(s => s.user);
   const canUseTerminal = group?.execution_mode !== 'host';
@@ -150,10 +167,29 @@ export function ChatView({ groupJid, onBack }: ChatViewProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Derived: active agent info and kind
+  const activeAgent = activeAgentTab ? agents.find(a => a.id === activeAgentTab) : null;
+  const isConversationTab = activeAgent?.kind === 'conversation';
+
+  // Load sub-agents for this group
+  useEffect(() => {
+    loadAgents(groupJid);
+  }, [groupJid, loadAgents]);
+
+  // Load messages for conversation agent tabs
+  useEffect(() => {
+    if (activeAgentTab && isConversationTab) {
+      const existing = agentMessages[activeAgentTab];
+      if (!existing) {
+        loadAgentMessages(groupJid, activeAgentTab);
+      }
+    }
+  }, [activeAgentTab, isConversationTab, groupJid, loadAgentMessages, agentMessages]);
+
   // 监听 WebSocket 流式事件
   useEffect(() => {
     const unsub1 = wsManager.on('stream_event', (data: any) => {
-      if (data.chatJid === groupJid) handleStreamEvent(groupJid, data.event);
+      if (data.chatJid === groupJid) handleStreamEvent(groupJid, data.event, data.agentId);
     });
     // agent_reply 作为 fallback：如果 new_message 已处理则为 no-op
     const unsub2 = wsManager.on('agent_reply', (data: any) => {
@@ -162,11 +198,17 @@ export function ChatView({ groupJid, onBack }: ChatViewProps) {
     // 通过 new_message 立即添加消息到本地状态（消除轮询延迟导致的消息"丢失"）
     const unsub3 = wsManager.on('new_message', (data: any) => {
       if (data.chatJid === groupJid && data.message) {
-        handleWsNewMessage(groupJid, data.message);
+        handleWsNewMessage(groupJid, data.message, data.agentId);
       }
     });
-    return () => { unsub1(); unsub2(); unsub3(); };
-  }, [groupJid, handleStreamEvent, handleWsNewMessage, clearStreaming]);
+    // 子 Agent 状态变更
+    const unsub4 = wsManager.on('agent_status', (data: any) => {
+      if (data.chatJid === groupJid) {
+        handleAgentStatus(groupJid, data.agentId, data.status, data.name, data.prompt, data.resultSummary, data.kind);
+      }
+    });
+    return () => { unsub1(); unsub2(); unsub3(); unsub4(); };
+  }, [groupJid, handleStreamEvent, handleWsNewMessage, handleAgentStatus, clearStreaming]);
 
   const [scrollTrigger, setScrollTrigger] = useState(0);
 
@@ -388,26 +430,94 @@ export function ChatView({ groupJid, onBack }: ChatViewProps) {
         </div>
       )}
 
+      {/* Agent tab bar */}
+      <AgentTabBar
+        agents={agents}
+        activeTab={activeAgentTab}
+        onSelectTab={(id) => setActiveAgentTab(groupJid, id)}
+        onDeleteAgent={(id) => deleteAgentAction(groupJid, id)}
+        onCreateConversation={() => {
+          const name = prompt('对话名称：');
+          if (name?.trim()) {
+            createConversation(groupJid, name.trim()).then((agent) => {
+              if (agent) setActiveAgentTab(groupJid, agent.id);
+            });
+          }
+        }}
+      />
+
       {/* Main Content: Messages + Sidebar */}
       <div className="flex-1 flex overflow-hidden min-h-0">
         {/* Messages Area */}
         <div className="flex-1 flex flex-col min-w-0 overflow-x-hidden">
-          <MessageList
-            messages={groupMessages || []}
-            loading={loading}
-            hasMore={hasMoreMessages}
-            onLoadMore={handleLoadMore}
-            scrollTrigger={scrollTrigger}
-            groupJid={groupJid}
-            isWaiting={isWaiting}
-            onInterrupt={() => interruptQuery(groupJid)}
-          />
-          <MessageInput
-            onSend={handleSend}
-            groupJid={groupJid}
-            onResetSession={() => setShowResetConfirm(true)}
-            onToggleTerminal={canUseTerminal ? handleTerminalToggle : undefined}
-          />
+          {activeAgentTab && isConversationTab ? (
+            /* Conversation agent tab: interactive — user can send messages */
+            <>
+              <MessageList
+                key={`conv-${activeAgentTab}`}
+                messages={agentMessages[activeAgentTab] || []}
+                loading={false}
+                hasMore={!!agentHasMore[activeAgentTab]}
+                onLoadMore={() => loadAgentMessages(groupJid, activeAgentTab, true)}
+                scrollTrigger={scrollTrigger}
+                groupJid={groupJid}
+                isWaiting={!!agentWaiting[activeAgentTab] || !!agentStreaming[activeAgentTab]}
+                onInterrupt={() => {}}
+                agentId={activeAgentTab}
+              />
+              <MessageInput
+                onSend={async (content) => {
+                  sendAgentMessage(groupJid, activeAgentTab, content);
+                  setScrollTrigger(n => n + 1);
+                }}
+                groupJid={groupJid}
+              />
+            </>
+          ) : activeAgentTab ? (
+            /* Task agent tab: read-only — show agent's messages from main chat */
+            <>
+              <MessageList
+                key={`task-${activeAgentTab}`}
+                messages={(groupMessages || []).filter(
+                  (m) => m.sender === `agent:${activeAgentTab}`,
+                )}
+                loading={false}
+                hasMore={false}
+                onLoadMore={() => {}}
+                scrollTrigger={scrollTrigger}
+                groupJid={groupJid}
+                isWaiting={!!agentStreaming[activeAgentTab]}
+                onInterrupt={() => {}}
+                agentId={activeAgentTab}
+              />
+              <div className="px-4 py-2 text-center text-xs text-slate-400 border-t">
+                子 Agent 独立运行中 — 仅主对话可发送消息
+              </div>
+            </>
+          ) : (
+            /* Main conversation tab */
+            <>
+              <MessageList
+                key={`main-${groupJid}`}
+                messages={groupMessages || []}
+                loading={loading}
+                hasMore={hasMoreMessages}
+                onLoadMore={handleLoadMore}
+                scrollTrigger={scrollTrigger}
+                groupJid={groupJid}
+                isWaiting={isWaiting}
+                onInterrupt={() => interruptQuery(groupJid)}
+                agents={agents}
+                onAgentClick={(agentId) => setActiveAgentTab(groupJid, agentId)}
+              />
+              <MessageInput
+                onSend={handleSend}
+                groupJid={groupJid}
+                onResetSession={() => setShowResetConfirm(true)}
+                onToggleTerminal={canUseTerminal ? handleTerminalToggle : undefined}
+              />
+            </>
+          )}
         </div>
 
         {/* Desktop: sidebar with tabs (collapsible) */}

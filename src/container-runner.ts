@@ -39,6 +39,8 @@ export interface ContainerInput {
   isAdminHome?: boolean;
   isScheduledTask?: boolean;
   images?: Array<{ data: string; mimeType?: string }>;
+  agentId?: string;
+  agentName?: string;
 }
 
 export interface ContainerOutput {
@@ -60,6 +62,7 @@ function buildVolumeMounts(
   isAdminHome: boolean,
   mountUserSkills = true,
   selectedSkills: string[] | null = null,
+  agentId?: string,
 ): VolumeMount[] {
   const mounts: VolumeMount[] = [];
   const projectRoot = process.cwd();
@@ -119,13 +122,10 @@ function buildVolumeMounts(
   });
 
   // Per-group Claude sessions directory (isolated from other groups)
-  // Each group gets their own .claude/ to prevent cross-group session access
-  const groupSessionsDir = path.join(
-    DATA_DIR,
-    'sessions',
-    group.folder,
-    '.claude',
-  );
+  // Sub-agents get their own session dir under agents/{agentId}/.claude/
+  const groupSessionsDir = agentId
+    ? path.join(DATA_DIR, 'sessions', group.folder, 'agents', agentId, '.claude')
+    : path.join(DATA_DIR, 'sessions', group.folder, '.claude');
   fs.mkdirSync(groupSessionsDir, { recursive: true });
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
   if (!fs.existsSync(settingsFile)) {
@@ -211,11 +211,15 @@ function buildVolumeMounts(
   }
 
   // Per-group IPC namespace: each group gets its own IPC directory
-  // This prevents cross-group privilege escalation via IPC
-  const groupIpcDir = path.join(DATA_DIR, 'ipc', group.folder);
+  // Sub-agents get their own IPC subdirectory under agents/{agentId}/
+  const groupIpcDir = agentId
+    ? path.join(DATA_DIR, 'ipc', group.folder, 'agents', agentId)
+    : path.join(DATA_DIR, 'ipc', group.folder);
   fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'input'), { recursive: true });
+  // All agents (main + sub/conversation) get agents/ subdir for spawn/message IPC
+  fs.mkdirSync(path.join(groupIpcDir, 'agents'), { recursive: true });
   mounts.push({
     hostPath: groupIpcDir,
     containerPath: '/workspace/ipc',
@@ -310,9 +314,10 @@ export async function runContainerAgent(
   const isAdminHome = !!group.is_home && group.folder === 'main';
   // Per-user skills: always mount if the group has an owner
   const shouldMountUserSkills = !!group.created_by;
-  const mounts = buildVolumeMounts(group, isAdminHome, shouldMountUserSkills, group.selected_skills ?? null);
+  const mounts = buildVolumeMounts(group, isAdminHome, shouldMountUserSkills, group.selected_skills ?? null, input.agentId);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
-  const containerName = `happyclaw-${safeName}-${Date.now()}`;
+  const agentSuffix = input.agentId ? `-${input.agentId.replace(/[^a-zA-Z0-9-]/g, '-')}` : '';
+  const containerName = `happyclaw-${safeName}${agentSuffix}-${Date.now()}`;
   const containerArgs = buildContainerArgs(mounts, containerName);
 
   logger.debug(
@@ -922,17 +927,19 @@ export async function runHostAgent(
   fs.mkdirSync(path.join(DATA_DIR, 'memory', group.folder), { recursive: true });
 
   // 2. 确保目录结构（宿主机模式下限制目录权限）
-  const groupIpcDir = path.join(DATA_DIR, 'ipc', group.folder);
+  // Sub-agents get their own IPC and session directories
+  const groupIpcDir = input.agentId
+    ? path.join(DATA_DIR, 'ipc', group.folder, 'agents', input.agentId)
+    : path.join(DATA_DIR, 'ipc', group.folder);
   fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true, mode: 0o700 });
   fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true, mode: 0o700 });
   fs.mkdirSync(path.join(groupIpcDir, 'input'), { recursive: true, mode: 0o700 });
+  // All agents (main + sub/conversation) get agents/ subdir for spawn/message IPC
+  fs.mkdirSync(path.join(groupIpcDir, 'agents'), { recursive: true, mode: 0o700 });
 
-  const groupSessionsDir = path.join(
-    DATA_DIR,
-    'sessions',
-    group.folder,
-    '.claude',
-  );
+  const groupSessionsDir = input.agentId
+    ? path.join(DATA_DIR, 'sessions', group.folder, 'agents', input.agentId, '.claude')
+    : path.join(DATA_DIR, 'sessions', group.folder, '.claude');
   fs.mkdirSync(groupSessionsDir, { recursive: true });
 
   // 3. 写入 settings.json

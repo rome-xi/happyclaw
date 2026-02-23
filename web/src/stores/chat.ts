@@ -1,10 +1,11 @@
 import { create } from 'zustand';
 import { api } from '../api/client';
+import { wsManager } from '../api/ws';
 import { useFileStore } from './files';
 import { useAuthStore } from './auth';
-import type { GroupInfo } from '../types';
+import type { GroupInfo, AgentInfo } from '../types';
 
-export type { GroupInfo };
+export type { GroupInfo, AgentInfo };
 
 export interface Message {
   id: string;
@@ -127,6 +128,14 @@ interface ChatState {
   pendingThinking: Record<string, string>;
   /** Per-group lock: true while clearHistory is in-flight, prevents race re-injection */
   clearing: Record<string, boolean>;
+  // Sub-agent state
+  agents: Record<string, AgentInfo[]>;              // jid → agents
+  agentStreaming: Record<string, StreamingState>;    // agentId → streaming state
+  activeAgentTab: Record<string, string | null>;     // jid → selected agentId (null = main)
+  // Conversation agent state
+  agentMessages: Record<string, Message[]>;          // agentId → messages
+  agentWaiting: Record<string, boolean>;             // agentId → waiting for reply
+  agentHasMore: Record<string, boolean>;             // agentId → has more messages
   loadGroups: () => Promise<void>;
   selectGroup: (jid: string) => void;
   loadMessages: (jid: string, loadMore?: boolean) => Promise<void>;
@@ -139,13 +148,23 @@ interface ChatState {
   createFlow: (name: string, options?: { execution_mode?: 'container' | 'host'; custom_cwd?: string; init_source_path?: string; init_git_url?: string }) => Promise<{ jid: string; folder: string } | null>;
   renameFlow: (jid: string, name: string) => Promise<void>;
   deleteFlow: (jid: string) => Promise<void>;
-  handleStreamEvent: (chatJid: string, event: StreamEvent) => void;
-  handleWsNewMessage: (chatJid: string, wsMsg: any) => void;
+  handleStreamEvent: (chatJid: string, event: StreamEvent, agentId?: string) => void;
+  handleWsNewMessage: (chatJid: string, wsMsg: any, agentId?: string) => void;
+  handleAgentStatus: (chatJid: string, agentId: string, status: AgentInfo['status'], name: string, prompt: string, resultSummary?: string, kind?: AgentInfo['kind']) => void;
   clearStreaming: (
     chatJid: string,
     options?: { preserveThinking?: boolean },
   ) => void;
   restoreActiveState: () => Promise<void>;
+  // Sub-agent actions
+  loadAgents: (jid: string) => Promise<void>;
+  deleteAgentAction: (jid: string, agentId: string) => Promise<boolean>;
+  setActiveAgentTab: (jid: string, agentId: string | null) => void;
+  // Conversation agent actions
+  createConversation: (jid: string, name: string, description?: string) => Promise<AgentInfo | null>;
+  loadAgentMessages: (jid: string, agentId: string, loadMore?: boolean) => Promise<void>;
+  sendAgentMessage: (jid: string, agentId: string, content: string) => void;
+  refreshAgentMessages: (jid: string, agentId: string) => Promise<void>;
 }
 
 export const useChatStore = create<ChatState>((set, get) => ({
@@ -160,6 +179,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
   thinkingCache: {},
   pendingThinking: {},
   clearing: {},
+  agents: {},
+  agentStreaming: {},
+  activeAgentTab: {},
+  agentMessages: {},
+  agentWaiting: {},
+  agentHasMore: {},
 
   loadGroups: async () => {
     set({ loading: true });
@@ -564,9 +589,41 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   // 处理流式事件
-  handleStreamEvent: (chatJid, event) => {
+  handleStreamEvent: (chatJid, event, agentId?) => {
     // Skip while clearHistory is in-flight
     if (get().clearing[chatJid]) return;
+
+    // Route to agentStreaming if this is a sub-agent event
+    if (agentId) {
+      if (event.eventType === 'status' && event.statusText === 'interrupted') {
+        set((s) => {
+          const next = { ...s.agentStreaming };
+          delete next[agentId];
+          return { agentStreaming: next };
+        });
+        return;
+      }
+      set((s) => {
+        const MAX_STREAMING_TEXT = 8000;
+        const prev = s.agentStreaming[agentId] || {
+          partialText: '', thinkingText: '', isThinking: false,
+          activeTools: [], activeHook: null, systemStatus: null, recentEvents: [],
+        };
+        const next = { ...prev };
+        if (event.eventType === 'text_delta') {
+          const combined = prev.partialText + (event.text || '');
+          next.partialText = combined.length > MAX_STREAMING_TEXT ? combined.slice(-MAX_STREAMING_TEXT) : combined;
+          next.isThinking = false;
+        } else if (event.eventType === 'thinking_delta') {
+          const combined = prev.thinkingText + (event.text || '');
+          next.thinkingText = combined.length > MAX_STREAMING_TEXT ? combined.slice(-MAX_STREAMING_TEXT) : combined;
+          next.isThinking = true;
+        }
+        // For sub-agents, we track basic text/thinking; tool events are passed through minimally
+        return { agentStreaming: { ...s.agentStreaming, [agentId]: next } };
+      });
+      return;
+    }
 
     // 中断事件需要在所有客户端显式收尾，避免 waiting 残留。
     if (event.eventType === 'status' && event.statusText === 'interrupted') {
@@ -748,24 +805,47 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   // 通过 WebSocket new_message 事件立即添加消息（避免轮询延迟导致消息"丢失"）
-  handleWsNewMessage: (chatJid, wsMsg) => {
+  handleWsNewMessage: (chatJid, wsMsg, agentId?) => {
     if (!wsMsg || !wsMsg.id) return;
     // Skip while clearHistory is in-flight to prevent race re-injection
     if (get().clearing[chatJid]) return;
 
+    const msg: Message = {
+      id: wsMsg.id,
+      chat_jid: wsMsg.chat_jid || chatJid,
+      sender: wsMsg.sender || '',
+      sender_name: wsMsg.sender_name || '',
+      content: wsMsg.content || '',
+      timestamp: wsMsg.timestamp || new Date().toISOString(),
+      is_from_me: wsMsg.is_from_me ?? false,
+      attachments: wsMsg.attachments,
+    };
+
+    // Route to agentMessages if this is a conversation agent message
+    if (agentId) {
+      set((s) => {
+        const existing = s.agentMessages[agentId] || [];
+        const alreadyExists = existing.some((m) => m.id === wsMsg.id);
+        const updated = alreadyExists ? existing : [...existing, msg];
+        const isAgentReply = msg.is_from_me && msg.sender !== '__system__';
+
+        const nextAgentStreaming = isAgentReply
+          ? (() => { const n = { ...s.agentStreaming }; delete n[agentId]; return n; })()
+          : s.agentStreaming;
+
+        return {
+          agentMessages: { ...s.agentMessages, [agentId]: updated },
+          agentWaiting: isAgentReply
+            ? { ...s.agentWaiting, [agentId]: false }
+            : s.agentWaiting,
+          agentStreaming: nextAgentStreaming,
+        };
+      });
+      return;
+    }
+
     set((s) => {
       const existing = s.messages[chatJid] || [];
-
-      const msg: Message = {
-        id: wsMsg.id,
-        chat_jid: wsMsg.chat_jid || chatJid,
-        sender: wsMsg.sender || '',
-        sender_name: wsMsg.sender_name || '',
-        content: wsMsg.content || '',
-        timestamp: wsMsg.timestamp || new Date().toISOString(),
-        is_from_me: wsMsg.is_from_me ?? false,
-        attachments: wsMsg.attachments,
-      };
 
       // 消息已存在时保留原顺序，仅执行状态收尾（清 waiting/streaming）
       const alreadyExists = existing.some((m) => m.id === wsMsg.id);
@@ -804,6 +884,210 @@ export const useChatStore = create<ChatState>((set, get) => ({
         messages: { ...s.messages, [chatJid]: updated },
       };
     });
+  },
+
+  // 处理子 Agent 状态变更事件
+  handleAgentStatus: (chatJid, agentId, status, name, prompt, resultSummary?, kind?) => {
+    set((s) => {
+      const existing = s.agents[chatJid] || [];
+
+      // '__removed__' signal: agent has been cleaned up, remove from list
+      if (resultSummary === '__removed__') {
+        const filtered = existing.filter((a) => a.id !== agentId);
+        const nextAgentStreaming = { ...s.agentStreaming };
+        delete nextAgentStreaming[agentId];
+        const nextActiveTab = { ...s.activeAgentTab };
+        if (nextActiveTab[chatJid] === agentId) nextActiveTab[chatJid] = null;
+        // Clean up conversation agent state
+        const nextAgentMessages = { ...s.agentMessages };
+        delete nextAgentMessages[agentId];
+        const nextAgentWaiting = { ...s.agentWaiting };
+        delete nextAgentWaiting[agentId];
+        const nextAgentHasMore = { ...s.agentHasMore };
+        delete nextAgentHasMore[agentId];
+        return {
+          agents: { ...s.agents, [chatJid]: filtered },
+          agentStreaming: nextAgentStreaming,
+          activeAgentTab: nextActiveTab,
+          agentMessages: nextAgentMessages,
+          agentWaiting: nextAgentWaiting,
+          agentHasMore: nextAgentHasMore,
+        };
+      }
+
+      const idx = existing.findIndex((a) => a.id === agentId);
+      const resolvedKind = kind || (idx >= 0 ? existing[idx].kind : 'task');
+      const agentInfo: AgentInfo = {
+        id: agentId,
+        name,
+        prompt,
+        status,
+        kind: resolvedKind,
+        created_at: idx >= 0 ? existing[idx].created_at : new Date().toISOString(),
+        completed_at: (status === 'completed' || status === 'error') ? new Date().toISOString() : undefined,
+        result_summary: resultSummary,
+      };
+      const updated = idx >= 0
+        ? existing.map((a, i) => (i === idx ? agentInfo : a))
+        : [...existing, agentInfo];
+
+      // Clean up agent streaming if not actively running
+      const nextAgentStreaming = { ...s.agentStreaming };
+      if (status !== 'running') {
+        delete nextAgentStreaming[agentId];
+      }
+
+      return {
+        agents: { ...s.agents, [chatJid]: updated },
+        agentStreaming: nextAgentStreaming,
+      };
+    });
+  },
+
+  // 加载子 Agent 列表
+  loadAgents: async (jid) => {
+    try {
+      const data = await api.get<{ agents: AgentInfo[] }>(
+        `/api/groups/${encodeURIComponent(jid)}/agents`,
+      );
+      set((s) => ({
+        agents: { ...s.agents, [jid]: data.agents },
+      }));
+    } catch {
+      // Silent fail
+    }
+  },
+
+  // 删除子 Agent
+  deleteAgentAction: async (jid, agentId) => {
+    try {
+      await api.delete(`/api/groups/${encodeURIComponent(jid)}/agents/${agentId}`);
+      set((s) => {
+        const updated = (s.agents[jid] || []).filter((a) => a.id !== agentId);
+        const nextAgentStreaming = { ...s.agentStreaming };
+        delete nextAgentStreaming[agentId];
+        const nextActiveTab = { ...s.activeAgentTab };
+        if (nextActiveTab[jid] === agentId) nextActiveTab[jid] = null;
+        return {
+          agents: { ...s.agents, [jid]: updated },
+          agentStreaming: nextAgentStreaming,
+          activeAgentTab: nextActiveTab,
+        };
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  },
+
+  // 切换子 Agent 标签页
+  setActiveAgentTab: (jid, agentId) => {
+    set((s) => ({
+      activeAgentTab: { ...s.activeAgentTab, [jid]: agentId },
+    }));
+  },
+
+  // -- Conversation agent actions --
+
+  createConversation: async (jid, name, description?) => {
+    try {
+      const data = await api.post<{ agent: AgentInfo }>(
+        `/api/groups/${encodeURIComponent(jid)}/agents`,
+        { name, description },
+      );
+      set((s) => {
+        const existing = s.agents[jid] || [];
+        // WS agent_status broadcast may have already added it
+        if (existing.some((a) => a.id === data.agent.id)) return s;
+        return { agents: { ...s.agents, [jid]: [...existing, data.agent] } };
+      });
+      return data.agent;
+    } catch (err) {
+      set({ error: err instanceof Error ? err.message : String(err) });
+      return null;
+    }
+  },
+
+  loadAgentMessages: async (jid, agentId, loadMore = false) => {
+    const existing = get().agentMessages[agentId] || [];
+    const before = loadMore && existing.length > 0 ? existing[0].timestamp : undefined;
+
+    try {
+      const params = new URLSearchParams(
+        before
+          ? { before: String(before), limit: '50', agentId }
+          : { limit: '50', agentId },
+      );
+      const data = await api.get<{ messages: Message[]; hasMore: boolean }>(
+        `/api/groups/${encodeURIComponent(jid)}/messages?${params}`,
+      );
+      const sorted = [...data.messages].reverse();
+      set((s) => {
+        const merged = mergeMessagesChronologically(
+          s.agentMessages[agentId] || [],
+          sorted,
+        );
+        return {
+          agentMessages: { ...s.agentMessages, [agentId]: merged },
+          agentHasMore: { ...s.agentHasMore, [agentId]: data.hasMore },
+        };
+      });
+    } catch (err) {
+      set({ error: err instanceof Error ? err.message : String(err) });
+    }
+  },
+
+  sendAgentMessage: (jid, agentId, content) => {
+    // Clear agent streaming state before sending
+    set((s) => {
+      const next = { ...s.agentStreaming };
+      delete next[agentId];
+      return { agentStreaming: next };
+    });
+    // Send via WebSocket with agentId
+    wsManager.send({ type: 'send_message', chatJid: jid, content, agentId });
+    set((s) => ({
+      agentWaiting: { ...s.agentWaiting, [agentId]: true },
+    }));
+  },
+
+  refreshAgentMessages: async (jid, agentId) => {
+    const existing = get().agentMessages[agentId] || [];
+    const lastTs = existing.length > 0 ? existing[existing.length - 1].timestamp : undefined;
+
+    try {
+      const params = new URLSearchParams({ limit: '50', agentId });
+      if (lastTs) params.set('after', lastTs);
+
+      const data = await api.get<{ messages: Message[] }>(
+        `/api/groups/${encodeURIComponent(jid)}/messages?${params}`,
+      );
+
+      if (data.messages.length > 0) {
+        set((s) => {
+          const merged = mergeMessagesChronologically(
+            s.agentMessages[agentId] || [],
+            data.messages,
+          );
+          const agentReplied = data.messages.some(
+            (m) => m.is_from_me && m.sender !== '__system__',
+          );
+          const nextAgentStreaming = agentReplied
+            ? (() => { const n = { ...s.agentStreaming }; delete n[agentId]; return n; })()
+            : s.agentStreaming;
+
+          return {
+            agentMessages: { ...s.agentMessages, [agentId]: merged },
+            agentWaiting: agentReplied
+              ? { ...s.agentWaiting, [agentId]: false }
+              : s.agentWaiting,
+            agentStreaming: nextAgentStreaming,
+          };
+        });
+      }
+    } catch (err) {
+      set({ error: err instanceof Error ? err.message : String(err) });
+    }
   },
 
   // 刷新/重连时恢复正在运行的 agent 状态

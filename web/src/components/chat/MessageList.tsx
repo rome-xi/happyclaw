@@ -1,8 +1,10 @@
-import { useEffect, useRef, useState, useMemo, useCallback } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, useMemo, useCallback } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { Message, useChatStore } from '../../stores/chat';
+import type { AgentInfo } from '../../types';
 import { MessageBubble } from './MessageBubble';
 import { StreamingDisplay } from './StreamingDisplay';
+import { AgentStatusCard } from './AgentStatusCard';
 import { Loader2, ChevronUp, ChevronDown, AlertTriangle, Square } from 'lucide-react';
 
 interface MessageListProps {
@@ -18,6 +20,12 @@ interface MessageListProps {
   isWaiting?: boolean;
   /** Callback to interrupt the current agent query */
   onInterrupt?: () => void;
+  /** Sub-agents to display as status cards in the main conversation */
+  agents?: AgentInfo[];
+  /** Callback when a sub-agent status card is clicked */
+  onAgentClick?: (agentId: string) => void;
+  /** If set, this MessageList is showing a sub-agent's messages */
+  agentId?: string;
 }
 
 type FlatItem =
@@ -26,17 +34,13 @@ type FlatItem =
   | { type: 'error'; content: string }
   | { type: 'message'; content: Message };
 
-// Module-level map: groupJid → scrollTop (persists across re-renders/unmounts)
-const scrollPositionCache = new Map<string, number>();
-
-export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrigger, groupJid, isWaiting, onInterrupt }: MessageListProps) {
+export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrigger, groupJid, isWaiting, onInterrupt, agents, onAgentClick, agentId }: MessageListProps) {
   const thinkingCache = useChatStore(s => s.thinkingCache ?? {});
   const isShared = useChatStore(s => !!s.groups[groupJid ?? '']?.is_shared);
   const parentRef = useRef<HTMLDivElement>(null);
   const [autoScroll, setAutoScroll] = useState(true);
   const [atTop, setAtTop] = useState(false);
   const prevMessageCount = useRef(messages.length);
-  const currentGroupRef = useRef(groupJid);
 
   // Compute flatMessages (with date headers) before virtualizer
   const flatMessages = useMemo<FlatItem[]>(() => {
@@ -71,9 +75,12 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
     return items;
   }, [messages]);
 
+  // Chat always starts at bottom — no scroll position restoration.
+  // key={...} on <MessageList> guarantees a fresh mount on group/tab switch.
   const virtualizer = useVirtualizer({
     count: flatMessages.length,
     getScrollElement: () => parentRef.current,
+    initialOffset: flatMessages.length > 0 ? 99999999 : 0,
     getItemKey: (index) => {
       const item = flatMessages[index];
       if (!item) return index;
@@ -104,11 +111,6 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
     overscan: 8,
   });
 
-  // Save scroll position when switching away from a group
-  useEffect(() => {
-    currentGroupRef.current = groupJid;
-  }, [groupJid]);
-
   // 检测向上滚动触发 loadMore + 保存滚动位置
   useEffect(() => {
     const parent = parentRef.current;
@@ -120,11 +122,6 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
       setAutoScroll(atBottom);
       setAtTop(scrollTop < 50);
 
-      // Save scroll position for current group
-      if (currentGroupRef.current) {
-        scrollPositionCache.set(currentGroupRef.current, atBottom ? -1 : scrollTop);
-      }
-
       if (scrollTop < 100 && hasMore && !loading) {
         onLoadMore();
       }
@@ -132,18 +129,17 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
 
     parent.addEventListener('scroll', handleScroll);
     return () => parent.removeEventListener('scroll', handleScroll);
-  }, [hasMore, loading, onLoadMore]);
+  }, [hasMore, loading, onLoadMore, groupJid]);
 
   // 新消息自动滚到底部
   useEffect(() => {
     if (autoScroll && messages.length > prevMessageCount.current) {
-      parentRef.current?.scrollTo({
-        top: parentRef.current.scrollHeight,
-        behavior: 'smooth',
+      requestAnimationFrame(() => {
+        parentRef.current?.scrollTo({ top: parentRef.current.scrollHeight, behavior: 'smooth' });
       });
     }
     prevMessageCount.current = messages.length;
-  }, [messages, autoScroll]);
+  }, [messages.length, autoScroll]);
 
   // 外部触发滚到底部（发送消息后）
   useEffect(() => {
@@ -155,31 +151,40 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
     }
   }, [scrollTrigger]);
 
-  // 初始滚动：恢复保存的位置，或滚到底部（首次加载完消息后触发）
-  const initialScrollDone = useRef(false);
-  const lastGroupJidRef = useRef(groupJid);
-  useEffect(() => {
-    // Reset when groupJid changes
-    if (lastGroupJidRef.current !== groupJid) {
-      initialScrollDone.current = false;
-      lastGroupJidRef.current = groupJid;
-    }
-    if (!initialScrollDone.current && parentRef.current && messages.length > 0) {
-      const saved = groupJid ? scrollPositionCache.get(groupJid) : undefined;
-      if (saved !== undefined && saved !== -1) {
-        // Restore saved scroll position
-        parentRef.current.scrollTop = saved;
-        setAutoScroll(false);
-      } else {
-        // First visit or was at bottom — scroll to bottom
+  // Fallback: 消息在挂载后加载（首次页面加载时 store 为空）
+  // initialOffset 只在挂载时生效，消息后加载需要手动定位
+  const initialScrollDone = useRef(flatMessages.length > 0);
+  useLayoutEffect(() => {
+    if (!initialScrollDone.current && flatMessages.length > 0) {
+      initialScrollDone.current = true;
+      prevMessageCount.current = messages.length;
+      virtualizer.scrollToIndex(flatMessages.length - 1, { align: 'end' });
+      if (parentRef.current) {
         parentRef.current.scrollTop = parentRef.current.scrollHeight;
       }
-      initialScrollDone.current = true;
+      setAutoScroll(true);
     }
-  }, [messages.length, groupJid]);
+  }, [flatMessages.length, virtualizer, messages.length]);
+
+  // Safety net: initialOffset relies on estimated sizes which may be inaccurate.
+  // After mount, verify we're actually at the bottom and correct if not.
+  useEffect(() => {
+    if (flatMessages.length === 0) return;
+    const raf1 = requestAnimationFrame(() => {
+      const el = parentRef.current;
+      if (!el) return;
+      const gap = el.scrollHeight - el.scrollTop - el.clientHeight;
+      if (gap > 100) {
+        el.scrollTop = el.scrollHeight;
+      }
+    });
+    return () => cancelAnimationFrame(raf1);
+    // Only on mount
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Auto-scroll when streaming content updates
-  const streaming = useChatStore(s => s.streaming[groupJid ?? '']);
+  const streaming = useChatStore(s => agentId ? s.agentStreaming[agentId] : s.streaming[groupJid ?? '']);
   useEffect(() => {
     if (autoScroll && streaming) {
       parentRef.current?.scrollTo({ top: parentRef.current.scrollHeight });
@@ -325,9 +330,26 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
           </div>
         )}
 
-        {groupJid && (
+        {groupJid && !agentId && (
           <StreamingDisplay groupJid={groupJid} isWaiting={!!isWaiting} />
         )}
+        {groupJid && agentId && (
+          <StreamingDisplay groupJid={groupJid} isWaiting={!!isWaiting} agentId={agentId} />
+        )}
+
+        {/* Agent status cards in main conversation (task agents only) */}
+        {!agentId && agents && agents.filter(a => a.kind === 'task').length > 0 && (
+          <div className="py-2">
+            {agents.filter(a => a.kind === 'task').map((agent) => (
+              <AgentStatusCard
+                key={agent.id}
+                agent={agent}
+                onClick={() => onAgentClick?.(agent.id)}
+              />
+            ))}
+          </div>
+        )}
+
         {isWaiting && onInterrupt && (
           <div className="flex justify-center py-1">
             <button
