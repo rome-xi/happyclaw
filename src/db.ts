@@ -151,8 +151,8 @@ export function initDatabase(): void {
     CREATE TABLE IF NOT EXISTS sessions (
       group_folder TEXT NOT NULL,
       session_id TEXT NOT NULL,
-      agent_id TEXT,
-      PRIMARY KEY (group_folder, COALESCE(agent_id, ''))
+      agent_id TEXT NOT NULL DEFAULT '',
+      PRIMARY KEY (group_folder, agent_id)
     );
     CREATE TABLE IF NOT EXISTS registered_groups (
       jid TEXT PRIMARY KEY,
@@ -285,7 +285,7 @@ export function initDatabase(): void {
   ensureColumn('users', 'ai_avatar_color', 'TEXT');
   ensureColumn('scheduled_tasks', 'created_by', 'TEXT');
   ensureColumn('registered_groups', 'selected_skills', 'TEXT');
-  ensureColumn('sessions', 'agent_id', 'TEXT');
+  ensureColumn('sessions', 'agent_id', "TEXT NOT NULL DEFAULT ''");
   ensureColumn('agents', 'kind', "TEXT NOT NULL DEFAULT 'task'");
 
   // Migration: remove UNIQUE constraint from registered_groups.folder
@@ -496,11 +496,11 @@ export function initDatabase(): void {
           CREATE TABLE sessions_new (
             group_folder TEXT NOT NULL,
             session_id TEXT NOT NULL,
-            agent_id TEXT,
-            PRIMARY KEY (group_folder, COALESCE(agent_id, ''))
+            agent_id TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (group_folder, agent_id)
           );
           INSERT OR IGNORE INTO sessions_new (group_folder, session_id, agent_id)
-            SELECT group_folder, session_id, agent_id FROM sessions;
+            SELECT group_folder, session_id, COALESCE(agent_id, '') FROM sessions;
           DROP TABLE sessions;
           ALTER TABLE sessions_new RENAME TO sessions;
         `);
@@ -856,38 +856,24 @@ export function setRouterState(key: string, value: string): void {
 // --- Session accessors ---
 
 export function getSession(groupFolder: string, agentId?: string | null): string | undefined {
-  if (agentId) {
-    const row = db
-      .prepare('SELECT session_id FROM sessions WHERE group_folder = ? AND agent_id = ?')
-      .get(groupFolder, agentId) as { session_id: string } | undefined;
-    return row?.session_id;
-  }
+  const effectiveAgentId = agentId || '';
   const row = db
-    .prepare('SELECT session_id FROM sessions WHERE group_folder = ? AND agent_id IS NULL')
-    .get(groupFolder) as { session_id: string } | undefined;
+    .prepare('SELECT session_id FROM sessions WHERE group_folder = ? AND agent_id = ?')
+    .get(groupFolder, effectiveAgentId) as { session_id: string } | undefined;
   return row?.session_id;
 }
 
 export function setSession(groupFolder: string, sessionId: string, agentId?: string | null): void {
-  if (agentId) {
-    db.prepare(
-      `INSERT INTO sessions (group_folder, session_id, agent_id) VALUES (?, ?, ?)
-       ON CONFLICT(group_folder, COALESCE(agent_id, '')) DO UPDATE SET session_id = excluded.session_id`,
-    ).run(groupFolder, sessionId, agentId);
-    return;
-  }
+  const effectiveAgentId = agentId || '';
   db.prepare(
-    `INSERT INTO sessions (group_folder, session_id) VALUES (?, ?)
-     ON CONFLICT(group_folder, COALESCE(agent_id, '')) DO UPDATE SET session_id = excluded.session_id`,
-  ).run(groupFolder, sessionId);
+    `INSERT INTO sessions (group_folder, session_id, agent_id) VALUES (?, ?, ?)
+     ON CONFLICT(group_folder, agent_id) DO UPDATE SET session_id = excluded.session_id`,
+  ).run(groupFolder, sessionId, effectiveAgentId);
 }
 
 export function deleteSession(groupFolder: string, agentId?: string | null): void {
-  if (agentId) {
-    db.prepare('DELETE FROM sessions WHERE group_folder = ? AND agent_id = ?').run(groupFolder, agentId);
-    return;
-  }
-  db.prepare('DELETE FROM sessions WHERE group_folder = ? AND agent_id IS NULL').run(groupFolder);
+  const effectiveAgentId = agentId || '';
+  db.prepare('DELETE FROM sessions WHERE group_folder = ? AND agent_id = ?').run(groupFolder, effectiveAgentId);
 }
 
 export function deleteAllSessionsForFolder(groupFolder: string): void {
@@ -896,7 +882,7 @@ export function deleteAllSessionsForFolder(groupFolder: string): void {
 
 export function getAllSessions(): Record<string, string> {
   const rows = db
-    .prepare('SELECT group_folder, session_id FROM sessions WHERE agent_id IS NULL')
+    .prepare("SELECT group_folder, session_id FROM sessions WHERE agent_id = ''")
     .all() as Array<{ group_folder: string; session_id: string }>;
   const result: Record<string, string> = {};
   for (const row of rows) {
