@@ -25,6 +25,10 @@ const WORKSPACE_GLOBAL = process.env.HAPPYCLAW_WORKSPACE_GLOBAL || '/workspace/g
 const WORKSPACE_MEMORY = process.env.HAPPYCLAW_WORKSPACE_MEMORY || '/workspace/memory';
 const WORKSPACE_IPC = process.env.HAPPYCLAW_WORKSPACE_IPC || '/workspace/ipc';
 
+// 模型配置：支持别名（opus/sonnet/haiku）或完整模型 ID
+// 别名自动解析为最新版本，如 opus → Opus 4.6
+const CLAUDE_MODEL = process.env.HAPPYCLAW_MODEL || 'opus';
+
 interface ContainerInput {
   prompt: string;
   sessionId?: string;
@@ -784,6 +788,7 @@ async function runQuery(
     const q = query({
     prompt: stream,
     options: {
+      model: CLAUDE_MODEL,
       cwd: WORKSPACE_GROUP,
       additionalDirectories: extraDirs,
       resume: sessionId,
