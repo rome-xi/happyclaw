@@ -501,6 +501,7 @@ export async function runContainerAgent(
 
       if (timedOut) {
         const ts = new Date().toISOString().replace(/[:.]/g, '-');
+        fs.mkdirSync(logsDir, { recursive: true });
         const timeoutLog = path.join(logsDir, `container-${ts}.log`);
         fs.writeFileSync(
           timeoutLog,
@@ -528,6 +529,7 @@ export async function runContainerAgent(
       }
 
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      fs.mkdirSync(logsDir, { recursive: true });
       const logFile = path.join(logsDir, `container-${timestamp}.log`);
       const isVerbose =
         process.env.LOG_LEVEL === 'debug' || process.env.LOG_LEVEL === 'trace';
@@ -1293,6 +1295,7 @@ export async function runHostAgent(
 
       if (timedOut) {
         const ts = new Date().toISOString().replace(/[:.]/g, '-');
+        fs.mkdirSync(logsDir, { recursive: true });
         const timeoutLog = path.join(logsDir, `host-${ts}.log`);
         fs.writeFileSync(
           timeoutLog,
@@ -1320,6 +1323,7 @@ export async function runHostAgent(
       }
 
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      fs.mkdirSync(logsDir, { recursive: true });
       const logFile = path.join(logsDir, `host-${timestamp}.log`);
       const isVerbose =
         process.env.LOG_LEVEL === 'debug' || process.env.LOG_LEVEL === 'trace';
