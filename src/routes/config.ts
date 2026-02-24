@@ -370,6 +370,21 @@ configRoutes.post(
         scope?: string;
         [key: string]: unknown;
       };
+
+      // 打印 OAuth token 响应的关键字段，排查 expires_in 值
+      logger.info(
+        {
+          hasAccessToken: !!tokenData.access_token,
+          hasRefreshToken: !!tokenData.refresh_token,
+          expires_in: tokenData.expires_in,
+          expires_in_type: typeof tokenData.expires_in,
+          scope: tokenData.scope,
+          // 打印所有非敏感字段名
+          responseKeys: Object.keys(tokenData).filter(k => !['access_token', 'refresh_token'].includes(k)),
+        },
+        'OAuth token exchange response',
+      );
+
       if (!tokenData.access_token) {
         return c.json({ error: 'No access_token in response' }, 400);
       }
@@ -380,12 +395,23 @@ configRoutes.post(
       // Build full OAuth credentials when refresh_token is available
       let oauthCredentials: ClaudeOAuthCredentials | null = null;
       if (tokenData.refresh_token) {
+        // expiresAt 计算与 SDK 保持一致：Date.now() + expires_in * 1000
+        // SDK 内部 sF() 已有 5 分钟提前量，此处不再额外扣减
+        const expiresAt = tokenData.expires_in
+          ? Date.now() + tokenData.expires_in * 1000
+          : Date.now() + 8 * 60 * 60 * 1000; // default 8h
+        logger.info(
+          {
+            expires_in_raw: tokenData.expires_in,
+            calculatedExpiresAt: new Date(expiresAt).toISOString(),
+            now: new Date().toISOString(),
+          },
+          'OAuth expiresAt calculation',
+        );
         oauthCredentials = {
           accessToken: tokenData.access_token,
           refreshToken: tokenData.refresh_token,
-          expiresAt: tokenData.expires_in
-            ? Date.now() + tokenData.expires_in * 1000 - 5 * 60 * 1000
-            : Date.now() + 8 * 60 * 60 * 1000, // default 8h
+          expiresAt,
           scopes: tokenData.scope ? tokenData.scope.split(' ') : [],
         };
       }
