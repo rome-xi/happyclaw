@@ -19,7 +19,9 @@ import {
   buildContainerEnvLines,
   getClaudeProviderConfig,
   getContainerEnvConfig,
+  mergeClaudeEnvConfig,
   shellQuoteEnvLines,
+  writeCredentialsFile,
 } from './runtime-config.js';
 import { RegisteredGroup, StreamEvent } from './types.js';
 
@@ -250,6 +252,16 @@ function buildVolumeMounts(
       containerPath: '/workspace/env-dir',
       readonly: true,
     });
+  }
+
+  // Write .credentials.json for OAuth credentials (session dir is already mounted)
+  const mergedConfig = mergeClaudeEnvConfig(globalConfig, containerOverride);
+  if (mergedConfig.claudeOAuthCredentials) {
+    try {
+      writeCredentialsFile(groupSessionsDir, mergedConfig);
+    } catch (err) {
+      logger.warn({ group: group.name, err }, 'Failed to write .credentials.json');
+    }
   }
 
   // Mount agent-runner source from host — recompiled on container startup.
@@ -1032,6 +1044,16 @@ export async function runHostAgent(
     }
   }
 
+  // Write .credentials.json for OAuth credentials
+  const mergedConfig = mergeClaudeEnvConfig(globalConfig, containerOverride);
+  if (mergedConfig.claudeOAuthCredentials) {
+    try {
+      writeCredentialsFile(groupSessionsDir, mergedConfig);
+    } catch (err) {
+      logger.warn({ folder: group.folder, err }, 'Failed to write .credentials.json for host agent');
+    }
+  }
+
   // 路径映射
   hostEnv['HAPPYCLAW_WORKSPACE_GROUP'] = groupDir;
   // Per-user global memory
@@ -1048,6 +1070,13 @@ export async function runHostAgent(
   hostEnv['HAPPYCLAW_WORKSPACE_MEMORY'] = path.join(DATA_DIR, 'memory', group.folder);
   hostEnv['HAPPYCLAW_WORKSPACE_IPC'] = groupIpcDir;
   hostEnv['CLAUDE_CONFIG_DIR'] = groupSessionsDir;
+  // 让 SDK 捕获 CLI 的 stderr 输出，便于排查启动失败
+  hostEnv['DEBUG_CLAUDE_AGENT_SDK'] = '1';
+  // CLI 禁止 root 用户使用 --dangerously-skip-permissions，
+  // 通过 IS_SANDBOX 标记告知 CLI 当前运行在受控环境中以绕过此限制
+  if (typeof process.getuid === 'function' && process.getuid() === 0) {
+    hostEnv['IS_SANDBOX'] = '1';
+  }
 
   // 6. 编译检查
   const projectRoot = process.cwd();

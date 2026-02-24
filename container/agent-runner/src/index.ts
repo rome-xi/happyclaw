@@ -1323,6 +1323,9 @@ async function main(): Promise<void> {
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
     log(`Agent error: ${errorMessage}`);
+    if (err instanceof Error && err.stack) {
+      log(`Agent error stack: ${err.stack}`);
+    }
     // 不在 error output 中携带 sessionId：
     // 流式输出已通过 onOutput 回调传递了有效的 session 更新。
     // 如果这里携带的是 throw 前的旧 sessionId，会覆盖中间成功产生的新 session。
