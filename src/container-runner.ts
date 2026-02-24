@@ -1070,6 +1070,8 @@ export async function runHostAgent(
   hostEnv['HAPPYCLAW_WORKSPACE_MEMORY'] = path.join(DATA_DIR, 'memory', group.folder);
   hostEnv['HAPPYCLAW_WORKSPACE_IPC'] = groupIpcDir;
   hostEnv['CLAUDE_CONFIG_DIR'] = groupSessionsDir;
+  // 让 SDK 捕获 CLI 的 stderr 输出，便于排查启动失败
+  hostEnv['DEBUG_CLAUDE_AGENT_SDK'] = '1';
 
   // 6. 编译检查
   const projectRoot = process.cwd();
