@@ -173,9 +173,10 @@ function getImageDimensions(base64Data: string): { width: number; height: number
       return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
     }
 
-    // JPEG: 扫描 SOF marker
+    // JPEG: 扫描 SOF marker（SOF 可能在大 EXIF/ICC 之后，需要 ~30KB）
     if (buf.length >= 4 && buf[0] === 0xFF && buf[1] === 0xD8) {
-      const fullHeader = Buffer.from(base64Data.slice(0, 2000), 'base64');
+      const JPEG_SCAN_B64_LEN = 40000; // ~30KB binary，覆盖大多数 EXIF/ICC 场景
+      const fullHeader = Buffer.from(base64Data.slice(0, JPEG_SCAN_B64_LEN), 'base64');
       for (let i = 2; i < fullHeader.length - 9; i++) {
         if (fullHeader[i] !== 0xFF) continue;
         const marker = fullHeader[i + 1];
@@ -249,9 +250,6 @@ class MessageStream {
       const { valid, rejected } = filterOversizedImages(filteredImages);
       rejectedReasons.push(...rejected);
       filteredImages = valid.length > 0 ? valid : undefined;
-      if (rejected.length > 0) {
-        text += '\n\n[系统提示] ' + rejected.join('; ');
-      }
     }
 
     let content:
@@ -344,16 +342,15 @@ function isContextOverflowError(msg: string): boolean {
  * 检测会话转录中不可恢复的请求错误（400 invalid_request_error）。
  * 这类错误被固化在会话历史中，每次 resume 都会重放导致永久失败。
  * 例如：图片尺寸超过 8000px 限制、消息格式非法等。
+ *
+ * 判定条件：必须同时满足「图片特征」+「API 拒绝」，避免对通用 400 错误误判导致会话丢失。
  */
 function isUnrecoverableTranscriptError(msg: string): boolean {
-  const patterns: RegExp[] = [
-    /image.*dimensions?\s+exceed/i,
-    /max\s+allowed\s+size.*pixels/i,
-    /invalid_request_error/i,
-    /messages\.\d+\.content\.\d+/i,
-  ];
-  // 需要匹配至少两个模式才认定（避免误匹配普通的临时错误）
-  return patterns.filter(p => p.test(msg)).length >= 2;
+  const isImageSizeError =
+    /image.*dimensions?\s+exceed/i.test(msg) ||
+    /max\s+allowed\s+size.*pixels/i.test(msg);
+  const isApiReject = /invalid_request_error/i.test(msg);
+  return isImageSizeError && isApiReject;
 }
 
 function getSessionSummary(sessionId: string, transcriptPath: string): string | null {

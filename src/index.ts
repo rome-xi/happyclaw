@@ -35,6 +35,7 @@ import { CronExpressionParser } from 'cron-parser';
 
 import {
   ASSISTANT_NAME,
+  CONTAINER_IMAGE,
   DATA_DIR,
   GROUPS_DIR,
   STORE_DIR,
@@ -662,7 +663,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       if (!cleared) {
         try {
           await execFileAsync('docker', [
-            'run', '--rm', '-v', `${claudeDir}:/target`, 'node:22-slim',
+            'run', '--rm', '-v', `${claudeDir}:/target`, CONTAINER_IMAGE,
             'sh', '-c', 'find /target -mindepth 1 -not -name settings.json -exec rm -rf {} + 2>/dev/null; exit 0',
           ], { timeout: 15_000 });
         } catch (err) {
