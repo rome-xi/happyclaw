@@ -27,7 +27,7 @@ const WORKSPACE_IPC = process.env.HAPPYCLAW_WORKSPACE_IPC || '/workspace/ipc';
 
 // 模型配置：支持别名（opus/sonnet/haiku）或完整模型 ID
 // 别名自动解析为最新版本，如 opus → Opus 4.6
-const CLAUDE_MODEL = process.env.HAPPYCLAW_MODEL || 'opus';
+const CLAUDE_MODEL = process.env.ANTHROPIC_MODEL || 'opus';
 
 interface ContainerInput {
   prompt: string;
@@ -65,6 +65,7 @@ export type StreamEventType =
   | 'text_delta' | 'thinking_delta'
   | 'tool_use_start' | 'tool_use_end' | 'tool_progress'
   | 'hook_started' | 'hook_progress' | 'hook_response' // TODO: hook 事件尚未实现
+  | 'task_start' | 'task_notification'
   | 'status' | 'init'; // TODO: init 事件尚未实现
 
 export interface StreamEvent {
@@ -81,6 +82,10 @@ export interface StreamEvent {
   hookEvent?: string;
   hookOutcome?: string;
   statusText?: string;
+  taskDescription?: string;   // Task tool 的 description 参数
+  taskId?: string;            // task_notification 的 task_id
+  taskStatus?: string;        // task_notification 的 status
+  taskSummary?: string;       // task_notification 的 summary
 }
 
 interface ContainerOutput {
@@ -545,22 +550,6 @@ function drainIpcInput(): Array<{ text: string; images?: Array<{ data: string; m
             text: data.text,
             images: data.images,
           });
-        } else if (data.type === 'agent_result') {
-          // Sub-agent completed — format result as a message injection
-          const statusLabel = data.status === 'completed' ? '已完成任务' : '执行出错';
-          const promptSnippet = data.prompt ? data.prompt.slice(0, 200) : '';
-          const lines = [
-            `[子 Agent "${data.agentName || data.agentId}" ${statusLabel}]`,
-            '',
-            promptSnippet ? `任务: ${promptSnippet}` : '',
-            '',
-            '结果:',
-            data.result || '(无结果)',
-          ].filter(Boolean);
-          messages.push({ text: lines.join('\n') });
-        } else if (data.type === 'agent_message' && data.message) {
-          // Message from main agent to sub-agent (via message_agent)
-          messages.push({ text: `[来自主 Agent 的消息]\n${data.message}` });
         }
       } catch (err) {
         log(`Failed to process input file ${file}: ${err instanceof Error ? err.message : String(err)}`);
@@ -725,8 +714,14 @@ async function runQuery(
   };
   setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
 
-  // 文本聚合缓冲区 - 流式事件批量发送
-  let textBuf = '', thinkBuf = '';
+  // 文本聚合缓冲区 - 按 parentToolUseId 分离，确保子 agent 文本携带正确的 parentToolUseId
+  const BUF_MAIN = '__main__';
+  const streamBufs = new Map<string, { text: string; think: string }>();
+  function getBuf(key: string) {
+    let b = streamBufs.get(key);
+    if (!b) { b = { text: '', think: '' }; streamBufs.set(key, b); }
+    return b;
+  }
   let flushTimer: ReturnType<typeof setTimeout> | null = null;
   let seenTextualResult = false;
   const FLUSH_MS = 100, FLUSH_CHARS = 200;
@@ -736,19 +731,26 @@ async function runQuery(
   let fullTextAccumulator = '';
 
   function flushBuffers() {
-    if (textBuf) {
-      emit({ status: 'stream', result: null, streamEvent: { eventType: 'text_delta', text: textBuf } });
-      textBuf = '';
-    }
-    if (thinkBuf) {
-      emit({ status: 'stream', result: null, streamEvent: { eventType: 'thinking_delta', text: thinkBuf } });
-      thinkBuf = '';
+    for (const [key, buf] of streamBufs) {
+      const pid = key === BUF_MAIN ? undefined : key;
+      if (buf.text) {
+        emit({ status: 'stream', result: null, streamEvent: { eventType: 'text_delta', text: buf.text, parentToolUseId: pid } });
+        buf.text = '';
+      }
+      if (buf.think) {
+        emit({ status: 'stream', result: null, streamEvent: { eventType: 'thinking_delta', text: buf.think, parentToolUseId: pid } });
+        buf.think = '';
+      }
     }
     flushTimer = null;
   }
 
   function scheduleFlush() {
-    if (textBuf.length >= FLUSH_CHARS || thinkBuf.length >= FLUSH_CHARS) {
+    let maxLen = 0;
+    for (const buf of streamBufs.values()) {
+      maxLen = Math.max(maxLen, buf.text.length, buf.think.length);
+    }
+    if (maxLen >= FLUSH_CHARS) {
       if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
       flushBuffers();
     } else if (!flushTimer) {
@@ -888,6 +890,22 @@ async function runQuery(
   // 以 content block 索引（event.index）为 key，确保 delta 正确匹配到对应的 block
   const pendingSkillInput: Map<number, { toolUseId: string; inputJson: string; resolved: boolean; parentToolUseId: string | null; isNested: boolean }> = new Map();
 
+  // 累积 Task 工具的 input_json_delta 以提取 description
+  const pendingTaskInput: Map<number, { toolUseId: string; inputJson: string; resolved: boolean }> = new Map();
+
+  // 追踪 Task 工具的 tool_use_id — 这些工具的 tool_use_end 只通过 tool_use_summary 发射，
+  // 而不是在下一个 content block 开始时过早发射（Task 工具创建子 Agent，执行周期远长于 content block）
+  const taskToolUseIds = new Set<string>();
+
+  // 追踪每个 parent context 下当前活跃的嵌套工具 ID（用于生成合成 tool_use_end）
+  // SDK 不为子 Agent 的内部工具发射 tool_use_end，导致前端 activeTools 持续累积
+  const activeNestedToolByParent = new Map<string, { toolUseId: string; toolName: string }>();
+
+  // 追踪后台 Task 的 tool_use_id（run_in_background: true）
+  // 前台 Task 完成时 SDK 只发射 tool_use_summary（不发射 task_notification），
+  // 需在 tool_use_summary 中为前台 Task 合成 task_notification
+  const backgroundTaskToolUseIds = new Set<string>();
+
   // Home containers (admin & member) can access global and memory directories
   // Non-home containers only access memory (global CLAUDE.md injected via systemPromptAppend)
   const extraDirs = isHome
@@ -944,6 +962,9 @@ async function runQuery(
 
       const event = partial.event;
       if (event.type === 'content_block_start') {
+        // Debug: 记录 content_block_start 关键字段，帮助排查嵌套事件流
+        const _b = event.content_block;
+        log(`[stream] parent=${parentToolUseId ?? 'null'} block=${_b?.type}${_b?.name ? ` name=${_b.name}` : ''}${_b?.id ? ` id=${_b.id.slice(0, 12)}` : ''}`);
         const block = event.content_block;
         if (block?.type === 'tool_use') {
           // 判断是否为 Skill 内部的工具调用：SDK 可能不设置 parent_tool_use_id，
@@ -953,17 +974,34 @@ async function runQuery(
           const effectiveParentToolUseId = isInsideSkill ? activeSkillToolUseId : parentToolUseId;
 
           if (!effectiveIsNested && activeTopLevelToolUseId && activeTopLevelToolUseId !== block.id) {
-            emit({
-              status: 'stream',
-              result: null,
-              streamEvent: { eventType: 'tool_use_end', toolUseId: activeTopLevelToolUseId },
-            });
+            // Task 工具的 tool_use_end 只通过 tool_use_summary 发射（工具实际执行完毕后），
+            // 不在此处过早发射 — Task 创建子 Agent，执行周期远长于 content block 生成
+            if (!taskToolUseIds.has(activeTopLevelToolUseId)) {
+              emit({
+                status: 'stream',
+                result: null,
+                streamEvent: { eventType: 'tool_use_end', toolUseId: activeTopLevelToolUseId },
+              });
+            }
             // 如果被结束的是 Skill 工具，清除 Skill 追踪
             if (activeTopLevelToolUseId === activeSkillToolUseId) {
               activeSkillToolUseId = null;
             }
           }
           if (!effectiveIsNested) activeTopLevelToolUseId = block.id || null;
+
+          // 追踪嵌套工具：结束同一 parent 下的前一个活跃工具
+          if (effectiveIsNested && effectiveParentToolUseId) {
+            const prevNested = activeNestedToolByParent.get(effectiveParentToolUseId);
+            if (prevNested && prevNested.toolUseId !== block.id) {
+              emit({
+                status: 'stream',
+                result: null,
+                streamEvent: { eventType: 'tool_use_end', toolUseId: prevNested.toolUseId, parentToolUseId: effectiveParentToolUseId },
+              });
+            }
+            activeNestedToolByParent.set(effectiveParentToolUseId, { toolUseId: block.id || '', toolName: block.name });
+          }
 
           emit({
             status: 'stream',
@@ -994,26 +1032,64 @@ async function runQuery(
               });
             }
           }
-        } else if (block?.type === 'text') {
-          // 新的文本 block 开始意味着顶层工具已执行完毕
-          if (activeTopLevelToolUseId) {
+
+          // 追踪 Task 工具：发射 task_start 事件并开始跟踪 input_json_delta 以提取 description
+          if (block.name === 'Task' && block.id) {
+            taskToolUseIds.add(block.id);
             emit({
-              status: 'stream',
-              result: null,
-              streamEvent: { eventType: 'tool_use_end', toolUseId: activeTopLevelToolUseId },
+              status: 'stream', result: null,
+              streamEvent: {
+                eventType: 'task_start',
+                toolUseId: block.id,
+                toolName: 'Task',
+              },
             });
+            const blockIndex = event.index;
+            if (typeof blockIndex === 'number') {
+              pendingTaskInput.set(blockIndex, {
+                toolUseId: block.id, inputJson: '', resolved: false,
+              });
+            }
+          }
+        } else if (block?.type === 'text') {
+          // 新的文本 block 开始意味着顶层工具已执行完毕（仅主 agent 的文本 block）
+          // 子 agent 的文本 block 带有 parentToolUseId，不应触发顶层工具结束
+          if (!isNested && activeTopLevelToolUseId) {
+            // Task 工具的 tool_use_end 延迟到 tool_use_summary 或 task_notification 发射
+            if (!taskToolUseIds.has(activeTopLevelToolUseId)) {
+              emit({
+                status: 'stream',
+                result: null,
+                streamEvent: { eventType: 'tool_use_end', toolUseId: activeTopLevelToolUseId },
+              });
+            }
             activeTopLevelToolUseId = null;
             activeSkillToolUseId = null;
+          }
+          // 嵌套文本 block：结束该 parent 下的活跃嵌套工具
+          if (isNested && parentToolUseId) {
+            const prevNested = activeNestedToolByParent.get(parentToolUseId);
+            if (prevNested) {
+              emit({
+                status: 'stream',
+                result: null,
+                streamEvent: { eventType: 'tool_use_end', toolUseId: prevNested.toolUseId, parentToolUseId },
+              });
+              activeNestedToolByParent.delete(parentToolUseId);
+            }
           }
         }
       } else if (event.type === 'content_block_delta') {
         const delta = event.delta;
         if (delta?.type === 'text_delta' && delta.text) {
-          textBuf += delta.text;
-          fullTextAccumulator += delta.text;
+          const bufKey = parentToolUseId || BUF_MAIN;
+          getBuf(bufKey).text += delta.text;
+          // 仅累积主 agent 文本到 fullTextAccumulator（用于最终结果）
+          if (bufKey === BUF_MAIN) fullTextAccumulator += delta.text;
           scheduleFlush();
         } else if (delta?.type === 'thinking_delta' && delta.thinking) {
-          thinkBuf += delta.thinking;
+          const bufKey = parentToolUseId || BUF_MAIN;
+          getBuf(bufKey).think += delta.thinking;
           scheduleFlush();
         } else if (delta?.type === 'input_json_delta' && delta.partial_json) {
           // 累积 Skill 工具的 input JSON，提取 skillName
@@ -1038,6 +1114,26 @@ async function runQuery(
                     parentToolUseId: pending.parentToolUseId,
                     isNested: pending.isNested,
                     skillName: skillMatch[1],
+                  },
+                });
+              }
+            }
+
+            // 累积 Task 工具的 input JSON，提取 description
+            const pendingTask = pendingTaskInput.get(blockIndex);
+            if (pendingTask && !pendingTask.resolved) {
+              pendingTask.inputJson += delta.partial_json;
+              const descMatch = pendingTask.inputJson.match(/"description"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+              if (descMatch) {
+                pendingTask.resolved = true;
+                pendingTaskInput.delete(blockIndex);
+                emit({
+                  status: 'stream', result: null,
+                  streamEvent: {
+                    eventType: 'task_start',
+                    toolUseId: pendingTask.toolUseId,
+                    toolName: 'Task',
+                    taskDescription: descMatch[1].replace(/\\"/g, '"').slice(0, 200),
                   },
                 });
               }
@@ -1072,7 +1168,33 @@ async function runQuery(
       const ids = Array.isArray(summary.preceding_tool_use_ids)
         ? summary.preceding_tool_use_ids.filter((id: unknown): id is string => typeof id === 'string')
         : [];
+      log(`[tool_use_summary] ids=[${ids.map((id: string) => id.slice(0, 12)).join(',')}] taskToolUseIds=[${[...taskToolUseIds].map(id => id.slice(0, 12)).join(',')}] bgTasks=[${[...backgroundTaskToolUseIds].map(id => id.slice(0, 12)).join(',')}]`);
       for (const id of ids) {
+        // 前台 Task 完成：SDK 只发射 tool_use_summary（不发射 task_notification），
+        // 此处为前台 Task 合成 task_notification 以驱动前端标签页自动关闭
+        if (taskToolUseIds.has(id) && !backgroundTaskToolUseIds.has(id)) {
+          log(`Synthesizing task_notification for foreground Task ${id.slice(0, 12)}`);
+          // 清理该 Task 下活跃的嵌套工具
+          const nestedForTask = activeNestedToolByParent.get(id);
+          if (nestedForTask) {
+            emit({
+              status: 'stream', result: null,
+              streamEvent: { eventType: 'tool_use_end', toolUseId: nestedForTask.toolUseId, parentToolUseId: id },
+            });
+            activeNestedToolByParent.delete(id);
+          }
+          emit({
+            status: 'stream', result: null,
+            streamEvent: {
+              eventType: 'task_notification',
+              taskId: id,
+              taskStatus: 'completed',
+              taskSummary: '',
+            },
+          });
+        }
+        taskToolUseIds.delete(id);
+        backgroundTaskToolUseIds.delete(id);
         emit({
           status: 'stream',
           result: null,
@@ -1171,8 +1293,22 @@ async function runQuery(
           }
         }
       }
-      // assistant 消息处理完毕，清空残留的 pendingSkillInput 避免内存泄漏
+      // 从完整的 assistant 消息中识别后台 Task 工具
+      // （input_json_delta 阶段可能遗漏 run_in_background，此处从完整 input 兜底）
+      if (Array.isArray(content)) {
+        for (const block of content) {
+          if (block.type === 'tool_use' && block.name === 'Task' && block.id && block.input) {
+            const taskInput = block.input as Record<string, unknown>;
+            if (taskInput.run_in_background === true) {
+              backgroundTaskToolUseIds.add(block.id);
+              log(`Task ${block.id.slice(0, 12)} marked as background`);
+            }
+          }
+        }
+      }
+      // assistant 消息处理完毕，清空残留的 pending 追踪器避免内存泄漏
       pendingSkillInput.clear();
+      pendingTaskInput.clear();
     }
 
     if (message.type === 'system' && message.subtype === 'init') {
@@ -1183,6 +1319,37 @@ async function runQuery(
     if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
       const tn = message as { task_id: string; status: string; summary: string };
       log(`Task notification: task=${tn.task_id} status=${tn.status} summary=${tn.summary}`);
+      emit({
+        status: 'stream', result: null,
+        streamEvent: {
+          eventType: 'task_notification',
+          taskId: tn.task_id,
+          taskStatus: tn.status,
+          taskSummary: tn.summary,
+        },
+      });
+      // 清理该 Task 下活跃的嵌套工具
+      const nestedForTask = activeNestedToolByParent.get(tn.task_id);
+      if (nestedForTask) {
+        emit({
+          status: 'stream', result: null,
+          streamEvent: { eventType: 'tool_use_end', toolUseId: nestedForTask.toolUseId, parentToolUseId: tn.task_id },
+        });
+        activeNestedToolByParent.delete(tn.task_id);
+      }
+      // task_notification 携带个别 Task 完成状态 — 立即发射 tool_use_end
+      // （task_id 即 tool_use_id，SDK 使用相同标识符）
+      backgroundTaskToolUseIds.delete(tn.task_id);
+      if (taskToolUseIds.has(tn.task_id)) {
+        taskToolUseIds.delete(tn.task_id);
+        emit({
+          status: 'stream', result: null,
+          streamEvent: { eventType: 'tool_use_end', toolUseId: tn.task_id },
+        });
+        if (activeTopLevelToolUseId === tn.task_id) {
+          activeTopLevelToolUseId = null;
+        }
+      }
     }
 
     if (message.type === 'result') {
@@ -1229,20 +1396,65 @@ async function runQuery(
   if (seenTextualResult) {
     // Textual result already emitted. Drop any buffered tail to avoid
     // stale stream residue in UI after message persistence.
-    textBuf = '';
-    thinkBuf = '';
+    streamBufs.clear();
   } else {
     flushBuffers();
   }
   if (activeTopLevelToolUseId) {
-    emit({
-      status: 'stream',
-      result: null,
-      streamEvent: { eventType: 'tool_use_end', toolUseId: activeTopLevelToolUseId },
-    });
+    // 退出时为非 Task 顶层工具发射 tool_use_end
+    if (!taskToolUseIds.has(activeTopLevelToolUseId)) {
+      emit({
+        status: 'stream',
+        result: null,
+        streamEvent: { eventType: 'tool_use_end', toolUseId: activeTopLevelToolUseId },
+      });
+    }
     activeTopLevelToolUseId = null;
     activeSkillToolUseId = null;
   }
+  // 安全网：为所有仍未收到 tool_use_summary/task_notification 的 Task 工具发射完成信号
+  // （正常流程下 taskToolUseIds 此时应为空，仅在异常情况下有残留）
+  if (taskToolUseIds.size > 0) {
+    log(`[safety-net] ${taskToolUseIds.size} Task tools still pending: [${[...taskToolUseIds].map(id => id.slice(0, 12)).join(',')}]`);
+  }
+  for (const id of taskToolUseIds) {
+    // 前台 Task 残留：合成 task_notification 以驱动前端标签页关闭
+    if (!backgroundTaskToolUseIds.has(id)) {
+      log(`[safety-net] Synthesizing task_notification for Task ${id.slice(0, 12)}`);
+      // 清理嵌套工具
+      const nestedForTask = activeNestedToolByParent.get(id);
+      if (nestedForTask) {
+        emit({
+          status: 'stream', result: null,
+          streamEvent: { eventType: 'tool_use_end', toolUseId: nestedForTask.toolUseId, parentToolUseId: id },
+        });
+        activeNestedToolByParent.delete(id);
+      }
+      emit({
+        status: 'stream', result: null,
+        streamEvent: {
+          eventType: 'task_notification',
+          taskId: id,
+          taskStatus: 'completed',
+          taskSummary: '',
+        },
+      });
+    }
+    emit({
+      status: 'stream',
+      result: null,
+      streamEvent: { eventType: 'tool_use_end', toolUseId: id },
+    });
+  }
+  taskToolUseIds.clear();
+  // 清理残留的嵌套工具追踪
+  for (const [parentId, nested] of activeNestedToolByParent) {
+    emit({
+      status: 'stream', result: null,
+      streamEvent: { eventType: 'tool_use_end', toolUseId: nested.toolUseId, parentToolUseId: parentId },
+    });
+  }
+  activeNestedToolByParent.clear();
 
   ipcPolling = false;
   log(`Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}, interruptedDuringQuery: ${interruptedDuringQuery}`);

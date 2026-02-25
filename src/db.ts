@@ -2317,13 +2317,6 @@ export function listAgentsByJid(chatJid: string): SubAgent[] {
   return rows.map(mapAgentRow);
 }
 
-export function listRunningAgentsByFolder(folder: string): SubAgent[] {
-  const rows = db
-    .prepare("SELECT * FROM agents WHERE group_folder = ? AND status = 'running' ORDER BY created_at ASC")
-    .all(folder) as Array<Record<string, unknown>>;
-  return rows.map(mapAgentRow);
-}
-
 export function updateAgentStatus(
   id: string,
   status: AgentStatus,
@@ -2335,17 +2328,37 @@ export function updateAgentStatus(
   ).run(status, completedAt, resultSummary ?? null, id);
 }
 
+export function updateAgentInfo(id: string, name: string, prompt: string): void {
+  db.prepare('UPDATE agents SET name = ?, prompt = ? WHERE id = ?').run(name, prompt, id);
+}
+
+export function deleteCompletedTaskAgents(beforeTimestamp: string): number {
+  const result = db.prepare(
+    "DELETE FROM agents WHERE kind = 'task' AND status IN ('completed', 'error') AND completed_at IS NOT NULL AND completed_at < ?",
+  ).run(beforeTimestamp);
+  return result.changes;
+}
+
+export function markRunningTaskAgentsAsError(chatJid: string): number {
+  const now = new Date().toISOString();
+  const result = db.prepare(
+    "UPDATE agents SET status = 'error', completed_at = ? WHERE chat_jid = ? AND kind = 'task' AND status = 'running'",
+  ).run(now, chatJid);
+  return result.changes;
+}
+
+export function markAllRunningTaskAgentsAsError(summary = '进程重启，任务中断'): number {
+  const now = new Date().toISOString();
+  const result = db.prepare(
+    "UPDATE agents SET status = 'error', completed_at = ?, result_summary = COALESCE(result_summary, ?) WHERE kind = 'task' AND status = 'running'",
+  ).run(now, summary);
+  return result.changes;
+}
+
 export function deleteAgent(id: string): void {
   // Delete associated session
   db.prepare("DELETE FROM sessions WHERE agent_id = ?").run(id);
   db.prepare('DELETE FROM agents WHERE id = ?').run(id);
-}
-
-export function deleteAgentsForFolder(folder: string): void {
-  const agents = listAgentsByFolder(folder);
-  for (const agent of agents) {
-    deleteAgent(agent.id);
-  }
 }
 
 function mapAgentRow(row: Record<string, unknown>): SubAgent {

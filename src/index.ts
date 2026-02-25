@@ -89,10 +89,11 @@ import {
   updateTask,
   createAgent,
   getAgent,
-  listRunningAgentsByFolder,
-  listAgentsByFolder,
   updateAgentStatus,
-  deleteAgent as deleteAgentDb,
+  updateAgentInfo,
+  deleteCompletedTaskAgents,
+  markRunningTaskAgentsAsError,
+  markAllRunningTaskAgentsAsError,
   getSession,
   listAgentsByJid,
 } from './db.js';
@@ -111,7 +112,7 @@ import {
 import type { FeishuConnectConfig, TelegramConnectConfig } from './im-manager.js';
 import { GroupQueue } from './group-queue.js';
 import { startSchedulerLoop } from './task-scheduler.js';
-import { AgentStatus, MessageCursor, NewMessage, RegisteredGroup, SubAgent } from './types.js';
+import { AgentStatus, MessageCursor, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
 import {
   startWebServer,
@@ -572,7 +573,24 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let sentReply = false;
   let lastError = '';
   let cursorCommitted = false;
+  const queryTaskIds = new Set<string>();
   const lastProcessed = missedMessages[missedMessages.length - 1];
+
+  const pickRunningTaskForNotification = (): string | null => {
+    const runningInQuery = Array.from(queryTaskIds)
+      .map((id) => getAgent(id))
+      .filter((a): a is NonNullable<ReturnType<typeof getAgent>> =>
+        !!a && a.kind === 'task' && a.chat_jid === chatJid && a.status === 'running',
+      )
+      .sort((a, b) => a.created_at.localeCompare(b.created_at));
+    if (runningInQuery.length > 0) {
+      return runningInQuery[0].id;
+    }
+    const runningInChat = listAgentsByJid(chatJid)
+      .filter((a) => a.kind === 'task' && a.status === 'running')
+      .sort((a, b) => a.created_at.localeCompare(b.created_at));
+    return runningInChat[0]?.id || null;
+  };
 
   const commitCursor = (): void => {
     if (cursorCommitted) return;
@@ -590,9 +608,93 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     chatJid,
     async (result) => {
       try {
-        // 流式事件处理 - 仅广播 WebSocket，不存 DB，不发飞书，不重置 idle timer
+        // 流式事件处理 - 广播 WebSocket + 持久化 SDK Task 生命周期到 DB
         if (result.status === 'stream' && result.streamEvent) {
           broadcastStreamEvent(chatJid, result.streamEvent);
+
+          // Persist SDK Task lifecycle to DB so tabs survive page refresh
+          const se = result.streamEvent;
+          if (
+            (se.eventType === 'task_start' && se.toolUseId)
+            || (se.eventType === 'tool_use_start' && se.toolName === 'Task' && se.toolUseId)
+          ) {
+            try {
+              const taskId = se.toolUseId;
+              queryTaskIds.add(taskId);
+              const existing = getAgent(taskId);
+              const desc = se.taskDescription || se.toolInputSummary || '';
+              if (!existing) {
+                createAgent({
+                  id: taskId,
+                  group_folder: group.folder,
+                  chat_jid: chatJid,
+                  name: desc.slice(0, 40) || 'Task',
+                  prompt: desc,
+                  status: 'running',
+                  kind: 'task',
+                  created_by: null,
+                  created_at: new Date().toISOString(),
+                  completed_at: null,
+                  result_summary: null,
+                });
+              } else if (se.taskDescription) {
+                updateAgentInfo(taskId, se.taskDescription.slice(0, 40), se.taskDescription);
+              }
+            } catch (err) {
+              logger.warn({ err, toolUseId: se.toolUseId }, 'Failed to persist task_start to DB');
+            }
+          }
+          if (se.eventType === 'tool_use_end' && se.toolUseId) {
+            try {
+              const existing = getAgent(se.toolUseId);
+              if (existing && existing.kind === 'task' && existing.status === 'running') {
+                updateAgentStatus(se.toolUseId, 'completed');
+              }
+            } catch (err) {
+              logger.warn({ err, toolUseId: se.toolUseId }, 'Failed to persist tool_use_end to DB');
+            }
+          }
+          if (se.eventType === 'task_notification' && se.taskId) {
+            try {
+              const status = se.taskStatus === 'completed' ? 'completed' : 'error';
+              const summary = se.taskSummary?.slice(0, 2000);
+              let targetTaskId = se.taskId;
+              let existing = getAgent(targetTaskId);
+              if (!existing || existing.kind !== 'task') {
+                const fallbackTaskId = pickRunningTaskForNotification();
+                if (fallbackTaskId) {
+                  targetTaskId = fallbackTaskId;
+                  existing = getAgent(fallbackTaskId);
+                  logger.warn(
+                    { chatJid, sdkTaskId: se.taskId, mappedTaskId: fallbackTaskId },
+                    'Task notification ID mismatch, mapped to running task',
+                  );
+                }
+              }
+
+              if (!existing) {
+                createAgent({
+                  id: targetTaskId,
+                  group_folder: group.folder,
+                  chat_jid: chatJid,
+                  name: 'Task',
+                  prompt: '',
+                  status,
+                  kind: 'task',
+                  created_by: null,
+                  created_at: new Date().toISOString(),
+                  completed_at: new Date().toISOString(),
+                  result_summary: summary || null,
+                });
+              } else if (existing.kind === 'task') {
+                updateAgentStatus(existing.id, status, summary);
+                queryTaskIds.delete(existing.id);
+              }
+            } catch (err) {
+              logger.warn({ err, taskId: se.taskId }, 'Failed to persist task_notification to DB');
+            }
+          }
+
           return;
         }
 
@@ -685,7 +787,39 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     return true;
   }
 
-  if ((output.status === 'error' || hadError) && !sentReply) {
+  // Query 出错时，将残留 running task 标记为 error，避免长期僵尸状态。
+  // 正常退出不做强制 completed，避免把未确认完成的任务误判为已完成。
+  const isErrorExit = output.status === 'error' || hadError;
+  if (isErrorExit) {
+    try {
+      const marked = markRunningTaskAgentsAsError(chatJid);
+      if (marked > 0) {
+        logger.info({ chatJid, marked }, 'Marked remaining running task agents as error');
+      }
+    } catch (err) {
+      logger.warn({ chatJid, err }, 'Failed to mark running task agents');
+    }
+  } else {
+    // Safety net: if query already ended successfully but some task agents are still
+    // running (usually due SDK event ID mismatch), force-complete them to avoid stale tabs.
+    try {
+      let completed = 0;
+      for (const taskId of queryTaskIds) {
+        const agent = getAgent(taskId);
+        if (!agent || agent.kind !== 'task' || agent.chat_jid !== chatJid || agent.status !== 'running') continue;
+        updateAgentStatus(taskId, 'completed', agent.result_summary || '任务已完成');
+        broadcastAgentStatus(chatJid, taskId, 'completed', agent.name, agent.prompt, agent.result_summary || '任务已完成', agent.kind);
+        completed += 1;
+      }
+      if (completed > 0) {
+        logger.warn({ chatJid, completed }, 'Force-completed stale running task agents after successful query');
+      }
+    } catch (err) {
+      logger.warn({ chatJid, err }, 'Failed to force-complete stale running task agents');
+    }
+  }
+
+  if (isErrorExit && !sentReply) {
     // Only roll back cursor if no reply was sent — if the agent already
     // replied successfully, a subsequent timeout is not a real error and
     // rolling back would cause the same messages to be re-processed,
@@ -1155,129 +1289,6 @@ function startIpcWatcher(): void {
         logger.error({ err, sourceGroup }, 'Error reading IPC tasks directory');
       }
 
-      // Process agent spawn/message requests from this group's IPC directory
-      const agentsDir = path.join(ipcBaseDir, sourceGroup, 'agents');
-      try {
-        if (fs.existsSync(agentsDir)) {
-          const agentEntries = fs.readdirSync(agentsDir, { withFileTypes: true });
-
-          // Process top-level .json files (from main agent)
-          for (const entry of agentEntries) {
-            if (!entry.isFile() || !entry.name.endsWith('.json') || entry.name === 'status.json') continue;
-            const filePath = path.join(agentsDir, entry.name);
-            try {
-              const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-              fs.unlinkSync(filePath);
-
-              if (data.type === 'spawn_agent' && data.agentId && data.name && data.prompt) {
-                await processAgentSpawn(sourceGroup, data, sourceGroupEntry);
-              } else if (data.type === 'message_agent' && data.agentId && data.message) {
-                await processAgentMessage(sourceGroup, data);
-              }
-            } catch (err) {
-              logger.error(
-                { file: entry.name, sourceGroup, err },
-                'Error processing agent IPC',
-              );
-              try { fs.unlinkSync(filePath); } catch { /* ignore */ }
-            }
-          }
-
-          // Process IPC from conversation/sub-agent subdirectories (agents/{agentId}/*)
-          for (const entry of agentEntries) {
-            if (!entry.isDirectory()) continue;
-            const subAgentIpcDir = path.join(agentsDir, entry.name);
-
-            // messages/ — proactive send_message from conversation agents
-            const subMsgDir = path.join(subAgentIpcDir, 'messages');
-            try {
-              if (fs.existsSync(subMsgDir)) {
-                const msgFiles = fs.readdirSync(subMsgDir).filter((f) => f.endsWith('.json'));
-                for (const file of msgFiles) {
-                  const filePath = path.join(subMsgDir, file);
-                  try {
-                    const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-                    if (data.type === 'message' && data.chatJid && data.text) {
-                      const targetGroup = registeredGroups[data.chatJid];
-                      if (canSendCrossGroupMessage(isAdminHome, isHome, sourceGroup, sourceGroupEntry, targetGroup)) {
-                        await sendMessage(data.chatJid, data.text);
-                        logger.info({ chatJid: data.chatJid, sourceGroup, agentId: entry.name }, 'Sub-agent IPC message sent');
-                      } else {
-                        logger.warn({ chatJid: data.chatJid, sourceGroup, agentId: entry.name }, 'Unauthorized sub-agent IPC message blocked');
-                      }
-                    }
-                    fs.unlinkSync(filePath);
-                  } catch (err) {
-                    logger.error({ file, sourceGroup, agentId: entry.name, err }, 'Error processing sub-agent IPC message');
-                    try { fs.unlinkSync(filePath); } catch { /* ignore */ }
-                  }
-                }
-              }
-            } catch (err) {
-              logger.error({ err, sourceGroup, agentId: entry.name }, 'Error reading sub-agent messages dir');
-            }
-
-            // tasks/ — task scheduling from conversation agents
-            const subTasksDir = path.join(subAgentIpcDir, 'tasks');
-            try {
-              if (fs.existsSync(subTasksDir)) {
-                const taskFiles = fs
-                  .readdirSync(subTasksDir, { withFileTypes: true })
-                  .filter((e) =>
-                    e.isFile() &&
-                    e.name.endsWith('.json') &&
-                    !e.name.startsWith('install_skill_result_') &&
-                    !e.name.startsWith('uninstall_skill_result_')
-                  )
-                  .map((e) => e.name);
-                for (const file of taskFiles) {
-                  const filePath = path.join(subTasksDir, file);
-                  try {
-                    const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-                    await processTaskIpc(data, sourceGroup, isAdminHome);
-                    fs.unlinkSync(filePath);
-                  } catch (err) {
-                    logger.error({ file, sourceGroup, agentId: entry.name, err }, 'Error processing sub-agent IPC task');
-                    try { fs.unlinkSync(filePath); } catch { /* ignore */ }
-                  }
-                }
-              }
-            } catch (err) {
-              logger.error({ err, sourceGroup, agentId: entry.name }, 'Error reading sub-agent tasks dir');
-            }
-
-            // agents/ — message_agent from conversation agents (spawn_agent blocked to prevent recursion)
-            const subAgentsDir = path.join(subAgentIpcDir, 'agents');
-            try {
-              if (fs.existsSync(subAgentsDir)) {
-                const spawnFiles = fs.readdirSync(subAgentsDir).filter((f) => f.endsWith('.json') && f !== 'status.json');
-                for (const file of spawnFiles) {
-                  const filePath = path.join(subAgentsDir, file);
-                  try { if (fs.statSync(filePath).isDirectory()) continue; } catch { continue; }
-                  try {
-                    const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-                    fs.unlinkSync(filePath);
-
-                    if (data.type === 'spawn_agent') {
-                      // Sub-agents cannot spawn their own sub-agents (prevent infinite recursion)
-                      logger.warn({ sourceGroup, parentAgentId: entry.name, childAgentId: data.agentId }, 'Blocked recursive spawn_agent from sub-agent');
-                    } else if (data.type === 'message_agent' && data.agentId && data.message) {
-                      await processAgentMessage(sourceGroup, data);
-                    }
-                  } catch (err) {
-                    logger.error({ file, sourceGroup, agentId: entry.name, err }, 'Error processing sub-agent spawn IPC');
-                    try { fs.unlinkSync(filePath); } catch { /* ignore */ }
-                  }
-                }
-              }
-            } catch (err) {
-              logger.error({ err, sourceGroup, agentId: entry.name }, 'Error reading sub-agent agents dir');
-            }
-          }
-        }
-      } catch (err) {
-        logger.error({ err, sourceGroup }, 'Error reading agent IPC directory');
-      }
     }
 
     if (!shuttingDown) setTimeout(processIpcFiles, IPC_POLL_INTERVAL);
@@ -1622,353 +1633,6 @@ async function processTaskIpc(
   }
 }
 
-// --- Sub-Agent orchestration ---
-
-/**
- * Write the agents status file for the main agent to read via list_agents MCP tool.
- */
-function writeAgentStatusFile(folder: string): void {
-  const agents = listRunningAgentsByFolder(folder);
-  // Include recently completed agents (within the last 5 minutes)
-  const allAgents = [...agents];
-  const statusData = allAgents.map((a) => ({
-    id: a.id,
-    name: a.name,
-    status: a.status,
-    prompt: a.prompt.slice(0, 200),
-    created_at: a.created_at,
-    completed_at: a.completed_at,
-    result_summary: a.result_summary,
-  }));
-  const statusJson = JSON.stringify(statusData);
-
-  // Write to main agent's IPC agents dir
-  const statusDir = path.join(DATA_DIR, 'ipc', folder, 'agents');
-  fs.mkdirSync(statusDir, { recursive: true });
-  const statusFile = path.join(statusDir, 'status.json');
-  const tmpFile = `${statusFile}.tmp`;
-  fs.writeFileSync(tmpFile, statusJson);
-  fs.renameSync(tmpFile, statusFile);
-
-  // Also replicate to each conversation/sub-agent's IPC agents dir
-  // so they can read status via list_agents
-  try {
-    const entries = fs.readdirSync(statusDir, { withFileTypes: true });
-    for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
-      const subAgentsDir = path.join(statusDir, entry.name, 'agents');
-      if (fs.existsSync(subAgentsDir)) {
-        const subStatusFile = path.join(subAgentsDir, 'status.json');
-        const subTmpFile = `${subStatusFile}.tmp`;
-        try {
-          fs.writeFileSync(subTmpFile, statusJson);
-          fs.renameSync(subTmpFile, subStatusFile);
-        } catch { /* ignore write errors for stale dirs */ }
-      }
-    }
-  } catch { /* ignore */ }
-}
-
-/**
- * Clean up sub-agent resources after completion.
- * Removes IPC directories, session directories, and DB record.
- * Broadcasts removal to frontend so the tab disappears.
- */
-function cleanupSubAgent(folder: string, agentId: string, chatJid: string): void {
-  const agent = getAgent(agentId);
-  if (!agent) return; // Already cleaned up
-
-  // Never auto-cleanup conversation agents — they persist until user deletes them
-  if (agent.kind === 'conversation') return;
-
-  // Delete agent session
-  deleteSession(folder, agentId);
-
-  // Remove agent IPC directory
-  const agentIpcDir = path.join(DATA_DIR, 'ipc', folder, 'agents', agentId);
-  try {
-    fs.rmSync(agentIpcDir, { recursive: true, force: true });
-  } catch { /* ignore */ }
-
-  // Remove agent session directory
-  const agentSessionDir = path.join(DATA_DIR, 'sessions', folder, 'agents', agentId);
-  try {
-    fs.rmSync(agentSessionDir, { recursive: true, force: true });
-  } catch { /* ignore */ }
-
-  // Clean up lastAgentTimestamp to prevent memory/state bloat
-  const virtualJid = `${chatJid}#agent:${agentId}`;
-  delete lastAgentTimestamp[virtualJid];
-
-  // Delete DB record
-  deleteAgentDb(agentId);
-
-  // Notify frontend to remove the tab
-  broadcastAgentStatus(chatJid, agentId, 'completed', agent.name, agent.prompt, '__removed__');
-
-  logger.info({ folder, agentId }, 'Sub-agent resources cleaned up');
-}
-
-/**
- * Clean up stale task-type agents from previous process runs.
- * Called at startup to handle agents whose setTimeout cleanup was lost.
- */
-function cleanupStaleAgents(): void {
-  const allGroups = getAllRegisteredGroups();
-  for (const [jid, group] of Object.entries(allGroups)) {
-    const agents = listAgentsByFolder(group.folder);
-    for (const agent of agents) {
-      if (agent.kind === 'conversation') continue;
-      if (agent.status === 'completed' || agent.status === 'error') {
-        cleanupSubAgent(group.folder, agent.id, jid);
-      } else if (agent.status === 'running') {
-        // Mark orphaned running agents as error (process restarted while they were running)
-        updateAgentStatus(agent.id, 'error', '进程重启，任务中断');
-        cleanupSubAgent(group.folder, agent.id, jid);
-      }
-    }
-  }
-}
-
-/**
- * Process a spawn_agent IPC request from the main agent.
- */
-const SAFE_AGENT_ID_RE = /^[a-zA-Z0-9_-]+$/;
-
-async function processAgentSpawn(
-  sourceFolder: string,
-  data: { agentId: string; name: string; prompt: string; chatJid?: string; groupFolder?: string },
-  sourceGroupEntry: RegisteredGroup | undefined,
-): Promise<void> {
-  // Validate agentId to prevent path traversal (agentId is generated inside the container)
-  if (!SAFE_AGENT_ID_RE.test(data.agentId)) {
-    logger.warn({ agentId: data.agentId, sourceFolder }, 'Rejected spawn_agent: invalid agentId format');
-    return;
-  }
-
-  const chatJid = data.chatJid || Object.keys(registeredGroups).find(
-    (jid) => registeredGroups[jid]?.folder === sourceFolder,
-  );
-  if (!chatJid) {
-    logger.warn({ sourceFolder, agentId: data.agentId }, 'Cannot spawn agent: no chat JID found');
-    return;
-  }
-
-  // Create agent record in DB
-  const agent: SubAgent = {
-    id: data.agentId,
-    group_folder: sourceFolder,
-    chat_jid: chatJid,
-    name: data.name,
-    prompt: data.prompt,
-    status: 'running',
-    kind: 'task',
-    created_by: `group:${sourceFolder}`,
-    created_at: new Date().toISOString(),
-    completed_at: null,
-    result_summary: null,
-  };
-  createAgent(agent);
-  logger.info(
-    { agentId: agent.id, name: agent.name, folder: sourceFolder },
-    'Sub-agent spawned',
-  );
-
-  // Create agent-specific IPC directories
-  const agentIpcDir = path.join(DATA_DIR, 'ipc', sourceFolder, 'agents', agent.id);
-  fs.mkdirSync(path.join(agentIpcDir, 'input'), { recursive: true });
-  fs.mkdirSync(path.join(agentIpcDir, 'messages'), { recursive: true });
-  fs.mkdirSync(path.join(agentIpcDir, 'tasks'), { recursive: true });
-
-  // Create agent-specific session directory
-  const agentSessionDir = path.join(DATA_DIR, 'sessions', sourceFolder, 'agents', agent.id, '.claude');
-  fs.mkdirSync(agentSessionDir, { recursive: true });
-
-  // Broadcast agent status via WebSocket
-  broadcastAgentStatus(chatJid, agent.id, 'running', agent.name, agent.prompt);
-
-  // Update status.json
-  writeAgentStatusFile(sourceFolder);
-
-  // Use virtual JID for queue isolation: {chatJid}#agent:{agentId}
-  const virtualJid = `${chatJid}#agent:${agent.id}`;
-
-  // Find the effective group (inherit home-group properties)
-  let effectiveGroup = sourceGroupEntry;
-  if (!effectiveGroup) {
-    effectiveGroup = registeredGroups[chatJid];
-  }
-  if (!effectiveGroup) {
-    logger.warn({ sourceFolder, agentId: agent.id }, 'Cannot spawn agent: group not found');
-    updateAgentStatus(agent.id, 'error', 'Group not found');
-    writeAgentStatusFile(sourceFolder);
-    return;
-  }
-
-  // Enqueue agent execution as a task (like scheduled tasks, but parallel)
-  const taskId = `agent:${agent.id}`;
-  queue.enqueueTask(virtualJid, taskId, async () => {
-    await runSubAgent(effectiveGroup!, agent, chatJid, virtualJid);
-  });
-}
-
-/**
- * Run a sub-agent in its own container/process.
- */
-async function runSubAgent(
-  parentGroup: RegisteredGroup,
-  agent: SubAgent,
-  chatJid: string,
-  virtualJid: string,
-): Promise<void> {
-  const isHome = !!parentGroup.is_home;
-  const isAdminHome = isHome && parentGroup.folder === MAIN_GROUP_FOLDER;
-  const sessionId = getSession(parentGroup.folder, agent.id) || undefined;
-
-  const prompt = `你是子 Agent "${agent.name}"。你的任务是：\n\n${agent.prompt}\n\n完成后请输出任务结果摘要。`;
-
-  const wrappedOnOutput = async (output: ContainerOutput) => {
-    // Track session for this sub-agent
-    if (output.newSessionId && output.status !== 'error') {
-      setSession(parentGroup.folder, output.newSessionId, agent.id);
-    }
-
-    // Forward stream events with agentId
-    if (output.status === 'stream' && output.streamEvent) {
-      broadcastStreamEvent(chatJid, output.streamEvent, agent.id);
-      return;
-    }
-
-    // Store agent replies as messages
-    if (output.result) {
-      const raw = typeof output.result === 'string' ? output.result : JSON.stringify(output.result);
-      const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
-      if (text) {
-        const msgId = crypto.randomUUID();
-        const timestamp = new Date().toISOString();
-        ensureChatExists(chatJid);
-        storeMessageDirect(
-          msgId,
-          chatJid,
-          `agent:${agent.id}`,
-          agent.name,
-          text,
-          timestamp,
-          true,
-        );
-        broadcastNewMessage(chatJid, {
-          id: msgId,
-          chat_jid: chatJid,
-          sender: `agent:${agent.id}`,
-          sender_name: agent.name,
-          content: text,
-          timestamp,
-          is_from_me: true,
-        });
-      }
-    }
-  };
-
-  try {
-    const executionMode = parentGroup.executionMode || 'container';
-
-    const onProcessCb = (proc: ChildProcess, identifier: string) => {
-      const containerName = executionMode === 'container' ? identifier : null;
-      queue.registerProcess(virtualJid, proc, containerName, parentGroup.folder, identifier, agent.id);
-    };
-
-    let output: ContainerOutput;
-
-    const containerInput: ContainerInput = {
-      prompt,
-      sessionId,
-      groupFolder: parentGroup.folder,
-      chatJid,
-      isMain: isAdminHome,
-      isHome,
-      isAdminHome,
-      agentId: agent.id,
-      agentName: agent.name,
-    };
-
-    if (executionMode === 'host') {
-      output = await runHostAgent(parentGroup, containerInput, onProcessCb, wrappedOnOutput);
-    } else {
-      output = await runContainerAgent(parentGroup, containerInput, onProcessCb, wrappedOnOutput);
-    }
-
-    // Finalize session
-    if (output.newSessionId && output.status !== 'error') {
-      setSession(parentGroup.folder, output.newSessionId, agent.id);
-    }
-
-    // Determine result summary
-    const resultSummary = output.result
-      ? (typeof output.result === 'string' ? output.result : JSON.stringify(output.result))
-          .replace(/<internal>[\s\S]*?<\/internal>/g, '').trim().slice(0, 2000)
-      : undefined;
-
-    if (output.status === 'error') {
-      updateAgentStatus(agent.id, 'error', output.error || '未知错误');
-      broadcastAgentStatus(chatJid, agent.id, 'error', agent.name, agent.prompt, output.error);
-    } else {
-      updateAgentStatus(agent.id, 'completed', resultSummary || '任务已完成');
-      broadcastAgentStatus(chatJid, agent.id, 'completed', agent.name, agent.prompt, resultSummary);
-    }
-
-    // Inject result into main agent's IPC input
-    injectAgentResultToMain(parentGroup.folder, agent, output);
-  } catch (err) {
-    const errorMsg = err instanceof Error ? err.message : String(err);
-    logger.error({ agentId: agent.id, err }, 'Sub-agent execution error');
-    updateAgentStatus(agent.id, 'error', errorMsg);
-    broadcastAgentStatus(chatJid, agent.id, 'error', agent.name, agent.prompt, errorMsg);
-  }
-
-  // Update status.json
-  writeAgentStatusFile(parentGroup.folder);
-
-  // Delay cleanup so the user can review the agent's results in the UI
-  setTimeout(() => {
-    cleanupSubAgent(parentGroup.folder, agent.id, chatJid);
-  }, 5 * 60 * 1000); // 5 minutes
-}
-
-/**
- * Inject a sub-agent's result into the main agent's IPC input directory.
- */
-function injectAgentResultToMain(
-  folder: string,
-  agent: SubAgent,
-  output: ContainerOutput,
-): void {
-  const inputDir = path.join(DATA_DIR, 'ipc', folder, 'input');
-  fs.mkdirSync(inputDir, { recursive: true });
-
-  const resultText = output.result
-    ? (typeof output.result === 'string' ? output.result : JSON.stringify(output.result))
-        .replace(/<internal>[\s\S]*?<\/internal>/g, '').trim().slice(0, 2000)
-    : (output.error || '任务已完成');
-
-  const resultMsg = {
-    type: 'agent_result',
-    agentId: agent.id,
-    agentName: agent.name,
-    status: output.status === 'error' ? 'error' : 'completed',
-    prompt: agent.prompt.slice(0, 200),
-    result: resultText,
-  };
-
-  const fileName = `agent-result-${agent.id}-${Date.now()}.json`;
-  const filePath = path.join(inputDir, fileName);
-  const tmpPath = `${filePath}.tmp`;
-  fs.writeFileSync(tmpPath, JSON.stringify(resultMsg));
-  fs.renameSync(tmpPath, filePath);
-  logger.info(
-    { agentId: agent.id, folder, fileName },
-    'Injected agent result to main agent IPC',
-  );
-}
 
 /**
  * Process messages for a user-created conversation agent.
@@ -2149,55 +1813,6 @@ async function processAgentConversation(chatJid: string, agentId: string): Promi
   broadcastAgentStatus(chatJid, agentId, 'idle', agent.name, agent.prompt);
 }
 
-/**
- * Process a message_agent IPC request — forward message to a running sub-agent.
- */
-async function processAgentMessage(
-  sourceFolder: string,
-  data: { agentId: string; message: string },
-): Promise<void> {
-  if (!SAFE_AGENT_ID_RE.test(data.agentId)) {
-    logger.warn({ agentId: data.agentId, sourceFolder }, 'Rejected message_agent: invalid agentId format');
-    return;
-  }
-
-  const agentRecord = getAgent(data.agentId);
-  if (!agentRecord || agentRecord.group_folder !== sourceFolder) {
-    logger.warn(
-      { agentId: data.agentId, sourceFolder },
-      'Cannot message agent: not found or wrong folder',
-    );
-    return;
-  }
-
-  if (agentRecord.status !== 'running') {
-    logger.warn(
-      { agentId: data.agentId, status: agentRecord.status },
-      'Cannot message agent: not running',
-    );
-    return;
-  }
-
-  // Write message to the sub-agent's IPC input directory
-  const agentInputDir = path.join(DATA_DIR, 'ipc', sourceFolder, 'agents', data.agentId, 'input');
-  fs.mkdirSync(agentInputDir, { recursive: true });
-
-  const msg = {
-    type: 'agent_message',
-    message: data.message,
-    from: 'main',
-  };
-
-  const fileName = `msg-${Date.now()}.json`;
-  const filePath = path.join(agentInputDir, fileName);
-  const tmpPath = `${filePath}.tmp`;
-  fs.writeFileSync(tmpPath, JSON.stringify(msg));
-  fs.renameSync(tmpPath, filePath);
-  logger.info(
-    { agentId: data.agentId, sourceFolder },
-    'Message forwarded to sub-agent',
-  );
-}
 
 async function startMessageLoop(): Promise<void> {
   if (messageLoopRunning) {
@@ -2633,6 +2248,29 @@ async function main(): Promise<void> {
   migrateDataDirectories();
   initDatabase();
   logger.info('Database initialized');
+
+  // Clean up stale completed task agents (older than 1 hour) to prevent DB bloat
+  try {
+    const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    const cleaned = deleteCompletedTaskAgents(oneHourAgo);
+    if (cleaned > 0) {
+      logger.info({ cleaned }, 'Cleaned up stale completed task agents');
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Failed to clean up stale task agents');
+  }
+
+  // After process restart there cannot be truly running SDK tasks.
+  // Mark all persisted running tasks as error to avoid stale "running" tabs.
+  try {
+    const marked = markAllRunningTaskAgentsAsError();
+    if (marked > 0) {
+      logger.warn({ marked }, 'Marked stale running task agents as error at startup');
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Failed to mark stale running tasks at startup');
+  }
+
   loadState();
 
   // --- Channel reload helpers (hot-reload on config save) ---
@@ -2900,7 +2538,6 @@ async function main(): Promise<void> {
   });
   startIpcWatcher();
   recoverPendingMessages();
-  cleanupStaleAgents();
   startMessageLoop();
 
   // --- IM Connection Pool: connect per-user IM channels ---

@@ -7,6 +7,7 @@ interface AgentTabBarProps {
   onSelectTab: (agentId: string | null) => void;
   onDeleteAgent: (agentId: string) => void;
   onCreateConversation?: () => void;
+  sdkTaskIds?: Set<string>; // SDK Task IDs (managed by SDK, no manual delete)
 }
 
 const TASK_STATUS_ICON: Record<string, string> = {
@@ -22,7 +23,7 @@ const tabClass = (active: boolean) =>
       : 'text-slate-500 hover:bg-slate-100 hover:text-slate-700'
   }`;
 
-export function AgentTabBar({ agents, activeTab, onSelectTab, onDeleteAgent, onCreateConversation }: AgentTabBarProps) {
+export function AgentTabBar({ agents, activeTab, onSelectTab, onDeleteAgent, onCreateConversation, sdkTaskIds }: AgentTabBarProps) {
   const conversations = agents.filter(a => a.kind === 'conversation');
   const tasks = agents.filter(a => a.kind === 'task');
 
@@ -84,13 +85,16 @@ export function AgentTabBar({ agents, activeTab, onSelectTab, onDeleteAgent, onC
             >
               <span>{TASK_STATUS_ICON[agent.status] || ''}</span>
               <span className="truncate max-w-[100px]">{agent.name}</span>
-              <button
-                onClick={(e) => { e.stopPropagation(); onDeleteAgent(agent.id); }}
-                className="opacity-0 group-hover:opacity-100 p-0.5 rounded hover:bg-slate-200 transition-all cursor-pointer"
-                title="删除 Agent"
-              >
-                <X className="w-3 h-3" />
-              </button>
+              {/* SDK Task 由 SDK 管理生命周期，不允许手动删除 */}
+              {!sdkTaskIds?.has(agent.id) && (
+                <button
+                  onClick={(e) => { e.stopPropagation(); onDeleteAgent(agent.id); }}
+                  className="opacity-0 group-hover:opacity-100 p-0.5 rounded hover:bg-slate-200 transition-all cursor-pointer"
+                  title="删除 Agent"
+                >
+                  <X className="w-3 h-3" />
+                </button>
+              )}
             </div>
           ))}
         </>

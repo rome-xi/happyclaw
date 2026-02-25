@@ -305,6 +305,7 @@ export type StreamEventType =
   | 'text_delta' | 'thinking_delta'
   | 'tool_use_start' | 'tool_use_end' | 'tool_progress'
   | 'hook_started' | 'hook_progress' | 'hook_response'
+  | 'task_start' | 'task_notification'
   | 'status' | 'init';
 
 export interface StreamEvent {
@@ -321,4 +322,8 @@ export interface StreamEvent {
   hookEvent?: string;
   hookOutcome?: string;
   statusText?: string;
+  taskDescription?: string;
+  taskId?: string;
+  taskStatus?: string;
+  taskSummary?: string;
 }

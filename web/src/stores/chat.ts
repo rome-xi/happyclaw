@@ -24,6 +24,7 @@ export type StreamEventType =
   | 'text_delta' | 'thinking_delta'
   | 'tool_use_start' | 'tool_use_end' | 'tool_progress'
   | 'hook_started' | 'hook_progress' | 'hook_response'
+  | 'task_start' | 'task_notification'
   | 'status' | 'init';
 
 export interface StreamEvent {
@@ -40,6 +41,10 @@ export interface StreamEvent {
   hookEvent?: string;
   hookOutcome?: string;
   statusText?: string;
+  taskDescription?: string;
+  taskId?: string;
+  taskStatus?: string;
+  taskSummary?: string;
 }
 
 export interface StreamingTimelineEvent {
@@ -132,6 +137,15 @@ interface ChatState {
   agents: Record<string, AgentInfo[]>;              // jid → agents
   agentStreaming: Record<string, StreamingState>;    // agentId → streaming state
   activeAgentTab: Record<string, string | null>;     // jid → selected agentId (null = main)
+  // SDK Task subagent state (in-process via Task tool, not DB-persisted)
+  sdkTasks: Record<string, {  // toolUseId → task info
+    chatJid: string;
+    description: string;
+    status: 'running' | 'completed' | 'error';
+    summary?: string;
+  }>;
+  // SDK Task alias map: runtime taskId/parentToolUseId -> canonical sdkTasks key
+  sdkTaskAliases: Record<string, string>;
   // Conversation agent state
   agentMessages: Record<string, Message[]>;          // agentId → messages
   agentWaiting: Record<string, boolean>;             // agentId → waiting for reply
@@ -167,6 +181,232 @@ interface ChatState {
   refreshAgentMessages: (jid: string, agentId: string) => Promise<void>;
 }
 
+const DEFAULT_STREAMING_STATE: StreamingState = {
+  partialText: '', thinkingText: '', isThinking: false,
+  activeTools: [], activeHook: null, systemStatus: null, recentEvents: [],
+};
+
+const MAX_EVENT_LOG = 30;
+const SDK_TASK_AUTO_CLOSE_MS = 3000;
+const SDK_TASK_TOOL_END_FALLBACK_CLOSE_MS = 1200;
+const sdkTaskCleanupTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function removeSdkTaskAliases(
+  aliases: Record<string, string>,
+  taskId: string,
+): Record<string, string> {
+  const next: Record<string, string> = {};
+  for (const [alias, target] of Object.entries(aliases)) {
+    if (alias === taskId || target === taskId) continue;
+    next[alias] = target;
+  }
+  return next;
+}
+
+function resolveSdkTaskId(
+  state: Pick<ChatState, 'sdkTasks' | 'sdkTaskAliases'>,
+  rawId: string,
+): string {
+  if (state.sdkTasks[rawId]) return rawId;
+  return state.sdkTaskAliases[rawId] || rawId;
+}
+
+function pickSdkTaskAliasTarget(
+  state: Pick<ChatState, 'sdkTasks' | 'sdkTaskAliases' | 'agents'>,
+  chatJid: string,
+): string | null {
+  const runningIds = Object.entries(state.sdkTasks)
+    .filter(([, task]) => task.chatJid === chatJid && task.status === 'running')
+    .map(([id]) => id);
+  if (runningIds.length === 0) return null;
+
+  const usedTargets = new Set(Object.values(state.sdkTaskAliases));
+  const unbound = runningIds.filter((id) => !usedTargets.has(id));
+  const pool = (unbound.length > 0 ? unbound : runningIds).slice();
+  const createdAtMap = new Map((state.agents[chatJid] || []).map((a) => [a.id, a.created_at]));
+  pool.sort((a, b) => (createdAtMap.get(a) || '').localeCompare(createdAtMap.get(b) || ''));
+  return pool[0] || null;
+}
+
+function clearSdkTaskCleanupTimer(taskId: string): void {
+  const timer = sdkTaskCleanupTimers.get(taskId);
+  if (timer) {
+    clearTimeout(timer);
+    sdkTaskCleanupTimers.delete(taskId);
+  }
+}
+
+function scheduleSdkTaskCleanup(
+  set: (fn: (s: ChatState) => Partial<ChatState>) => void,
+  taskId: string,
+  chatJid: string,
+  delayMs = SDK_TASK_AUTO_CLOSE_MS,
+): void {
+  clearSdkTaskCleanupTimer(taskId);
+  const timer = setTimeout(() => {
+    sdkTaskCleanupTimers.delete(taskId);
+    set((s) => {
+      const nextSdkTasks = { ...s.sdkTasks };
+      delete nextSdkTasks[taskId];
+      const nextStreaming = { ...s.agentStreaming };
+      delete nextStreaming[taskId];
+      const nextActiveTab = { ...s.activeAgentTab };
+      if (nextActiveTab[chatJid] === taskId) nextActiveTab[chatJid] = null;
+      const nextAliases = removeSdkTaskAliases(s.sdkTaskAliases, taskId);
+      return {
+        sdkTasks: nextSdkTasks,
+        sdkTaskAliases: nextAliases,
+        agents: { ...s.agents, [chatJid]: (s.agents[chatJid] || []).filter(a => a.id !== taskId) },
+        agentStreaming: nextStreaming,
+        activeAgentTab: nextActiveTab,
+      };
+    });
+  }, delayMs);
+  sdkTaskCleanupTimers.set(taskId, timer);
+}
+
+function pushEvent(
+  events: StreamingTimelineEvent[],
+  kind: StreamingTimelineEvent['kind'],
+  text: string,
+): StreamingTimelineEvent[] {
+  const item: StreamingTimelineEvent = {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    timestamp: Date.now(),
+    kind,
+    text,
+  };
+  return [...events, item].slice(-MAX_EVENT_LOG);
+}
+
+/**
+ * Apply a single StreamEvent to a StreamingState object.
+ * Shared by main conversation and SDK subagent streaming.
+ */
+function applyStreamEvent(
+  event: StreamEvent,
+  prev: StreamingState,
+  next: StreamingState,
+  maxText: number,
+): void {
+  switch (event.eventType) {
+    case 'text_delta': {
+      const combined = prev.partialText + (event.text || '');
+      next.partialText = combined.length > maxText ? combined.slice(-maxText) : combined;
+      next.isThinking = false;
+      break;
+    }
+    case 'thinking_delta': {
+      const combined = prev.thinkingText + (event.text || '');
+      next.thinkingText = combined.length > maxText ? combined.slice(-maxText) : combined;
+      next.isThinking = true;
+      break;
+    }
+    case 'tool_use_start': {
+      next.isThinking = false;
+      const toolUseId = event.toolUseId || '';
+      const existing = prev.activeTools.find(t => t.toolUseId === toolUseId && toolUseId);
+      const tool = {
+        toolName: event.toolName || 'unknown',
+        toolUseId,
+        startTime: Date.now(),
+        parentToolUseId: event.parentToolUseId,
+        isNested: event.isNested,
+        skillName: event.skillName,
+        toolInputSummary: event.toolInputSummary,
+      };
+      next.activeTools = existing
+        ? prev.activeTools.map(t => (t.toolUseId === toolUseId ? { ...t, ...tool } : t))
+        : [...prev.activeTools, tool];
+
+      const isSkill = tool.toolName === 'Skill';
+      const label = isSkill
+        ? `技能 ${tool.skillName || 'unknown'}`
+        : `工具 ${tool.toolName}`;
+      const detail = tool.toolInputSummary ? ` (${tool.toolInputSummary})` : '';
+      next.recentEvents = pushEvent(prev.recentEvents, isSkill ? 'skill' : 'tool', `${label}${detail}`);
+      break;
+    }
+    case 'tool_use_end':
+      if (event.toolUseId) {
+        const ended = prev.activeTools.find(t => t.toolUseId === event.toolUseId);
+        next.activeTools = prev.activeTools.filter(t => t.toolUseId !== event.toolUseId);
+        if (ended) {
+          const rawSec = (Date.now() - ended.startTime) / 1000;
+          const elapsedSec = rawSec % 1 === 0 ? rawSec.toFixed(0) : rawSec.toFixed(1);
+          const isSkill = ended.toolName === 'Skill';
+          const label = isSkill
+            ? `技能 ${ended.skillName || 'unknown'}`
+            : `工具 ${ended.toolName}`;
+          next.recentEvents = pushEvent(prev.recentEvents, isSkill ? 'skill' : 'tool', `✓ ${label} (${elapsedSec}s)`);
+        }
+      } else {
+        next.activeTools = [];
+      }
+      break;
+    case 'tool_progress': {
+      const existing = prev.activeTools.find(t => t.toolUseId === event.toolUseId);
+      if (existing) {
+        const skillNameResolved = event.skillName && !existing.skillName;
+        next.activeTools = prev.activeTools.map(t =>
+          t.toolUseId === event.toolUseId
+            ? {
+                ...t,
+                elapsedSeconds: event.elapsedSeconds,
+                ...(event.skillName ? { skillName: event.skillName } : {}),
+              }
+            : t
+        );
+        if (skillNameResolved) {
+          const oldLabel = `技能 unknown`;
+          const newLabel = `技能 ${event.skillName}`;
+          next.recentEvents = prev.recentEvents.map(e =>
+            e.kind === 'skill' && e.text.includes(oldLabel)
+              ? { ...e, text: e.text.replace(oldLabel, newLabel) }
+              : e
+          );
+        }
+      } else {
+        next.activeTools = [...prev.activeTools, {
+          toolName: event.toolName || 'unknown',
+          toolUseId: event.toolUseId || '',
+          startTime: Date.now(),
+          parentToolUseId: event.parentToolUseId,
+          isNested: event.isNested,
+          elapsedSeconds: event.elapsedSeconds,
+        }];
+      }
+      break;
+    }
+    case 'hook_started':
+      next.activeHook = { hookName: event.hookName || '', hookEvent: event.hookEvent || '' };
+      next.recentEvents = pushEvent(
+        prev.recentEvents,
+        'hook',
+        `Hook 开始: ${event.hookName || 'unknown'} (${event.hookEvent || 'unknown'})`,
+      );
+      break;
+    case 'hook_progress':
+      next.activeHook = { hookName: event.hookName || '', hookEvent: event.hookEvent || '' };
+      break;
+    case 'hook_response':
+      next.activeHook = null;
+      next.recentEvents = pushEvent(
+        prev.recentEvents,
+        'hook',
+        `Hook 结束: ${event.hookName || 'unknown'} (${event.hookOutcome || 'success'})`,
+      );
+      break;
+    case 'status': {
+      next.systemStatus = event.statusText || null;
+      if (event.statusText) {
+        next.recentEvents = pushEvent(prev.recentEvents, 'status', `状态: ${event.statusText}`);
+      }
+      break;
+    }
+  }
+}
+
 export const useChatStore = create<ChatState>((set, get) => ({
   groups: {},
   currentGroup: null,
@@ -182,6 +422,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
   agents: {},
   agentStreaming: {},
   activeAgentTab: {},
+  sdkTasks: {},
+  sdkTaskAliases: {},
   agentMessages: {},
   agentWaiting: {},
   agentHasMore: {},
@@ -593,7 +835,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // Skip while clearHistory is in-flight
     if (get().clearing[chatJid]) return;
 
-    // Route to agentStreaming if this is a sub-agent event
+    // ① conversation agent（DB 持久化的）— 已有逻辑不变
     if (agentId) {
       if (event.eventType === 'status' && event.statusText === 'interrupted') {
         set((s) => {
@@ -604,25 +846,170 @@ export const useChatStore = create<ChatState>((set, get) => ({
         return;
       }
       set((s) => {
-        const MAX_STREAMING_TEXT = 8000;
-        const prev = s.agentStreaming[agentId] || {
-          partialText: '', thinkingText: '', isThinking: false,
-          activeTools: [], activeHook: null, systemStatus: null, recentEvents: [],
-        };
+        const prev = s.agentStreaming[agentId] || { ...DEFAULT_STREAMING_STATE };
         const next = { ...prev };
-        if (event.eventType === 'text_delta') {
-          const combined = prev.partialText + (event.text || '');
-          next.partialText = combined.length > MAX_STREAMING_TEXT ? combined.slice(-MAX_STREAMING_TEXT) : combined;
-          next.isThinking = false;
-        } else if (event.eventType === 'thinking_delta') {
-          const combined = prev.thinkingText + (event.text || '');
-          next.thinkingText = combined.length > MAX_STREAMING_TEXT ? combined.slice(-MAX_STREAMING_TEXT) : combined;
-          next.isThinking = true;
-        }
-        // For sub-agents, we track basic text/thinking; tool events are passed through minimally
+        applyStreamEvent(event, prev, next, 8000);
         return { agentStreaming: { ...s.agentStreaming, [agentId]: next } };
       });
       return;
+    }
+
+    const ensureSdkTask = (taskId: string, description?: string) => {
+      set((s) => {
+        const existingTask = s.sdkTasks[taskId];
+        const desc = description || existingTask?.description || 'Task';
+        const agents = s.agents[chatJid] || [];
+        const idx = agents.findIndex(a => a.id === taskId);
+        const nextAgent: AgentInfo = {
+          id: taskId,
+          name: desc.slice(0, 40),
+          prompt: desc,
+          status: 'running',
+          kind: 'task',
+          created_at: idx >= 0 ? agents[idx].created_at : new Date().toISOString(),
+        };
+        const updatedAgents = idx >= 0
+          ? agents.map((a, i) => (i === idx ? { ...a, ...nextAgent } : a))
+          : [...agents, nextAgent];
+
+        return {
+          sdkTasks: {
+            ...s.sdkTasks,
+            [taskId]: {
+              chatJid,
+              description: desc,
+              status: 'running',
+              summary: existingTask?.summary,
+            },
+          },
+          agents: { ...s.agents, [chatJid]: updatedAgents },
+        };
+      });
+    };
+
+    const resolveOrBindTaskId = (rawId: string): string => {
+      const state = get();
+      const resolved = resolveSdkTaskId(state, rawId);
+      if (state.sdkTasks[resolved]) return resolved;
+      const target = pickSdkTaskAliasTarget(state, chatJid);
+      if (target && rawId !== target) {
+        set((s) => ({ sdkTaskAliases: { ...s.sdkTaskAliases, [rawId]: target } }));
+        return target;
+      }
+      return resolved;
+    };
+
+    const finalizeSdkTask = (
+      taskId: string,
+      status: 'completed' | 'error',
+      summary?: string,
+      closeAfterMs = SDK_TASK_AUTO_CLOSE_MS,
+    ) => {
+      let targetChatJid: string | null = null;
+      set((s) => {
+        const existingTask = s.sdkTasks[taskId];
+        const taskChatJid = existingTask?.chatJid || chatJid;
+        const agents = s.agents[taskChatJid] || [];
+        const idx = agents.findIndex(a => a.id === taskId && a.kind === 'task');
+        if (!existingTask && idx < 0) return {};
+
+        const desc = existingTask?.description
+          || (idx >= 0 ? (agents[idx].prompt || agents[idx].name) : 'Task');
+        const nextAgents = idx >= 0
+          ? agents.map((a, i) => (
+            i === idx
+              ? {
+                  ...a,
+                  status,
+                  completed_at: new Date().toISOString(),
+                  ...(summary ? { result_summary: summary } : {}),
+                }
+              : a
+          ))
+          : [
+              ...agents,
+              {
+                id: taskId,
+                name: desc.slice(0, 40),
+                prompt: desc,
+                status,
+                kind: 'task' as const,
+                created_at: new Date().toISOString(),
+                completed_at: new Date().toISOString(),
+                ...(summary ? { result_summary: summary } : {}),
+              },
+            ];
+        targetChatJid = taskChatJid;
+        return {
+          sdkTasks: {
+            ...s.sdkTasks,
+            [taskId]: {
+              chatJid: taskChatJid,
+              description: desc,
+              status,
+              summary: summary ?? existingTask?.summary,
+            },
+          },
+          agents: { ...s.agents, [taskChatJid]: nextAgents },
+        };
+      });
+      if (targetChatJid) {
+        scheduleSdkTaskCleanup(set, taskId, targetChatJid, closeAfterMs);
+      }
+    };
+
+    // ② task_start / Task tool start → 创建/更新虚拟 Agent（SDK Task）
+    if (
+      (event.eventType === 'task_start' && event.toolUseId)
+      || (event.eventType === 'tool_use_start' && event.toolName === 'Task' && event.toolUseId)
+    ) {
+      ensureSdkTask(
+        event.toolUseId!,
+        event.taskDescription || event.toolInputSummary,
+      );
+      // 不 return — 让 task_start 同时落入主对话 streaming（显示 Task 工具卡片）
+    }
+
+    // ③ task_notification → 标记完成/失败并自动关闭标签页
+    if (event.eventType === 'task_notification' && event.taskId) {
+      const resolvedTaskId = resolveOrBindTaskId(event.taskId);
+      finalizeSdkTask(
+        resolvedTaskId,
+        event.taskStatus === 'completed' ? 'completed' : 'error',
+        event.taskSummary,
+      );
+      // 不落入主对话 streaming
+      return;
+    }
+
+    // ④ parentToolUseId 匹配虚拟 Agent → 路由到 subagent streaming
+    if (event.parentToolUseId) {
+      const tid = resolveOrBindTaskId(event.parentToolUseId);
+      const state = get();
+      const taskFromDb = (state.agents[chatJid] || []).find(a => a.id === tid && a.kind === 'task');
+      const knownTask = !!state.sdkTasks[tid] || !!taskFromDb;
+      if (knownTask) {
+        if (!state.sdkTasks[tid]) {
+          ensureSdkTask(tid, taskFromDb?.prompt || taskFromDb?.name);
+        }
+        set((s) => {
+          const prev = s.agentStreaming[tid] || { ...DEFAULT_STREAMING_STATE };
+          const next = { ...prev };
+          applyStreamEvent(event, prev, next, 8000);
+          return { agentStreaming: { ...s.agentStreaming, [tid]: next } };
+        });
+        return;
+      }
+    }
+
+    // ⑤ task tool_use_end 兜底：若 task_notification 缺失，仍然收敛状态并自动关闭
+    if (event.eventType === 'tool_use_end' && event.toolUseId) {
+      const resolvedToolUseId = resolveOrBindTaskId(event.toolUseId);
+      const task = get().sdkTasks[resolvedToolUseId];
+      if (task && task.status === 'running') {
+        finalizeSdkTask(resolvedToolUseId, 'completed', task.summary, SDK_TASK_TOOL_END_FALLBACK_CLOSE_MS);
+      }
+      // fall-through 到主对话处理，移除 activeTools 中的 Task 条目
     }
 
     // 中断事件需要在所有客户端显式收尾，避免 waiting 残留。
@@ -643,160 +1030,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
       return;
     }
 
+    // ⑥ 主对话 streaming — 使用 applyStreamEvent 共享函数
     set((s) => {
-      const MAX_STREAMING_TEXT = 8000; // 限制内存中保留的流式文本长度
-      const MAX_EVENT_LOG = 30; // 最近事件条数上限
-
-      const pushEvent = (
-        events: StreamingTimelineEvent[],
-        kind: StreamingTimelineEvent['kind'],
-        text: string,
-      ): StreamingTimelineEvent[] => {
-        const item: StreamingTimelineEvent = {
-          id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-          timestamp: Date.now(),
-          kind,
-          text,
-        };
-        return [...events, item].slice(-MAX_EVENT_LOG);
-      };
-
-      const prev = s.streaming[chatJid] || {
-        partialText: '',
-        thinkingText: '',
-        isThinking: false,
-        activeTools: [],
-        activeHook: null,
-        systemStatus: null,
-        recentEvents: [],
-      };
+      const MAX_STREAMING_TEXT = 8000;
+      const prev = s.streaming[chatJid] || { ...DEFAULT_STREAMING_STATE };
       const next = { ...prev };
-
-      switch (event.eventType) {
-        case 'text_delta': {
-          const combined = prev.partialText + (event.text || '');
-          next.partialText = combined.length > MAX_STREAMING_TEXT
-            ? combined.slice(-MAX_STREAMING_TEXT)
-            : combined;
-          next.isThinking = false;
-          break;
-        }
-        case 'thinking_delta': {
-          const combined = prev.thinkingText + (event.text || '');
-          next.thinkingText = combined.length > MAX_STREAMING_TEXT
-            ? combined.slice(-MAX_STREAMING_TEXT)
-            : combined;
-          next.isThinking = true;
-          break;
-        }
-        case 'tool_use_start': {
-          next.isThinking = false;
-          const toolUseId = event.toolUseId || '';
-          const existing = prev.activeTools.find(t => t.toolUseId === toolUseId && toolUseId);
-          const tool = {
-            toolName: event.toolName || 'unknown',
-            toolUseId,
-            startTime: Date.now(),
-            parentToolUseId: event.parentToolUseId,
-            isNested: event.isNested,
-            skillName: event.skillName,
-            toolInputSummary: event.toolInputSummary,
-          };
-          next.activeTools = existing
-            ? prev.activeTools.map(t => (t.toolUseId === toolUseId ? { ...t, ...tool } : t))
-            : [...prev.activeTools, tool];
-
-          const isSkill = tool.toolName === 'Skill';
-          const label = isSkill
-            ? `技能 ${tool.skillName || 'unknown'}`
-            : `工具 ${tool.toolName}`;
-          const detail = tool.toolInputSummary ? ` (${tool.toolInputSummary})` : '';
-          next.recentEvents = pushEvent(prev.recentEvents, isSkill ? 'skill' : 'tool', `${label}${detail}`);
-          break;
-        }
-        case 'tool_use_end':
-          if (event.toolUseId) {
-            const ended = prev.activeTools.find(t => t.toolUseId === event.toolUseId);
-            next.activeTools = prev.activeTools.filter(t => t.toolUseId !== event.toolUseId);
-            if (ended) {
-              const rawSec = (Date.now() - ended.startTime) / 1000;
-              const elapsedSec = rawSec % 1 === 0 ? rawSec.toFixed(0) : rawSec.toFixed(1);
-              const isSkill = ended.toolName === 'Skill';
-              const label = isSkill
-                ? `技能 ${ended.skillName || 'unknown'}`
-                : `工具 ${ended.toolName}`;
-              next.recentEvents = pushEvent(prev.recentEvents, isSkill ? 'skill' : 'tool', `✓ ${label} (${elapsedSec}s)`);
-            }
-          } else {
-            next.activeTools = [];
-          }
-          break;
-        case 'tool_progress': {
-          // tool_progress 可能在 tool_use_start 之后（正常），也可能独立到达
-          // 如果工具已存在则更新，否则添加
-          const existing = prev.activeTools.find(t => t.toolUseId === event.toolUseId);
-          if (existing) {
-            const skillNameResolved = event.skillName && !existing.skillName;
-            next.activeTools = prev.activeTools.map(t =>
-              t.toolUseId === event.toolUseId
-                ? {
-                    ...t,
-                    elapsedSeconds: event.elapsedSeconds,
-                    // skillName 通过 input_json_delta 后续到达，合并更新
-                    ...(event.skillName ? { skillName: event.skillName } : {}),
-                  }
-                : t
-            );
-            // skillName 首次解析成功时，回溯更新 recentEvents 中的 /unknown 条目
-            if (skillNameResolved) {
-              const oldLabel = `技能 unknown`;
-              const newLabel = `技能 ${event.skillName}`;
-              next.recentEvents = prev.recentEvents.map(e =>
-                e.kind === 'skill' && e.text.includes(oldLabel)
-                  ? { ...e, text: e.text.replace(oldLabel, newLabel) }
-                  : e
-              );
-            }
-          } else {
-            next.activeTools = [...prev.activeTools, {
-              toolName: event.toolName || 'unknown',
-              toolUseId: event.toolUseId || '',
-              startTime: Date.now(),
-              parentToolUseId: event.parentToolUseId,
-              isNested: event.isNested,
-              elapsedSeconds: event.elapsedSeconds,
-            }];
-          }
-          break;
-        }
-        case 'hook_started':
-          next.activeHook = { hookName: event.hookName || '', hookEvent: event.hookEvent || '' };
-          next.recentEvents = pushEvent(
-            prev.recentEvents,
-            'hook',
-            `Hook 开始: ${event.hookName || 'unknown'} (${event.hookEvent || 'unknown'})`,
-          );
-          break;
-        case 'hook_progress':
-          next.activeHook = { hookName: event.hookName || '', hookEvent: event.hookEvent || '' };
-          break;
-        case 'hook_response':
-          next.activeHook = null;
-          next.recentEvents = pushEvent(
-            prev.recentEvents,
-            'hook',
-            `Hook 结束: ${event.hookName || 'unknown'} (${event.hookOutcome || 'success'})`,
-          );
-          break;
-        case 'status': {
-          next.systemStatus = event.statusText || null;
-          if (event.statusText) {
-            next.recentEvents = pushEvent(prev.recentEvents, 'status', `状态: ${event.statusText}`);
-          }
-          break;
-        }
-      }
-
+      applyStreamEvent(event, prev, next, MAX_STREAMING_TEXT);
       return {
         waiting: { ...s.waiting, [chatJid]: true },
         streaming: { ...s.streaming, [chatJid]: next },
@@ -893,11 +1132,15 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
       // '__removed__' signal: agent has been cleaned up, remove from list
       if (resultSummary === '__removed__') {
+        clearSdkTaskCleanupTimer(agentId);
         const filtered = existing.filter((a) => a.id !== agentId);
         const nextAgentStreaming = { ...s.agentStreaming };
         delete nextAgentStreaming[agentId];
         const nextActiveTab = { ...s.activeAgentTab };
         if (nextActiveTab[chatJid] === agentId) nextActiveTab[chatJid] = null;
+        const nextSdkTasks = { ...s.sdkTasks };
+        delete nextSdkTasks[agentId];
+        const nextSdkTaskAliases = removeSdkTaskAliases(s.sdkTaskAliases, agentId);
         // Clean up conversation agent state
         const nextAgentMessages = { ...s.agentMessages };
         delete nextAgentMessages[agentId];
@@ -909,6 +1152,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
           agents: { ...s.agents, [chatJid]: filtered },
           agentStreaming: nextAgentStreaming,
           activeAgentTab: nextActiveTab,
+          sdkTasks: nextSdkTasks,
+          sdkTaskAliases: nextSdkTaskAliases,
           agentMessages: nextAgentMessages,
           agentWaiting: nextAgentWaiting,
           agentHasMore: nextAgentHasMore,
@@ -936,10 +1181,28 @@ export const useChatStore = create<ChatState>((set, get) => ({
       if (status !== 'running') {
         delete nextAgentStreaming[agentId];
       }
+      const nextSdkTasks = { ...s.sdkTasks };
+      let nextSdkTaskAliases = { ...s.sdkTaskAliases };
+      if (resolvedKind === 'task') {
+        if (status !== 'running') {
+          clearSdkTaskCleanupTimer(agentId);
+          delete nextSdkTasks[agentId];
+          nextSdkTaskAliases = removeSdkTaskAliases(nextSdkTaskAliases, agentId);
+        } else if (nextSdkTasks[agentId]) {
+          nextSdkTasks[agentId] = {
+            ...nextSdkTasks[agentId],
+            chatJid,
+            description: prompt,
+            status: 'running',
+          };
+        }
+      }
 
       return {
         agents: { ...s.agents, [chatJid]: updated },
         agentStreaming: nextAgentStreaming,
+        sdkTasks: nextSdkTasks,
+        sdkTaskAliases: nextSdkTaskAliases,
       };
     });
   },
@@ -950,9 +1213,71 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const data = await api.get<{ agents: AgentInfo[] }>(
         `/api/groups/${encodeURIComponent(jid)}/agents`,
       );
-      set((s) => ({
-        agents: { ...s.agents, [jid]: data.agents },
-      }));
+      set((s) => {
+        const visibleAgents = data.agents.filter((a) => a.kind === 'conversation' || a.status === 'running');
+        const runningTasks = data.agents.filter((a) => a.kind === 'task' && a.status === 'running');
+        const runningTaskIds = new Set(runningTasks.map((a) => a.id));
+        const runningTaskMap = new Map(runningTasks.map((a) => [a.id, a]));
+
+        const nextSdkTasks: ChatState['sdkTasks'] = {};
+        for (const [id, task] of Object.entries(s.sdkTasks)) {
+          if (task.chatJid !== jid) {
+            nextSdkTasks[id] = task;
+            continue;
+          }
+          if (runningTaskIds.has(id)) {
+            const agent = runningTaskMap.get(id)!;
+            nextSdkTasks[id] = {
+              ...task,
+              chatJid: jid,
+              description: agent.prompt || agent.name,
+              status: 'running',
+            };
+          } else {
+            clearSdkTaskCleanupTimer(id);
+          }
+        }
+
+        for (const agent of runningTasks) {
+          if (!nextSdkTasks[agent.id]) {
+            nextSdkTasks[agent.id] = {
+              chatJid: jid,
+              description: agent.prompt || agent.name,
+              status: 'running',
+            };
+          }
+        }
+
+        const nextAgentStreaming = { ...s.agentStreaming };
+        for (const [id, task] of Object.entries(s.sdkTasks)) {
+          if (task.chatJid === jid && !runningTaskIds.has(id)) {
+            delete nextAgentStreaming[id];
+          }
+        }
+
+        const nextActiveTab = { ...s.activeAgentTab };
+        if (nextActiveTab[jid] && !runningTaskIds.has(nextActiveTab[jid]!)) {
+          const stillExists = visibleAgents.some((a) => a.id === nextActiveTab[jid]);
+          if (!stillExists) nextActiveTab[jid] = null;
+        }
+
+        const nextSdkTaskAliases: Record<string, string> = {};
+        for (const [alias, target] of Object.entries(s.sdkTaskAliases)) {
+          const task = nextSdkTasks[target];
+          if (!task) continue;
+          if (task.chatJid === jid && task.status !== 'running') continue;
+          if (alias === target && task.status !== 'running') continue;
+          nextSdkTaskAliases[alias] = target;
+        }
+
+        return {
+          agents: { ...s.agents, [jid]: visibleAgents },
+          sdkTasks: nextSdkTasks,
+          sdkTaskAliases: nextSdkTaskAliases,
+          agentStreaming: nextAgentStreaming,
+          activeAgentTab: nextActiveTab,
+        };
+      });
     } catch {
       // Silent fail
     }
@@ -962,16 +1287,22 @@ export const useChatStore = create<ChatState>((set, get) => ({
   deleteAgentAction: async (jid, agentId) => {
     try {
       await api.delete(`/api/groups/${encodeURIComponent(jid)}/agents/${agentId}`);
+      clearSdkTaskCleanupTimer(agentId);
       set((s) => {
         const updated = (s.agents[jid] || []).filter((a) => a.id !== agentId);
         const nextAgentStreaming = { ...s.agentStreaming };
         delete nextAgentStreaming[agentId];
         const nextActiveTab = { ...s.activeAgentTab };
         if (nextActiveTab[jid] === agentId) nextActiveTab[jid] = null;
+        const nextSdkTasks = { ...s.sdkTasks };
+        delete nextSdkTasks[agentId];
+        const nextSdkTaskAliases = removeSdkTaskAliases(s.sdkTaskAliases, agentId);
         return {
           agents: { ...s.agents, [jid]: updated },
           agentStreaming: nextAgentStreaming,
           activeAgentTab: nextActiveTab,
+          sdkTasks: nextSdkTasks,
+          sdkTaskAliases: nextSdkTaskAliases,
         };
       });
       return true;
