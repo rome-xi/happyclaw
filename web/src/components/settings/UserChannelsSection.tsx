@@ -158,7 +158,7 @@ export function UserChannelsSection({ setNotice, setError }: UserChannelsSection
     try {
       const result = await api.post<PairingCodeResult>('/api/config/user-im/telegram/pairing-code');
       setPairingCode(result.code);
-      startCountdown(result.expiresAt);
+      startCountdown(Date.now() + result.ttlSeconds * 1000);
     } catch (err) {
       setError(getErrorMessage(err, '生成配对码失败'));
     } finally {

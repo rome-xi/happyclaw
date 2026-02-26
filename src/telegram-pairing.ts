@@ -3,7 +3,8 @@
  *
  * - 6-character uppercase alphanumeric code (crypto random)
  * - 5-minute expiry, single use, one active code per user
- * - Periodic cleanup of expired codes every 60 s
+ * - No periodic cleanup needed: generatePairingCode() enforces one code per user,
+ *   and verifyPairingCode() lazily cleans expired entries on access.
  */
 import crypto from 'crypto';
 
@@ -14,7 +15,6 @@ interface PairingEntry {
 
 const PAIRING_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const CODE_LENGTH = 6;
-const CLEANUP_INTERVAL_MS = 60 * 1000;
 
 // code → entry
 const codes = new Map<string, PairingEntry>();
@@ -22,12 +22,12 @@ const codes = new Map<string, PairingEntry>();
 const userCodes = new Map<string, string>();
 
 function randomCode(): string {
-  // Base36 uppercase: 0-9 A-Z
-  const bytes = crypto.randomBytes(CODE_LENGTH);
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  const limit = 256 - (256 % chars.length); // 252 — eliminates modulo bias
   let result = '';
-  for (let i = 0; i < CODE_LENGTH; i++) {
-    result += chars[bytes[i] % chars.length];
+  while (result.length < CODE_LENGTH) {
+    const byte = crypto.randomBytes(1)[0];
+    if (byte < limit) result += chars[byte % chars.length];
   }
   return result;
 }
@@ -67,16 +67,3 @@ export function verifyPairingCode(code: string): { userId: string } | null {
   }
   return { userId: entry.userId };
 }
-
-// Periodic cleanup
-setInterval(() => {
-  const now = Date.now();
-  for (const [code, entry] of codes.entries()) {
-    if (now > entry.expiresAt) {
-      codes.delete(code);
-      if (userCodes.get(entry.userId) === code) {
-        userCodes.delete(entry.userId);
-      }
-    }
-  }
-}, CLEANUP_INTERVAL_MS);

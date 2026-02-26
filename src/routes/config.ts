@@ -3,7 +3,7 @@
 import { randomBytes, createHash } from 'node:crypto';
 import { Hono } from 'hono';
 import type { Variables } from '../web-context.js';
-import { deleteRegisteredGroup } from '../db.js';
+import { deleteRegisteredGroup, deleteChatHistory } from '../db.js';
 import { authMiddleware, systemConfigMiddleware } from '../middleware/auth.js';
 import {
   ClaudeConfigSchema,
@@ -931,6 +931,7 @@ configRoutes.delete('/user-im/telegram/paired-chats/:jid', authMiddleware, (c) =
   }
 
   deleteRegisteredGroup(jid);
+  deleteChatHistory(jid);
   delete groups[jid];
   logger.info({ jid, userId: user.id }, 'Telegram chat unpaired');
   return c.json({ success: true });
