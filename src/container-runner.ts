@@ -235,15 +235,18 @@ function buildVolumeMounts(
 
   // Per-group IPC namespace: each group gets its own IPC directory
   // Sub-agents get their own IPC subdirectory under agents/{agentId}/
+  // Use 0o777 so container (node/1000) and host (agent/1002) can both read/write.
   const groupIpcDir = agentId
     ? path.join(DATA_DIR, 'ipc', group.folder, 'agents', agentId)
     : path.join(DATA_DIR, 'ipc', group.folder);
   mkdirForContainer(groupIpcDir);
-  fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true });
-  fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
-  fs.mkdirSync(path.join(groupIpcDir, 'input'), { recursive: true });
   // All agents (main + sub/conversation) get agents/ subdir for spawn/message IPC
-  fs.mkdirSync(path.join(groupIpcDir, 'agents'), { recursive: true });
+  // Use chmod 777 so both host (agent/1002) and container (node/1000) can write
+  for (const sub of ['messages', 'tasks', 'input', 'agents'] as const) {
+    const subDir = path.join(groupIpcDir, sub);
+    fs.mkdirSync(subDir, { recursive: true });
+    try { fs.chmodSync(subDir, 0o777); } catch { /* ignore if already correct */ }
+  }
   mounts.push({
     hostPath: groupIpcDir,
     containerPath: '/workspace/ipc',
