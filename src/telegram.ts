@@ -23,6 +23,8 @@ export interface TelegramConnectOpts {
   isChatAuthorized: (jid: string) => boolean;
   /** 配对尝试回调：验证码并注册聊天，返回是否成功 */
   onPairAttempt?: (jid: string, chatName: string, code: string) => Promise<boolean>;
+  /** 斜杠指令回调（如 /clear），返回回复文本或 null */
+  onCommand?: (chatJid: string, command: string) => Promise<string | null>;
 }
 
 export interface TelegramConnection {
@@ -265,6 +267,17 @@ export function createTelegramConnection(config: TelegramConnectionConfig): Tele
           storeChatMetadata(jid, new Date().toISOString());
           updateChatName(jid, chatName);
           opts.onNewChat(jid, chatName);
+
+          // ── /clear 指令：重置上下文，不进入消息流 ──
+          if (text.trim() === '/clear' && opts.onCommand) {
+            try {
+              const reply = await opts.onCommand(jid, 'clear');
+              if (reply) await ctx.reply(reply);
+            } catch (err) {
+              logger.error({ jid, err }, 'Telegram /clear command failed');
+            }
+            return;
+          }
 
           // Reaction 确认
           try {
