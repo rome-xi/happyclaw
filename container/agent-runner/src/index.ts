@@ -675,8 +675,19 @@ async function runQuery(
     '且 agent-browser 可用，立即改用 agent-browser 通过真实浏览器访问。不要反复重试 WebFetch。',
   ].join('\n');
 
+  // Read HEARTBEAT.md (recent work summary) for context injection
+  let heartbeatContent = '';
+  const heartbeatPath = path.join(WORKSPACE_GLOBAL, 'HEARTBEAT.md');
+  if (fs.existsSync(heartbeatPath)) {
+    try {
+      const raw = fs.readFileSync(heartbeatPath, 'utf-8');
+      heartbeatContent = raw.length > 4096 ? raw.slice(0, 4096) + '\n\n[...截断]' : raw;
+    } catch { /* skip */ }
+  }
+
   const systemPromptAppend = [
     globalClaudeMd,
+    heartbeatContent,
     memoryRecall,
     outputGuidelines,
     webFetchGuidelines,

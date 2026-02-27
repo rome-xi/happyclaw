@@ -9,6 +9,7 @@ import {
   SCHEDULER_POLL_INTERVAL,
   TIMEZONE,
 } from './config.js';
+import { DailySummaryDeps, runDailySummaryIfNeeded } from './daily-summary.js';
 import { getSystemSettings } from './runtime-config.js';
 import {
   ContainerOutput,
@@ -41,6 +42,7 @@ export interface SchedulerDependencies {
   ) => void;
   sendMessage: (jid: string, text: string) => Promise<void>;
   assistantName: string;
+  dailySummaryDeps?: DailySummaryDeps;
 }
 
 const runningTaskIds = new Set<string>();
@@ -250,6 +252,15 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
           }
         } catch (err) {
           logger.error({ err }, 'Failed to cleanup old task run logs');
+        }
+      }
+
+      // Daily summary generation (runs at most once per hour, 2-3 AM)
+      if (deps.dailySummaryDeps) {
+        try {
+          runDailySummaryIfNeeded(deps.dailySummaryDeps);
+        } catch (err) {
+          logger.error({ err }, 'Daily summary check failed');
         }
       }
 
