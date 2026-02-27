@@ -727,8 +727,12 @@ groupRoutes.post('/:jid/interrupt', authMiddleware, async (c) => {
   const deps = getWebDeps();
   if (!deps) return c.json({ error: 'Server not initialized' }, 500);
 
-  const jid = c.req.param('jid');
-  const group = getRegisteredGroup(jid);
+  const rawJid = c.req.param('jid');
+  const jid = decodeURIComponent(rawJid);
+  // Support virtual JIDs for conversation agents: {jid}#agent:{agentId}
+  const agentSep = jid.indexOf('#agent:');
+  const baseJid = agentSep >= 0 ? jid.slice(0, agentSep) : jid;
+  const group = getRegisteredGroup(baseJid);
   if (!group) return c.json({ error: 'Group not found' }, 404);
   const authUser = c.get('user') as AuthUser;
   if (!canAccessGroup({ id: authUser.id, role: authUser.role }, group)) {

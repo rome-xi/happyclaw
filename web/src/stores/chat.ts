@@ -676,12 +676,25 @@ export const useChatStore = create<ChatState>((set, get) => ({
         return false;
       }
 
-      get().clearStreaming(jid, { preserveThinking: false });
-      set((s) => {
-        const next = { ...s.waiting };
-        delete next[jid];
-        return { waiting: next };
-      });
+      // Agent conversation JIDs contain #agent:{agentId}
+      const agentSep = jid.indexOf('#agent:');
+      if (agentSep >= 0) {
+        const agentId = jid.slice(agentSep + 7);
+        set((s) => {
+          const nextStreaming = { ...s.agentStreaming };
+          delete nextStreaming[agentId];
+          const nextWaiting = { ...s.agentWaiting };
+          delete nextWaiting[agentId];
+          return { agentStreaming: nextStreaming, agentWaiting: nextWaiting };
+        });
+      } else {
+        get().clearStreaming(jid, { preserveThinking: false });
+        set((s) => {
+          const next = { ...s.waiting };
+          delete next[jid];
+          return { waiting: next };
+        });
+      }
       return true;
     } catch (err) {
       set({ error: err instanceof Error ? err.message : String(err) });
@@ -856,9 +869,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
     if (agentId) {
       if (event.eventType === 'status' && event.statusText === 'interrupted') {
         set((s) => {
-          const next = { ...s.agentStreaming };
-          delete next[agentId];
-          return { agentStreaming: next };
+          const nextStreaming = { ...s.agentStreaming };
+          delete nextStreaming[agentId];
+          const nextWaiting = { ...s.agentWaiting };
+          delete nextWaiting[agentId];
+          return { agentStreaming: nextStreaming, agentWaiting: nextWaiting };
         });
         return;
       }
