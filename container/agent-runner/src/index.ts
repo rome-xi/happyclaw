@@ -700,6 +700,7 @@ async function runQuery(
       systemPrompt: { type: 'preset' as const, preset: 'claude_code' as const, append: systemPromptAppend },
       allowedTools,
       ...(disallowedTools && { disallowedTools }),
+      maxThinkingTokens: 16384,
       permissionMode: 'bypassPermissions',
       allowDangerouslySkipPermissions: true,
       settingSources: ['project', 'user'],
