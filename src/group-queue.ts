@@ -5,6 +5,9 @@ import path from 'path';
 import { DATA_DIR } from './config.js';
 import { getSystemSettings } from './runtime-config.js';
 import { logger } from './logger.js';
+import { type MessageIntent } from './intent-analyzer.js';
+
+export type SendMessageResult = 'sent' | 'no_active' | 'interrupted_stop' | 'interrupted_correction';
 
 interface QueuedTask {
   id: string;
@@ -242,15 +245,34 @@ export class GroupQueue {
 
   /**
    * Send a follow-up message to the active container via IPC file.
-   * Returns true if the message was written, false if no active container.
+   * Analyzes message intent and may interrupt the current query.
+   *
+   * Returns:
+   * - 'sent': message written to IPC (continue intent)
+   * - 'no_active': no active container/process for this group
+   * - 'interrupted_stop': stop intent detected, query interrupted, message NOT written
+   * - 'interrupted_correction': correction intent detected, query interrupted, message written
    */
   sendMessage(
     groupJid: string,
     text: string,
     images?: Array<{ data: string; mimeType?: string }>,
-  ): boolean {
+    intent: MessageIntent = 'continue',
+  ): SendMessageResult {
     const state = this.resolveActiveState(groupJid);
-    if (!state) return false;
+    if (!state) return 'no_active';
+
+    if (intent === 'stop') {
+      this.interruptQuery(groupJid);
+      logger.info({ groupJid, intent }, 'Stop intent detected, interrupting query without IPC message');
+      return 'interrupted_stop';
+    }
+
+    if (intent === 'correction') {
+      this.interruptQuery(groupJid);
+      logger.info({ groupJid, intent }, 'Correction intent detected, interrupting query and writing IPC message');
+      // Fall through to write the IPC message so the agent sees the correction after restart
+    }
 
     const inputDir = this.resolveIpcInputDir(state);
     try {
@@ -263,9 +285,9 @@ export class GroupQueue {
         JSON.stringify({ type: 'message', text, images }),
       );
       fs.renameSync(tempPath, filepath);
-      return true;
+      return intent === 'correction' ? 'interrupted_correction' : 'sent';
     } catch {
-      return false;
+      return 'no_active';
     }
   }
 

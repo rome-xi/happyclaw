@@ -65,6 +65,7 @@ import { isSessionExpired } from './auth.js';
 import type { NewMessage, WsMessageOut, WsMessageIn, AuthUser, StreamEvent, UserRole } from './types.js';
 import { WEB_PORT, SESSION_COOKIE_NAME } from './config.js';
 import { logger } from './logger.js';
+import { analyzeIntent } from './intent-analyzer.js';
 
 // --- App Setup ---
 
@@ -256,9 +257,17 @@ async function handleWebUserMessage(
       data: attachment.data,
       mimeType: attachment.mimeType,
     }));
-    const sent = deps.queue.sendMessage(chatJid, formatted, images);
-    pipedToActive = sent;
-    if (!sent) {
+    const intent = analyzeIntent(content);
+    const sendResult = deps.queue.sendMessage(chatJid, formatted, images, intent);
+    if (sendResult === 'sent') {
+      pipedToActive = true;
+    } else if (sendResult === 'interrupted_stop') {
+      // Stop intent: cursor updated, no enqueue needed
+      pipedToActive = true;
+    } else if (sendResult === 'interrupted_correction') {
+      // Correction intent: IPC message written, agent handles it after interrupt
+      pipedToActive = true;
+    } else {
       deps.queue.enqueueMessageCheck(chatJid);
     }
   }
@@ -326,8 +335,9 @@ async function handleAgentConversationMessage(
   }], shared);
 
   // Try to pipe into running agent process
-  const sent = deps.queue.sendMessage(virtualChatJid, formatted);
-  if (!sent) {
+  const agentIntent = analyzeIntent(content);
+  const agentSendResult = deps.queue.sendMessage(virtualChatJid, formatted, undefined, agentIntent);
+  if (agentSendResult === 'no_active') {
     // No running process — start one via processAgentConversation
     if (deps.processAgentConversation) {
       const taskId = `agent-conv:${agentId}:${Date.now()}`;
@@ -336,6 +346,8 @@ async function handleAgentConversationMessage(
       });
     }
   }
+  // 'sent', 'interrupted_stop', 'interrupted_correction' need no further action —
+  // for correction, the IPC message was written and the agent handles it after interrupt
 }
 
 // --- Static Files ---
