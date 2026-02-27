@@ -1,34 +1,7 @@
-// --- Optional .env loader (no external dependency) ---
-// Must run before any import that reads process.env at module level.
-import fs from 'fs';
-import path from 'path';
-
-const dotenvPath = path.resolve(process.cwd(), '.env');
-if (fs.existsSync(dotenvPath)) {
-  const lines = fs.readFileSync(dotenvPath, 'utf-8').split('\n');
-  for (const line of lines) {
-    let trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-    // Strip optional 'export ' prefix (common in .env files)
-    if (trimmed.startsWith('export ')) trimmed = trimmed.slice(7);
-    const eqIdx = trimmed.indexOf('=');
-    if (eqIdx <= 0) continue;
-    const key = trimmed.slice(0, eqIdx).trim();
-    let value = trimmed.slice(eqIdx + 1).trim();
-    // Strip surrounding quotes
-    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-      value = value.slice(1, -1);
-    }
-    // Do not overwrite existing env vars (explicit env takes priority)
-    if (!(key in process.env)) {
-      process.env[key] = value;
-    }
-  }
-}
-// --- End .env loader ---
-
 import { ChildProcess, execFile } from 'child_process';
 import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
 import { promisify } from 'util';
 
 import { CronExpressionParser } from 'cron-parser';
@@ -39,12 +12,10 @@ import {
   DATA_DIR,
   GROUPS_DIR,
   STORE_DIR,
-  IDLE_TIMEOUT,
   IPC_POLL_INTERVAL,
   MAIN_GROUP_FOLDER,
   POLL_INTERVAL,
   TIMEZONE,
-  validateConfig,
 } from './config.js';
 import {
   AvailableGroup,
@@ -105,6 +76,7 @@ import {
   getTelegramProviderConfigWithSource,
   getUserFeishuConfig,
   getUserTelegramConfig,
+  getSystemSettings,
   refreshOAuthCredentials,
   saveClaudeProviderConfig as saveClaudeProviderConfigForRefresh,
   updateAllSessionCredentials,
@@ -474,7 +446,7 @@ function collectMessageImages(
  * Called by the GroupQueue when it's this group's turn.
  *
  * Uses streaming output: agent results are sent to Feishu as they arrive.
- * The container stays alive for IDLE_TIMEOUT after each result, allowing
+ * The container stays alive for idleTimeout after each result, allowing
  * rapid-fire messages to be piped in without spawning a new container.
  */
 async function processGroupMessages(chatJid: string): Promise<boolean> {
@@ -569,7 +541,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         'Idle timeout, closing container stdin',
       );
       queue.closeStdin(chatJid);
-    }, IDLE_TIMEOUT);
+    }, getSystemSettings().idleTimeout);
   };
 
   await setTyping(chatJid, true);
@@ -723,7 +695,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             });
             sentReply = true;
             // Persist cursor as soon as a visible reply is emitted.
-            // Long-lived runners may stay alive for IDLE_TIMEOUT, and waiting
+            // Long-lived runners may stay alive for idleTimeout, and waiting
             // until process exit would cause duplicate replay after restart.
             commitCursor();
           }
@@ -879,7 +851,7 @@ async function runTerminalWarmup(chatJid: string): Promise<void> {
     idleTimer = setTimeout(() => {
       logger.debug({ chatJid, group: group.name }, 'Terminal warmup idle timeout, closing stdin');
       queue.closeStdin(chatJid);
-    }, IDLE_TIMEOUT);
+    }, getSystemSettings().idleTimeout);
   };
 
   try {
@@ -1644,7 +1616,7 @@ async function processTaskIpc(
 /**
  * Process messages for a user-created conversation agent.
  * Similar to processGroupMessages but uses agent-specific session/IPC and virtual JID.
- * The agent process stays alive for IDLE_TIMEOUT, cycling idle→running.
+ * The agent process stays alive for idleTimeout, cycling idle→running.
  */
 async function processAgentConversation(chatJid: string, agentId: string): Promise<void> {
   const agent = getAgent(agentId);
@@ -1706,7 +1678,7 @@ async function processAgentConversation(chatJid: string, agentId: string): Promi
     idleTimer = setTimeout(() => {
       logger.debug({ agentId, chatJid }, 'Agent conversation idle timeout, closing stdin');
       queue.closeStdin(virtualJid);
-    }, IDLE_TIMEOUT);
+    }, getSystemSettings().idleTimeout);
   };
 
   let cursorCommitted = false;
@@ -2270,7 +2242,6 @@ function migrateGlobalMemoryToPerUser(): void {
 }
 
 async function main(): Promise<void> {
-  validateConfig();
   migrateDataDirectories();
   initDatabase();
   logger.info('Database initialized');

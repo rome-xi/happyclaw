@@ -51,7 +51,8 @@ import {
 import type { AuthUser, User, UserPublic } from '../types.js';
 import { logger } from '../logger.js';
 import { lastActiveCache } from '../web-context.js';
-import { MAX_LOGIN_ATTEMPTS, LOGIN_LOCKOUT_MINUTES, SESSION_COOKIE_NAME } from '../config.js';
+import { SESSION_COOKIE_NAME } from '../config.js';
+import { getSystemSettings } from '../runtime-config.js';
 
 const authRoutes = new Hono<{ Variables: Variables }>();
 
@@ -222,11 +223,12 @@ authRoutes.post('/login', async (c) => {
   const ua = c.req.header('user-agent') || null;
 
   // Rate limiting
+  const { maxLoginAttempts, loginLockoutMinutes } = getSystemSettings();
   const rateCheck = checkLoginRateLimit(
     username,
     ip,
-    MAX_LOGIN_ATTEMPTS,
-    LOGIN_LOCKOUT_MINUTES,
+    maxLoginAttempts,
+    loginLockoutMinutes,
   );
   if (!rateCheck.allowed) {
     logAuthEvent({
@@ -371,11 +373,12 @@ authRoutes.post('/register', async (c) => {
   const ua = c.req.header('user-agent') || null;
 
   // IP-based rate limiting for register endpoint
+  const { maxLoginAttempts: regMaxAttempts, loginLockoutMinutes: regLockoutMin } = getSystemSettings();
   const rateCheck = checkLoginRateLimit(
     `register:${ip}`,
     ip,
-    MAX_LOGIN_ATTEMPTS,
-    LOGIN_LOCKOUT_MINUTES,
+    regMaxAttempts,
+    regLockoutMin,
   );
   if (!rateCheck.allowed) {
     return c.json(

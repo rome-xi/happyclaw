@@ -69,7 +69,17 @@ export interface SettingsNotification {
   setError: (msg: string | null) => void;
 }
 
-export type SettingsTab = 'channels' | 'claude' | 'registration' | 'appearance' | 'profile' | 'my-channels' | 'security' | 'groups' | 'memory' | 'skills' | 'users' | 'about';
+export interface SystemSettings {
+  containerTimeout: number;
+  idleTimeout: number;
+  containerMaxOutputSize: number;
+  maxConcurrentContainers: number;
+  maxConcurrentHostProcesses: number;
+  maxLoginAttempts: number;
+  loginLockoutMinutes: number;
+}
+
+export type SettingsTab = 'channels' | 'claude' | 'registration' | 'appearance' | 'system' | 'profile' | 'my-channels' | 'security' | 'groups' | 'memory' | 'skills' | 'users' | 'about';
 
 export function getErrorMessage(err: unknown, fallback: string): string {
   if (typeof err === 'object' && err !== null && 'message' in err) {

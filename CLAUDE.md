@@ -17,7 +17,7 @@ HappyClaw 是一个自托管的多用户 AI Agent 系统：
 
 | 模块 | 职责 |
 |------|------|
-| `src/index.ts` | 入口：.env 加载器（所有 import 之前）、管理员引导、消息轮询（2s）、IPC 监听（1s）、容器生命周期 |
+| `src/index.ts` | 入口：管理员引导、消息轮询（2s）、IPC 监听（1s）、容器生命周期 |
 | `src/web.ts` | Hono 框架：路由挂载、WebSocket 升级、HMAC Cookie 认证、静态文件托管 |
 | `src/routes/auth.ts` | 认证：登录 / 登出 / 注册、`GET /api/auth/me`（含 `setupStatus`）、设置向导、RBAC、邀请码 |
 | `src/routes/groups.ts` | 群组 CRUD、消息分页、会话重置（重建工作区）、群组级容器环境变量 |
@@ -186,7 +186,7 @@ StreamEvent 类型以 `shared/stream-event.ts` 为单一真相源，构建时通
 
 容器环境变量生效顺序（从低到高）：
 
-1. 进程环境变量（`.env`，如存在）
+1. 进程环境变量
 2. 全局 Claude 配置（`data/config/claude-provider.json`）
 3. 全局自定义环境变量（`data/config/claude-custom-env.json`）
 4. 群组级覆盖（`data/config/container-env/{folder}.json`）
@@ -318,6 +318,7 @@ data/
   config/user-im/{userId}/telegram.json    # 用户级 Telegram IM 配置（AES-256-GCM 加密）
   config/registration.json                 # 注册设置（开关、邀请码要求）
   config/session-secret.key                # 会话签名密钥（0600 权限）
+  config/system-settings.json              # 系统运行参数（容器超时、并发限制等）
 
 config/default-groups.json    # 预注册群组配置
 config/mount-allowlist.json   # 容器挂载白名单
@@ -363,6 +364,7 @@ scripts/                      # 构建辅助脚本
 - `GET|PUT /api/config/feishu`
 - `GET|PUT /api/config/telegram` · `POST /api/config/telegram/test`（系统级 Telegram 配置）
 - `GET|PUT /api/config/appearance` · `GET /api/config/appearance/public`（外观配置，public 端点无需认证）
+- `GET|PUT /api/config/system` — 系统运行参数（容器超时、并发限制等），需要 `manage_system_config` 权限
 - `GET|PUT /api/config/user-im/feishu`（用户级飞书 IM 配置，每个用户独立）
 - `GET|PUT /api/config/user-im/telegram`（用户级 Telegram IM 配置）
 - `POST /api/config/user-im/telegram/test`（Telegram Bot Token 连通性测试）
@@ -434,18 +436,14 @@ scripts/                      # 构建辅助脚本
 - 容器超时：默认 30 分钟（`CONTAINER_TIMEOUT`）
 - 空闲超时：默认 30 分钟（`IDLE_TIMEOUT`），最后一次输出后无新消息则关闭
 
-### 8.8 .env 加载器
-
-`src/index.ts` 顶部（所有 import 之前）包含手动 `.env` 加载器，支持 `export` 前缀和 `#` 注释。替代 Node.js `--env-file` 标志，确保环境变量在模块初始化之前可用。
-
-### 8.9 Per-user 主容器自动创建
+### 8.8 Per-user 主容器自动创建
 
 用户注册时（`POST /api/auth/register`）自动调用 `ensureUserHomeGroup()` 创建主容器：
 - admin：folder=`main`，执行模式=`host`
 - member：folder=`home-{userId}`，执行模式=`container`
 - 同时创建 `web:{folder}` 的 chat 记录和 `registered_groups` 记录（`is_home=1`）
 
-### 8.10 Per-user AI 外观
+### 8.9 Per-user AI 外观
 
 用户可通过 `PUT /api/auth/profile` 自定义 AI 外观：
 - `ai_name`：AI 助手名称（默认使用系统 `ASSISTANT_NAME`）
@@ -454,7 +452,7 @@ scripts/                      # 构建辅助脚本
 
 前端 `MessageBubble` 组件根据消息来源的群组 owner 显示对应的 AI 外观。
 
-### 8.11 IM 通道热管理
+### 8.10 IM 通道热管理
 
 通过 `PUT /api/config/user-im/feishu` 或 `PUT /api/config/user-im/telegram` 更新 IM 配置后：
 - 保存配置到 `data/config/user-im/{userId}/` 目录（AES-256-GCM 加密）
@@ -472,12 +470,13 @@ scripts/                      # 构建辅助脚本
 | `FEISHU_APP_ID` | - | 飞书应用 ID |
 | `FEISHU_APP_SECRET` | - | 飞书应用密钥 |
 | `CONTAINER_IMAGE` | `happyclaw-agent:latest` | Docker 镜像名称 |
-| `CONTAINER_TIMEOUT` | `1800000`（30min） | 容器最大运行时间 |
-| `CONTAINER_MAX_OUTPUT_SIZE` | `10485760`（10MB） | 单次输出最大字节 |
-| `IDLE_TIMEOUT` | `1800000`（30min） | 容器空闲超时 |
-| `MAX_CONCURRENT_HOST_PROCESSES` | `5` | 宿主机模式并发上限 |
-| `MAX_LOGIN_ATTEMPTS` | `5` | 登录失败锁定阈值 |
-| `LOGIN_LOCKOUT_MINUTES` | `15` | 锁定持续时间（分钟） |
+| `CONTAINER_TIMEOUT` | `1800000`（30min） | 容器最大运行时间（可通过设置页覆盖） |
+| `CONTAINER_MAX_OUTPUT_SIZE` | `10485760`（10MB） | 单次输出最大字节（可通过设置页覆盖） |
+| `IDLE_TIMEOUT` | `1800000`（30min） | 容器空闲超时（可通过设置页覆盖） |
+| `MAX_CONCURRENT_CONTAINERS` | `20` | 最大并发容器数（可通过设置页覆盖） |
+| `MAX_CONCURRENT_HOST_PROCESSES` | `5` | 宿主机模式并发上限（可通过设置页覆盖） |
+| `MAX_LOGIN_ATTEMPTS` | `5` | 登录失败锁定阈值（可通过设置页覆盖） |
+| `LOGIN_LOCKOUT_MINUTES` | `15` | 锁定持续时间（分钟）（可通过设置页覆盖） |
 | `TZ` | 系统时区 | 定时任务时区 |
 
 ## 10. 开发约束
@@ -533,6 +532,16 @@ make reset-init    # 重置为首装状态（清空数据库和配置，用于�
 1. 在对应的 `src/routes/*.ts` 文件中添加鉴权 API
 2. 持久化写入 `data/config/*.json`（参考 `runtime-config.ts` 的加密模式）
 3. 前端 `SettingsPage` 增加表单
+
+### 将环境变量迁移为 Web 可配置
+
+如需将新的环境变量迁移到 Web 可配置，参考 `runtime-config.ts` 中的 `SystemSettings` 模式：
+
+1. 在 `runtime-config.ts` 的 `SystemSettings` 接口添加字段
+2. 在 `getSystemSettings()` 中实现 file → env → default 三级 fallback
+3. 在 `saveSystemSettings()` 中添加范围校验
+4. 在 `schemas.ts` 的 `SystemSettingsSchema` 添加 zod 校验
+5. 前端 `SystemSettingsSection.tsx` 的 `fields` 数组添加表单项
 
 ### 新增会话级功能
 

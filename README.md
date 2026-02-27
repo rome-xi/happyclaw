@@ -222,7 +222,7 @@ make start
 3. **配置 IM 通道**（可选）— 飞书 App ID/Secret 或 Telegram Bot Token
 4. **开始对话** — 在 Web 聊天页面直接发送消息
 
-> 所有配置通过 Web 界面完成，无需手动编辑 `.env` 文件。API 密钥 AES-256-GCM 加密存储。
+> 所有配置通过 Web 界面完成，不依赖任何配置文件。API 密钥 AES-256-GCM 加密存储。
 
 
 ### 启用容器模式
@@ -441,13 +441,8 @@ make reset-init       # 重置为首装状态（清空数据库、配置、工�
 **生产模式**（`make start`）：只有后端服务，前端作为静态文件由后端托管，通过 `WEB_PORT` 环境变量修改端口：
 
 ```bash
-# 方式一：.env 文件
-echo "WEB_PORT=8080" >> .env
-make start
-# 访问 http://localhost:8080
-
-# 方式二：命令行传入
 WEB_PORT=8080 make start
+# 访问 http://localhost:8080
 ```
 
 **开发模式**（`make dev`）：前端 Vite 开发服务器（`5173`）和后端（`3000`）分别运行，开发时访问 `5173`。
@@ -455,7 +450,7 @@ WEB_PORT=8080 make start
 修改后端端口：
 
 ```bash
-# 后端改为 8080（通过 .env 或环境变量）
+# 后端改为 8080（通过环境变量）
 WEB_PORT=8080 make dev-backend
 
 # 前端需同步修改代理目标，否则 API 请求会发到默认的 3000

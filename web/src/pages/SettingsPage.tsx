@@ -11,6 +11,7 @@ import { ProfileSection } from '../components/settings/ProfileSection';
 import { SecuritySection } from '../components/settings/SecuritySection';
 import { AboutSection } from '../components/settings/AboutSection';
 import { AppearanceSection } from '../components/settings/AppearanceSection';
+import { SystemSettingsSection } from '../components/settings/SystemSettingsSection';
 import { UserChannelsSection } from '../components/settings/UserChannelsSection';
 import { GroupsPage } from './GroupsPage';
 import { MemoryPage } from './MemoryPage';
@@ -18,8 +19,8 @@ import { SkillsPage } from './SkillsPage';
 import { UsersPage } from './UsersPage';
 import type { SettingsTab } from '../components/settings/types';
 
-const VALID_TABS: SettingsTab[] = ['channels', 'claude', 'registration', 'appearance', 'profile', 'my-channels', 'security', 'groups', 'memory', 'skills', 'users', 'about'];
-const SYSTEM_TABS: SettingsTab[] = ['channels', 'claude', 'registration', 'appearance'];
+const VALID_TABS: SettingsTab[] = ['channels', 'claude', 'registration', 'appearance', 'system', 'profile', 'my-channels', 'security', 'groups', 'memory', 'skills', 'users', 'about'];
+const SYSTEM_TABS: SettingsTab[] = ['channels', 'claude', 'registration', 'appearance', 'system'];
 const FULLPAGE_TABS: SettingsTab[] = ['groups', 'memory', 'skills', 'users'];
 
 export function SettingsPage() {
@@ -68,6 +69,7 @@ export function SettingsPage() {
       tabs.push({ key: 'channels', label: '渠道' });
       tabs.push({ key: 'claude', label: 'Claude' });
       tabs.push({ key: 'appearance', label: '外观' });
+      tabs.push({ key: 'system', label: '系统' });
     }
     tabs.push({ key: 'groups', label: '会话' });
     tabs.push({ key: 'memory', label: '记忆' });
@@ -94,6 +96,7 @@ export function SettingsPage() {
     claude: 'Claude 提供商',
     registration: '注册管理',
     appearance: '外观设置',
+    system: '系统参数',
     profile: '个人资料',
     'my-channels': '消息通道',
     security: '安全与设备',
@@ -196,6 +199,7 @@ export function SettingsPage() {
                 {activeTab === 'claude' && <ClaudeProviderSection setNotice={setNotice} setError={setError} />}
                 {activeTab === 'registration' && <RegistrationSection setNotice={setNotice} setError={setError} />}
                 {activeTab === 'appearance' && <AppearanceSection setNotice={setNotice} setError={setError} />}
+                {activeTab === 'system' && <SystemSettingsSection setNotice={setNotice} setError={setError} />}
                 {activeTab === 'profile' && <ProfileSection setNotice={setNotice} setError={setError} />}
                 {activeTab === 'my-channels' && <UserChannelsSection setNotice={setNotice} setError={setError} />}
                 {activeTab === 'security' && <SecuritySection setNotice={setNotice} setError={setError} />}

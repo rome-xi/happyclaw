@@ -135,6 +135,16 @@ export const RegistrationConfigSchema = z.object({
   requireInviteCode: z.boolean(),
 });
 
+export const SystemSettingsSchema = z.object({
+  containerTimeout: z.number().int().min(60000).max(86400000).optional(),
+  idleTimeout: z.number().int().min(60000).max(86400000).optional(),
+  containerMaxOutputSize: z.number().int().min(1048576).max(104857600).optional(),
+  maxConcurrentContainers: z.number().int().min(1).max(100).optional(),
+  maxConcurrentHostProcesses: z.number().int().min(1).max(50).optional(),
+  maxLoginAttempts: z.number().int().min(1).max(100).optional(),
+  loginLockoutMinutes: z.number().int().min(1).max(1440).optional(),
+});
+
 export const AppearanceConfigSchema = z.object({
   appName: z.string().max(32).optional(),
   aiName: z.string().min(1).max(32),

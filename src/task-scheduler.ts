@@ -5,11 +5,11 @@ import path from 'path';
 
 import {
   GROUPS_DIR,
-  IDLE_TIMEOUT,
   MAIN_GROUP_FOLDER,
   SCHEDULER_POLL_INTERVAL,
   TIMEZONE,
 } from './config.js';
+import { getSystemSettings } from './runtime-config.js';
 import {
   ContainerOutput,
   runContainerAgent,
@@ -106,7 +106,7 @@ async function runTask(
   const sessionId =
     task.context_mode === 'group' ? sessions[task.group_folder] : undefined;
 
-  // Idle timer: writes _close sentinel after IDLE_TIMEOUT of no output,
+  // Idle timer: writes _close sentinel after idleTimeout of no output,
   // so the container exits instead of hanging at waitForIpcMessage forever.
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -118,7 +118,7 @@ async function runTask(
         'Scheduled task idle timeout, closing container stdin',
       );
       deps.queue.closeStdin(groupJid);
-    }, IDLE_TIMEOUT);
+    }, getSystemSettings().idleTimeout);
   };
 
   try {

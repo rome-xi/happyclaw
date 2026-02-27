@@ -8,7 +8,6 @@ import {
 } from './db.js';
 import { broadcastNewMessage } from './web.js';
 import { logger } from './logger.js';
-import { ASSISTANT_NAME } from './config.js';
 
 // ─── TelegramConnection Interface ──────────────────────────────
 

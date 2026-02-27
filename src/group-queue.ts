@@ -2,11 +2,8 @@ import { ChildProcess, exec, execFile } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
-import {
-  DATA_DIR,
-  MAX_CONCURRENT_CONTAINERS,
-  MAX_CONCURRENT_HOST_PROCESSES,
-} from './config.js';
+import { DATA_DIR } from './config.js';
+import { getSystemSettings } from './runtime-config.js';
 import { logger } from './logger.js';
 
 interface QueuedTask {
@@ -121,8 +118,8 @@ export class GroupQueue {
   private hasCapacityFor(groupJid: string): boolean {
     const isHost = this.isHostMode(groupJid);
     return isHost
-      ? this.activeHostProcessCount < MAX_CONCURRENT_HOST_PROCESSES
-      : this.activeContainerCount < MAX_CONCURRENT_CONTAINERS;
+      ? this.activeHostProcessCount < getSystemSettings().maxConcurrentHostProcesses
+      : this.activeContainerCount < getSystemSettings().maxConcurrentContainers;
   }
 
   private resolveActiveState(groupJid: string): ActiveGroupState | null {

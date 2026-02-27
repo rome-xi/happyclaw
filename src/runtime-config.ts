@@ -1459,3 +1459,151 @@ export function saveUserTelegramConfig(
   fs.renameSync(tmp, filePath);
   return normalized;
 }
+
+// ─── System settings (plain JSON, no encryption) ─────────────────
+
+const SYSTEM_SETTINGS_FILE = path.join(CLAUDE_CONFIG_DIR, 'system-settings.json');
+
+export interface SystemSettings {
+  containerTimeout: number;
+  idleTimeout: number;
+  containerMaxOutputSize: number;
+  maxConcurrentContainers: number;
+  maxConcurrentHostProcesses: number;
+  maxLoginAttempts: number;
+  loginLockoutMinutes: number;
+}
+
+const DEFAULT_SYSTEM_SETTINGS: SystemSettings = {
+  containerTimeout: 1800000,
+  idleTimeout: 1800000,
+  containerMaxOutputSize: 10485760,
+  maxConcurrentContainers: 20,
+  maxConcurrentHostProcesses: 5,
+  maxLoginAttempts: 5,
+  loginLockoutMinutes: 15,
+};
+
+function parseIntEnv(envVar: string | undefined, fallback: number): number {
+  if (!envVar) return fallback;
+  const parsed = parseInt(envVar, 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+// In-memory cache: avoid synchronous file I/O on hot paths (stdout data handler, queue capacity check)
+let _settingsCache: SystemSettings | null = null;
+let _settingsMtimeMs = 0;
+
+function readSystemSettingsFromFile(): SystemSettings | null {
+  if (!fs.existsSync(SYSTEM_SETTINGS_FILE)) return null;
+  const raw = JSON.parse(
+    fs.readFileSync(SYSTEM_SETTINGS_FILE, 'utf-8'),
+  ) as Record<string, unknown>;
+  return {
+    containerTimeout:
+      typeof raw.containerTimeout === 'number' && raw.containerTimeout > 0
+        ? raw.containerTimeout
+        : DEFAULT_SYSTEM_SETTINGS.containerTimeout,
+    idleTimeout:
+      typeof raw.idleTimeout === 'number' && raw.idleTimeout > 0
+        ? raw.idleTimeout
+        : DEFAULT_SYSTEM_SETTINGS.idleTimeout,
+    containerMaxOutputSize:
+      typeof raw.containerMaxOutputSize === 'number' && raw.containerMaxOutputSize > 0
+        ? raw.containerMaxOutputSize
+        : DEFAULT_SYSTEM_SETTINGS.containerMaxOutputSize,
+    maxConcurrentContainers:
+      typeof raw.maxConcurrentContainers === 'number' && raw.maxConcurrentContainers > 0
+        ? raw.maxConcurrentContainers
+        : DEFAULT_SYSTEM_SETTINGS.maxConcurrentContainers,
+    maxConcurrentHostProcesses:
+      typeof raw.maxConcurrentHostProcesses === 'number' && raw.maxConcurrentHostProcesses > 0
+        ? raw.maxConcurrentHostProcesses
+        : DEFAULT_SYSTEM_SETTINGS.maxConcurrentHostProcesses,
+    maxLoginAttempts:
+      typeof raw.maxLoginAttempts === 'number' && raw.maxLoginAttempts > 0
+        ? raw.maxLoginAttempts
+        : DEFAULT_SYSTEM_SETTINGS.maxLoginAttempts,
+    loginLockoutMinutes:
+      typeof raw.loginLockoutMinutes === 'number' && raw.loginLockoutMinutes > 0
+        ? raw.loginLockoutMinutes
+        : DEFAULT_SYSTEM_SETTINGS.loginLockoutMinutes,
+  };
+}
+
+function buildEnvFallbackSettings(): SystemSettings {
+  return {
+    containerTimeout: parseIntEnv(process.env.CONTAINER_TIMEOUT, DEFAULT_SYSTEM_SETTINGS.containerTimeout),
+    idleTimeout: parseIntEnv(process.env.IDLE_TIMEOUT, DEFAULT_SYSTEM_SETTINGS.idleTimeout),
+    containerMaxOutputSize: parseIntEnv(process.env.CONTAINER_MAX_OUTPUT_SIZE, DEFAULT_SYSTEM_SETTINGS.containerMaxOutputSize),
+    maxConcurrentContainers: parseIntEnv(process.env.MAX_CONCURRENT_CONTAINERS, DEFAULT_SYSTEM_SETTINGS.maxConcurrentContainers),
+    maxConcurrentHostProcesses: parseIntEnv(process.env.MAX_CONCURRENT_HOST_PROCESSES, DEFAULT_SYSTEM_SETTINGS.maxConcurrentHostProcesses),
+    maxLoginAttempts: parseIntEnv(process.env.MAX_LOGIN_ATTEMPTS, DEFAULT_SYSTEM_SETTINGS.maxLoginAttempts),
+    loginLockoutMinutes: parseIntEnv(process.env.LOGIN_LOCKOUT_MINUTES, DEFAULT_SYSTEM_SETTINGS.loginLockoutMinutes),
+  };
+}
+
+export function getSystemSettings(): SystemSettings {
+  // Fast path: return cached value if file hasn't changed
+  try {
+    if (_settingsCache) {
+      if (!fs.existsSync(SYSTEM_SETTINGS_FILE)) return _settingsCache;
+      const mtimeMs = fs.statSync(SYSTEM_SETTINGS_FILE).mtimeMs;
+      if (mtimeMs === _settingsMtimeMs) return _settingsCache;
+    }
+  } catch {
+    // stat failed — fall through to full read
+  }
+
+  // 1. Try reading from file
+  try {
+    if (fs.existsSync(SYSTEM_SETTINGS_FILE)) {
+      const settings = readSystemSettingsFromFile();
+      if (settings) {
+        _settingsCache = settings;
+        try { _settingsMtimeMs = fs.statSync(SYSTEM_SETTINGS_FILE).mtimeMs; } catch { /* ignore */ }
+        return settings;
+      }
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Failed to read system settings, falling back to env/defaults');
+  }
+
+  // 2. Fall back to env vars, then hardcoded defaults
+  const settings = buildEnvFallbackSettings();
+  _settingsCache = settings;
+  _settingsMtimeMs = 0; // no file — will re-check on next call
+  return settings;
+}
+
+export function saveSystemSettings(partial: Partial<SystemSettings>): SystemSettings {
+  const existing = getSystemSettings();
+  const merged: SystemSettings = { ...existing, ...partial };
+
+  // Range validation
+  if (merged.containerTimeout < 60000) merged.containerTimeout = 60000;           // min 1 min
+  if (merged.containerTimeout > 86400000) merged.containerTimeout = 86400000;     // max 24 hours
+  if (merged.idleTimeout < 60000) merged.idleTimeout = 60000;
+  if (merged.idleTimeout > 86400000) merged.idleTimeout = 86400000;
+  if (merged.containerMaxOutputSize < 1048576) merged.containerMaxOutputSize = 1048576;   // min 1MB
+  if (merged.containerMaxOutputSize > 104857600) merged.containerMaxOutputSize = 104857600; // max 100MB
+  if (merged.maxConcurrentContainers < 1) merged.maxConcurrentContainers = 1;
+  if (merged.maxConcurrentContainers > 100) merged.maxConcurrentContainers = 100;
+  if (merged.maxConcurrentHostProcesses < 1) merged.maxConcurrentHostProcesses = 1;
+  if (merged.maxConcurrentHostProcesses > 50) merged.maxConcurrentHostProcesses = 50;
+  if (merged.maxLoginAttempts < 1) merged.maxLoginAttempts = 1;
+  if (merged.maxLoginAttempts > 100) merged.maxLoginAttempts = 100;
+  if (merged.loginLockoutMinutes < 1) merged.loginLockoutMinutes = 1;
+  if (merged.loginLockoutMinutes > 1440) merged.loginLockoutMinutes = 1440;       // max 24 hours
+
+  fs.mkdirSync(CLAUDE_CONFIG_DIR, { recursive: true });
+  const tmp = `${SYSTEM_SETTINGS_FILE}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(merged, null, 2) + '\n', 'utf-8');
+  fs.renameSync(tmp, SYSTEM_SETTINGS_FILE);
+
+  // Update in-memory cache immediately
+  _settingsCache = merged;
+  try { _settingsMtimeMs = fs.statSync(SYSTEM_SETTINGS_FILE).mtimeMs; } catch { /* ignore */ }
+
+  return merged;
+}

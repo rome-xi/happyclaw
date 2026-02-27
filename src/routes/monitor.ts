@@ -13,11 +13,8 @@ import {
   getWebDeps,
 } from '../web-context.js';
 import { getRegisteredGroup, getRouterState } from '../db.js';
-import {
-  CONTAINER_IMAGE,
-  MAX_CONCURRENT_CONTAINERS,
-  MAX_CONCURRENT_HOST_PROCESSES,
-} from '../config.js';
+import { CONTAINER_IMAGE } from '../config.js';
+import { getSystemSettings } from '../runtime-config.js';
 import { logger } from '../logger.js';
 
 const execFileAsync = promisify(execFile);
@@ -127,8 +124,8 @@ monitorRoutes.get('/status', authMiddleware, async (c) => {
     activeContainers,
     activeHostProcesses: isAdmin ? queueStatus.activeHostProcessCount : undefined,
     activeTotal: isAdmin ? queueStatus.activeCount : activeContainers,
-    maxConcurrentContainers: MAX_CONCURRENT_CONTAINERS,
-    maxConcurrentHostProcesses: isAdmin ? MAX_CONCURRENT_HOST_PROCESSES : undefined,
+    maxConcurrentContainers: getSystemSettings().maxConcurrentContainers,
+    maxConcurrentHostProcesses: isAdmin ? getSystemSettings().maxConcurrentHostProcesses : undefined,
     queueLength,
     uptime: Math.floor(process.uptime()),
     groups: filteredGroups,

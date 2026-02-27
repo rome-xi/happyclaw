@@ -6,7 +6,7 @@ import fs from 'fs';
 import path from 'path';
 import type { Readable } from 'stream';
 
-import { CONTAINER_MAX_OUTPUT_SIZE } from './config.js';
+import { getSystemSettings } from './runtime-config.js';
 import { logger } from './logger.js';
 import type { ContainerOutput } from './container-runner.js';
 
@@ -54,7 +54,7 @@ export function attachStdoutHandler(
 
     // Always accumulate for logging
     if (!state.stdoutTruncated) {
-      const remaining = CONTAINER_MAX_OUTPUT_SIZE - state.stdout.length;
+      const remaining = getSystemSettings().containerMaxOutputSize - state.stdout.length;
       if (chunk.length > remaining) {
         state.stdout += chunk.slice(0, remaining);
         state.stdoutTruncated = true;
@@ -154,7 +154,7 @@ export function attachStderrHandler(
     // Don't reset timeout on stderr — SDK writes debug logs continuously.
     // Timeout only resets on actual output (OUTPUT_MARKER in stdout).
     if (state.stderrTruncated) return;
-    const remaining = CONTAINER_MAX_OUTPUT_SIZE - state.stderr.length;
+    const remaining = getSystemSettings().containerMaxOutputSize - state.stderr.length;
     if (chunk.length > remaining) {
       state.stderr += chunk.slice(0, remaining);
       state.stderrTruncated = true;

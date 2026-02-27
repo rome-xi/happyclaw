@@ -8,7 +8,6 @@ import path from 'path';
 
 import {
   CONTAINER_IMAGE,
-  CONTAINER_TIMEOUT,
   DATA_DIR,
   GROUPS_DIR,
 } from './config.js';
@@ -18,6 +17,7 @@ import {
   buildContainerEnvLines,
   getClaudeProviderConfig,
   getContainerEnvConfig,
+  getSystemSettings,
   mergeClaudeEnvConfig,
   shellQuoteEnvLines,
   writeCredentialsFile,
@@ -421,7 +421,7 @@ export async function runContainerAgent(
     container.stdin.end();
 
     let timedOut = false;
-    const timeoutMs = group.containerConfig?.timeout || CONTAINER_TIMEOUT;
+    const timeoutMs = group.containerConfig?.timeout || getSystemSettings().containerTimeout;
 
     const killOnTimeout = () => {
       timedOut = true;
@@ -894,7 +894,7 @@ export async function runHostAgent(
 
     // 9. 超时管理
     let timedOut = false;
-    const timeoutMs = group.containerConfig?.timeout || CONTAINER_TIMEOUT;
+    const timeoutMs = group.containerConfig?.timeout || getSystemSettings().containerTimeout;
 
     let killTimer: ReturnType<typeof setTimeout> | null = null;
 

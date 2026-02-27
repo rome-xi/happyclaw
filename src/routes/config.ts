@@ -14,6 +14,7 @@ import {
   TelegramConfigSchema,
   RegistrationConfigSchema,
   AppearanceConfigSchema,
+  SystemSettingsSchema,
 } from '../schemas.js';
 import {
   getClaudeProviderConfig,
@@ -34,6 +35,8 @@ import {
   saveRegistrationConfig,
   getAppearanceConfig,
   saveAppearanceConfig,
+  getSystemSettings,
+  saveSystemSettings,
   getUserFeishuConfig,
   saveUserFeishuConfig,
   getUserTelegramConfig,
@@ -714,6 +717,50 @@ configRoutes.get('/appearance/public', (c) => {
     return c.json({ error: 'Failed to load appearance config' }, 500);
   }
 });
+
+// ─── System settings ───────────────────────────────────────────────
+
+configRoutes.get(
+  '/system',
+  authMiddleware,
+  systemConfigMiddleware,
+  (c) => {
+    try {
+      return c.json(getSystemSettings());
+    } catch (err) {
+      logger.error({ err }, 'Failed to load system settings');
+      return c.json({ error: 'Failed to load system settings' }, 500);
+    }
+  },
+);
+
+configRoutes.put(
+  '/system',
+  authMiddleware,
+  systemConfigMiddleware,
+  async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const validation = SystemSettingsSchema.safeParse(body);
+    if (!validation.success) {
+      return c.json(
+        { error: 'Invalid request body', details: validation.error.format() },
+        400,
+      );
+    }
+
+    try {
+      const saved = saveSystemSettings(validation.data);
+      return c.json(saved);
+    } catch (err) {
+      const message =
+        err instanceof Error
+          ? err.message
+          : 'Invalid system settings payload';
+      logger.warn({ err }, 'Invalid system settings payload');
+      return c.json({ error: message }, 400);
+    }
+  },
+);
 
 // ─── Per-user IM connection status ──────────────────────────────────
 
