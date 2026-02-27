@@ -482,7 +482,7 @@ export function ChatView({ groupJid, onBack }: ChatViewProps) {
                 scrollTrigger={scrollTrigger}
                 groupJid={groupJid}
                 isWaiting={!!agentWaiting[activeAgentTab] || !!agentStreaming[activeAgentTab]}
-                onInterrupt={() => {}}
+                onInterrupt={() => interruptQuery(`${groupJid}#agent:${activeAgentTab}`)}
                 agentId={activeAgentTab}
               />
               <MessageInput
@@ -592,7 +592,7 @@ export function ChatView({ groupJid, onBack }: ChatViewProps) {
                   scrollTrigger={scrollTrigger}
                   groupJid={groupJid}
                   isWaiting={!!agentStreaming[activeAgentTab]}
-                  onInterrupt={() => {}}
+                  onInterrupt={() => interruptQuery(groupJid)}
                   agentId={activeAgentTab}
                 />
               )}
