@@ -25,6 +25,8 @@ export interface IMChannelConnectOpts {
   ignoreMessagesBefore?: number;
   isChatAuthorized?: (jid: string) => boolean;
   onPairAttempt?: (jid: string, chatName: string, code: string) => Promise<boolean>;
+  /** Slash command callback (e.g. /clear). Returns reply text or null. */
+  onCommand?: (chatJid: string, command: string) => Promise<string | null>;
 }
 
 export interface IMChannel {
@@ -79,6 +81,7 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
         onReady: opts.onReady,
         onNewChat: opts.onNewChat,
         ignoreMessagesBefore: opts.ignoreMessagesBefore,
+        onCommand: opts.onCommand,
       });
       if (!connected) {
         inner = null;
@@ -144,6 +147,7 @@ export function createTelegramChannel(config: TelegramConnectionConfig): IMChann
           onNewChat: opts.onNewChat,
           isChatAuthorized: opts.isChatAuthorized ?? (() => true),
           onPairAttempt: opts.onPairAttempt,
+          onCommand: opts.onCommand,
         });
         return inner.isConnected();
       } catch (err) {

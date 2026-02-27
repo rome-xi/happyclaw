@@ -100,6 +100,7 @@ import {
 } from './web.js';
 import { installSkillForUser, deleteSkillForUser } from './routes/skills.js';
 import { verifyPairingCode } from './telegram-pairing.js';
+import { executeSessionReset } from './commands.js';
 
 const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const execFileAsync = promisify(execFile);
@@ -157,6 +158,29 @@ function sendSystemMessage(jid: string, type: string, detail: string): void {
     timestamp,
     is_from_me: true,
   });
+}
+
+/**
+ * Slash command handler for IM channels (Feishu/Telegram).
+ * Returns a reply string on success, or null if command not recognized.
+ */
+async function handleCommand(chatJid: string, command: string): Promise<string | null> {
+  if (command !== 'clear') return null;
+
+  const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
+  if (!group) return null;
+
+  try {
+    await executeSessionReset(chatJid, group.folder, {
+      queue,
+      sessions,
+      broadcast: broadcastNewMessage,
+    });
+    return '已清除对话上下文 ✓';
+  } catch (err) {
+    logger.error({ chatJid, err }, 'handleCommand /clear failed');
+    return '清除上下文失败，请稍后重试';
+  }
 }
 
 async function setTyping(jid: string, isTyping: boolean): Promise<void> {
@@ -2113,11 +2137,11 @@ async function connectUserIMChannels(
   let telegram = false;
 
   if (feishuConfig && feishuConfig.enabled !== false && feishuConfig.appId && feishuConfig.appSecret) {
-    feishu = await imManager.connectUserFeishu(userId, feishuConfig, onNewChat, ignoreMessagesBefore);
+    feishu = await imManager.connectUserFeishu(userId, feishuConfig, onNewChat, ignoreMessagesBefore, handleCommand);
   }
 
   if (telegramConfig && telegramConfig.enabled !== false && telegramConfig.botToken) {
-    telegram = await imManager.connectUserTelegram(userId, telegramConfig, onNewChat, buildIsChatAuthorized(userId), buildOnPairAttempt(userId));
+    telegram = await imManager.connectUserTelegram(userId, telegramConfig, onNewChat, buildIsChatAuthorized(userId), buildOnPairAttempt(userId), handleCommand);
   }
 
   return { feishu, telegram };
@@ -2361,7 +2385,7 @@ async function main(): Promise<void> {
       const homeGroup = getUserHomeGroup(adminUser.id);
       const homeFolder = homeGroup?.folder || MAIN_GROUP_FOLDER;
       const onNewChat = buildOnNewChat(adminUser.id, homeFolder);
-      const connected = await imManager.connectUserFeishu(adminUser.id, config, onNewChat, Date.now());
+      const connected = await imManager.connectUserFeishu(adminUser.id, config, onNewChat, Date.now(), handleCommand);
       if (connected) {
         syncGroupMetadata().catch((err) =>
           logger.error({ err }, 'Group sync after Feishu reconnect failed'),
@@ -2393,7 +2417,7 @@ async function main(): Promise<void> {
       const homeGroup = getUserHomeGroup(adminUser.id);
       const homeFolder = homeGroup?.folder || MAIN_GROUP_FOLDER;
       const onNewChat = buildOnNewChat(adminUser.id, homeFolder);
-      const connected = await imManager.connectUserTelegram(adminUser.id, config, onNewChat, buildIsChatAuthorized(adminUser.id), buildOnPairAttempt(adminUser.id));
+      const connected = await imManager.connectUserTelegram(adminUser.id, config, onNewChat, buildIsChatAuthorized(adminUser.id), buildOnPairAttempt(adminUser.id), handleCommand);
       return connected;
     }
     logger.info('Telegram channel disabled via hot-reload');
@@ -2415,7 +2439,7 @@ async function main(): Promise<void> {
       await imManager.disconnectUserFeishu(userId);
       const config = getUserFeishuConfig(userId);
       if (config && config.enabled !== false && config.appId && config.appSecret) {
-        const connected = await imManager.connectUserFeishu(userId, config, onNewChat, ignoreMessagesBefore);
+        const connected = await imManager.connectUserFeishu(userId, config, onNewChat, ignoreMessagesBefore, handleCommand);
         logger.info({ userId, connected }, 'User Feishu connection hot-reloaded');
         return connected;
       }
@@ -2425,7 +2449,7 @@ async function main(): Promise<void> {
       await imManager.disconnectUserTelegram(userId);
       const config = getUserTelegramConfig(userId);
       if (config && config.enabled !== false && config.botToken) {
-        const connected = await imManager.connectUserTelegram(userId, config, onNewChat, buildIsChatAuthorized(userId), buildOnPairAttempt(userId));
+        const connected = await imManager.connectUserTelegram(userId, config, onNewChat, buildIsChatAuthorized(userId), buildOnPairAttempt(userId), handleCommand);
         logger.info({ userId, connected }, 'User Telegram connection hot-reloaded');
         return connected;
       }

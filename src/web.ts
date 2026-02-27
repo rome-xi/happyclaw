@@ -66,6 +66,7 @@ import type { NewMessage, WsMessageOut, WsMessageIn, AuthUser, StreamEvent, User
 import { WEB_PORT, SESSION_COOKIE_NAME } from './config.js';
 import { logger } from './logger.js';
 import { analyzeIntent } from './intent-analyzer.js';
+import { executeSessionReset } from './commands.js';
 
 // --- App Setup ---
 
@@ -514,6 +515,28 @@ function setupWebSocket(server: any): WebSocketServer {
               session.user_id, session.display_name || session.username,
               attachments,
             );
+            return;
+          }
+
+          // ── /clear command: reset session without entering message pipeline ──
+          if (content.trim() === '/clear' && deps) {
+            const targetGroup = getRegisteredGroup(chatJid);
+            if (targetGroup) {
+              try {
+                await executeSessionReset(chatJid, targetGroup.folder, {
+                  queue: deps.queue,
+                  sessions: deps.getSessions(),
+                  broadcast: broadcastNewMessage,
+                });
+              } catch (err) {
+                logger.error({ chatJid, err }, '/clear command failed');
+                const errId = crypto.randomUUID();
+                const errTs = new Date().toISOString();
+                ensureChatExists(chatJid);
+                storeMessageDirect(errId, chatJid, '__system__', 'system', 'system_error:清除上下文失败，请稍后重试', errTs, true);
+                broadcastNewMessage(chatJid, { id: errId, chat_jid: chatJid, sender: '__system__', sender_name: 'system', content: 'system_error:清除上下文失败，请稍后重试', timestamp: errTs, is_from_me: true });
+              }
+            }
             return;
           }
 

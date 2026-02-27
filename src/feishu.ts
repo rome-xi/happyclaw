@@ -21,6 +21,8 @@ export interface ConnectOptions {
   onNewChat?: (chatJid: string, chatName: string) => void;
   /** 热重连时设置：丢弃 create_time 早于此时间戳（epoch ms）的消息，避免处理渠道关闭期间的堆积消息 */
   ignoreMessagesBefore?: number;
+  /** 斜杠指令回调（如 /clear），返回回复文本或 null */
+  onCommand?: (chatJid: string, command: string) => Promise<string | null>;
 }
 
 export interface FeishuConnection {
@@ -395,11 +397,27 @@ export function createFeishuConnection(config: FeishuConnectionConfig): FeishuCo
     }
   }
 
+  async function sendTextToChat(chatId: string, text: string): Promise<void> {
+    if (!client) return;
+    try {
+      await client.im.message.create({
+        data: {
+          receive_id: chatId,
+          msg_type: 'text',
+          content: JSON.stringify({ text }),
+        },
+        params: { receive_id_type: 'chat_id' },
+      });
+    } catch (err) {
+      logger.error({ chatId, err }, 'Failed to send Feishu text reply');
+    }
+  }
+
   async function handleIncomingMessage(
     payload: IncomingMessagePayload,
     source: 'ws' | 'backfill',
   ): Promise<void> {
-    const { onNewChat, ignoreMessagesBefore } = connectOptions || {};
+    const { onNewChat, ignoreMessagesBefore, onCommand } = connectOptions || {};
     const {
       chatId,
       messageId,
@@ -482,6 +500,17 @@ export function createFeishuConnection(config: FeishuConnectionConfig): FeishuCo
     const resolvedSenderName = senderName || getSenderName(senderOpenId);
     const resolvedChatName = chatType === 'p2p' ? '飞书私聊' : '飞书群聊';
     onNewChat?.(chatJid, resolvedChatName);
+
+    // ── /clear 指令：重置上下文，不进入消息流 ──
+    if (text?.trim() === '/clear' && onCommand) {
+      try {
+        const reply = await onCommand(chatJid, 'clear');
+        if (reply) await sendTextToChat(chatId, reply);
+      } catch (err) {
+        logger.error({ chatJid, err }, 'Feishu /clear command failed');
+      }
+      return;
+    }
 
     storeChatMetadata(chatJid, timestamp);
     storeMessageDirect(

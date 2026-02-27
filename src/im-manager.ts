@@ -171,6 +171,7 @@ class IMConnectionManager {
     config: FeishuConnectConfig,
     onNewChat: (chatJid: string, chatName: string) => void,
     ignoreMessagesBefore?: number,
+    onCommand?: (chatJid: string, command: string) => Promise<string | null>,
   ): Promise<boolean> {
     if (!config.appId || !config.appSecret) {
       logger.info({ userId }, 'Feishu config empty, skipping connection');
@@ -188,6 +189,7 @@ class IMConnectionManager {
       },
       onNewChat,
       ignoreMessagesBefore,
+      onCommand,
     });
   }
 
@@ -200,6 +202,7 @@ class IMConnectionManager {
     onNewChat: (chatJid: string, chatName: string) => void,
     isChatAuthorized?: (jid: string) => boolean,
     onPairAttempt?: (jid: string, chatName: string, code: string) => Promise<boolean>,
+    onCommand?: (chatJid: string, command: string) => Promise<string | null>,
   ): Promise<boolean> {
     if (!config.botToken) {
       logger.info({ userId }, 'Telegram config empty, skipping connection');
@@ -217,6 +220,7 @@ class IMConnectionManager {
       onNewChat,
       isChatAuthorized,
       onPairAttempt,
+      onCommand,
     });
   }
 
