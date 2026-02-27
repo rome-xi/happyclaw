@@ -38,5 +38,14 @@ chmod -R a-w /tmp/dist
 cat > /tmp/input.json
 chmod 644 /tmp/input.json
 
+# Fix permissions on exit: Claude Code creates some files with mode 0600
+# (e.g. settings.json), which the host backend (agent user) cannot read.
+# The trap runs as root after the node process exits.
+cleanup() {
+  chmod -R a+rwX /home/node/.claude 2>/dev/null || true
+  chmod -R a+rwX /workspace/group 2>/dev/null || true
+}
+trap cleanup EXIT
+
 # Drop privileges and execute agent-runner as node user
-exec runuser -u node -- node /tmp/dist/index.js < /tmp/input.json
+runuser -u node -- node /tmp/dist/index.js < /tmp/input.json
