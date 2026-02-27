@@ -263,6 +263,14 @@ export function createFeishuConnection(config: FeishuConnectionConfig): FeishuCo
     }
   }
 
+  /**
+   * 通过访问飞书 SDK 的私有属性（wsConfig、isConnecting）获取 WebSocket 连接状态。
+   *
+   * 注意事项：
+   * 1. 该函数依赖 @larksuiteoapi/node-sdk 内部未公开的属性结构，SDK 版本升级可能导致失效
+   * 2. 失效时函数会静默降级（捕获异常后返回 null），健康检查将跳过状态判断，不会触发误重连
+   * 3. 后续可考虑使用 SDK 公开 API getReconnectInfo() 替代私有属性访问
+   */
   function getWsConnectionState(): WsConnectionState | null {
     const rawClient = wsClient as unknown as {
       wsConfig?: {
@@ -552,7 +560,13 @@ export function createFeishuConnection(config: FeishuConnectionConfig): FeishuCo
 
       const list = response.data?.items || [];
       const messages = list
-        .filter((item) => item.deleted !== true && !!item.message_id)
+        .filter((item) => {
+          if (item.deleted === true || !item.message_id) return false;
+          // 过滤 Bot 自身发送的消息，避免 backfill 将回复当作新消息处理
+          const senderType = (item as any).sender?.sender_type;
+          if (senderType === 'app') return false;
+          return true;
+        })
         .map((item) => {
           const senderOpenId = item.sender?.sender_id?.open_id || item.sender?.id || '';
           return {
@@ -631,10 +645,11 @@ export function createFeishuConnection(config: FeishuConnectionConfig): FeishuCo
       await wsClient.start({ eventDispatcher });
 
       lastWsStateConnected = true;
-      disconnectedSince = null;
       logger.info({ reason }, 'Feishu WebSocket reconnected');
       connectOptions.onReady();
+      // 先执行 backfill（需要读取 disconnectedSince 确定回填起点），完成后再重置
       await runBackfill('reconnect');
+      disconnectedSince = null;
     } catch (err) {
       logger.error({ err, reason }, 'Feishu WebSocket reconnect failed');
     } finally {
