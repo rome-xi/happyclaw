@@ -22,6 +22,8 @@ export function McpServerDetail({ server, onDeleted }: McpServerDetailProps) {
   const [editCommand, setEditCommand] = useState('');
   const [editArgs, setEditArgs] = useState<string[]>([]);
   const [editEnv, setEditEnv] = useState<Array<{ key: string; value: string }>>([]);
+  const [editUrl, setEditUrl] = useState('');
+  const [editHeaders, setEditHeaders] = useState<Array<{ key: string; value: string }>>([]);
   const [editDescription, setEditDescription] = useState('');
   const [saving, setSaving] = useState(false);
 
@@ -33,12 +35,20 @@ export function McpServerDetail({ server, onDeleted }: McpServerDetailProps) {
     );
   }
 
+  const isHttpType = server.type === 'http' || server.type === 'sse';
+
   const startEdit = () => {
-    setEditCommand(server.command);
+    setEditCommand(server.command || '');
     setEditArgs(server.args ? [...server.args] : []);
     setEditEnv(
       server.env
         ? Object.entries(server.env).map(([key, value]) => ({ key, value }))
+        : [],
+    );
+    setEditUrl(server.url || '');
+    setEditHeaders(
+      server.headers
+        ? Object.entries(server.headers).map(([key, value]) => ({ key, value }))
         : [],
     );
     setEditDescription(server.description || '');
@@ -52,17 +62,30 @@ export function McpServerDetail({ server, onDeleted }: McpServerDetailProps) {
   const saveEdit = async () => {
     setSaving(true);
     try {
-      const envObj: Record<string, string> = {};
-      for (const row of editEnv) {
-        const k = row.key.trim();
-        if (k) envObj[k] = row.value;
+      if (isHttpType) {
+        const headersObj: Record<string, string> = {};
+        for (const row of editHeaders) {
+          const k = row.key.trim();
+          if (k) headersObj[k] = row.value;
+        }
+        await updateServer(server.id, {
+          url: editUrl,
+          headers: Object.keys(headersObj).length > 0 ? headersObj : undefined,
+          description: editDescription || undefined,
+        });
+      } else {
+        const envObj: Record<string, string> = {};
+        for (const row of editEnv) {
+          const k = row.key.trim();
+          if (k) envObj[k] = row.value;
+        }
+        await updateServer(server.id, {
+          command: editCommand,
+          args: editArgs.length > 0 ? editArgs : undefined,
+          env: Object.keys(envObj).length > 0 ? envObj : undefined,
+          description: editDescription || undefined,
+        });
       }
-      await updateServer(server.id, {
-        command: editCommand,
-        args: editArgs.length > 0 ? editArgs : undefined,
-        env: Object.keys(envObj).length > 0 ? envObj : undefined,
-        description: editDescription || undefined,
-      });
       setEditing(false);
     } catch {
       // error handled by store
@@ -89,6 +112,7 @@ export function McpServerDetail({ server, onDeleted }: McpServerDetailProps) {
   };
 
   const envEntries = server.env ? Object.entries(server.env) : [];
+  const headerEntries = server.headers ? Object.entries(server.headers) : [];
 
   return (
     <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
@@ -144,96 +168,159 @@ export function McpServerDetail({ server, onDeleted }: McpServerDetailProps) {
       {editing ? (
         /* Edit Form */
         <div className="p-6 space-y-4">
-          {/* Command */}
-          <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1">命令</label>
-            <Input
-              value={editCommand}
-              onChange={(e) => setEditCommand(e.target.value)}
-              placeholder="npx, uvx, node..."
-            />
-          </div>
+          {isHttpType ? (
+            <>
+              {/* URL */}
+              <div>
+                <label className="block text-sm font-medium text-slate-700 mb-1">URL</label>
+                <Input
+                  value={editUrl}
+                  onChange={(e) => setEditUrl(e.target.value)}
+                  placeholder="https://..."
+                  className="font-mono"
+                />
+              </div>
 
-          {/* Args */}
-          <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1">参数</label>
-            <div className="space-y-2">
-              {editArgs.map((arg, i) => (
-                <div key={i} className="flex items-center gap-2">
-                  <Input
-                    value={arg}
-                    onChange={(e) => {
-                      const next = [...editArgs];
-                      next[i] = e.target.value;
-                      setEditArgs(next);
-                    }}
-                    className="flex-1 font-mono text-sm"
-                  />
-                  <button
+              {/* Headers */}
+              <div>
+                <label className="block text-sm font-medium text-slate-700 mb-1">Headers</label>
+                <div className="space-y-2">
+                  {editHeaders.map((row, i) => (
+                    <div key={i} className="flex items-center gap-2">
+                      <Input
+                        value={row.key}
+                        onChange={(e) => {
+                          const next = [...editHeaders];
+                          next[i] = { ...next[i], key: e.target.value };
+                          setEditHeaders(next);
+                        }}
+                        placeholder="Header-Name"
+                        className="w-1/3 font-mono text-sm"
+                      />
+                      <Input
+                        value={row.value}
+                        onChange={(e) => {
+                          const next = [...editHeaders];
+                          next[i] = { ...next[i], value: e.target.value };
+                          setEditHeaders(next);
+                        }}
+                        placeholder="value"
+                        className="flex-1 font-mono text-sm"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setEditHeaders(editHeaders.filter((_, j) => j !== i))}
+                        className="p-1.5 text-slate-400 hover:text-red-500 transition-colors"
+                      >
+                        <X size={16} />
+                      </button>
+                    </div>
+                  ))}
+                  <Button
                     type="button"
-                    onClick={() => setEditArgs(editArgs.filter((_, j) => j !== i))}
-                    className="p-1.5 text-slate-400 hover:text-red-500 transition-colors"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setEditHeaders([...editHeaders, { key: '', value: '' }])}
                   >
-                    <X size={16} />
-                  </button>
+                    添加 Header
+                  </Button>
                 </div>
-              ))}
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={() => setEditArgs([...editArgs, ''])}
-              >
-                添加参数
-              </Button>
-            </div>
-          </div>
+              </div>
+            </>
+          ) : (
+            <>
+              {/* Command */}
+              <div>
+                <label className="block text-sm font-medium text-slate-700 mb-1">命令</label>
+                <Input
+                  value={editCommand}
+                  onChange={(e) => setEditCommand(e.target.value)}
+                  placeholder="npx, uvx, node..."
+                />
+              </div>
 
-          {/* Env */}
-          <div>
-            <label className="block text-sm font-medium text-slate-700 mb-1">环境变量</label>
-            <div className="space-y-2">
-              {editEnv.map((row, i) => (
-                <div key={i} className="flex items-center gap-2">
-                  <Input
-                    value={row.key}
-                    onChange={(e) => {
-                      const next = [...editEnv];
-                      next[i] = { ...next[i], key: e.target.value };
-                      setEditEnv(next);
-                    }}
-                    placeholder="KEY"
-                    className="w-1/3 font-mono text-sm"
-                  />
-                  <Input
-                    value={row.value}
-                    onChange={(e) => {
-                      const next = [...editEnv];
-                      next[i] = { ...next[i], value: e.target.value };
-                      setEditEnv(next);
-                    }}
-                    placeholder="value"
-                    className="flex-1 font-mono text-sm"
-                  />
-                  <button
+              {/* Args */}
+              <div>
+                <label className="block text-sm font-medium text-slate-700 mb-1">参数</label>
+                <div className="space-y-2">
+                  {editArgs.map((arg, i) => (
+                    <div key={i} className="flex items-center gap-2">
+                      <Input
+                        value={arg}
+                        onChange={(e) => {
+                          const next = [...editArgs];
+                          next[i] = e.target.value;
+                          setEditArgs(next);
+                        }}
+                        className="flex-1 font-mono text-sm"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setEditArgs(editArgs.filter((_, j) => j !== i))}
+                        className="p-1.5 text-slate-400 hover:text-red-500 transition-colors"
+                      >
+                        <X size={16} />
+                      </button>
+                    </div>
+                  ))}
+                  <Button
                     type="button"
-                    onClick={() => setEditEnv(editEnv.filter((_, j) => j !== i))}
-                    className="p-1.5 text-slate-400 hover:text-red-500 transition-colors"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setEditArgs([...editArgs, ''])}
                   >
-                    <X size={16} />
-                  </button>
+                    添加参数
+                  </Button>
                 </div>
-              ))}
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={() => setEditEnv([...editEnv, { key: '', value: '' }])}
-              >
-                添加环境变量
-              </Button>
-            </div>
-          </div>
+              </div>
+
+              {/* Env */}
+              <div>
+                <label className="block text-sm font-medium text-slate-700 mb-1">环境变量</label>
+                <div className="space-y-2">
+                  {editEnv.map((row, i) => (
+                    <div key={i} className="flex items-center gap-2">
+                      <Input
+                        value={row.key}
+                        onChange={(e) => {
+                          const next = [...editEnv];
+                          next[i] = { ...next[i], key: e.target.value };
+                          setEditEnv(next);
+                        }}
+                        placeholder="KEY"
+                        className="w-1/3 font-mono text-sm"
+                      />
+                      <Input
+                        value={row.value}
+                        onChange={(e) => {
+                          const next = [...editEnv];
+                          next[i] = { ...next[i], value: e.target.value };
+                          setEditEnv(next);
+                        }}
+                        placeholder="value"
+                        className="flex-1 font-mono text-sm"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setEditEnv(editEnv.filter((_, j) => j !== i))}
+                        className="p-1.5 text-slate-400 hover:text-red-500 transition-colors"
+                      >
+                        <X size={16} />
+                      </button>
+                    </div>
+                  ))}
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setEditEnv([...editEnv, { key: '', value: '' }])}
+                  >
+                    添加环境变量
+                  </Button>
+                </div>
+              </div>
+            </>
+          )}
 
           {/* Description */}
           <div>
@@ -247,7 +334,7 @@ export function McpServerDetail({ server, onDeleted }: McpServerDetailProps) {
 
           {/* Actions */}
           <div className="flex items-center gap-3 pt-2">
-            <Button onClick={saveEdit} disabled={saving || !editCommand.trim()}>
+            <Button onClick={saveEdit} disabled={saving || (isHttpType ? !editUrl.trim() : !editCommand.trim())}>
               <Save size={16} />
               {saving ? '保存中...' : '保存'}
             </Button>
@@ -260,57 +347,107 @@ export function McpServerDetail({ server, onDeleted }: McpServerDetailProps) {
         /* Read-only View */
         <>
           <div className="p-6 border-b border-slate-200 space-y-4">
-            {/* Command */}
-            <div>
-              <span className="text-sm text-slate-500">命令</span>
-              <p className="font-mono text-sm text-slate-900 mt-1 bg-slate-50 rounded px-3 py-2">
-                {server.command}
-              </p>
-            </div>
-
-            {/* Args */}
-            {server.args && server.args.length > 0 && (
-              <div>
-                <span className="text-sm text-slate-500">参数</span>
-                <div className="flex flex-wrap gap-1.5 mt-1">
-                  {server.args.map((arg, i) => (
-                    <span
-                      key={i}
-                      className="px-2 py-1 bg-slate-100 text-slate-700 rounded text-xs font-mono"
-                    >
-                      {arg}
-                    </span>
-                  ))}
+            {isHttpType ? (
+              <>
+                {/* Type */}
+                <div>
+                  <span className="text-sm text-slate-500">类型</span>
+                  <p className="font-mono text-sm text-slate-900 mt-1 bg-blue-50 rounded px-3 py-2">
+                    {server.type?.toUpperCase()}
+                  </p>
                 </div>
-              </div>
-            )}
 
-            {/* Env */}
-            {envEntries.length > 0 && (
-              <div>
-                <span className="text-sm text-slate-500">环境变量</span>
-                <div className="space-y-1.5 mt-1">
-                  {envEntries.map(([key, value]) => (
-                    <div
-                      key={key}
-                      className="flex items-center gap-2 bg-slate-50 rounded px-3 py-2"
-                    >
-                      <span className="font-mono text-xs text-slate-700 font-medium">{key}</span>
-                      <span className="text-slate-300">=</span>
-                      <span className="font-mono text-xs text-slate-600 flex-1 truncate">
-                        {showEnvValues[key] ? value : '••••••••'}
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => toggleEnvVisibility(key)}
-                        className="p-1 text-slate-400 hover:text-slate-600 transition-colors"
-                      >
-                        {showEnvValues[key] ? <EyeOff size={14} /> : <Eye size={14} />}
-                      </button>
+                {/* URL */}
+                <div>
+                  <span className="text-sm text-slate-500">URL</span>
+                  <p className="font-mono text-sm text-slate-900 mt-1 bg-slate-50 rounded px-3 py-2 break-all">
+                    {server.url}
+                  </p>
+                </div>
+
+                {/* Headers */}
+                {headerEntries.length > 0 && (
+                  <div>
+                    <span className="text-sm text-slate-500">Headers</span>
+                    <div className="space-y-1.5 mt-1">
+                      {headerEntries.map(([key, value]) => (
+                        <div
+                          key={key}
+                          className="flex items-center gap-2 bg-slate-50 rounded px-3 py-2"
+                        >
+                          <span className="font-mono text-xs text-slate-700 font-medium">{key}</span>
+                          <span className="text-slate-300">:</span>
+                          <span className="font-mono text-xs text-slate-600 flex-1 truncate">
+                            {showEnvValues[key] ? value : '••••••••'}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => toggleEnvVisibility(key)}
+                            className="p-1 text-slate-400 hover:text-slate-600 transition-colors"
+                          >
+                            {showEnvValues[key] ? <EyeOff size={14} /> : <Eye size={14} />}
+                          </button>
+                        </div>
+                      ))}
                     </div>
-                  ))}
+                  </div>
+                )}
+              </>
+            ) : (
+              <>
+                {/* Command */}
+                <div>
+                  <span className="text-sm text-slate-500">命令</span>
+                  <p className="font-mono text-sm text-slate-900 mt-1 bg-slate-50 rounded px-3 py-2">
+                    {server.command}
+                  </p>
                 </div>
-              </div>
+
+                {/* Args */}
+                {server.args && server.args.length > 0 && (
+                  <div>
+                    <span className="text-sm text-slate-500">参数</span>
+                    <div className="flex flex-wrap gap-1.5 mt-1">
+                      {server.args.map((arg, i) => (
+                        <span
+                          key={i}
+                          className="px-2 py-1 bg-slate-100 text-slate-700 rounded text-xs font-mono"
+                        >
+                          {arg}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Env */}
+                {envEntries.length > 0 && (
+                  <div>
+                    <span className="text-sm text-slate-500">环境变量</span>
+                    <div className="space-y-1.5 mt-1">
+                      {envEntries.map(([key, value]) => (
+                        <div
+                          key={key}
+                          className="flex items-center gap-2 bg-slate-50 rounded px-3 py-2"
+                        >
+                          <span className="font-mono text-xs text-slate-700 font-medium">{key}</span>
+                          <span className="text-slate-300">=</span>
+                          <span className="font-mono text-xs text-slate-600 flex-1 truncate">
+                            {showEnvValues[key] ? value : '••••••••'}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => toggleEnvVisibility(key)}
+                            className="p-1 text-slate-400 hover:text-slate-600 transition-colors"
+                          >
+                            {showEnvValues[key] ? <EyeOff size={14} /> : <Eye size={14} />}
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </>
             )}
 
             {/* Added at */}

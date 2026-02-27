@@ -12,9 +12,15 @@ import { DATA_DIR } from '../config.js';
 // --- Types ---
 
 interface McpServerEntry {
-  command: string;
+  // stdio type
+  command?: string;
   args?: string[];
   env?: Record<string, string>;
+  // http/sse type
+  type?: 'http' | 'sse';
+  url?: string;
+  headers?: Record<string, string>;
+  // metadata
   enabled: boolean;
   syncedFromHost?: boolean;
   description?: string;
@@ -107,12 +113,15 @@ mcpServersRoutes.post('/', authMiddleware, async (c) => {
   const authUser = c.get('user') as AuthUser;
   const body = await c.req.json().catch(() => ({}));
 
-  const { id, command, args, env, description } = body as {
+  const { id, command, args, env, description, type, url, headers } = body as {
     id?: string;
     command?: string;
     args?: string[];
     env?: Record<string, string>;
     description?: string;
+    type?: string;
+    url?: string;
+    headers?: Record<string, string>;
   };
 
   if (!id || typeof id !== 'string') {
@@ -127,17 +136,29 @@ mcpServersRoutes.post('/', authMiddleware, async (c) => {
       400,
     );
   }
-  if (!command || typeof command !== 'string') {
-    return c.json(
-      { error: 'command is required and must be a string' },
-      400,
-    );
-  }
-  if (args !== undefined && !Array.isArray(args)) {
-    return c.json({ error: 'args must be an array of strings' }, 400);
-  }
-  if (env !== undefined && (typeof env !== 'object' || env === null || Array.isArray(env))) {
-    return c.json({ error: 'env must be a plain object' }, 400);
+
+  const isHttpType = type === 'http' || type === 'sse';
+
+  if (isHttpType) {
+    if (!url || typeof url !== 'string') {
+      return c.json({ error: 'url is required for http/sse type' }, 400);
+    }
+    if (headers !== undefined && (typeof headers !== 'object' || headers === null || Array.isArray(headers))) {
+      return c.json({ error: 'headers must be a plain object' }, 400);
+    }
+  } else {
+    if (!command || typeof command !== 'string') {
+      return c.json(
+        { error: 'command is required and must be a string' },
+        400,
+      );
+    }
+    if (args !== undefined && !Array.isArray(args)) {
+      return c.json({ error: 'args must be an array of strings' }, 400);
+    }
+    if (env !== undefined && (typeof env !== 'object' || env === null || Array.isArray(env))) {
+      return c.json({ error: 'env must be a plain object' }, 400);
+    }
   }
 
   const file = await readMcpServersFile(authUser.id);
@@ -145,14 +166,23 @@ mcpServersRoutes.post('/', authMiddleware, async (c) => {
     return c.json({ error: `Server "${id}" already exists` }, 409);
   }
 
-  file.servers[id] = {
-    command,
-    ...(args ? { args } : {}),
-    ...(env ? { env } : {}),
+  const entry: McpServerEntry = {
     enabled: true,
     ...(description ? { description } : {}),
     addedAt: new Date().toISOString(),
   };
+
+  if (isHttpType) {
+    entry.type = type as 'http' | 'sse';
+    entry.url = url;
+    if (headers && Object.keys(headers).length > 0) entry.headers = headers;
+  } else {
+    entry.command = command;
+    if (args && args.length > 0) entry.args = args;
+    if (env && Object.keys(env).length > 0) entry.env = env;
+  }
+
+  file.servers[id] = entry;
 
   await writeMcpServersFile(authUser.id, file);
   return c.json({ success: true, server: { id, ...file.servers[id] } });
@@ -168,12 +198,14 @@ mcpServersRoutes.patch('/:id', authMiddleware, async (c) => {
   }
 
   const body = await c.req.json().catch(() => ({}));
-  const { command, args, env, enabled, description } = body as {
+  const { command, args, env, enabled, description, url, headers } = body as {
     command?: string;
     args?: string[];
     env?: Record<string, string>;
     enabled?: boolean;
     description?: string;
+    url?: string;
+    headers?: Record<string, string>;
   };
 
   const file = await readMcpServersFile(authUser.id);
@@ -182,6 +214,7 @@ mcpServersRoutes.patch('/:id', authMiddleware, async (c) => {
     return c.json({ error: 'Server not found' }, 404);
   }
 
+  // stdio fields
   if (command !== undefined) {
     if (typeof command !== 'string' || !command) {
       return c.json({ error: 'command must be a non-empty string' }, 400);
@@ -200,6 +233,20 @@ mcpServersRoutes.patch('/:id', authMiddleware, async (c) => {
     }
     entry.env = env;
   }
+  // http/sse fields
+  if (url !== undefined) {
+    if (typeof url !== 'string' || !url) {
+      return c.json({ error: 'url must be a non-empty string' }, 400);
+    }
+    entry.url = url;
+  }
+  if (headers !== undefined) {
+    if (typeof headers !== 'object' || headers === null || Array.isArray(headers)) {
+      return c.json({ error: 'headers must be a plain object' }, 400);
+    }
+    entry.headers = headers;
+  }
+  // common fields
   if (enabled !== undefined) {
     if (typeof enabled !== 'boolean') {
       return c.json({ error: 'enabled must be a boolean' }, 400);
@@ -233,22 +280,45 @@ mcpServersRoutes.delete('/:id', authMiddleware, async (c) => {
   return c.json({ success: true });
 });
 
-// POST /sync-host — sync from host ~/.claude/settings.json (admin only)
+// POST /sync-host — sync from host MCP configs (admin only)
+// Reads from both ~/.claude/settings.json and ~/.claude.json
 mcpServersRoutes.post('/sync-host', authMiddleware, async (c) => {
   const authUser = c.get('user') as AuthUser;
   if (authUser.role !== 'admin') {
     return c.json({ error: 'Only admin can sync host MCP servers' }, 403);
   }
 
-  // Read host settings
-  const settingsPath = path.join(os.homedir(), '.claude', 'settings.json');
+  // Read MCP servers from both config file locations
   let hostServers: Record<string, any> = {};
+
+  // Source 1: ~/.claude/settings.json
+  const settingsPath = path.join(os.homedir(), '.claude', 'settings.json');
   try {
     const raw = await fs.readFile(settingsPath, 'utf-8');
     const settings = JSON.parse(raw);
-    hostServers = settings.mcpServers || {};
+    if (settings.mcpServers) {
+      hostServers = { ...hostServers, ...settings.mcpServers };
+    }
   } catch {
-    return c.json({ error: 'Failed to read host settings.json' }, 500);
+    // File may not exist, that's OK
+  }
+
+  // Source 2: ~/.claude.json (global Claude Code config, stores per-user MCP settings)
+  // When both files define the same server ID, ~/.claude.json wins because it's
+  // the primary user-facing config file where Claude Code persists MCP settings.
+  const globalConfigPath = path.join(os.homedir(), '.claude.json');
+  try {
+    const raw = await fs.readFile(globalConfigPath, 'utf-8');
+    const config = JSON.parse(raw);
+    if (config.mcpServers) {
+      hostServers = { ...hostServers, ...config.mcpServers };
+    }
+  } catch {
+    // File may not exist, that's OK
+  }
+
+  if (Object.keys(hostServers).length === 0) {
+    return c.json({ added: 0, updated: 0, deleted: 0, skipped: 0, message: 'No MCP servers found in host config files' });
   }
 
   const file = await readMcpServersFile(authUser.id);
@@ -260,7 +330,7 @@ mcpServersRoutes.post('/sync-host', authMiddleware, async (c) => {
   const newSyncedList: string[] = [];
 
   // Add/update from host
-  for (const [id, hostEntry] of Object.entries(hostServers)) {
+  for (const [id, hostEntry] of Object.entries(hostServers) as [string, any][]) {
     if (!validateServerId(id)) {
       stats.skipped++;
       continue;
@@ -275,16 +345,25 @@ mcpServersRoutes.post('/sync-host', authMiddleware, async (c) => {
       continue;
     }
 
+    const isHttpType = hostEntry.type === 'http' || hostEntry.type === 'sse';
+
     const entry: McpServerEntry = {
-      command: hostEntry.command || '',
-      ...(hostEntry.args ? { args: hostEntry.args } : {}),
-      ...(hostEntry.env ? { env: hostEntry.env } : {}),
       enabled: true,
       syncedFromHost: true,
       addedAt: existsInUser
         ? (file.servers[id].addedAt || new Date().toISOString())
         : new Date().toISOString(),
     };
+
+    if (isHttpType) {
+      entry.type = hostEntry.type;
+      entry.url = hostEntry.url || '';
+      if (hostEntry.headers) entry.headers = hostEntry.headers;
+    } else {
+      entry.command = hostEntry.command || '';
+      if (hostEntry.args) entry.args = hostEntry.args;
+      if (hostEntry.env) entry.env = hostEntry.env;
+    }
 
     if (existsInUser) {
       stats.updated++;
