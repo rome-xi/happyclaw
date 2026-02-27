@@ -269,7 +269,8 @@ export function createTelegramConnection(config: TelegramConnectionConfig): Tele
           opts.onNewChat(jid, chatName);
 
           // ── /clear 指令：重置上下文，不进入消息流 ──
-          if (text.trim() === '/clear' && opts.onCommand) {
+          // Match /clear and /clear@BotUsername (Telegram appends @bot in group chats)
+          if (/^\/clear(?:@\S+)?$/i.test(text.trim()) && opts.onCommand) {
             try {
               const reply = await opts.onCommand(jid, 'clear');
               if (reply) await ctx.reply(reply);

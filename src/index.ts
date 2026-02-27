@@ -70,6 +70,8 @@ import {
 } from './db.js';
 // feishu.js deprecated exports are no longer needed; imManager handles all connections
 import { imManager } from './im-manager.js';
+import { getChannelType } from './im-channel.js';
+import { analyzeIntent } from './intent-analyzer.js';
 import {
   getClaudeProviderConfig as getClaudeProviderConfigForRefresh,
   getFeishuProviderConfigWithSource,
@@ -182,17 +184,13 @@ async function handleCommand(chatJid: string, command: string): Promise<string |
 }
 
 async function setTyping(jid: string, isTyping: boolean): Promise<void> {
-  if (jid.startsWith('feishu:')) {
-    await imManager.setFeishuTyping(jid, isTyping);
-  }
-  if (jid.startsWith('telegram:')) {
-    await imManager.setTelegramTyping(jid, isTyping);
-  }
+  await imManager.setTyping(jid, isTyping);
   broadcastTyping(jid, isTyping);
 }
 
 interface SendMessageOptions {
-  sendToFeishu?: boolean;
+  /** Whether to forward the reply to the IM channel (Feishu/Telegram). Defaults to true for IM JIDs. */
+  sendToIM?: boolean;
 }
 
 function loadState(): void {
@@ -532,10 +530,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }
   }
 
-  // Reply routing: feishu JIDs reply to feishu, telegram JIDs reply to telegram.
+  // Reply routing: IM JIDs reply to their respective IM channel.
   // With the home-folder forced restart in the message loop, each JID gets its
   // own processGroupMessages call, so JID-based routing is always correct.
-  const shouldReplyToFeishu = chatJid.startsWith('feishu:');
+  const shouldReplyToIM = getChannelType(chatJid) !== null;
 
   const shared = isGroupShared(group.folder);
   const prompt = formatMessages(missedMessages, shared);
@@ -547,7 +545,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     {
       group: group.name,
       messageCount: missedMessages.length,
-      shouldReplyToFeishu,
+      shouldReplyToIM,
       imageCount: images.length,
       shared,
     },
@@ -715,7 +713,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             // so it doesn't keep firing while the agent stays alive in idle state.
             await setTyping(chatJid, false);
             await sendMessage(chatJid, text, {
-              sendToFeishu: shouldReplyToFeishu,
+              sendToIM: shouldReplyToIM,
             });
             sentReply = true;
             // Persist cursor as soon as a visible reply is emitted.
@@ -1082,21 +1080,14 @@ async function sendMessage(
   text: string,
   options: SendMessageOptions = {},
 ): Promise<void> {
-  const sendToFeishu = options.sendToFeishu ?? jid.startsWith('feishu:');
+  const isIMChannel = getChannelType(jid) !== null;
+  const sendToIM = options.sendToIM ?? isIMChannel;
   try {
-    if (sendToFeishu && jid.startsWith('feishu:')) {
+    if (sendToIM && isIMChannel) {
       try {
-        await imManager.sendFeishuMessage(jid, text);
+        await imManager.sendMessage(jid, text);
       } catch (err) {
-        logger.error({ jid, err }, 'Failed to send message to Feishu');
-      }
-    }
-
-    if (jid.startsWith('telegram:')) {
-      try {
-        await imManager.sendTelegramMessage(jid, text);
-      } catch (err) {
-        logger.error({ jid, err }, 'Failed to send message to Telegram');
+        logger.error({ jid, err }, 'Failed to send message to IM channel');
       }
     }
 
@@ -1123,7 +1114,7 @@ async function sendMessage(
       timestamp,
       is_from_me: true,
     });
-    logger.info({ jid, length: text.length, sendToFeishu }, 'Message sent');
+    logger.info({ jid, length: text.length, sendToIM }, 'Message sent');
     broadcastToWebClients(jid, text);
   } catch (err) {
     logger.error({ jid, err }, 'Failed to send message');
@@ -1932,7 +1923,10 @@ async function startMessageLoop(): Promise<void> {
           const images = collectMessageImages(chatJid, messagesToSend);
           const imagesForAgent = images.length > 0 ? images : undefined;
 
-          if (queue.sendMessage(chatJid, formatted, imagesForAgent)) {
+          const lastRawText = messagesToSend[messagesToSend.length - 1].content;
+          const intent = analyzeIntent(lastRawText);
+          const sendResult = queue.sendMessage(chatJid, formatted, imagesForAgent, intent);
+          if (sendResult === 'sent') {
             logger.debug(
               { chatJid, count: messagesToSend.length, imageCount: images.length },
               'Piped messages to active container',
@@ -1943,8 +1937,26 @@ async function startMessageLoop(): Promise<void> {
               id: lastProcessed.id,
             };
             saveState();
+          } else if (sendResult === 'interrupted_stop') {
+            // Stop intent: update cursor, don't enqueue (agent stops)
+            const lastProcessed = messagesToSend[messagesToSend.length - 1];
+            lastAgentTimestamp[chatJid] = {
+              timestamp: lastProcessed.timestamp,
+              id: lastProcessed.id,
+            };
+            saveState();
+          } else if (sendResult === 'interrupted_correction') {
+            // Correction intent: update cursor; the IPC message was written so the
+            // interrupted agent will pick it up in its session loop after the abort.
+            // No enqueueMessageCheck needed — the existing agent handles it.
+            const lastProcessed = messagesToSend[messagesToSend.length - 1];
+            lastAgentTimestamp[chatJid] = {
+              timestamp: lastProcessed.timestamp,
+              id: lastProcessed.id,
+            };
+            saveState();
           } else {
-            // No active container — enqueue for a new one
+            // no_active — enqueue for a new one
             queue.enqueueMessageCheck(chatJid);
           }
         }
@@ -2575,6 +2587,10 @@ async function main(): Promise<void> {
       queue.registerProcess(groupJid, proc, containerName, groupFolder, displayName),
     sendMessage,
     assistantName: ASSISTANT_NAME,
+    dailySummaryDeps: {
+      logger,
+      dataDir: DATA_DIR,
+    },
   });
   startIpcWatcher();
   recoverPendingMessages();

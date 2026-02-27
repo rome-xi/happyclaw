@@ -46,6 +46,7 @@ import monitorRoutes from './routes/monitor.js';
 import skillsRoutes from './routes/skills.js';
 import browseRoutes from './routes/browse.js';
 import agentRoutes from './routes/agents.js';
+import mcpServersRoutes from './routes/mcp-servers.js';
 
 // Database and types (only for handleWebUserMessage and broadcast)
 import {
@@ -64,6 +65,7 @@ import { isSessionExpired } from './auth.js';
 import type { NewMessage, WsMessageOut, WsMessageIn, AuthUser, StreamEvent, UserRole } from './types.js';
 import { WEB_PORT, SESSION_COOKIE_NAME } from './config.js';
 import { logger } from './logger.js';
+import { analyzeIntent } from './intent-analyzer.js';
 import { executeSessionReset } from './commands.js';
 
 // --- App Setup ---
@@ -136,6 +138,7 @@ app.route('/api/tasks', tasksRoutes);
 app.route('/api/skills', skillsRoutes);
 app.route('/api/admin', adminRoutes);
 app.route('/api/browse', browseRoutes);
+app.route('/api/mcp-servers', mcpServersRoutes);
 app.route('/api/groups', agentRoutes); // Agent routes under /api/groups/:jid/agents
 app.route('/api', monitorRoutes);
 
@@ -255,9 +258,17 @@ async function handleWebUserMessage(
       data: attachment.data,
       mimeType: attachment.mimeType,
     }));
-    const sent = deps.queue.sendMessage(chatJid, formatted, images);
-    pipedToActive = sent;
-    if (!sent) {
+    const intent = analyzeIntent(content);
+    const sendResult = deps.queue.sendMessage(chatJid, formatted, images, intent);
+    if (sendResult === 'sent') {
+      pipedToActive = true;
+    } else if (sendResult === 'interrupted_stop') {
+      // Stop intent: cursor updated, no enqueue needed
+      pipedToActive = true;
+    } else if (sendResult === 'interrupted_correction') {
+      // Correction intent: IPC message written, agent handles it after interrupt
+      pipedToActive = true;
+    } else {
       deps.queue.enqueueMessageCheck(chatJid);
     }
   }
@@ -325,8 +336,9 @@ async function handleAgentConversationMessage(
   }], shared);
 
   // Try to pipe into running agent process
-  const sent = deps.queue.sendMessage(virtualChatJid, formatted);
-  if (!sent) {
+  const agentIntent = analyzeIntent(content);
+  const agentSendResult = deps.queue.sendMessage(virtualChatJid, formatted, undefined, agentIntent);
+  if (agentSendResult === 'no_active') {
     // No running process — start one via processAgentConversation
     if (deps.processAgentConversation) {
       const taskId = `agent-conv:${agentId}:${Date.now()}`;
@@ -335,6 +347,8 @@ async function handleAgentConversationMessage(
       });
     }
   }
+  // 'sent', 'interrupted_stop', 'interrupted_correction' need no further action —
+  // for correction, the IPC message was written and the agent handles it after interrupt
 }
 
 // --- Static Files ---
@@ -516,6 +530,11 @@ function setupWebSocket(server: any): WebSocketServer {
                 });
               } catch (err) {
                 logger.error({ chatJid, err }, '/clear command failed');
+                const errId = crypto.randomUUID();
+                const errTs = new Date().toISOString();
+                ensureChatExists(chatJid);
+                storeMessageDirect(errId, chatJid, '__system__', 'system', 'system_error:清除上下文失败，请稍后重试', errTs, true);
+                broadcastNewMessage(chatJid, { id: errId, chat_jid: chatJid, sender: '__system__', sender_name: 'system', content: 'system_error:清除上下文失败，请稍后重试', timestamp: errTs, is_from_me: true });
               }
             }
             return;

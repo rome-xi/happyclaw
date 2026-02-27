@@ -8,14 +8,14 @@ import path from 'path';
 import { deleteSession, getJidsByFolder, storeMessageDirect, ensureChatExists } from './db.js';
 import { DATA_DIR } from './config.js';
 import { logger } from './logger.js';
+import type { NewMessage } from './types.js';
 
 // ─── Types ──────────────────────────────────────────────────────
 
 export interface CommandDeps {
   queue: { stopGroup(jid: string, opts?: { force?: boolean }): Promise<void> };
   sessions: Record<string, string>;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  broadcast: (jid: string, msg: any) => void;
+  broadcast: (jid: string, msg: NewMessage & { is_from_me: boolean }) => void;
 }
 
 // ─── Session file cleanup (mirrors groups.ts clearSessionJsonlFiles) ────

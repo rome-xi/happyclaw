@@ -110,6 +110,7 @@ export function initDatabase(): void {
       FOREIGN KEY (chat_jid) REFERENCES chats(jid)
     );
     CREATE INDEX IF NOT EXISTS idx_timestamp ON messages(timestamp);
+    CREATE INDEX IF NOT EXISTS idx_messages_jid_ts ON messages(chat_jid, timestamp);
 
     CREATE TABLE IF NOT EXISTS scheduled_tasks (
       id TEXT PRIMARY KEY,
@@ -1338,6 +1339,76 @@ export function getTaskRunLogs(taskId: string, limit = 20): TaskRunLog[] {
   `,
     )
     .all(taskId, limit) as TaskRunLog[];
+}
+
+// ===================== Daily Summary Queries =====================
+
+/**
+ * Get messages for a chat within a time range, ordered by timestamp ASC.
+ */
+export function getMessagesByTimeRange(
+  chatJid: string,
+  startTs: number,
+  endTs: number,
+  limit = 500,
+): Array<NewMessage & { is_from_me: boolean }> {
+  const startIso = new Date(startTs).toISOString();
+  const endIso = new Date(endTs).toISOString();
+  const rows = db
+    .prepare(
+      `SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me, attachments
+       FROM messages
+       WHERE chat_jid = ? AND timestamp >= ? AND timestamp < ?
+       ORDER BY timestamp ASC
+       LIMIT ?`,
+    )
+    .all(chatJid, startIso, endIso, limit) as Array<
+    NewMessage & { is_from_me: number }
+  >;
+
+  return rows.map((row) => ({
+    ...row,
+    is_from_me: row.is_from_me === 1,
+  }));
+}
+
+/**
+ * Get all registered groups owned by a specific user.
+ */
+export function getGroupsByOwner(userId: string): Array<RegisteredGroup & { jid: string }> {
+  const rows = db
+    .prepare('SELECT * FROM registered_groups WHERE created_by = ?')
+    .all(userId) as Array<{
+    jid: string;
+    name: string;
+    folder: string;
+    added_at: string;
+    container_config: string | null;
+    execution_mode: string | null;
+    custom_cwd: string | null;
+    init_source_path: string | null;
+    init_git_url: string | null;
+    created_by: string | null;
+    is_home: number;
+    selected_skills: string | null;
+  }>;
+
+  return rows.map((row) => ({
+    jid: row.jid,
+    name: row.name,
+    folder: row.folder,
+    added_at: row.added_at,
+    containerConfig: row.container_config
+      ? JSON.parse(row.container_config)
+      : undefined,
+    executionMode: parseExecutionMode(row.execution_mode, `group ${row.jid}`),
+    customCwd: row.custom_cwd ?? undefined,
+    initSourcePath: row.init_source_path ?? undefined,
+    initGitUrl: row.init_git_url ?? undefined,
+    created_by: row.created_by ?? undefined,
+    is_home: row.is_home === 1,
+    selected_skills: row.selected_skills ? JSON.parse(row.selected_skills) : null,
+  }));
 }
 
 // ===================== Auth CRUD =====================

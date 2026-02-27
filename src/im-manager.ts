@@ -1,19 +1,26 @@
 /**
  * IM Connection Pool Manager
  *
- * Manages per-user IM connections (Feishu, Telegram).
+ * Manages per-user IM connections using the unified IMChannel interface.
  * Each user can have independent IM connections that route messages
  * to their home container.
  */
-import { createFeishuConnection, FeishuConnection } from './feishu.js';
-import { createTelegramConnection, TelegramConnection } from './telegram.js';
+import {
+  type IMChannel,
+  type IMChannelConnectOpts,
+  getChannelType,
+  extractChatId,
+  createFeishuChannel,
+  createTelegramChannel,
+} from './im-channel.js';
+import type { FeishuConnectionConfig } from './feishu.js';
+import type { TelegramConnectionConfig } from './telegram.js';
 import { getRegisteredGroup, getJidsByFolder } from './db.js';
 import { logger } from './logger.js';
 
 export interface UserIMConnection {
   userId: string;
-  feishu?: FeishuConnection;
-  telegram?: TelegramConnection;
+  channels: Map<string, IMChannel>;
 }
 
 export interface FeishuConnectConfig {
@@ -30,8 +37,6 @@ export interface TelegramConnectConfig {
 class IMConnectionManager {
   private connections = new Map<string, UserIMConnection>();
   private adminUserIds = new Set<string>();
-  // Telegram typing indicator timers keyed by chatJid
-  private telegramTypingTimers = new Map<string, NodeJS.Timeout>();
 
   /** Register a user ID as admin (for fallback routing) */
   registerAdminUser(userId: string): void {
@@ -41,18 +46,125 @@ class IMConnectionManager {
   private getOrCreate(userId: string): UserIMConnection {
     let conn = this.connections.get(userId);
     if (!conn) {
-      conn = { userId };
+      conn = { userId, channels: new Map() };
       this.connections.set(userId, conn);
     }
     return conn;
   }
 
+  // ─── Generic Channel Methods ────────────────────────────────
+
+  /**
+   * Connect any IMChannel for a user.
+   */
+  async connectChannel(
+    userId: string,
+    channelType: string,
+    channel: IMChannel,
+    opts: IMChannelConnectOpts,
+  ): Promise<boolean> {
+    // Disconnect existing channel of same type
+    await this.disconnectChannel(userId, channelType);
+
+    const conn = this.getOrCreate(userId);
+    const connected = await channel.connect(opts);
+    if (connected) {
+      conn.channels.set(channelType, channel);
+      logger.info({ userId, channelType }, 'IM channel connected');
+    }
+    return connected;
+  }
+
+  /**
+   * Disconnect a specific channel type for a user.
+   */
+  async disconnectChannel(userId: string, channelType: string): Promise<void> {
+    const conn = this.connections.get(userId);
+    const channel = conn?.channels.get(channelType);
+    if (channel) {
+      await channel.disconnect();
+      conn!.channels.delete(channelType);
+      logger.info({ userId, channelType }, 'IM channel disconnected');
+    }
+  }
+
+  /**
+   * Send a message to an IM chat, auto-routing via JID prefix.
+   * Resolves the user by looking up chatJid -> registered_groups.created_by.
+   * Falls back to iterating sibling groups if no created_by is set.
+   */
+  async sendMessage(jid: string, text: string): Promise<void> {
+    const channelType = getChannelType(jid);
+    if (!channelType) {
+      logger.debug({ jid }, 'Unknown channel type for JID, skip sending');
+      return;
+    }
+
+    const chatId = extractChatId(jid);
+    const channel = this.findChannelForJid(jid, channelType);
+    if (channel) {
+      await channel.sendMessage(chatId, text);
+      return;
+    }
+
+    logger.warn({ jid, channelType }, 'No IM channel available to send message');
+  }
+
+  /**
+   * Set typing indicator on an IM chat, auto-routing via JID prefix.
+   */
+  async setTyping(jid: string, isTyping: boolean): Promise<void> {
+    const channelType = getChannelType(jid);
+    if (!channelType) return;
+
+    const chatId = extractChatId(jid);
+    const channel = this.findChannelForJid(jid, channelType);
+    if (channel) {
+      await channel.setTyping(chatId, isTyping);
+    }
+    // No fallback for typing — silently ignore if owner's connection is unavailable
+  }
+
+  /**
+   * Find the appropriate IMChannel for a given JID, using group ownership lookup
+   * and sibling fallback.
+   */
+  private findChannelForJid(jid: string, channelType: string): IMChannel | undefined {
+    // Direct lookup via group ownership
+    const group = getRegisteredGroup(jid);
+    if (group?.created_by) {
+      const conn = this.connections.get(group.created_by);
+      const ch = conn?.channels.get(channelType);
+      if (ch?.isConnected()) return ch;
+    }
+
+    // Fallback: find owner via sibling groups sharing the same folder
+    if (group) {
+      const siblingJids = getJidsByFolder(group.folder);
+      for (const sibJid of siblingJids) {
+        if (sibJid === jid) continue;
+        const sibling = getRegisteredGroup(sibJid);
+        if (sibling?.created_by) {
+          const conn = this.connections.get(sibling.created_by);
+          const ch = conn?.channels.get(channelType);
+          if (ch?.isConnected()) {
+            logger.warn(
+              { jid, fallbackUserId: sibling.created_by, folder: group.folder },
+              'IM message routed via sibling group owner connection',
+            );
+            return ch;
+          }
+        }
+      }
+    }
+
+    return undefined;
+  }
+
+  // ─── Convenience Methods (API-compatible wrappers) ──────────
+
   /**
    * Connect a Feishu instance for a specific user.
-   * @param userId - The user ID to associate the connection with
-   * @param config - Feishu app credentials
-   * @param onNewChat - Callback when a new chat is discovered
-   * @param ignoreMessagesBefore - Optional timestamp to ignore stale messages
    */
   async connectUserFeishu(
     userId: string,
@@ -66,16 +178,12 @@ class IMConnectionManager {
       return false;
     }
 
-    // Stop existing connection if any
-    await this.disconnectUserFeishu(userId);
-
-    const conn = this.getOrCreate(userId);
-    const feishu = createFeishuConnection({
+    const channel = createFeishuChannel({
       appId: config.appId,
       appSecret: config.appSecret,
     });
 
-    const connected = await feishu.connect({
+    return this.connectChannel(userId, 'feishu', channel, {
       onReady: () => {
         logger.info({ userId }, 'User Feishu WebSocket connected');
       },
@@ -83,13 +191,6 @@ class IMConnectionManager {
       ignoreMessagesBefore,
       onCommand,
     });
-
-    if (connected) {
-      conn.feishu = feishu;
-      logger.info({ userId }, 'User Feishu connection established');
-    }
-
-    return connected;
   }
 
   /**
@@ -108,190 +209,79 @@ class IMConnectionManager {
       return false;
     }
 
-    // Stop existing connection if any
-    await this.disconnectUserTelegram(userId);
-
-    const conn = this.getOrCreate(userId);
-    const telegram = createTelegramConnection({
+    const channel = createTelegramChannel({
       botToken: config.botToken,
     });
 
-    try {
-      await telegram.connect({
-        onReady: () => {
-          logger.info({ userId }, 'User Telegram bot connected');
-        },
-        onNewChat,
-        isChatAuthorized: isChatAuthorized ?? (() => true),
-        onPairAttempt,
-        onCommand,
-      });
-
-      if (telegram.isConnected()) {
-        conn.telegram = telegram;
-        logger.info({ userId }, 'User Telegram connection established');
-        return true;
-      }
-      return false;
-    } catch (err) {
-      logger.error({ userId, err }, 'Failed to connect user Telegram');
-      return false;
-    }
+    return this.connectChannel(userId, 'telegram', channel, {
+      onReady: () => {
+        logger.info({ userId }, 'User Telegram bot connected');
+      },
+      onNewChat,
+      isChatAuthorized,
+      onPairAttempt,
+      onCommand,
+    });
   }
 
   async disconnectUserFeishu(userId: string): Promise<void> {
-    const conn = this.connections.get(userId);
-    if (conn?.feishu) {
-      await conn.feishu.stop();
-      conn.feishu = undefined;
-      logger.info({ userId }, 'User Feishu connection disconnected');
-    }
+    await this.disconnectChannel(userId, 'feishu');
   }
 
   async disconnectUserTelegram(userId: string): Promise<void> {
-    const conn = this.connections.get(userId);
-    if (conn?.telegram) {
-      await conn.telegram.disconnect();
-      conn.telegram = undefined;
-      logger.info({ userId }, 'User Telegram connection disconnected');
-    }
+    await this.disconnectChannel(userId, 'telegram');
   }
 
   /**
-   * Send a message to a Feishu chat, routing through the correct user's connection.
-   * Resolves the user by looking up chatJid → registered_groups.created_by.
-   * Falls back to iterating all connections if no created_by is set.
+   * Send a message to a Feishu chat.
+   * @deprecated Use sendMessage(jid, text) which auto-routes.
    */
   async sendFeishuMessage(chatJid: string, text: string): Promise<void> {
-    const chatId = chatJid.replace(/^feishu:/, '');
-
-    // Find the appropriate connection by group ownership
-    const group = getRegisteredGroup(chatJid);
-    if (group?.created_by) {
-      const conn = this.connections.get(group.created_by);
-      if (conn?.feishu?.isConnected()) {
-        await conn.feishu.sendMessage(chatId, text);
-        return;
-      }
+    const chatId = extractChatId(chatJid);
+    const channel = this.findChannelForJid(chatJid, 'feishu');
+    if (channel) {
+      await channel.sendMessage(chatId, text);
+      return;
     }
-
-    // Fallback: find owner via sibling groups sharing the same folder
-    if (group) {
-      const siblingJids = getJidsByFolder(group.folder);
-      for (const sibJid of siblingJids) {
-        if (sibJid === chatJid) continue;
-        const sibling = getRegisteredGroup(sibJid);
-        if (sibling?.created_by) {
-          const conn = this.connections.get(sibling.created_by);
-          if (conn?.feishu?.isConnected()) {
-            logger.warn(
-              { chatJid, fallbackUserId: sibling.created_by, folder: group.folder },
-              'Feishu message routed via sibling group owner connection',
-            );
-            await conn.feishu.sendMessage(chatId, text);
-            return;
-          }
-        }
-      }
-    }
-
     logger.warn({ chatJid }, 'No Feishu connection available to send message');
   }
 
   /**
-   * Send a message to a Telegram chat, routing through the correct user's connection.
+   * Send a message to a Telegram chat.
+   * @deprecated Use sendMessage(jid, text) which auto-routes.
    */
   async sendTelegramMessage(chatJid: string, text: string): Promise<void> {
-    const chatId = chatJid.replace(/^telegram:/, '');
-
-    // Find the appropriate connection by group ownership
-    const group = getRegisteredGroup(chatJid);
-    if (group?.created_by) {
-      const conn = this.connections.get(group.created_by);
-      if (conn?.telegram?.isConnected()) {
-        await conn.telegram.sendMessage(chatId, text);
-        return;
-      }
+    const chatId = extractChatId(chatJid);
+    const channel = this.findChannelForJid(chatJid, 'telegram');
+    if (channel) {
+      await channel.sendMessage(chatId, text);
+      return;
     }
-
-    // Fallback: find owner via sibling groups sharing the same folder
-    if (group) {
-      const siblingJids = getJidsByFolder(group.folder);
-      for (const sibJid of siblingJids) {
-        if (sibJid === chatJid) continue;
-        const sibling = getRegisteredGroup(sibJid);
-        if (sibling?.created_by) {
-          const conn = this.connections.get(sibling.created_by);
-          if (conn?.telegram?.isConnected()) {
-            logger.warn(
-              { chatJid, fallbackUserId: sibling.created_by, folder: group.folder },
-              'Telegram message routed via sibling group owner connection',
-            );
-            await conn.telegram.sendMessage(chatId, text);
-            return;
-          }
-        }
-      }
-    }
-
     logger.warn({ chatJid }, 'No Telegram connection available to send message');
   }
 
   /**
    * Set typing reaction on a Feishu chat.
+   * @deprecated Use setTyping(jid, isTyping) which auto-routes.
    */
   async setFeishuTyping(chatJid: string, isTyping: boolean): Promise<void> {
-    const chatId = chatJid.replace(/^feishu:/, '');
-
-    const group = getRegisteredGroup(chatJid);
-    if (group?.created_by) {
-      const conn = this.connections.get(group.created_by);
-      if (conn?.feishu?.isConnected()) {
-        await conn.feishu.sendReaction(chatId, isTyping);
-        return;
-      }
+    const chatId = extractChatId(chatJid);
+    const channel = this.findChannelForJid(chatJid, 'feishu');
+    if (channel) {
+      await channel.setTyping(chatId, isTyping);
     }
-
-    // No fallback for typing — silently ignore if owner's connection is unavailable
   }
 
   /**
    * Set Telegram typing chat action for a chat.
-   * Telegram's typing indicator expires after ~5s, so we resend every 4s while active.
+   * @deprecated Use setTyping(jid, isTyping) which auto-routes.
    */
   async setTelegramTyping(chatJid: string, isTyping: boolean): Promise<void> {
-    // Clear any existing timer regardless of direction
-    const existing = this.telegramTypingTimers.get(chatJid);
-    if (existing) {
-      clearInterval(existing);
-      this.telegramTypingTimers.delete(chatJid);
+    const chatId = extractChatId(chatJid);
+    const channel = this.findChannelForJid(chatJid, 'telegram');
+    if (channel) {
+      await channel.setTyping(chatId, isTyping);
     }
-
-    if (!isTyping) return;
-
-    const chatId = chatJid.replace(/^telegram:/, '');
-
-    // Helper: find the right TelegramConnection for this chatJid
-    const findConn = (): TelegramConnection | undefined => {
-      const group = getRegisteredGroup(chatJid);
-      if (group?.created_by) {
-        const conn = this.connections.get(group.created_by);
-        if (conn?.telegram?.isConnected()) return conn.telegram;
-      }
-      return undefined;
-    };
-
-    const sendAction = async (): Promise<void> => {
-      const conn = findConn();
-      if (!conn) return;
-      await conn.sendChatAction(chatId, 'typing');
-    };
-
-    // Send immediately, then repeat every 4s to keep indicator alive
-    void sendAction();
-    const timer = setInterval(() => { void sendAction(); }, 4000);
-    this.telegramTypingTimers.set(chatJid, timer);
-    logger.debug({ chatJid }, 'Telegram typing indicator started');
   }
 
   /**
@@ -299,25 +289,26 @@ class IMConnectionManager {
    */
   async syncFeishuGroups(userId: string): Promise<void> {
     const conn = this.connections.get(userId);
-    if (conn?.feishu?.isConnected()) {
-      await conn.feishu.syncGroups();
+    const channel = conn?.channels.get('feishu');
+    if (channel?.isConnected() && channel.syncGroups) {
+      await channel.syncGroups();
     }
   }
 
   isFeishuConnected(userId: string): boolean {
     const conn = this.connections.get(userId);
-    return conn?.feishu?.isConnected() ?? false;
+    return conn?.channels.get('feishu')?.isConnected() ?? false;
   }
 
   isTelegramConnected(userId: string): boolean {
     const conn = this.connections.get(userId);
-    return conn?.telegram?.isConnected() ?? false;
+    return conn?.channels.get('telegram')?.isConnected() ?? false;
   }
 
   /** Check if any user has an active Feishu connection */
   isAnyFeishuConnected(): boolean {
     for (const conn of this.connections.values()) {
-      if (conn.feishu?.isConnected()) return true;
+      if (conn.channels.get('feishu')?.isConnected()) return true;
     }
     return false;
   }
@@ -325,27 +316,30 @@ class IMConnectionManager {
   /** Check if any user has an active Telegram connection */
   isAnyTelegramConnected(): boolean {
     for (const conn of this.connections.values()) {
-      if (conn.telegram?.isConnected()) return true;
+      if (conn.channels.get('telegram')?.isConnected()) return true;
     }
     return false;
   }
 
-  /** Get the Feishu connection for a user (for direct access like syncGroups) */
-  getFeishuConnection(userId: string): FeishuConnection | undefined {
-    return this.connections.get(userId)?.feishu;
+  /** Get the Feishu channel for a user (for direct access like syncGroups) */
+  getFeishuConnection(userId: string): IMChannel | undefined {
+    return this.connections.get(userId)?.channels.get('feishu');
   }
 
-  /** Get the Telegram connection for a user */
-  getTelegramConnection(userId: string): TelegramConnection | undefined {
-    return this.connections.get(userId)?.telegram;
+  /** Get the Telegram channel for a user */
+  getTelegramConnection(userId: string): IMChannel | undefined {
+    return this.connections.get(userId)?.channels.get('telegram');
   }
 
   /** Get all user IDs with active connections */
   getConnectedUserIds(): string[] {
     const ids: string[] = [];
     for (const [userId, conn] of this.connections.entries()) {
-      if (conn.feishu?.isConnected() || conn.telegram?.isConnected()) {
-        ids.push(userId);
+      for (const ch of conn.channels.values()) {
+        if (ch.isConnected()) {
+          ids.push(userId);
+          break;
+        }
       }
     }
     return ids;
@@ -359,26 +353,16 @@ class IMConnectionManager {
     const promises: Promise<void>[] = [];
 
     for (const [userId, conn] of this.connections.entries()) {
-      if (conn.feishu) {
+      for (const [channelType, channel] of conn.channels.entries()) {
         promises.push(
-          conn.feishu.stop().catch((err) => {
-            logger.warn({ userId, err }, 'Error stopping Feishu connection');
-          }),
-        );
-      }
-      if (conn.telegram) {
-        promises.push(
-          conn.telegram.disconnect().catch((err) => {
-            logger.warn({ userId, err }, 'Error stopping Telegram connection');
+          channel.disconnect().catch((err) => {
+            logger.warn({ userId, channelType, err }, 'Error stopping IM channel');
           }),
         );
       }
     }
 
     await Promise.allSettled(promises);
-    // Clear all Telegram typing timers
-    for (const timer of this.telegramTypingTimers.values()) clearInterval(timer);
-    this.telegramTypingTimers.clear();
     this.connections.clear();
     logger.info('All IM connections disconnected');
   }
