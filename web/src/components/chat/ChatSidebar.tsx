@@ -11,6 +11,28 @@ import { CreateContainerDialog } from './CreateContainerDialog';
 import { RenameDialog } from './RenameDialog';
 import { SkeletonCardList } from '@/components/common/Skeletons';
 import { cn } from '@/lib/utils';
+import type { GroupInfo } from '../../types';
+
+type GroupEntry = GroupInfo & { jid: string };
+type DateSection = { label: string; items: GroupEntry[] };
+
+function groupByDate(items: GroupEntry[]): DateSection[] {
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const weekAgo = new Date(today.getTime() - 7 * 86400000);
+  const sections: DateSection[] = [
+    { label: '今天', items: [] },
+    { label: '最近 7 天', items: [] },
+    { label: '更早', items: [] },
+  ];
+  items.forEach((g) => {
+    const time = new Date(g.lastMessageTime || g.added_at);
+    if (time >= today) sections[0].items.push(g);
+    else if (time >= weekAgo) sections[1].items.push(g);
+    else sections[2].items.push(g);
+  });
+  return sections.filter((s) => s.items.length > 0);
+}
 
 interface ChatSidebarProps {
   className?: string;
@@ -70,25 +92,6 @@ export function ChatSidebar({ className }: ChatSidebarProps) {
   }, [groups]);
 
   // Split non-main groups into private / collaborative, then sub-group by date
-  type DateSections = { label: string; items: typeof otherGroups }[];
-  const groupByDate = (items: typeof otherGroups): DateSections => {
-    const now = new Date();
-    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    const weekAgo = new Date(today.getTime() - 7 * 86400000);
-    const sections: DateSections = [
-      { label: '今天', items: [] },
-      { label: '最近 7 天', items: [] },
-      { label: '更早', items: [] },
-    ];
-    items.forEach((g) => {
-      const time = new Date(g.lastMessageTime || g.added_at);
-      if (time >= today) sections[0].items.push(g);
-      else if (time >= weekAgo) sections[1].items.push(g);
-      else sections[2].items.push(g);
-    });
-    return sections.filter((s) => s.items.length > 0);
-  };
-
   const { mySections, collabSections } = useMemo(() => {
     const filtered = searchQuery.trim()
       ? otherGroups.filter((g) => g.name.toLowerCase().includes(searchQuery.toLowerCase()))
@@ -146,6 +149,38 @@ export function ChatSidebar({ className }: ChatSidebarProps) {
   };
 
   const allGroups = mainGroup ? [mainGroup, ...otherGroups] : otherGroups;
+
+  const renderSections = (sections: DateSection[], showCollabBadge: boolean) =>
+    sections.map((section) => (
+      <div key={section.label} className="mb-1">
+        <div className="px-2 pt-2 pb-1">
+          <span className="text-[10px] text-muted-foreground/70 tracking-wide">
+            {section.label}
+          </span>
+        </div>
+        {section.items.map((g) => (
+          <ChatGroupItem
+            key={g.jid}
+            jid={g.jid}
+            name={g.name}
+            folder={g.folder}
+            lastMessage={g.lastMessage}
+            executionMode={g.execution_mode}
+            isShared={showCollabBadge ? g.is_shared : undefined}
+            memberRole={showCollabBadge ? g.member_role : undefined}
+            memberCount={showCollabBadge ? g.member_count : undefined}
+            isActive={currentGroup === g.jid}
+            isHome={false}
+            editable={g.editable}
+            deletable={g.deletable}
+            onSelect={handleGroupSelect}
+            onRename={(jid, name) => setRenameState({ open: true, jid, name })}
+            onClearHistory={(jid, name) => setClearState({ open: true, jid, name })}
+            onDelete={(jid, name) => setDeleteState({ open: true, jid, name })}
+          />
+        ))}
+      </div>
+    ));
 
   return (
     <div className={cn('flex flex-col h-full bg-background border-r', className)}>
@@ -224,33 +259,7 @@ export function ChatSidebar({ className }: ChatSidebarProps) {
                         我的工作区
                       </span>
                     </div>
-                    {mySections.map((section) => (
-                      <div key={section.label} className="mb-1">
-                        <div className="px-2 pt-2 pb-1">
-                          <span className="text-[10px] text-muted-foreground/70 tracking-wide">
-                            {section.label}
-                          </span>
-                        </div>
-                        {section.items.map((g) => (
-                          <ChatGroupItem
-                            key={g.jid}
-                            jid={g.jid}
-                            name={g.name}
-                            folder={g.folder}
-                            lastMessage={g.lastMessage}
-                            executionMode={g.execution_mode}
-                            isActive={currentGroup === g.jid}
-                            isHome={false}
-                            editable={g.editable}
-                            deletable={g.deletable}
-                            onSelect={handleGroupSelect}
-                            onRename={(jid, name) => setRenameState({ open: true, jid, name })}
-                            onClearHistory={(jid, name) => setClearState({ open: true, jid, name })}
-                            onDelete={(jid, name) => setDeleteState({ open: true, jid, name })}
-                          />
-                        ))}
-                      </div>
-                    ))}
+                    {renderSections(mySections, false)}
                   </div>
                 )}
 
@@ -261,36 +270,7 @@ export function ChatSidebar({ className }: ChatSidebarProps) {
                         协作工作区
                       </span>
                     </div>
-                    {collabSections.map((section) => (
-                      <div key={section.label} className="mb-1">
-                        <div className="px-2 pt-2 pb-1">
-                          <span className="text-[10px] text-muted-foreground/70 tracking-wide">
-                            {section.label}
-                          </span>
-                        </div>
-                        {section.items.map((g) => (
-                          <ChatGroupItem
-                            key={g.jid}
-                            jid={g.jid}
-                            name={g.name}
-                            folder={g.folder}
-                            lastMessage={g.lastMessage}
-                            executionMode={g.execution_mode}
-                            isShared={g.is_shared}
-                            memberRole={g.member_role}
-                            memberCount={g.member_count}
-                            isActive={currentGroup === g.jid}
-                            isHome={false}
-                            editable={g.editable}
-                            deletable={g.deletable}
-                            onSelect={handleGroupSelect}
-                            onRename={(jid, name) => setRenameState({ open: true, jid, name })}
-                            onClearHistory={(jid, name) => setClearState({ open: true, jid, name })}
-                            onDelete={(jid, name) => setDeleteState({ open: true, jid, name })}
-                          />
-                        ))}
-                      </div>
-                    ))}
+                    {renderSections(collabSections, true)}
                   </div>
                 )}
               </>
