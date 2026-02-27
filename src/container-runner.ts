@@ -48,7 +48,7 @@ const REQUIRED_SETTINGS_ENV: Record<string, string> = {
 /** Read existing settings.json, deep-merge required env keys and mcpServers, write only if changed */
 function ensureSettingsJson(
   settingsFile: string,
-  mcpServers?: Record<string, { command: string; args?: string[]; env?: Record<string, string> }>,
+  mcpServers?: Record<string, Record<string, unknown>>,
 ): void {
   let existing: Record<string, unknown> = {};
   try {
@@ -83,30 +83,41 @@ function ensureSettingsJson(
 /**
  * Load enabled MCP server configs for a user.
  * Reads data/mcp-servers/{userId}/servers.json and returns only enabled servers
- * with just the fields needed for settings.json (command/args/env).
+ * with fields needed for settings.json. Supports both stdio (command/args/env)
+ * and http/sse (type/url/headers) server types.
  */
 function loadUserMcpServers(
   userId: string,
-): Record<string, { command: string; args?: string[]; env?: Record<string, string> }> {
+): Record<string, Record<string, unknown>> {
   const serversFile = path.join(DATA_DIR, 'mcp-servers', userId, 'servers.json');
   try {
     if (!fs.existsSync(serversFile)) return {};
     const file = JSON.parse(fs.readFileSync(serversFile, 'utf8')) as {
-      servers?: Record<
-        string,
-        { enabled?: boolean; command?: string; args?: string[]; env?: Record<string, string> }
-      >;
+      servers?: Record<string, Record<string, unknown>>;
     };
     const raw = file.servers || {};
-    const result: Record<string, { command: string; args?: string[]; env?: Record<string, string> }> = {};
+    const result: Record<string, Record<string, unknown>> = {};
     for (const [name, server] of Object.entries(raw)) {
-      if (!server.enabled || !server.command) continue;
-      const entry: { command: string; args?: string[]; env?: Record<string, string> } = {
-        command: server.command,
-      };
-      if (server.args) entry.args = server.args;
-      if (server.env && Object.keys(server.env).length > 0) entry.env = server.env;
-      result[name] = entry;
+      if (!server.enabled) continue;
+
+      const isHttpType = server.type === 'http' || server.type === 'sse';
+
+      if (isHttpType) {
+        if (!server.url) continue;
+        const entry: Record<string, unknown> = { type: server.type, url: server.url };
+        if (server.headers && typeof server.headers === 'object' && Object.keys(server.headers as object).length > 0) {
+          entry.headers = server.headers;
+        }
+        result[name] = entry;
+      } else {
+        if (!server.command) continue;
+        const entry: Record<string, unknown> = { command: server.command };
+        if (server.args) entry.args = server.args;
+        if (server.env && typeof server.env === 'object' && Object.keys(server.env as object).length > 0) {
+          entry.env = server.env;
+        }
+        result[name] = entry;
+      }
     }
     return result;
   } catch {

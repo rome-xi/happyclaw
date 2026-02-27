@@ -39,7 +39,8 @@ export function McpServersPage() {
       (s) =>
         !q ||
         s.id.toLowerCase().includes(q) ||
-        s.command.toLowerCase().includes(q) ||
+        (s.command && s.command.toLowerCase().includes(q)) ||
+        (s.url && s.url.toLowerCase().includes(q)) ||
         (s.description && s.description.toLowerCase().includes(q)),
     );
   }, [servers, searchQuery]);
@@ -64,13 +65,7 @@ export function McpServersPage() {
     }
   };
 
-  const handleAdd = async (server: {
-    id: string;
-    command: string;
-    args?: string[];
-    env?: Record<string, string>;
-    description?: string;
-  }) => {
+  const handleAdd = async (server: Parameters<typeof addServer>[0]) => {
     await addServer(server);
   };
 
@@ -118,7 +113,7 @@ export function McpServersPage() {
               <SearchInput
                 value={searchQuery}
                 onChange={setSearchQuery}
-                placeholder="搜索 ID 或命令"
+                placeholder="搜索 ID、命令或 URL"
               />
             </div>
 

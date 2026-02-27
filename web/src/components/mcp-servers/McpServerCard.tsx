@@ -11,7 +11,10 @@ interface McpServerCardProps {
 export function McpServerCard({ server, selected, onSelect }: McpServerCardProps) {
   const toggleServer = useMcpServersStore((s) => s.toggleServer);
 
-  const commandPreview = [server.command, ...(server.args || [])].join(' ');
+  const isHttpType = server.type === 'http' || server.type === 'sse';
+  const preview = isHttpType
+    ? `${server.type?.toUpperCase()} ${server.url || ''}`
+    : [server.command, ...(server.args || [])].join(' ');
 
   return (
     <button
@@ -26,6 +29,11 @@ export function McpServerCard({ server, selected, onSelect }: McpServerCardProps
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 mb-1">
             <h3 className="font-medium text-slate-900 truncate">{server.id}</h3>
+            {isHttpType && (
+              <span className="px-1.5 py-0.5 rounded text-xs font-medium bg-blue-100 text-blue-700">
+                {server.type?.toUpperCase()}
+              </span>
+            )}
             {server.syncedFromHost && (
               <span className="px-2 py-0.5 rounded text-xs font-medium bg-amber-100 text-amber-700 inline-flex items-center gap-1">
                 <Download size={10} />
@@ -33,7 +41,7 @@ export function McpServerCard({ server, selected, onSelect }: McpServerCardProps
               </span>
             )}
           </div>
-          <p className="text-sm text-slate-500 truncate font-mono">{commandPreview}</p>
+          <p className="text-sm text-slate-500 truncate font-mono">{preview}</p>
           {server.description && (
             <p className="text-xs text-slate-400 mt-1 line-clamp-1">{server.description}</p>
           )}

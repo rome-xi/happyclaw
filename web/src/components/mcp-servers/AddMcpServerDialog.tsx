@@ -9,29 +9,40 @@ interface AddMcpServerDialogProps {
   onClose: () => void;
   onAdd: (server: {
     id: string;
-    command: string;
+    command?: string;
     args?: string[];
     env?: Record<string, string>;
+    type?: 'http' | 'sse';
+    url?: string;
+    headers?: Record<string, string>;
     description?: string;
   }) => Promise<void>;
 }
 
 const ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_-]*$/;
 
+type ServerType = 'stdio' | 'http' | 'sse';
+
 export function AddMcpServerDialog({ open, onClose, onAdd }: AddMcpServerDialogProps) {
   const [id, setId] = useState('');
+  const [serverType, setServerType] = useState<ServerType>('stdio');
   const [command, setCommand] = useState('');
   const [args, setArgs] = useState<string[]>([]);
   const [env, setEnv] = useState<Array<{ key: string; value: string }>>([]);
+  const [url, setUrl] = useState('');
+  const [headers, setHeaders] = useState<Array<{ key: string; value: string }>>([]);
   const [description, setDescription] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
   const reset = () => {
     setId('');
+    setServerType('stdio');
     setCommand('');
     setArgs([]);
     setEnv([]);
+    setUrl('');
+    setHeaders([]);
     setDescription('');
     setError(null);
   };
@@ -43,11 +54,17 @@ export function AddMcpServerDialog({ open, onClose, onAdd }: AddMcpServerDialogP
     }
   };
 
+  const isHttpType = serverType === 'http' || serverType === 'sse';
+
   const validate = (): string | null => {
     if (!id.trim()) return 'ID 不能为空';
     if (!ID_PATTERN.test(id.trim())) return 'ID 只能包含字母、数字、短横线和下划线，且不能以符号开头';
     if (id.trim().toLowerCase() === 'happyclaw') return 'ID 不能为 happyclaw（系统保留）';
-    if (!command.trim()) return '命令不能为空';
+    if (isHttpType) {
+      if (!url.trim()) return 'URL 不能为空';
+    } else {
+      if (!command.trim()) return '命令不能为空';
+    }
     return null;
   };
 
@@ -63,19 +80,33 @@ export function AddMcpServerDialog({ open, onClose, onAdd }: AddMcpServerDialogP
     setError(null);
 
     try {
-      const envObj: Record<string, string> = {};
-      for (const row of env) {
-        const k = row.key.trim();
-        if (k) envObj[k] = row.value;
+      if (isHttpType) {
+        const headersObj: Record<string, string> = {};
+        for (const row of headers) {
+          const k = row.key.trim();
+          if (k) headersObj[k] = row.value;
+        }
+        await onAdd({
+          id: id.trim(),
+          type: serverType as 'http' | 'sse',
+          url: url.trim(),
+          headers: Object.keys(headersObj).length > 0 ? headersObj : undefined,
+          description: description.trim() || undefined,
+        });
+      } else {
+        const envObj: Record<string, string> = {};
+        for (const row of env) {
+          const k = row.key.trim();
+          if (k) envObj[k] = row.value;
+        }
+        await onAdd({
+          id: id.trim(),
+          command: command.trim(),
+          args: args.length > 0 ? args : undefined,
+          env: Object.keys(envObj).length > 0 ? envObj : undefined,
+          description: description.trim() || undefined,
+        });
       }
-
-      await onAdd({
-        id: id.trim(),
-        command: command.trim(),
-        args: args.length > 0 ? args : undefined,
-        env: Object.keys(envObj).length > 0 ? envObj : undefined,
-        description: description.trim() || undefined,
-      });
       reset();
       onClose();
     } catch (err) {
@@ -110,111 +141,205 @@ export function AddMcpServerDialog({ open, onClose, onAdd }: AddMcpServerDialogP
             </p>
           </div>
 
-          {/* Command */}
+          {/* Type selector */}
           <div>
-            <label htmlFor="mcp-command" className="block text-sm font-medium text-foreground mb-1">
-              命令 <span className="text-red-500">*</span>
-            </label>
-            <Input
-              id="mcp-command"
-              value={command}
-              onChange={(e) => setCommand(e.target.value)}
-              placeholder="npx, uvx, node..."
-              disabled={submitting}
-              className="font-mono"
-            />
-          </div>
-
-          {/* Args */}
-          <div>
-            <label className="block text-sm font-medium text-foreground mb-1">参数</label>
-            <div className="space-y-2">
-              {args.map((arg, i) => (
-                <div key={i} className="flex items-center gap-2">
-                  <Input
-                    value={arg}
-                    onChange={(e) => {
-                      const next = [...args];
-                      next[i] = e.target.value;
-                      setArgs(next);
-                    }}
-                    placeholder={`参数 ${i + 1}`}
-                    disabled={submitting}
-                    className="flex-1 font-mono text-sm"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setArgs(args.filter((_, j) => j !== i))}
-                    disabled={submitting}
-                    className="p-1.5 text-slate-400 hover:text-red-500 transition-colors disabled:opacity-50"
-                  >
-                    <X size={16} />
-                  </button>
-                </div>
+            <label className="block text-sm font-medium text-foreground mb-1">类型</label>
+            <div className="flex gap-2">
+              {(['stdio', 'http', 'sse'] as const).map((t) => (
+                <button
+                  key={t}
+                  type="button"
+                  disabled={submitting}
+                  onClick={() => setServerType(t)}
+                  className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
+                    serverType === t
+                      ? 'bg-primary text-primary-foreground'
+                      : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                  } disabled:opacity-50`}
+                >
+                  {t.toUpperCase()}
+                </button>
               ))}
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={() => setArgs([...args, ''])}
-                disabled={submitting}
-              >
-                <Plus size={14} />
-                添加参数
-              </Button>
             </div>
           </div>
 
-          {/* Env */}
-          <div>
-            <label className="block text-sm font-medium text-foreground mb-1">环境变量</label>
-            <div className="space-y-2">
-              {env.map((row, i) => (
-                <div key={i} className="flex items-center gap-2">
-                  <Input
-                    value={row.key}
-                    onChange={(e) => {
-                      const next = [...env];
-                      next[i] = { ...next[i], key: e.target.value };
-                      setEnv(next);
-                    }}
-                    placeholder="KEY"
-                    disabled={submitting}
-                    className="w-2/5 font-mono text-sm"
-                  />
-                  <Input
-                    value={row.value}
-                    onChange={(e) => {
-                      const next = [...env];
-                      next[i] = { ...next[i], value: e.target.value };
-                      setEnv(next);
-                    }}
-                    placeholder="value"
-                    disabled={submitting}
-                    className="flex-1 font-mono text-sm"
-                  />
-                  <button
+          {isHttpType ? (
+            <>
+              {/* URL */}
+              <div>
+                <label htmlFor="mcp-url" className="block text-sm font-medium text-foreground mb-1">
+                  URL <span className="text-red-500">*</span>
+                </label>
+                <Input
+                  id="mcp-url"
+                  value={url}
+                  onChange={(e) => setUrl(e.target.value)}
+                  placeholder="https://mcp.example.com"
+                  disabled={submitting}
+                  className="font-mono"
+                />
+              </div>
+
+              {/* Headers */}
+              <div>
+                <label className="block text-sm font-medium text-foreground mb-1">Headers</label>
+                <div className="space-y-2">
+                  {headers.map((row, i) => (
+                    <div key={i} className="flex items-center gap-2">
+                      <Input
+                        value={row.key}
+                        onChange={(e) => {
+                          const next = [...headers];
+                          next[i] = { ...next[i], key: e.target.value };
+                          setHeaders(next);
+                        }}
+                        placeholder="Authorization"
+                        disabled={submitting}
+                        className="w-2/5 font-mono text-sm"
+                      />
+                      <Input
+                        value={row.value}
+                        onChange={(e) => {
+                          const next = [...headers];
+                          next[i] = { ...next[i], value: e.target.value };
+                          setHeaders(next);
+                        }}
+                        placeholder="Bearer token..."
+                        disabled={submitting}
+                        className="flex-1 font-mono text-sm"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setHeaders(headers.filter((_, j) => j !== i))}
+                        disabled={submitting}
+                        className="p-1.5 text-slate-400 hover:text-red-500 transition-colors disabled:opacity-50"
+                      >
+                        <X size={16} />
+                      </button>
+                    </div>
+                  ))}
+                  <Button
                     type="button"
-                    onClick={() => setEnv(env.filter((_, j) => j !== i))}
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setHeaders([...headers, { key: '', value: '' }])}
                     disabled={submitting}
-                    className="p-1.5 text-slate-400 hover:text-red-500 transition-colors disabled:opacity-50"
                   >
-                    <X size={16} />
-                  </button>
+                    <Plus size={14} />
+                    添加 Header
+                  </Button>
                 </div>
-              ))}
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={() => setEnv([...env, { key: '', value: '' }])}
-                disabled={submitting}
-              >
-                <Plus size={14} />
-                添加环境变量
-              </Button>
-            </div>
-          </div>
+              </div>
+            </>
+          ) : (
+            <>
+              {/* Command */}
+              <div>
+                <label htmlFor="mcp-command" className="block text-sm font-medium text-foreground mb-1">
+                  命令 <span className="text-red-500">*</span>
+                </label>
+                <Input
+                  id="mcp-command"
+                  value={command}
+                  onChange={(e) => setCommand(e.target.value)}
+                  placeholder="npx, uvx, node..."
+                  disabled={submitting}
+                  className="font-mono"
+                />
+              </div>
+
+              {/* Args */}
+              <div>
+                <label className="block text-sm font-medium text-foreground mb-1">参数</label>
+                <div className="space-y-2">
+                  {args.map((arg, i) => (
+                    <div key={i} className="flex items-center gap-2">
+                      <Input
+                        value={arg}
+                        onChange={(e) => {
+                          const next = [...args];
+                          next[i] = e.target.value;
+                          setArgs(next);
+                        }}
+                        placeholder={`参数 ${i + 1}`}
+                        disabled={submitting}
+                        className="flex-1 font-mono text-sm"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setArgs(args.filter((_, j) => j !== i))}
+                        disabled={submitting}
+                        className="p-1.5 text-slate-400 hover:text-red-500 transition-colors disabled:opacity-50"
+                      >
+                        <X size={16} />
+                      </button>
+                    </div>
+                  ))}
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setArgs([...args, ''])}
+                    disabled={submitting}
+                  >
+                    <Plus size={14} />
+                    添加参数
+                  </Button>
+                </div>
+              </div>
+
+              {/* Env */}
+              <div>
+                <label className="block text-sm font-medium text-foreground mb-1">环境变量</label>
+                <div className="space-y-2">
+                  {env.map((row, i) => (
+                    <div key={i} className="flex items-center gap-2">
+                      <Input
+                        value={row.key}
+                        onChange={(e) => {
+                          const next = [...env];
+                          next[i] = { ...next[i], key: e.target.value };
+                          setEnv(next);
+                        }}
+                        placeholder="KEY"
+                        disabled={submitting}
+                        className="w-2/5 font-mono text-sm"
+                      />
+                      <Input
+                        value={row.value}
+                        onChange={(e) => {
+                          const next = [...env];
+                          next[i] = { ...next[i], value: e.target.value };
+                          setEnv(next);
+                        }}
+                        placeholder="value"
+                        disabled={submitting}
+                        className="flex-1 font-mono text-sm"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setEnv(env.filter((_, j) => j !== i))}
+                        disabled={submitting}
+                        className="p-1.5 text-slate-400 hover:text-red-500 transition-colors disabled:opacity-50"
+                      >
+                        <X size={16} />
+                      </button>
+                    </div>
+                  ))}
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setEnv([...env, { key: '', value: '' }])}
+                    disabled={submitting}
+                  >
+                    <Plus size={14} />
+                    添加环境变量
+                  </Button>
+                </div>
+              </div>
+            </>
+          )}
 
           {/* Description */}
           <div>
@@ -242,7 +367,7 @@ export function AddMcpServerDialog({ open, onClose, onAdd }: AddMcpServerDialogP
             <Button type="button" variant="ghost" onClick={handleClose} disabled={submitting}>
               取消
             </Button>
-            <Button type="submit" disabled={submitting || !id.trim() || !command.trim()}>
+            <Button type="submit" disabled={submitting || !id.trim() || (isHttpType ? !url.trim() : !command.trim())}>
               {submitting && <Loader2 className="size-4 animate-spin" />}
               添加
             </Button>

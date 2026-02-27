@@ -3,9 +3,15 @@ import { api } from '../api/client';
 
 export interface McpServer {
   id: string;
-  command: string;
+  // stdio type
+  command?: string;
   args?: string[];
   env?: Record<string, string>;
+  // http/sse type
+  type?: 'http' | 'sse';
+  url?: string;
+  headers?: Record<string, string>;
+  // metadata
   enabled: boolean;
   syncedFromHost?: boolean;
   description?: string;
@@ -28,9 +34,12 @@ interface McpServersState {
   loadServers: () => Promise<void>;
   addServer: (server: {
     id: string;
-    command: string;
+    command?: string;
     args?: string[];
     env?: Record<string, string>;
+    type?: 'http' | 'sse';
+    url?: string;
+    headers?: Record<string, string>;
     description?: string;
   }) => Promise<void>;
   updateServer: (id: string, updates: Partial<McpServer>) => Promise<void>;
