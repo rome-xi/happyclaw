@@ -273,7 +273,12 @@ function walkFiles(
 ): void {
   if (out.length >= limit || currentDepth > maxDepth || !fs.existsSync(baseDir))
     return;
-  const entries = fs.readdirSync(baseDir, { withFileTypes: true });
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(baseDir, { withFileTypes: true });
+  } catch {
+    return;
+  }
   for (const entry of entries) {
     if (out.length >= limit) break;
     const fullPath = path.join(baseDir, entry.name);
