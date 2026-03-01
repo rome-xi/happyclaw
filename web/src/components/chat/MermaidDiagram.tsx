@@ -106,9 +106,9 @@ export function MermaidDiagram({ code }: MermaidDiagramProps) {
 
   if (loading) {
     return (
-      <div className="my-4 rounded-lg bg-slate-50 border border-slate-200 p-8 flex items-center justify-center">
+      <div className="my-4 rounded-lg bg-muted border border-border p-8 flex items-center justify-center">
         <div className="animate-pulse flex flex-col items-center gap-2">
-          <div className="h-24 w-48 bg-slate-200 rounded" />
+          <div className="h-24 w-48 bg-muted-foreground/20 rounded" />
           <span className="text-sm text-slate-400">Mermaid 图表渲染中...</span>
         </div>
       </div>
@@ -175,7 +175,7 @@ export function MermaidDiagram({ code }: MermaidDiagramProps) {
           </button>
         </div>
         <div
-          className="bg-white rounded-lg border border-slate-200 p-4 overflow-x-auto flex justify-center cursor-pointer [&>svg]:!max-w-full [&>svg]:!h-auto"
+          className="bg-card rounded-lg border border-border p-4 overflow-x-auto flex justify-center cursor-pointer [&>svg]:!max-w-full [&>svg]:!h-auto"
           onClick={() => setExpanded(true)}
           dangerouslySetInnerHTML={{ __html: svg! }}
         />
@@ -186,7 +186,7 @@ export function MermaidDiagram({ code }: MermaidDiagramProps) {
           onClick={() => setExpanded(false)}
         >
           <div
-            className="relative bg-white rounded-xl p-6 w-[95vw] h-[95vh] overflow-auto cursor-default"
+            className="relative bg-card rounded-xl p-6 w-[95vw] h-[95vh] overflow-auto cursor-default"
             onClick={(e) => e.stopPropagation()}
           >
             <button

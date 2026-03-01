@@ -73,7 +73,7 @@ export function TaskInlineCard({ toolUseId, description, startTime, groupJid }: 
         }`}
       >
         {statusIcon}
-        <span className="text-xs font-medium text-slate-700 truncate flex-1">
+        <span className="text-xs font-medium text-foreground truncate flex-1">
           Task: {description}
         </span>
         {summary && !expanded && (
@@ -97,7 +97,7 @@ export function TaskInlineCard({ toolUseId, description, startTime, groupJid }: 
       {expanded && hasContent && streaming && (
         <div
           ref={contentRef}
-          className="mt-1 rounded-lg border border-slate-200 bg-white max-h-80 overflow-y-auto"
+          className="mt-1 rounded-lg border border-border bg-card max-h-80 overflow-y-auto"
         >
           <div className="px-3 py-2 space-y-2">
             {/* Thinking / Reasoning */}
@@ -137,7 +137,7 @@ export function TaskInlineCard({ toolUseId, description, startTime, groupJid }: 
 
             {/* Recent events timeline */}
             {streaming.recentEvents.length > 0 && (
-              <div className="rounded-md border border-slate-100 bg-slate-50/50 p-1.5">
+              <div className="rounded-md border border-border bg-muted/50 p-1.5">
                 <div className="text-[10px] font-medium text-slate-500 mb-0.5">调用轨迹</div>
                 <div className="space-y-0.5 max-h-20 overflow-y-auto">
                   {streaming.recentEvents.map((item) => (

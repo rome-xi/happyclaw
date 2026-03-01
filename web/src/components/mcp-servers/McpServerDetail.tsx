@@ -29,7 +29,7 @@ export function McpServerDetail({ server, onDeleted }: McpServerDetailProps) {
 
   if (!server) {
     return (
-      <div className="bg-white rounded-xl border border-slate-200 p-12 flex items-center justify-center">
+      <div className="bg-card rounded-xl border border-border p-12 flex items-center justify-center">
         <p className="text-slate-400 text-center">选择一个 MCP 服务器查看详情</p>
       </div>
     );
@@ -115,13 +115,13 @@ export function McpServerDetail({ server, onDeleted }: McpServerDetailProps) {
   const headerEntries = server.headers ? Object.entries(server.headers) : [];
 
   return (
-    <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+    <div className="bg-card rounded-xl border border-border overflow-hidden">
       {/* Header */}
       <div className="p-6 border-b border-slate-200">
         <div className="flex items-start justify-between gap-4 mb-3">
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-2 mb-2">
-              <h2 className="text-xl font-bold text-slate-900">{server.id}</h2>
+              <h2 className="text-xl font-bold text-foreground">{server.id}</h2>
               {server.syncedFromHost && (
                 <span className="px-2 py-0.5 rounded text-xs font-medium bg-amber-100 text-amber-700 inline-flex items-center gap-1">
                   <Download size={10} />
@@ -352,7 +352,7 @@ export function McpServerDetail({ server, onDeleted }: McpServerDetailProps) {
                 {/* Type */}
                 <div>
                   <span className="text-sm text-slate-500">类型</span>
-                  <p className="font-mono text-sm text-slate-900 mt-1 bg-blue-50 rounded px-3 py-2">
+                  <p className="font-mono text-sm text-foreground mt-1 bg-blue-50 rounded px-3 py-2">
                     {server.type?.toUpperCase()}
                   </p>
                 </div>
@@ -360,7 +360,7 @@ export function McpServerDetail({ server, onDeleted }: McpServerDetailProps) {
                 {/* URL */}
                 <div>
                   <span className="text-sm text-slate-500">URL</span>
-                  <p className="font-mono text-sm text-slate-900 mt-1 bg-slate-50 rounded px-3 py-2 break-all">
+                  <p className="font-mono text-sm text-foreground mt-1 bg-slate-50 rounded px-3 py-2 break-all">
                     {server.url}
                   </p>
                 </div>
@@ -398,7 +398,7 @@ export function McpServerDetail({ server, onDeleted }: McpServerDetailProps) {
                 {/* Command */}
                 <div>
                   <span className="text-sm text-slate-500">命令</span>
-                  <p className="font-mono text-sm text-slate-900 mt-1 bg-slate-50 rounded px-3 py-2">
+                  <p className="font-mono text-sm text-foreground mt-1 bg-slate-50 rounded px-3 py-2">
                     {server.command}
                   </p>
                 </div>

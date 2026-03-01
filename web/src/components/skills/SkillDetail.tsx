@@ -44,7 +44,7 @@ export function SkillDetail({ skillId, onDeleted }: SkillDetailProps) {
 
   if (!skillId) {
     return (
-      <div className="bg-white rounded-xl border border-slate-200 p-12 flex items-center justify-center">
+      <div className="bg-card rounded-xl border border-border p-12 flex items-center justify-center">
         <p className="text-slate-400 text-center">选择一个技能查看详情</p>
       </div>
     );
@@ -52,7 +52,7 @@ export function SkillDetail({ skillId, onDeleted }: SkillDetailProps) {
 
   if (loading) {
     return (
-      <div className="bg-white rounded-xl border border-slate-200 p-12 flex items-center justify-center">
+      <div className="bg-card rounded-xl border border-border p-12 flex items-center justify-center">
         <Loader2 className="animate-spin text-primary" size={32} />
       </div>
     );
@@ -60,14 +60,14 @@ export function SkillDetail({ skillId, onDeleted }: SkillDetailProps) {
 
   if (error || !detail) {
     return (
-      <div className="bg-white rounded-xl border border-slate-200 p-12 flex items-center justify-center">
+      <div className="bg-card rounded-xl border border-border p-12 flex items-center justify-center">
         <p className="text-red-600 text-center">{error || '加载失败'}</p>
       </div>
     );
   }
 
   return (
-    <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+    <div className="bg-card rounded-xl border border-border overflow-hidden">
       <div className="p-6 border-b border-slate-200">
         <div className="flex items-start justify-between gap-4 mb-3">
           <div className="flex-1 min-w-0">

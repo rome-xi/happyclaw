@@ -258,7 +258,7 @@ export function ClaudeProviderSection({ setNotice, setError }: ClaudeProviderSec
           type="button"
           onClick={() => setProviderMode('official')}
           className={`px-3 py-1.5 text-sm rounded-md transition-colors cursor-pointer ${
-            providerMode === 'official' ? 'bg-white text-primary shadow-sm' : 'text-slate-500'
+            providerMode === 'official' ? 'bg-background text-primary shadow-sm' : 'text-slate-500'
           }`}
         >
           官方
@@ -267,7 +267,7 @@ export function ClaudeProviderSection({ setNotice, setError }: ClaudeProviderSec
           type="button"
           onClick={() => setProviderMode('third_party')}
           className={`px-3 py-1.5 text-sm rounded-md transition-colors cursor-pointer ${
-            providerMode === 'third_party' ? 'bg-white text-primary shadow-sm' : 'text-slate-500'
+            providerMode === 'third_party' ? 'bg-background text-primary shadow-sm' : 'text-slate-500'
           }`}
         >
           第三方

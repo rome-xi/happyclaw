@@ -83,7 +83,7 @@ export function SetupChannelsPage() {
           <div className="w-12 h-12 rounded-xl bg-primary/10 flex items-center justify-center mx-auto mb-4">
             <MessageSquare className="w-6 h-6 text-primary" />
           </div>
-          <h1 className="text-2xl font-bold text-slate-900 mb-2">配置消息通道（可选）</h1>
+          <h1 className="text-2xl font-bold text-foreground mb-2">配置消息通道（可选）</h1>
           <p className="text-sm text-slate-600">
             绑定飞书或 Telegram，即可通过 IM 与 AI 对话。跳过后也可在设置中随时配置。
           </p>
@@ -94,8 +94,8 @@ export function SetupChannelsPage() {
         )}
 
         {/* Feishu */}
-        <section className="bg-white rounded-xl border border-slate-200 shadow-sm p-5">
-          <h2 className="text-base font-semibold text-slate-900 mb-3">飞书</h2>
+        <section className="bg-card rounded-xl border border-border shadow-sm p-5">
+          <h2 className="text-base font-semibold text-foreground mb-3">飞书</h2>
           <p className="text-xs text-slate-500 mb-3">
             填写你的飞书应用凭证，绑定后即可在飞书中与 AI 对话。
           </p>
@@ -122,8 +122,8 @@ export function SetupChannelsPage() {
         </section>
 
         {/* Telegram */}
-        <section className="bg-white rounded-xl border border-slate-200 shadow-sm p-5">
-          <h2 className="text-base font-semibold text-slate-900 mb-3">Telegram</h2>
+        <section className="bg-card rounded-xl border border-border shadow-sm p-5">
+          <h2 className="text-base font-semibold text-foreground mb-3">Telegram</h2>
           <p className="text-xs text-slate-500 mb-3">
             填写 Telegram Bot Token，绑定后即可在 Telegram 中与 AI 对话。
           </p>

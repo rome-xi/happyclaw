@@ -101,7 +101,7 @@ export function RegisterPage() {
 
   if (initialized !== true || statusLoading) {
     return (
-      <div className="h-screen bg-slate-50 overflow-y-auto flex items-center justify-center p-4">
+      <div className="h-screen bg-background overflow-y-auto flex items-center justify-center p-4">
         <div className="text-slate-500 text-sm">加载中...</div>
       </div>
     );
@@ -110,15 +110,15 @@ export function RegisterPage() {
   // Registration disabled
   if (!status.allowRegistration) {
     return (
-      <div className="h-screen bg-slate-50 overflow-y-auto flex items-center justify-center p-4">
+      <div className="h-screen bg-background overflow-y-auto flex items-center justify-center p-4">
         <div className="w-full max-w-md">
-          <div className="bg-white rounded-lg border border-slate-200 p-8">
+          <div className="bg-card rounded-lg border border-border p-8">
             <div className="flex justify-center mb-6">
               <div className="w-16 h-16 rounded-2xl overflow-hidden mx-auto">
                 <img src={`${import.meta.env.BASE_URL}icons/icon-192.png`} alt="HappyClaw" className="w-full h-full object-cover" />
               </div>
             </div>
-            <h1 className="text-2xl font-bold text-slate-900 text-center mb-2">
+            <h1 className="text-2xl font-bold text-foreground text-center mb-2">
               注册已关闭
             </h1>
             <p className="text-slate-500 text-center mb-6">
@@ -137,9 +137,9 @@ export function RegisterPage() {
   }
 
   return (
-    <div className="h-screen bg-slate-50 overflow-y-auto flex items-center justify-center p-4">
+    <div className="h-screen bg-background overflow-y-auto flex items-center justify-center p-4">
       <div className="w-full max-w-md">
-        <div className="bg-white rounded-lg border border-slate-200 p-8">
+        <div className="bg-card rounded-lg border border-border p-8">
           {/* Logo */}
           <div className="flex justify-center mb-6">
             <div className="w-16 h-16 rounded-2xl overflow-hidden mx-auto">
@@ -147,7 +147,7 @@ export function RegisterPage() {
             </div>
           </div>
 
-          <h1 className="text-2xl font-bold text-slate-900 text-center mb-2">
+          <h1 className="text-2xl font-bold text-foreground text-center mb-2">
             注册新账户
           </h1>
           <p className="text-slate-500 text-center mb-6">
@@ -163,7 +163,7 @@ export function RegisterPage() {
           <form onSubmit={handleSubmit}>
             {status.requireInviteCode && (
               <div className="mb-4">
-                <label htmlFor="invite_code" className="block text-sm font-medium text-slate-700 mb-1">
+                <label htmlFor="invite_code" className="block text-sm font-medium text-foreground mb-1">
                   邀请码
                 </label>
                 <Input
@@ -180,7 +180,7 @@ export function RegisterPage() {
             )}
 
             <div className="mb-4">
-              <label htmlFor="reg-username" className="block text-sm font-medium text-slate-700 mb-1">
+              <label htmlFor="reg-username" className="block text-sm font-medium text-foreground mb-1">
                 用户名
               </label>
               <Input
@@ -195,7 +195,7 @@ export function RegisterPage() {
             </div>
 
             <div className="mb-4">
-              <label htmlFor="reg-display-name" className="block text-sm font-medium text-slate-700 mb-1">
+              <label htmlFor="reg-display-name" className="block text-sm font-medium text-foreground mb-1">
                 显示名称 <span className="text-slate-400">(可选)</span>
               </label>
               <Input
@@ -208,7 +208,7 @@ export function RegisterPage() {
             </div>
 
             <div className="mb-6">
-              <label htmlFor="reg-password" className="block text-sm font-medium text-slate-700 mb-1">
+              <label htmlFor="reg-password" className="block text-sm font-medium text-foreground mb-1">
                 密码
               </label>
               <Input

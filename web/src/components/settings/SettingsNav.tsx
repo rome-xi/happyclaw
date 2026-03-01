@@ -78,7 +78,7 @@ export function SettingsNav({ activeTab, onTabChange, canManageSystemConfig, can
   return (
     <>
       {/* Desktop: vertical sidebar */}
-      <nav className="hidden lg:block w-56 shrink-0 bg-white border-r border-slate-200 py-6 px-3">
+      <nav className="hidden lg:block w-56 shrink-0 bg-background border-r border-border py-6 px-3">
         {visibleItems.map((section, si) => (
           <div key={section.group} className={si > 0 ? 'mt-6' : ''}>
             <div className="px-3 mb-2 text-xs font-semibold text-slate-400 uppercase tracking-wider">

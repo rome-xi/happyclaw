@@ -17,21 +17,21 @@ export function SystemInfo({ status }: SystemInfoProps) {
   };
 
   return (
-    <div className="bg-white rounded-xl border border-slate-200 p-6">
+    <div className="bg-card rounded-xl border border-border p-6">
       <div className="flex items-center gap-3 mb-4">
         <div className="p-2 bg-green-100 rounded-lg">
           <Activity className="w-6 h-6 text-green-600" />
         </div>
         <div>
           <h3 className="text-sm font-medium text-slate-500">系统信息</h3>
-          <p className="text-2xl font-bold text-slate-900">运行中</p>
+          <p className="text-2xl font-bold text-foreground">运行中</p>
         </div>
       </div>
 
       <div className="space-y-2">
         <div className="flex items-center justify-between text-sm">
           <span className="text-slate-500">运行时间</span>
-          <span className="text-slate-900 font-medium">
+          <span className="text-foreground font-medium">
             {formatUptime(status.uptime)}
           </span>
         </div>
@@ -39,7 +39,7 @@ export function SystemInfo({ status }: SystemInfoProps) {
         {status.claudeCodeVersion !== undefined && (
           <div className="flex items-center justify-between text-sm">
             <span className="text-slate-500">Claude Code</span>
-            <span className="text-slate-900 font-medium font-mono text-xs">
+            <span className="text-foreground font-medium font-mono text-xs">
               {status.claudeCodeVersion || '未知'}
             </span>
           </div>

@@ -111,9 +111,9 @@ export function SettingsPage() {
   };
 
   return (
-    <div className="min-h-full bg-slate-50 flex flex-col lg:flex-row">
+    <div className="min-h-full bg-background flex flex-col lg:flex-row">
       {/* Mobile header */}
-      <div className="lg:hidden sticky top-0 z-10 flex items-center bg-white border-b border-slate-200 px-4 h-12">
+      <div className="lg:hidden sticky top-0 z-10 flex items-center bg-background border-b border-border px-4 h-12">
         <button
           onClick={() => setNavOpen(true)}
           className="p-1.5 -ml-1.5 rounded-lg hover:bg-slate-100 transition-colors"
@@ -127,7 +127,7 @@ export function SettingsPage() {
       {/* Mobile horizontal tab bar */}
       <div
         ref={tabBarRef}
-        className="lg:hidden flex items-center gap-1 px-3 py-2 overflow-x-auto bg-white border-b border-slate-200 [&::-webkit-scrollbar]:hidden"
+        className="lg:hidden flex items-center gap-1 px-3 py-2 overflow-x-auto bg-background border-b border-border [&::-webkit-scrollbar]:hidden"
         style={{ scrollbarWidth: 'none', WebkitOverflowScrolling: 'touch' } as React.CSSProperties}
       >
         {mobileTabs.map((tab) => {
@@ -192,13 +192,13 @@ export function SettingsPage() {
               )}
 
               {(notice || error) && (
-                <div className="bg-white rounded-xl border border-slate-200 p-4 space-y-1">
+                <div className="bg-card rounded-xl border border-border p-4 space-y-1">
                   {notice && <div className="text-sm text-green-600">{notice}</div>}
                   {error && <div className="text-sm text-red-600">{error}</div>}
                 </div>
               )}
 
-              <div className="bg-white rounded-xl border border-slate-200 p-6">
+              <div className="bg-card rounded-xl border border-border p-6">
                 {activeTab === 'channels' && <ChannelsSection setNotice={setNotice} setError={setError} />}
                 {activeTab === 'claude' && <ClaudeProviderSection setNotice={setNotice} setError={setError} />}
                 {activeTab === 'registration' && <RegistrationSection setNotice={setNotice} setError={setError} />}

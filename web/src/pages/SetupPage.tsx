@@ -44,14 +44,14 @@ export function SetupPage() {
   // Loading or redirecting
   if (initialized !== false) {
     return (
-      <div className="min-h-screen bg-slate-50 flex items-center justify-center">
+      <div className="min-h-screen bg-background flex items-center justify-center">
         <Loader2 className="w-16 h-16 text-primary animate-spin" />
       </div>
     );
   }
 
   return (
-    <div className="h-screen bg-slate-50 overflow-y-auto p-4 flex flex-col items-center justify-center">
+    <div className="h-screen bg-background overflow-y-auto p-4 flex flex-col items-center justify-center">
       <div className="w-full max-w-lg">
         {/* Header */}
         <div className="text-center mb-8">
@@ -60,12 +60,12 @@ export function SetupPage() {
               <img src={`${import.meta.env.BASE_URL}icons/icon-192.png`} alt="HappyClaw" className="w-full h-full object-cover" />
             </div>
           </div>
-          <h1 className="text-2xl font-bold text-slate-900 mb-1">HappyClaw 初始设置</h1>
+          <h1 className="text-2xl font-bold text-foreground mb-1">HappyClaw 初始设置</h1>
           <p className="text-sm text-slate-500">先创建管理员账号，完成后进入后台继续配置飞书 Token 与 Claude Key</p>
         </div>
 
         {/* Step card */}
-        <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-6">
+        <div className="bg-card rounded-xl border border-border shadow-sm p-6">
           <CreateAdminStep
             onDone={() => navigate('/setup/providers', { replace: true })}
             setupAdmin={setupAdmin}
@@ -138,7 +138,7 @@ function CreateAdminStep({
 
   return (
     <div>
-      <h2 className="text-lg font-semibold text-slate-900 mb-1">创建管理员账号</h2>
+      <h2 className="text-lg font-semibold text-foreground mb-1">创建管理员账号</h2>
       <p className="text-sm text-slate-500 mb-4">首次使用请先创建管理员，提交后进入系统接入配置向导。</p>
 
       {error && (
@@ -147,7 +147,7 @@ function CreateAdminStep({
 
       <div className="space-y-3">
         <div>
-          <label className="block text-sm font-medium text-slate-700 mb-1">用户名</label>
+          <label className="block text-sm font-medium text-foreground mb-1">用户名</label>
           <Input
             type="text"
             value={username}
@@ -157,7 +157,7 @@ function CreateAdminStep({
           />
         </div>
         <div>
-          <label className="block text-sm font-medium text-slate-700 mb-1">密码</label>
+          <label className="block text-sm font-medium text-foreground mb-1">密码</label>
           <div className="relative">
             <Input
               type={showPassword ? 'text' : 'password'}
@@ -176,7 +176,7 @@ function CreateAdminStep({
           </div>
         </div>
         <div>
-          <label className="block text-sm font-medium text-slate-700 mb-1">确认密码</label>
+          <label className="block text-sm font-medium text-foreground mb-1">确认密码</label>
           <div className="relative">
             <Input
               type={showConfirm ? 'text' : 'password'}

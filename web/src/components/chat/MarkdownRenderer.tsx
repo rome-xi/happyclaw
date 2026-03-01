@@ -65,7 +65,7 @@ function MarkdownImage({ src, alt }: { src?: string; alt?: string }) {
       <img
         src={src}
         alt={alt || ''}
-        className="my-3 max-w-full rounded-lg border border-slate-200 cursor-pointer hover:shadow-md transition-shadow"
+        className="my-3 max-w-full rounded-lg border border-border cursor-pointer hover:shadow-md transition-shadow"
         style={{ maxHeight: '400px', objectFit: 'contain' }}
         onClick={() => setExpanded(true)}
         onError={() => setError(true)}
@@ -80,8 +80,8 @@ const sanitizeSchema = {
   ...defaultSchema,
   attributes: {
     ...defaultSchema.attributes,
-    code: [...(defaultSchema.attributes?.code || []), 'className'],
-    span: [...(defaultSchema.attributes?.span || []), 'className'],
+    code: [...(defaultSchema.attributes?.code || []), 'class', 'className'],
+    span: [...(defaultSchema.attributes?.span || []), 'class', 'className'],
   },
   protocols: {
     ...defaultSchema.protocols,
@@ -125,7 +125,7 @@ function CodeBlock({
         <div className="absolute right-2 top-2 opacity-70 lg:opacity-0 lg:group-hover:opacity-100 transition-opacity">
           <button
             onClick={handleCopy}
-            className="p-2 rounded-lg bg-slate-200 hover:bg-slate-300 text-slate-700 text-xs flex items-center gap-1"
+            className="p-2 rounded-lg bg-muted hover:bg-muted/80 text-muted-foreground text-xs flex items-center gap-1"
           >
             {copied ? (
               <>
@@ -140,7 +140,7 @@ function CodeBlock({
             )}
           </button>
         </div>
-        <pre className="!bg-[#f6f8fa] rounded-lg p-4 overflow-x-auto">
+        <pre className="!bg-[#f6f8fa] dark:!bg-[#22272e] rounded-lg p-4 overflow-x-auto">
           <code className={className} {...props}>
             {children}
           </code>
@@ -153,8 +153,8 @@ function CodeBlock({
     <code
       className={
         variant === 'chat'
-          ? 'bg-brand-50 text-primary px-1.5 py-0.5 rounded text-[0.9em] leading-relaxed font-mono break-all'
-          : 'bg-brand-50 text-primary px-1.5 py-0.5 rounded text-sm font-mono break-all'
+          ? 'bg-primary/10 dark:bg-primary/20 text-primary px-1.5 py-0.5 rounded text-[0.9em] leading-relaxed font-mono break-all'
+          : 'bg-primary/10 dark:bg-primary/20 text-primary px-1.5 py-0.5 rounded text-sm font-mono break-all'
       }
       {...props}
     >
@@ -165,8 +165,8 @@ function CodeBlock({
 
 export const MarkdownRenderer = memo(function MarkdownRenderer({ content, groupJid, variant = 'chat' }: MarkdownRendererProps) {
   const textSizeClass = variant === 'chat'
-    ? 'text-[15px] leading-7 text-slate-800'
-    : 'text-sm leading-6 text-slate-800';
+    ? 'text-[15px] leading-7 text-foreground'
+    : 'text-sm leading-6 text-foreground';
   const tableTextClass = variant === 'chat' ? 'text-[0.95em]' : 'text-sm';
 
   return (
@@ -192,27 +192,27 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, groupJ
               className="my-4 max-w-full overflow-x-auto overflow-y-hidden overscroll-x-contain [-webkit-overflow-scrolling:touch] [touch-action:pan-x]"
               data-swipe-back-ignore="true"
             >
-              <table className="w-max min-w-full border-collapse border border-slate-200">
+              <table className="w-max min-w-full border-collapse border border-border">
                 {children}
               </table>
             </div>
           ),
           thead: ({ children }) => (
-            <thead className="bg-slate-50">{children}</thead>
+            <thead className="bg-muted">{children}</thead>
           ),
-          tbody: ({ children }) => <tbody className="divide-y divide-slate-200">{children}</tbody>,
+          tbody: ({ children }) => <tbody className="divide-y divide-border">{children}</tbody>,
           tr: ({ children }) => (
-            <tr className="even:bg-white odd:bg-slate-50">
+            <tr className="even:bg-card odd:bg-muted/30">
               {children}
             </tr>
           ),
           th: ({ children }) => (
-            <th className={`px-4 py-2 text-left font-semibold text-slate-900 border border-slate-200 whitespace-nowrap break-normal align-top ${tableTextClass}`}>
+            <th className={`px-4 py-2 text-left font-semibold text-foreground border border-border whitespace-nowrap break-normal align-top ${tableTextClass}`}>
               {children}
             </th>
           ),
           td: ({ children }) => (
-            <td className={`px-4 py-2 text-slate-700 border border-slate-200 whitespace-nowrap break-normal align-top ${tableTextClass}`}>
+            <td className={`px-4 py-2 text-foreground border border-border whitespace-nowrap break-normal align-top ${tableTextClass}`}>
               {children}
             </td>
           ),

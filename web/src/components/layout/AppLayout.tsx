@@ -4,10 +4,12 @@ import { NavRail } from './NavRail';
 import { BottomTabBar } from './BottomTabBar';
 import { ConnectionBanner } from '../common/ConnectionBanner';
 import { wsManager } from '../../api/ws';
+import { useTheme } from '../../hooks/useTheme';
 
 export function AppLayout() {
   const location = useLocation();
   const hideMobileTabBar = /^\/chat\/.+/.test(location.pathname);
+  useTheme(); // 应用并同步持久化的主题偏好
 
   // 应用级别建立 WebSocket 连接，确保所有页面（非仅 ChatView）都有连接
   useEffect(() => {

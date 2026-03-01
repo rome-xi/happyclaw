@@ -22,7 +22,7 @@ export function GroupCard({ group }: GroupCardProps) {
   };
 
   return (
-    <div className="bg-white rounded-xl border border-slate-200 hover:border-brand-300 transition-colors duration-200">
+    <div className="bg-card rounded-xl border border-border hover:border-brand-300 transition-colors duration-200">
       {/* Card Header - Clickable */}
       <button
         onClick={() => setExpanded(!expanded)}
@@ -32,7 +32,7 @@ export function GroupCard({ group }: GroupCardProps) {
           <div className="flex-1 min-w-0">
             {/* Group Name */}
             <div className="flex items-center gap-2 mb-1">
-              <h3 className="text-lg font-semibold text-slate-900 truncate">
+              <h3 className="text-lg font-semibold text-foreground truncate">
                 {group.name}
               </h3>
               {group.is_shared && (
@@ -52,7 +52,7 @@ export function GroupCard({ group }: GroupCardProps) {
             <div className="space-y-1 text-sm">
               <div className="flex items-center gap-2">
                 <span className="text-slate-500">文件夹:</span>
-                <span className="text-slate-900 font-medium">
+                <span className="text-foreground font-medium">
                   {group.folder}
                 </span>
               </div>
@@ -72,7 +72,7 @@ export function GroupCard({ group }: GroupCardProps) {
 
       {/* Expanded Detail */}
       {expanded && (
-        <div className="border-t border-slate-200">
+        <div className="border-t border-border">
           <GroupDetail group={group} />
         </div>
       )}

@@ -261,7 +261,7 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
                   }}
                 >
                   <div className="flex justify-center my-6">
-                    <span className="bg-white px-4 py-1 rounded-full text-xs text-slate-500 border border-slate-200">
+                    <span className="bg-card px-4 py-1 rounded-full text-xs text-muted-foreground border border-border">
                       {item.content}
                     </span>
                   </div>
@@ -370,7 +370,7 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
                     <button
                       key={prompt}
                       onClick={() => onSend(prompt)}
-                      className="w-full text-left px-4 py-3 rounded-xl text-sm text-slate-700 transition-all active:scale-[0.98] cursor-pointer bg-white/60 backdrop-blur-sm border border-white/40 shadow-[0_2px_8px_rgba(0,0,0,0.04),inset_0_1px_1px_rgba(255,255,255,0.6)] hover:bg-white/80 hover:shadow-[0_4px_12px_rgba(0,0,0,0.06)]"
+                      className="w-full text-left px-4 py-3 rounded-xl text-sm text-foreground transition-all active:scale-[0.98] cursor-pointer bg-card/60 backdrop-blur-sm border border-border/60 shadow-[0_2px_8px_rgba(0,0,0,0.04)] hover:bg-card/80 hover:shadow-[0_4px_12px_rgba(0,0,0,0.06)]"
                     >
                       {prompt}
                     </button>
@@ -422,7 +422,7 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
           {!atTop && (
             <button
               onClick={scrollToTop}
-              className="w-10 h-10 rounded-full bg-white border border-slate-200 shadow-sm flex items-center justify-center text-slate-400 hover:text-slate-600 hover:bg-slate-50 transition-colors cursor-pointer"
+              className="w-10 h-10 rounded-full bg-card border border-border shadow-sm flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-accent transition-colors cursor-pointer"
               title="回到顶部"
             >
               <ChevronUp className="w-4 h-4" />
@@ -431,7 +431,7 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
           {!autoScroll && (
             <button
               onClick={scrollToBottom}
-              className="w-10 h-10 rounded-full bg-white border border-slate-200 shadow-sm flex items-center justify-center text-slate-400 hover:text-slate-600 hover:bg-slate-50 transition-colors cursor-pointer"
+              className="w-10 h-10 rounded-full bg-card border border-border shadow-sm flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-accent transition-colors cursor-pointer"
               title="回到底部"
             >
               <ChevronDown className="w-4 h-4" />

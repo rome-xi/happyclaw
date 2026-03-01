@@ -146,10 +146,10 @@ export function CreateTaskForm({ groups, onSubmit, onClose, isAdmin }: CreateTas
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
-      <div className="bg-white rounded-xl shadow-xl w-full max-w-2xl max-h-[90vh] overflow-y-auto">
+      <div className="bg-card rounded-xl shadow-xl w-full max-w-2xl max-h-[90vh] overflow-y-auto">
         {/* Header */}
-        <div className="flex items-center justify-between p-6 border-b border-slate-200">
-          <h2 className="text-xl font-bold text-slate-900">创建定时任务</h2>
+        <div className="flex items-center justify-between p-6 border-b border-border">
+          <h2 className="text-xl font-bold text-foreground">创建定时任务</h2>
           <button
             onClick={onClose}
             className="p-2 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-lg transition-colors"
@@ -162,7 +162,7 @@ export function CreateTaskForm({ groups, onSubmit, onClose, isAdmin }: CreateTas
         <form onSubmit={handleSubmit} className="p-6 space-y-4">
           {/* Group Selection */}
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-2">
+            <label className="block text-sm font-medium text-foreground mb-2">
               选择群组 <span className="text-red-500">*</span>
             </label>
             <Select value={formData.groupFolder || undefined} onValueChange={handleGroupChange}>
@@ -185,7 +185,7 @@ export function CreateTaskForm({ groups, onSubmit, onClose, isAdmin }: CreateTas
           {/* Execution Type */}
           {isAdmin && (
             <div>
-              <label className="block text-sm font-medium text-slate-700 mb-2">
+              <label className="block text-sm font-medium text-foreground mb-2">
                 执行方式
               </label>
               <Select
@@ -216,7 +216,7 @@ export function CreateTaskForm({ groups, onSubmit, onClose, isAdmin }: CreateTas
           {/* Script Command (script mode only) */}
           {isScript && (
             <div>
-              <label className="block text-sm font-medium text-slate-700 mb-2">
+              <label className="block text-sm font-medium text-foreground mb-2">
                 脚本命令 <span className="text-red-500">*</span>
               </label>
               <Textarea
@@ -238,7 +238,7 @@ export function CreateTaskForm({ groups, onSubmit, onClose, isAdmin }: CreateTas
 
           {/* Prompt / Task Description */}
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-2">
+            <label className="block text-sm font-medium text-foreground mb-2">
               {isScript ? '任务描述' : '任务 Prompt'}{' '}
               {!isScript && <span className="text-red-500">*</span>}
             </label>
@@ -256,7 +256,7 @@ export function CreateTaskForm({ groups, onSubmit, onClose, isAdmin }: CreateTas
 
           {/* Schedule Type */}
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-2">
+            <label className="block text-sm font-medium text-foreground mb-2">
               调度类型 <span className="text-red-500">*</span>
             </label>
             <Select
@@ -284,7 +284,7 @@ export function CreateTaskForm({ groups, onSubmit, onClose, isAdmin }: CreateTas
 
           {/* Schedule Value */}
           <div>
-            <label className="block text-sm font-medium text-slate-700 mb-2">
+            <label className="block text-sm font-medium text-foreground mb-2">
               调度值 <span className="text-red-500">*</span>
             </label>
 
@@ -357,7 +357,7 @@ export function CreateTaskForm({ groups, onSubmit, onClose, isAdmin }: CreateTas
           {/* Context Mode (agent mode only) */}
           {!isScript && (
             <div>
-              <label className="block text-sm font-medium text-slate-700 mb-2">
+              <label className="block text-sm font-medium text-foreground mb-2">
                 上下文模式
               </label>
               <Select
@@ -384,7 +384,7 @@ export function CreateTaskForm({ groups, onSubmit, onClose, isAdmin }: CreateTas
           )}
 
           {/* Actions */}
-          <div className="flex items-center justify-end gap-3 pt-4 border-t border-slate-200">
+          <div className="flex items-center justify-end gap-3 pt-4 border-t border-border">
             <Button type="button" variant="outline" onClick={onClose}>
               取消
             </Button>

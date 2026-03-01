@@ -10,8 +10,9 @@ import { FilePanel } from './FilePanel';
 import { ContainerEnvPanel } from './ContainerEnvPanel';
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { ConfirmDialog } from '@/components/common/ConfirmDialog';
-import { ArrowLeft, Link, MessageSquare, MoreHorizontal, PanelRightClose, PanelRightOpen, Terminal, Users, X } from 'lucide-react';
+import { ArrowLeft, Link, MessageSquare, Monitor, Moon, MoreHorizontal, PanelRightClose, PanelRightOpen, Sun, Terminal, Users, X } from 'lucide-react';
 import { useDisplayMode } from '../../hooks/useDisplayMode';
+import { useTheme } from '../../hooks/useTheme';
 import { cn } from '@/lib/utils';
 import { wsManager } from '../../api/ws';
 import { api } from '../../api/client';
@@ -52,6 +53,7 @@ interface ChatViewProps {
 
 export function ChatView({ groupJid, onBack }: ChatViewProps) {
   const { mode: displayMode, toggle: toggleDisplayMode } = useDisplayMode();
+  const { theme, toggle: toggleTheme } = useTheme();
   const [mobilePanel, setMobilePanel] = useState<SidebarTab | null>(null);
   const [sidebarTab, setSidebarTab] = useState<SidebarTab>('files');
   const [panelOpen, setPanelOpen] = useState(false);
@@ -354,7 +356,7 @@ export function ChatView({ groupJid, onBack }: ChatViewProps) {
   return (
     <div ref={containerRef} className="h-full flex flex-col bg-background">
       {/* Header */}
-      <div className="flex items-center gap-3 px-4 py-2.5 border-b lg:bg-white/80 lg:backdrop-blur-sm lg:border-slate-200/60 max-lg:bg-white/60 max-lg:backdrop-blur-xl max-lg:saturate-[1.8] max-lg:border-white/20 max-lg:shadow-[0_8px_32px_rgba(0,0,0,0.06),inset_0_1px_1px_rgba(255,255,255,0.6)]">
+      <div className="flex items-center gap-3 px-4 py-2.5 border-b border-border lg:bg-background/80 lg:backdrop-blur-sm max-lg:bg-background/60 max-lg:backdrop-blur-xl max-lg:saturate-[1.8] max-lg:border-border/40 max-lg:shadow-[0_8px_32px_rgba(0,0,0,0.06)]">
         {onBack && (
           <button
             onClick={onBack}
@@ -404,6 +406,15 @@ export function ChatView({ groupJid, onBack }: ChatViewProps) {
             )}
           </div>
         </div>
+        {/* Desktop: toggle theme (light → dark → system) */}
+        <button
+          onClick={toggleTheme}
+          className="hidden lg:flex p-2 rounded-lg hover:bg-accent text-muted-foreground transition-colors cursor-pointer"
+          title={theme === 'light' ? '切换到暗色模式' : theme === 'dark' ? '跟随系统' : '切换到亮色模式'}
+          aria-label={theme === 'light' ? '切换到暗色模式' : theme === 'dark' ? '跟随系统' : '切换到亮色模式'}
+        >
+          {theme === 'light' ? <Moon className="w-5 h-5" /> : theme === 'dark' ? <Monitor className="w-5 h-5" /> : <Sun className="w-5 h-5" />}
+        </button>
         {/* Desktop: toggle display mode */}
         <button
           onClick={toggleDisplayMode}
@@ -666,7 +677,7 @@ export function ChatView({ groupJid, onBack }: ChatViewProps) {
 
         {/* Desktop: sidebar with tabs (collapsible) */}
         <div className={cn(
-          "hidden lg:flex lg:flex-col flex-shrink-0 border-l border-border bg-white transition-[width] duration-200",
+          "hidden lg:flex lg:flex-col flex-shrink-0 border-l border-border bg-background transition-[width] duration-200",
           panelOpen ? "w-80" : "w-0 overflow-hidden border-l-0"
         )}>
           {/* Tab bar */}

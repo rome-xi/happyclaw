@@ -25,6 +25,7 @@
     <title>HappyClaw</title>
   </head>
   <body>
+    <script>(function(){var s=localStorage.getItem('happyclaw-theme');var dark=s==='dark'||(s!=='light'&&window.matchMedia('(prefers-color-scheme: dark)').matches);if(dark)document.documentElement.classList.add('dark');})();</script>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

@@ -9,14 +9,14 @@ export function QueueStatus({ status }: QueueStatusProps) {
   const groupsWithQueue = status.groups?.filter((g) => g.pendingMessages || g.pendingTasks > 0) || [];
 
   return (
-    <div className="bg-white rounded-xl border border-slate-200 p-6">
+    <div className="bg-card rounded-xl border border-border p-6">
       <div className="flex items-center gap-3 mb-4">
         <div className="p-2 bg-amber-100 rounded-lg">
           <ListOrdered className="w-6 h-6 text-amber-600" />
         </div>
         <div>
           <h3 className="text-sm font-medium text-slate-500">队列状态</h3>
-          <p className="text-2xl font-bold text-slate-900">
+          <p className="text-2xl font-bold text-foreground">
             {status.queueLength}
           </p>
         </div>
@@ -35,7 +35,7 @@ export function QueueStatus({ status }: QueueStatusProps) {
                 className="flex items-center justify-between text-xs"
               >
                 <span className="text-slate-600 truncate">{group.jid}</span>
-                <span className="text-slate-900 font-medium ml-2">
+                <span className="text-foreground font-medium ml-2">
                   {group.pendingTasks}{group.pendingMessages ? ' + 消息' : ''}
                 </span>
               </div>

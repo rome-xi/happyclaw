@@ -7,6 +7,7 @@ interface AgentTabBarProps {
   onSelectTab: (agentId: string | null) => void;
   onDeleteAgent: (agentId: string) => void;
   onCreateConversation?: () => void;
+  sdkTaskIds?: Set<string>; // SDK Task IDs (managed by SDK, no manual delete)
 }
 
 const TASK_STATUS_ICON: Record<string, string> = {
@@ -18,11 +19,11 @@ const TASK_STATUS_ICON: Record<string, string> = {
 const tabClass = (active: boolean) =>
   `flex-shrink-0 px-3 py-1 rounded-md text-xs font-medium transition-colors cursor-pointer ${
     active
-      ? 'bg-teal-100 text-teal-800 shadow-sm'
-      : 'text-slate-500 hover:bg-slate-100 hover:text-slate-700'
+      ? 'bg-accent text-accent-foreground shadow-sm'
+      : 'text-muted-foreground hover:bg-accent/60 hover:text-foreground'
   }`;
 
-export function AgentTabBar({ agents, activeTab, onSelectTab, onDeleteAgent, onCreateConversation }: AgentTabBarProps) {
+export function AgentTabBar({ agents, activeTab, onSelectTab, onDeleteAgent, onCreateConversation, sdkTaskIds }: AgentTabBarProps) {
   const conversations = agents.filter(a => a.kind === 'conversation');
   const tasks = agents.filter(a => a.kind === 'task');
 
@@ -30,7 +31,7 @@ export function AgentTabBar({ agents, activeTab, onSelectTab, onDeleteAgent, onC
   if (conversations.length === 0 && tasks.length === 0 && !onCreateConversation) return null;
 
   return (
-    <div className="flex items-center gap-1 px-3 py-1.5 border-b border-slate-200 bg-slate-50/80 overflow-x-auto scrollbar-none">
+    <div className="flex items-center gap-1 px-3 py-1.5 border-b border-border bg-background/80 overflow-x-auto scrollbar-none">
       {/* Main conversation tab */}
       <button onClick={() => onSelectTab(null)} className={tabClass(activeTab === null)}>
         主对话
@@ -49,7 +50,7 @@ export function AgentTabBar({ agents, activeTab, onSelectTab, onDeleteAgent, onC
           <span className="truncate max-w-[120px]">{agent.name}</span>
           <button
             onClick={(e) => { e.stopPropagation(); onDeleteAgent(agent.id); }}
-            className="opacity-0 group-hover:opacity-100 p-0.5 rounded hover:bg-slate-200/80 transition-all cursor-pointer"
+            className="opacity-0 group-hover:opacity-100 p-0.5 rounded hover:bg-accent transition-all cursor-pointer"
             title="关闭对话"
           >
             <X className="w-3 h-3" />
@@ -61,7 +62,7 @@ export function AgentTabBar({ agents, activeTab, onSelectTab, onDeleteAgent, onC
       {onCreateConversation && (
         <button
           onClick={onCreateConversation}
-          className="flex-shrink-0 flex items-center gap-0.5 px-2 py-1 rounded-md text-xs font-medium text-slate-400 hover:bg-slate-100 hover:text-slate-600 transition-colors cursor-pointer"
+          className="flex-shrink-0 flex items-center gap-0.5 px-2 py-1 rounded-md text-xs font-medium text-muted-foreground hover:bg-accent hover:text-foreground transition-colors cursor-pointer"
           title="新建对话"
         >
           <Plus className="w-3.5 h-3.5" />
@@ -71,26 +72,29 @@ export function AgentTabBar({ agents, activeTab, onSelectTab, onDeleteAgent, onC
       {/* Task agent tabs — subordinate style, separated */}
       {tasks.length > 0 && (
         <>
-          <div className="w-px h-4 bg-slate-200 mx-1 flex-shrink-0" />
+          <div className="w-px h-4 bg-border mx-1 flex-shrink-0" />
           {tasks.map((agent) => (
             <div
               key={agent.id}
               className={`flex-shrink-0 flex items-center gap-1 px-2 py-1 rounded-md text-xs font-medium transition-colors cursor-pointer group ${
                 activeTab === agent.id
-                  ? 'bg-slate-200 text-slate-700 shadow-sm'
-                  : 'text-slate-400 hover:bg-slate-100 hover:text-slate-600'
+                  ? 'bg-muted text-foreground shadow-sm'
+                  : 'text-muted-foreground hover:bg-accent/60 hover:text-foreground'
               }`}
               onClick={() => onSelectTab(agent.id)}
             >
               <span>{TASK_STATUS_ICON[agent.status] || ''}</span>
               <span className="truncate max-w-[100px]">{agent.name}</span>
-              <button
-                onClick={(e) => { e.stopPropagation(); onDeleteAgent(agent.id); }}
-                className="opacity-0 group-hover:opacity-100 p-0.5 rounded hover:bg-slate-200 transition-all cursor-pointer"
-                title="关闭"
-              >
-                <X className="w-3 h-3" />
-              </button>
+              {/* SDK Task 由 SDK 管理生命周期，不允许手动删除 */}
+              {!sdkTaskIds?.has(agent.id) && (
+                <button
+                  onClick={(e) => { e.stopPropagation(); onDeleteAgent(agent.id); }}
+                  className="opacity-0 group-hover:opacity-100 p-0.5 rounded hover:bg-border transition-all cursor-pointer"
+                  title="删除 Agent"
+                >
+                  <X className="w-3 h-3" />
+                </button>
+              )}
             </div>
           ))}
         </>

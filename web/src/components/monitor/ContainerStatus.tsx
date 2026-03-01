@@ -11,21 +11,21 @@ export function ContainerStatus({ status }: ContainerStatusProps) {
   const progressWidth = Math.min(100, percentage);
 
   return (
-    <div className="bg-white rounded-xl border border-slate-200 p-6">
+    <div className="bg-card rounded-xl border border-border p-6">
       <div className="flex items-center gap-3 mb-4">
         <div className="p-2 bg-brand-100 rounded-lg">
           <Server className="w-6 h-6 text-primary" />
         </div>
         <div>
           <h3 className="text-sm font-medium text-slate-500">活跃工作区</h3>
-          <p className="text-2xl font-bold text-slate-900">
+          <p className="text-2xl font-bold text-foreground">
             {status.activeContainers} / {maxConcurrent}
           </p>
         </div>
       </div>
 
       {/* Progress Bar */}
-      <div className="w-full bg-slate-200 rounded-full h-2">
+      <div className="w-full bg-muted rounded-full h-2">
         <div
           className={`h-2 rounded-full transition-all duration-300 ${
             percentage > 80

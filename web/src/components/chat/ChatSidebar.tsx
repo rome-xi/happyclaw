@@ -191,7 +191,7 @@ export function ChatSidebar({ className }: ChatSidebarProps) {
           alt={appName}
           className="w-8 h-8 rounded-lg"
         />
-        <span className="text-lg font-bold text-slate-900 truncate">{appName}</span>
+        <span className="text-lg font-bold text-foreground truncate">{appName}</span>
       </div>
 
       {/* New Chat + Search */}
@@ -209,7 +209,7 @@ export function ChatSidebar({ className }: ChatSidebarProps) {
           onChange={setSearchQuery}
           placeholder="搜索工作区..."
           debounce={200}
-          className="max-lg:bg-white/50 max-lg:backdrop-blur-lg max-lg:border-white/30 max-lg:rounded-lg"
+          className="max-lg:bg-background/60 max-lg:backdrop-blur-lg max-lg:border-border/30 max-lg:rounded-lg"
         />
       </div>
 
