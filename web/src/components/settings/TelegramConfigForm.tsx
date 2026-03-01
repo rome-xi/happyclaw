@@ -97,7 +97,7 @@ export function TelegramConfigForm({ setNotice, setError }: TelegramConfigFormPr
   const formDisabled = !enabled;
 
   return (
-    <div className="rounded-xl border border-slate-200 bg-white overflow-hidden">
+    <div className="rounded-xl border border-border bg-card overflow-hidden">
       {/* 卡片头部 */}
       <div className="flex items-center justify-between px-5 py-4 border-b border-slate-100 bg-slate-50/50">
         <div className="flex items-center gap-2">

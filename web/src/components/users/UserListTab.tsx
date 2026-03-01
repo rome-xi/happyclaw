@@ -298,8 +298,8 @@ export function UserListTab({ currentUser, setNotice, setError }: UserListTabPro
       </div>
 
       {showCreate && (
-        <div className="bg-white rounded-xl border border-slate-200 p-6 space-y-4">
-          <h3 className="text-sm font-medium text-slate-900">创建新用户</h3>
+        <div className="bg-card rounded-xl border border-border p-6 space-y-4">
+          <h3 className="text-sm font-medium text-foreground">创建新用户</h3>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
             <Input
               type="text"
@@ -376,7 +376,7 @@ export function UserListTab({ currentUser, setNotice, setError }: UserListTabPro
               <div className="text-xs text-slate-500 mb-1">权限明细</div>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
                 {assignablePermissions.map((perm) => (
-                  <label key={perm} className="inline-flex items-center gap-2 text-xs text-slate-700">
+                  <label key={perm} className="inline-flex items-center gap-2 text-xs text-foreground">
                     <input
                       type="checkbox"
                       checked={newPermissions.includes(perm)}
@@ -399,7 +399,7 @@ export function UserListTab({ currentUser, setNotice, setError }: UserListTabPro
         </div>
       )}
 
-      <div className="bg-white rounded-xl border border-slate-200 divide-y divide-slate-100 overflow-hidden">
+      <div className="bg-card rounded-xl border border-border divide-y divide-border overflow-hidden">
         {users.length === 0 ? (
           <div className="p-6 text-center text-sm text-slate-500">暂无用户</div>
         ) : (
@@ -408,10 +408,10 @@ export function UserListTab({ currentUser, setNotice, setError }: UserListTabPro
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0">
                   <div className="flex items-center gap-2 flex-wrap">
-                    <span className="text-sm font-medium text-slate-900">{user.display_name || user.username}</span>
+                    <span className="text-sm font-medium text-foreground">{user.display_name || user.username}</span>
                     <span className="text-xs text-slate-500">@{user.username}</span>
                     <span className={`text-xs px-1.5 py-0.5 rounded ${
-                      user.role === 'admin' ? 'bg-brand-100 text-primary' : 'bg-slate-100 text-slate-700'
+                      user.role === 'admin' ? 'bg-brand-100 text-primary' : 'bg-muted text-foreground'
                     }`}>
                       {user.role}
                     </span>
@@ -445,7 +445,7 @@ export function UserListTab({ currentUser, setNotice, setError }: UserListTabPro
                           setChangePasswordValue('');
                           if (opening) setEditingId(null);
                         }}
-                        className="p-2 hover:bg-slate-100 rounded-lg text-slate-500 hover:text-indigo-700 cursor-pointer"
+                        className="p-2 hover:bg-muted rounded-lg text-slate-500 hover:text-indigo-700 cursor-pointer"
                         title="修改密码"
                       >
                         <KeyRound className="w-4 h-4" />
@@ -455,7 +455,7 @@ export function UserListTab({ currentUser, setNotice, setError }: UserListTabPro
                       <>
                         <button
                           onClick={() => startEdit(user)}
-                          className="p-2 hover:bg-slate-100 rounded-lg text-slate-500 hover:text-slate-700 cursor-pointer"
+                          className="p-2 hover:bg-muted rounded-lg text-slate-500 hover:text-foreground cursor-pointer"
                           title="编辑"
                         >
                           <Edit3 className="w-4 h-4" />
@@ -463,7 +463,7 @@ export function UserListTab({ currentUser, setNotice, setError }: UserListTabPro
                         {user.status === 'active' ? (
                           <button
                             onClick={() => changeStatus(user, 'disabled')}
-                            className="p-2 hover:bg-slate-100 rounded-lg text-slate-500 hover:text-amber-700 cursor-pointer"
+                            className="p-2 hover:bg-muted rounded-lg text-slate-500 hover:text-amber-700 cursor-pointer"
                             title="禁用"
                           >
                             <ShieldOff className="w-4 h-4" />
@@ -471,7 +471,7 @@ export function UserListTab({ currentUser, setNotice, setError }: UserListTabPro
                         ) : user.status === 'disabled' ? (
                           <button
                             onClick={() => changeStatus(user, 'active')}
-                            className="p-2 hover:bg-slate-100 rounded-lg text-slate-500 hover:text-primary cursor-pointer"
+                            className="p-2 hover:bg-muted rounded-lg text-slate-500 hover:text-primary cursor-pointer"
                             title="启用"
                           >
                             <ShieldCheck className="w-4 h-4" />
@@ -479,7 +479,7 @@ export function UserListTab({ currentUser, setNotice, setError }: UserListTabPro
                         ) : (
                           <button
                             onClick={() => handleRestore(user)}
-                            className="p-2 hover:bg-slate-100 rounded-lg text-slate-500 hover:text-primary cursor-pointer"
+                            className="p-2 hover:bg-muted rounded-lg text-slate-500 hover:text-primary cursor-pointer"
                             title="恢复"
                           >
                             <Undo2 className="w-4 h-4" />
@@ -487,14 +487,14 @@ export function UserListTab({ currentUser, setNotice, setError }: UserListTabPro
                         )}
                         <button
                           onClick={() => handleRevokeAll(user)}
-                          className="p-2 hover:bg-slate-100 rounded-lg text-slate-500 hover:text-orange-600 cursor-pointer"
+                          className="p-2 hover:bg-muted rounded-lg text-slate-500 hover:text-orange-600 cursor-pointer"
                           title="撤销全部会话"
                         >
                           <LogOut className="w-4 h-4" />
                         </button>
                         <button
                           onClick={() => handleDelete(user)}
-                          className="p-2 hover:bg-slate-100 rounded-lg text-slate-500 hover:text-red-600 cursor-pointer"
+                          className="p-2 hover:bg-muted rounded-lg text-slate-500 hover:text-red-600 cursor-pointer"
                           title="删除"
                         >
                           <Trash2 className="w-4 h-4" />
@@ -535,7 +535,7 @@ export function UserListTab({ currentUser, setNotice, setError }: UserListTabPro
               )}
 
               {editingId === user.id && (
-                <div className="rounded-lg border border-slate-200 p-3 space-y-3 bg-slate-50">
+                <div className="rounded-lg border border-border p-3 space-y-3 bg-muted/30">
                   <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
                     <Input
                       type="text"
@@ -559,7 +559,7 @@ export function UserListTab({ currentUser, setNotice, setError }: UserListTabPro
                         type="text"
                         value={user.role}
                         disabled
-                        className="bg-slate-100 px-2.5 py-1.5 text-sm text-slate-500 h-auto"
+                        className="bg-muted px-2.5 py-1.5 text-sm text-slate-500 h-auto"
                       />
                     )}
                     <Input

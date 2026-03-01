@@ -40,9 +40,9 @@ export function AuthGuard({
   if (checking) {
     if (timedOut) {
       return (
-        <div className="min-h-screen bg-slate-50 flex items-center justify-center p-6">
-          <div className="max-w-md text-center bg-white rounded-xl border border-slate-200 p-6">
-            <h2 className="text-lg font-semibold text-slate-900 mb-2">页面初始化超时</h2>
+        <div className="min-h-screen bg-background flex items-center justify-center p-6">
+          <div className="max-w-md text-center bg-card rounded-xl border border-border p-6">
+            <h2 className="text-lg font-semibold text-foreground mb-2">页面初始化超时</h2>
             <p className="text-sm text-slate-600 mb-4">
               后端可能刚启动或浏览器缓存异常，请先刷新页面；若仍失败，重新登录。
             </p>
@@ -67,7 +67,7 @@ export function AuthGuard({
       );
     }
     return (
-      <div className="min-h-screen bg-slate-50 flex items-center justify-center">
+      <div className="min-h-screen bg-background flex items-center justify-center">
         <div className="text-center">
           <Loader2 className="w-16 h-16 text-primary animate-spin mx-auto mb-4" />
           <p className="text-slate-500">加载中...</p>

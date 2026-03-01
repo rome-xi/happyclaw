@@ -89,13 +89,13 @@ export function AuditLogTab({ setError }: AuditLogTabProps) {
         </a>
       </div>
 
-      <div className="bg-white rounded-xl border border-slate-200 divide-y divide-slate-100 overflow-hidden">
+      <div className="bg-card rounded-xl border border-border divide-y divide-border overflow-hidden">
         {auditLogs.length === 0 ? (
           <div className="p-6 text-center text-sm text-slate-500">暂无记录</div>
         ) : (
           auditLogs.map((log) => (
             <div key={log.id} className="px-5 py-3">
-              <div className="text-sm text-slate-900">
+              <div className="text-sm text-foreground">
                 {log.event_type} · {log.username}
               </div>
               <div className="text-xs text-slate-500 mt-1">

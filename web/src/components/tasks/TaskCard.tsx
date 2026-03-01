@@ -54,7 +54,7 @@ export function TaskCard({ task, onPause, onResume, onDelete }: TaskCardProps) {
   };
 
   return (
-    <div className="bg-white rounded-xl border border-slate-200 hover:border-brand-300 transition-colors duration-200">
+    <div className="bg-card rounded-xl border border-border hover:border-brand-300 transition-colors duration-200">
       {/* Card Header - Clickable */}
       <button
         onClick={() => setExpanded(!expanded)}
@@ -63,7 +63,7 @@ export function TaskCard({ task, onPause, onResume, onDelete }: TaskCardProps) {
         <div className="flex items-start justify-between">
           <div className="flex-1 min-w-0 mr-4">
             {/* Prompt / Script (truncated 2 lines) */}
-            <p className="text-slate-900 font-medium line-clamp-2 mb-2">
+            <p className="text-foreground font-medium line-clamp-2 mb-2">
               {task.execution_type === 'script'
                 ? task.script_command || task.prompt
                 : task.prompt}
@@ -78,19 +78,19 @@ export function TaskCard({ task, onPause, onResume, onDelete }: TaskCardProps) {
               )}
               <div className="flex items-center gap-2">
                 <span className="text-slate-500">调度:</span>
-                <span className="text-slate-900 font-medium">
+                <span className="text-foreground font-medium">
                   {task.schedule_type === 'cron' && 'Cron'}
                   {task.schedule_type === 'interval' && '间隔'}
                   {task.schedule_type === 'once' && '单次'}
                 </span>
-                <code className="text-xs bg-slate-100 px-2 py-0.5 rounded">
+                <code className="text-xs bg-muted px-2 py-0.5 rounded">
                   {task.schedule_value}
                 </code>
               </div>
 
               <div className="flex items-center gap-2">
                 <span className="text-slate-500">群组:</span>
-                <span className="text-slate-900 font-medium">
+                <span className="text-foreground font-medium">
                   {task.group_folder}
                 </span>
               </div>
@@ -150,7 +150,7 @@ export function TaskCard({ task, onPause, onResume, onDelete }: TaskCardProps) {
 
       {/* Expanded Detail */}
       {expanded && (
-        <div className="border-t border-slate-200">
+        <div className="border-t border-border">
           <TaskDetail task={task} />
         </div>
       )}

@@ -60,7 +60,7 @@ export function ChatGroupItem({
       className={cn(
         'group relative rounded-lg mb-0.5 transition-colors',
         isActive
-          ? 'bg-accent max-lg:bg-white/55 max-lg:backdrop-blur-lg max-lg:saturate-[1.8] max-lg:border max-lg:border-white/35 max-lg:shadow-[0_8px_32px_rgba(0,0,0,0.06),inset_0_1px_1px_rgba(255,255,255,0.6)]'
+          ? 'bg-accent max-lg:bg-background/70 max-lg:backdrop-blur-lg max-lg:saturate-[1.8] max-lg:border max-lg:border-border/40 max-lg:shadow-[0_8px_32px_rgba(0,0,0,0.06)]'
           : 'hover:bg-accent/50',
       )}
     >

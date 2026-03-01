@@ -112,8 +112,8 @@ export function InviteCodesTab({ currentUser, setNotice, setError }: InviteCodes
       </div>
 
       {showCreate && (
-        <div className="bg-white rounded-xl border border-slate-200 p-6 space-y-4">
-          <h3 className="text-sm font-medium text-slate-900">创建邀请码</h3>
+        <div className="bg-card rounded-xl border border-border p-6 space-y-4">
+          <h3 className="text-sm font-medium text-foreground">创建邀请码</h3>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
             <Select
               value={inviteTemplate}
@@ -198,7 +198,7 @@ export function InviteCodesTab({ currentUser, setNotice, setError }: InviteCodes
             <div className="mt-3 p-3 bg-green-50 border border-green-200 rounded-lg">
               <div className="text-xs text-green-700 mb-1">邀请码已生成（请立即复制）：</div>
               <div className="flex items-center gap-2">
-                <code className="flex-1 text-sm font-mono bg-white px-2 py-1 rounded border border-green-200 select-all">
+                <code className="flex-1 text-sm font-mono bg-card px-2 py-1 rounded border border-green-200 select-all">
                   {generatedCode}
                 </code>
                 <button
@@ -213,7 +213,7 @@ export function InviteCodesTab({ currentUser, setNotice, setError }: InviteCodes
         </div>
       )}
 
-      <div className="bg-white rounded-xl border border-slate-200 divide-y divide-slate-100 overflow-hidden">
+      <div className="bg-card rounded-xl border border-border divide-y divide-border overflow-hidden">
         {invites.length === 0 ? (
           <div className="p-6 text-center text-sm text-slate-500">暂无邀请码</div>
         ) : (
@@ -224,14 +224,14 @@ export function InviteCodesTab({ currentUser, setNotice, setError }: InviteCodes
               <div key={invite.code} className="flex items-center justify-between px-6 py-4">
                 <div className="min-w-0">
                   <div className="flex items-center gap-2 flex-wrap">
-                    <code className="text-sm font-mono text-slate-700">{invite.code.slice(0, 12)}...</code>
+                    <code className="text-sm font-mono text-foreground">{invite.code.slice(0, 12)}...</code>
                     <button
                       onClick={() => copyToClipboard(invite.code)}
-                      className="p-1 hover:bg-slate-100 rounded cursor-pointer"
+                      className="p-1 hover:bg-muted rounded cursor-pointer"
                     >
                       <Copy className="w-3.5 h-3.5 text-slate-400" />
                     </button>
-                    <span className="text-xs px-1.5 py-0.5 rounded bg-slate-100 text-slate-700">
+                    <span className="text-xs px-1.5 py-0.5 rounded bg-muted text-foreground">
                       {invite.role}
                     </span>
                     {invite.permission_template && (
@@ -261,7 +261,7 @@ export function InviteCodesTab({ currentUser, setNotice, setError }: InviteCodes
                       setError(getErrorMessage(err, '删除失败'));
                     }
                   }}
-                  className="p-2 hover:bg-slate-100 rounded-lg text-slate-500 hover:text-red-600 cursor-pointer"
+                  className="p-2 hover:bg-muted rounded-lg text-slate-500 hover:text-red-600 cursor-pointer"
                   title="删除邀请码"
                 >
                   <Trash2 className="w-4 h-4" />

@@ -58,7 +58,7 @@ export function MonitorPage() {
   };
 
   return (
-    <div className="min-h-full bg-slate-50 p-4 lg:p-8">
+    <div className="min-h-full bg-background p-4 lg:p-8">
       <div className="max-w-7xl mx-auto">
         <PageHeader
           title="系统监控"
@@ -79,8 +79,8 @@ export function MonitorPage() {
         {status && (
           <div className="space-y-6">
             {/* Docker 镜像状态 */}
-            <div className="bg-white rounded-xl border border-slate-200 p-6">
-              <h2 className="text-lg font-semibold text-slate-900 mb-4">
+            <div className="bg-card rounded-xl border border-border p-6">
+              <h2 className="text-lg font-semibold text-foreground mb-4">
                 Docker 镜像
               </h2>
               <div className="flex items-center justify-between">
@@ -158,8 +158,8 @@ export function MonitorPage() {
 
             {/* 群组详情 */}
             {status.groups && status.groups.length > 0 && (
-              <div className="bg-white rounded-xl border border-slate-200 p-4 lg:p-6">
-                <h2 className="text-lg font-semibold text-slate-900 mb-4">
+              <div className="bg-card rounded-xl border border-border p-4 lg:p-6">
+                <h2 className="text-lg font-semibold text-foreground mb-4">
                   群组状态
                 </h2>
 
@@ -172,7 +172,7 @@ export function MonitorPage() {
 
                 {/* 桌面端：表格 */}
                 <div className="hidden lg:block overflow-x-auto">
-                  <table className="min-w-full divide-y divide-slate-200">
+                  <table className="min-w-full divide-y divide-border">
                     <thead>
                       <tr>
                         <th className="px-4 py-3 text-left text-xs font-medium text-slate-500 uppercase">
@@ -189,10 +189,10 @@ export function MonitorPage() {
                         </th>
                       </tr>
                     </thead>
-                    <tbody className="divide-y divide-slate-200">
+                    <tbody className="divide-y divide-border">
                       {status.groups.map((group) => (
-                        <tr key={group.jid} className="hover:bg-slate-50">
-                          <td className="px-4 py-3 text-sm font-medium text-slate-900">
+                        <tr key={group.jid} className="hover:bg-muted/50">
+                          <td className="px-4 py-3 text-sm font-medium text-foreground">
                             {group.jid}
                           </td>
                           <td className="px-4 py-3 text-sm text-slate-600">

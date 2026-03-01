@@ -74,7 +74,7 @@ export function TasksPage() {
   const otherTasks = tasks.filter((t) => t.status !== 'active' && t.status !== 'paused');
 
   return (
-    <div className="min-h-full bg-slate-50">
+    <div className="min-h-full bg-background">
       <div className="max-w-6xl mx-auto p-6">
         <PageHeader
           title="定时任务管理"

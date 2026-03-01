@@ -60,21 +60,21 @@ export function MessageContextMenu({ content, position, onClose }: MessageContex
     <div className="fixed inset-0 z-[60]" onClick={onClose}>
       <div
         ref={menuRef}
-        className="absolute bg-white rounded-xl shadow-lg border border-slate-200 py-1 min-w-[160px] animate-in zoom-in-95 fade-in duration-150"
+        className="absolute bg-card rounded-xl shadow-lg border border-border py-1 min-w-[160px] animate-in zoom-in-95 fade-in duration-150"
         style={{ left: position.x, top: position.y }}
         onClick={(e) => e.stopPropagation()}
       >
         <button
           onClick={handleCopyText}
-          className="w-full flex items-center gap-3 px-4 py-2.5 text-sm text-slate-700 hover:bg-slate-50 active:bg-slate-100 transition-colors"
+          className="w-full flex items-center gap-3 px-4 py-2.5 text-sm text-foreground hover:bg-muted/50 active:bg-muted transition-colors"
         >
           <Copy className="w-4 h-4 text-slate-400" />
           复制文本
         </button>
-        <div className="mx-3 border-t border-slate-100" />
+        <div className="mx-3 border-t border-border" />
         <button
           onClick={handleCopyMarkdown}
-          className="w-full flex items-center gap-3 px-4 py-2.5 text-sm text-slate-700 hover:bg-slate-50 active:bg-slate-100 transition-colors"
+          className="w-full flex items-center gap-3 px-4 py-2.5 text-sm text-foreground hover:bg-muted/50 active:bg-muted transition-colors"
         >
           <FileText className="w-4 h-4 text-slate-400" />
           复制 Markdown

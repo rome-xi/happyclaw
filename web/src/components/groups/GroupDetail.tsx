@@ -16,11 +16,11 @@ export function GroupDetail({ group }: GroupDetailProps) {
   };
 
   return (
-    <div className="p-4 bg-slate-50 space-y-3">
+    <div className="p-4 bg-background space-y-3">
       {/* JID */}
       <div>
         <div className="text-xs text-slate-500 mb-1">完整 JID</div>
-        <code className="block text-xs font-mono bg-white px-3 py-2 rounded border border-slate-200 break-all">
+        <code className="block text-xs font-mono bg-card px-3 py-2 rounded border border-border break-all">
           {group.jid}
         </code>
       </div>
@@ -28,13 +28,13 @@ export function GroupDetail({ group }: GroupDetailProps) {
       {/* Folder */}
       <div>
         <div className="text-xs text-slate-500 mb-1">文件夹</div>
-        <div className="text-sm text-slate-900 font-medium">{group.folder}</div>
+        <div className="text-sm text-foreground font-medium">{group.folder}</div>
       </div>
 
       {/* Added At */}
       <div>
         <div className="text-xs text-slate-500 mb-1">添加时间</div>
-        <div className="text-sm text-slate-900">
+        <div className="text-sm text-foreground">
           {formatDate(group.added_at)}
         </div>
       </div>
@@ -43,7 +43,7 @@ export function GroupDetail({ group }: GroupDetailProps) {
       {group.lastMessage && (
         <div>
           <div className="text-xs text-slate-500 mb-1">最后消息</div>
-          <div className="text-sm text-slate-700 bg-white px-3 py-2 rounded border border-slate-200 line-clamp-3 break-words">
+          <div className="text-sm text-foreground bg-card px-3 py-2 rounded border border-border line-clamp-3 break-words">
             {group.lastMessage}
           </div>
           {group.lastMessageTime && (

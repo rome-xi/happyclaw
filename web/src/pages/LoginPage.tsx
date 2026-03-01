@@ -69,16 +69,16 @@ export function LoginPage() {
 
   if (initialized !== true) {
     return (
-      <div className="h-screen bg-slate-50 overflow-y-auto flex items-center justify-center p-4">
+      <div className="h-screen bg-background overflow-y-auto flex items-center justify-center p-4">
         <div className="text-slate-500 text-sm">加载中...</div>
       </div>
     );
   }
 
   return (
-    <div className="h-screen bg-slate-50 overflow-y-auto flex items-center justify-center p-4">
+    <div className="h-screen bg-background overflow-y-auto flex items-center justify-center p-4">
       <div className="w-full max-w-md">
-        <div className="bg-white rounded-lg border border-slate-200 p-8">
+        <div className="bg-card rounded-lg border border-border p-8">
           {/* Logo */}
           <div className="flex justify-center mb-6">
             <div className="w-16 h-16 rounded-2xl overflow-hidden mx-auto">
@@ -87,7 +87,7 @@ export function LoginPage() {
           </div>
 
           {/* Title */}
-          <h1 className="text-2xl font-bold text-slate-900 text-center mb-2">
+          <h1 className="text-2xl font-bold text-foreground text-center mb-2">
             欢迎使用 HappyClaw
           </h1>
           <p className="text-slate-500 text-center mb-6">
@@ -104,7 +104,7 @@ export function LoginPage() {
           {/* Login Form */}
           <form onSubmit={handleSubmit}>
             <div className="mb-4">
-              <label htmlFor="username" className="block text-sm font-medium text-slate-700 mb-1">
+              <label htmlFor="username" className="block text-sm font-medium text-foreground mb-1">
                 用户名
               </label>
               <Input
@@ -118,7 +118,7 @@ export function LoginPage() {
             </div>
 
             <div className="mb-6">
-              <label htmlFor="password" className="block text-sm font-medium text-slate-700 mb-1">
+              <label htmlFor="password" className="block text-sm font-medium text-foreground mb-1">
                 密码
               </label>
               <Input

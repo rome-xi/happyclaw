@@ -39,8 +39,8 @@ export function UsersPage() {
 
   if (tabs.length === 0) {
     return (
-      <div className="min-h-full bg-slate-50 p-4 lg:p-8">
-        <div className="max-w-3xl mx-auto bg-white rounded-xl border border-slate-200 p-8 text-sm text-slate-600">
+      <div className="min-h-full bg-background p-4 lg:p-8">
+        <div className="max-w-3xl mx-auto bg-card rounded-xl border border-border p-8 text-sm text-slate-600">
           当前账户无用户管理权限。
         </div>
       </div>
@@ -48,7 +48,7 @@ export function UsersPage() {
   }
 
   return (
-    <div className="min-h-full bg-slate-50 p-4 lg:p-8">
+    <div className="min-h-full bg-background p-4 lg:p-8">
       <div className="max-w-5xl mx-auto space-y-6">
         <PageHeader
           title="用户管理"
@@ -56,7 +56,7 @@ export function UsersPage() {
         />
 
         {(notice || error) && (
-          <div className="bg-white rounded-xl border border-slate-200 p-4 space-y-1">
+          <div className="bg-card rounded-xl border border-border p-4 space-y-1">
             {notice && <div className="text-sm text-green-600">{notice}</div>}
             {error && <div className="text-sm text-red-600">{error}</div>}
           </div>

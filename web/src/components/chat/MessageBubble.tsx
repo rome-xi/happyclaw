@@ -167,10 +167,10 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
       : (isOtherUser ? (message.sender_name || '用户') : (currentUser?.display_name || currentUser?.username || '我'));
 
     return (
-      <div className="group mb-2 border-b border-slate-100 pb-2" onTouchStart={handleTouchStart} onTouchEnd={handleTouchEnd} onTouchMove={handleTouchMove}>
+      <div className="group mb-2 border-b border-border pb-2" onTouchStart={handleTouchStart} onTouchEnd={handleTouchEnd} onTouchMove={handleTouchMove}>
         {/* Sender line — no avatars in compact mode */}
         <div className="flex items-center gap-1.5 mb-1">
-          <span className={`text-xs font-semibold ${isAI ? 'text-brand-600' : 'text-slate-700'}`}>{senderName}</span>
+          <span className={`text-xs font-semibold ${isAI ? 'text-primary' : 'text-muted-foreground'}`}>{senderName}</span>
           {showTime && <span className="text-[11px] text-slate-400">{time}</span>}
           <button
             onClick={handleCopy}
@@ -205,7 +205,7 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
             {isAI ? (
               <MarkdownRenderer content={message.content} groupJid={message.chat_jid} variant="chat" />
             ) : (
-              <p className="text-[15px] leading-relaxed whitespace-pre-wrap break-words text-slate-800">{message.content}</p>
+              <p className="text-[15px] leading-relaxed whitespace-pre-wrap break-words text-foreground">{message.content}</p>
             )}
           </div>
         )}
@@ -262,7 +262,7 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
                   </div>
                 )}
                 {!hasOnlyImages && (
-                  <div className="bg-white border border-slate-200 text-foreground px-4 py-2.5 rounded-2xl rounded-tl-sm shadow-sm">
+                  <div className="bg-card border border-border text-foreground px-4 py-2.5 rounded-2xl rounded-tl-sm shadow-sm">
                     <p className="text-[15px] leading-relaxed whitespace-pre-wrap break-words">{message.content}</p>
                   </div>
                 )}
@@ -324,7 +324,7 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
               </div>
             )}
             {!hasOnlyImages && (
-              <div className="bg-white border border-slate-200 text-foreground px-4 py-2.5 rounded-2xl rounded-tr-sm shadow-sm">
+              <div className="bg-card border border-border text-foreground px-4 py-2.5 rounded-2xl rounded-tr-sm shadow-sm">
                 <p className="text-[15px] leading-relaxed whitespace-pre-wrap break-words">{message.content}</p>
               </div>
             )}
@@ -390,7 +390,7 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
           </div>
 
           {/* Card */}
-          <div className="relative bg-white rounded-xl border border-slate-100 border-l-[3px] border-l-brand-400 px-5 py-4 max-lg:bg-white/90 max-lg:backdrop-blur-sm overflow-hidden">
+          <div className="relative bg-card rounded-xl border border-border border-l-[3px] border-l-[var(--brand-400)] px-5 py-4 max-lg:bg-card/90 max-lg:backdrop-blur-sm overflow-hidden">
             {/* Copy button — desktop only, mobile uses long-press menu */}
             <button
               onClick={handleCopy}

@@ -118,7 +118,7 @@ export function DirectoryBrowser({ value, onChange, placeholder }: DirectoryBrow
 
   return (
     <div>
-      <label className="block text-sm font-medium text-slate-700 mb-1">
+      <label className="block text-sm font-medium text-foreground mb-1">
         工作目录（可选）
       </label>
       <div className="flex gap-2">
@@ -139,10 +139,10 @@ export function DirectoryBrowser({ value, onChange, placeholder }: DirectoryBrow
       </div>
 
       {browsing && (
-        <div className="mt-2 border border-slate-200 rounded-lg overflow-hidden bg-white">
+        <div className="mt-2 border border-border rounded-lg overflow-hidden bg-card">
           {/* Breadcrumbs + select current dir */}
           {currentPath && (
-            <div className="flex items-center justify-between px-3 py-2 bg-slate-50 border-b border-slate-200">
+            <div className="flex items-center justify-between px-3 py-2 bg-muted border-b border-border">
               <div className="flex items-center gap-1 text-xs text-slate-500 overflow-x-auto min-w-0">
                 <button
                   onClick={() => fetchDirectories()}
@@ -161,7 +161,7 @@ export function DirectoryBrowser({ value, onChange, placeholder }: DirectoryBrow
                       }
                       className={`hover:text-primary transition-colors ${
                         i === breadcrumbs.length - 1
-                          ? 'text-slate-700 font-medium'
+                          ? 'text-foreground font-medium'
                           : 'cursor-pointer'
                       }`}
                       disabled={i === breadcrumbs.length - 1}
@@ -195,7 +195,7 @@ export function DirectoryBrowser({ value, onChange, placeholder }: DirectoryBrow
                 {(parentPath !== null || currentPath !== null) && (
                   <button
                     onClick={handleGoUp}
-                    className="w-full flex items-center gap-2 px-3 py-2 text-sm text-slate-600 hover:bg-slate-50 transition-colors cursor-pointer border-b border-slate-100"
+                    className="w-full flex items-center gap-2 px-3 py-2 text-sm text-slate-600 hover:bg-muted/50 transition-colors cursor-pointer border-b border-border"
                   >
                     <ArrowLeft className="w-4 h-4" />
                     返回上级
@@ -211,11 +211,11 @@ export function DirectoryBrowser({ value, onChange, placeholder }: DirectoryBrow
                 {directories.map((dir) => (
                   <div
                     key={dir.path}
-                    className="flex items-center justify-between px-3 py-2 hover:bg-slate-50 transition-colors"
+                    className="flex items-center justify-between px-3 py-2 hover:bg-muted/50 transition-colors"
                   >
                     <button
                       onClick={() => handleNavigate(dir.path)}
-                      className="flex items-center gap-2 text-sm text-slate-700 cursor-pointer flex-1 min-w-0"
+                      className="flex items-center gap-2 text-sm text-foreground cursor-pointer flex-1 min-w-0"
                     >
                       <Folder className="w-4 h-4 text-primary flex-shrink-0" />
                       <span className="truncate">{dir.name}</span>
@@ -237,7 +237,7 @@ export function DirectoryBrowser({ value, onChange, placeholder }: DirectoryBrow
 
           {/* New folder section */}
           {currentPath && (
-            <div className="border-t border-slate-200 px-3 py-2">
+            <div className="border-t border-border px-3 py-2">
               {creating ? (
                 <div className="flex items-center gap-2">
                   <Input
@@ -271,7 +271,7 @@ export function DirectoryBrowser({ value, onChange, placeholder }: DirectoryBrow
                       setCreating(false);
                       setNewFolderName('');
                     }}
-                    className="px-2 py-1.5 text-xs text-slate-500 hover:text-slate-700 transition-colors cursor-pointer"
+                    className="px-2 py-1.5 text-xs text-slate-500 hover:text-foreground transition-colors cursor-pointer"
                   >
                     取消
                   </button>

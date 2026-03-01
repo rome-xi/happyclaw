@@ -69,10 +69,10 @@ export function SkillsPage() {
   };
 
   return (
-    <div className="min-h-full bg-slate-50">
+    <div className="min-h-full bg-background">
       <div className="max-w-7xl mx-auto">
         {/* Header */}
-        <div className="bg-white border-b border-slate-200 px-6 py-4">
+        <div className="bg-background border-b border-border px-6 py-4">
           <PageHeader
             title="技能管理"
             subtitle={`用户级 ${manualUserSkills.length + syncedUserSkills.length}${syncedUserSkills.length > 0 ? `（含同步 ${syncedUserSkills.length}）` : ''} · 项目级 ${projectSkills.length} · 启用 ${enabledCount}`}
@@ -120,7 +120,7 @@ export function SkillsPage() {
               {loading && skills.length === 0 ? (
                 <SkeletonCardList count={3} />
               ) : error ? (
-                <div className="bg-white rounded-xl border border-red-200 p-6 text-center">
+                <div className="bg-card rounded-xl border border-red-200 p-6 text-center">
                   <p className="text-red-600">{error}</p>
                 </div>
               ) : filtered.length === 0 ? (
@@ -132,7 +132,7 @@ export function SkillsPage() {
                 <>
                   {manualUserSkills.length > 0 && (
                     <div>
-                      <h2 className="text-sm font-semibold text-slate-700 mb-3">
+                      <h2 className="text-sm font-semibold text-muted-foreground mb-3">
                         用户级技能 ({manualUserSkills.length})
                       </h2>
                       <div className="space-y-2">
@@ -150,7 +150,7 @@ export function SkillsPage() {
 
                   {syncedUserSkills.length > 0 && (
                     <div>
-                      <h2 className="text-sm font-semibold text-slate-700 mb-3">
+                      <h2 className="text-sm font-semibold text-muted-foreground mb-3">
                         宿主机同步 ({syncedUserSkills.length})
                       </h2>
                       <div className="space-y-2">
@@ -168,7 +168,7 @@ export function SkillsPage() {
 
                   {projectSkills.length > 0 && (
                     <div>
-                      <h2 className="text-sm font-semibold text-slate-700 mb-3">
+                      <h2 className="text-sm font-semibold text-muted-foreground mb-3">
                         项目级技能 ({projectSkills.length})
                       </h2>
                       <div className="space-y-2">

@@ -25,7 +25,7 @@ export function NavRail() {
 
   return (
     <TooltipProvider delayDuration={200}>
-      <nav className="w-16 h-full bg-white border-r border-border flex flex-col items-center py-4 gap-2">
+      <nav className="w-16 h-full bg-background border-r border-border flex flex-col items-center py-4 gap-2">
         {/* Logo */}
         <div className="w-10 h-10 rounded-xl overflow-hidden mb-2 flex-shrink-0">
           <img src={`${import.meta.env.BASE_URL}icons/icon-192.png`} alt="HappyClaw" className="w-full h-full object-cover" />

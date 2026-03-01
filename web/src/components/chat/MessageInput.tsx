@@ -309,13 +309,13 @@ export function MessageInput({
 
   return (
     <div
-      className="px-4 pt-2 pb-6 bg-background ios-pwa-bottom-safe max-lg:bg-white/60 max-lg:backdrop-blur-xl max-lg:saturate-[1.8] max-lg:border-t max-lg:border-white/20"
+      className="px-4 pt-2 pb-6 bg-background ios-pwa-bottom-safe max-lg:bg-background/60 max-lg:backdrop-blur-xl max-lg:saturate-[1.8] max-lg:border-t max-lg:border-border/40"
       style={{ paddingBottom: `max(1.5rem, var(--keyboard-height, 0px))` }}
     >
       <div className={isCompact ? 'mx-auto' : 'max-w-3xl mx-auto'}>
         {/* Upload progress bar */}
         {uploading && uploadProgress && (
-          <div className={`mb-2 px-4 py-2.5 ${isCompact ? 'bg-white border border-slate-200' : 'bg-white rounded-xl border border-slate-200 shadow-sm'}`}>
+          <div className={`mb-2 px-4 py-2.5 ${isCompact ? 'bg-card border border-border' : 'bg-card rounded-xl border border-border shadow-sm'}`}>
             <div className="flex items-center justify-between mb-1.5">
               <span className="text-xs text-slate-600 truncate max-w-[65%]">
                 {uploadProgress.currentFile || '完成'}
@@ -334,7 +334,7 @@ export function MessageInput({
         )}
 
         {/* Main input card */}
-        <div className={isCompact ? 'bg-white border border-slate-200 rounded-lg' : 'bg-white rounded-2xl border border-slate-200 shadow-sm'}>
+        <div className={isCompact ? 'bg-card border border-border rounded-lg' : 'bg-card rounded-2xl border border-border shadow-sm'}>
           {/* Send error banner */}
           {sendError && (
             <div className={`px-4 py-2 bg-red-50 text-red-600 text-xs font-medium border-b border-red-100 flex items-center gap-2 ${isCompact ? 'rounded-t-lg' : 'rounded-t-2xl'}`}>
@@ -344,7 +344,7 @@ export function MessageInput({
 
           {/* Pending images preview */}
           {pendingImages.length > 0 && (
-            <div className="px-3 pt-2.5 pb-1 border-b border-slate-100">
+            <div className="px-3 pt-2.5 pb-1 border-b border-border">
               <div className="flex items-center gap-1 mb-1.5">
                 <ImageIcon className="w-3 h-3 text-slate-400" />
                 <span className="text-[11px] text-slate-400">
@@ -380,7 +380,7 @@ export function MessageInput({
 
           {/* Pending files chips */}
           {pendingFiles.length > 0 && (
-            <div className="px-3 pt-2.5 pb-1 border-b border-slate-100">
+            <div className="px-3 pt-2.5 pb-1 border-b border-border">
               <div className="flex items-center gap-1 mb-1">
                 <Paperclip className="w-3 h-3 text-slate-400" />
                 <span className="text-[11px] text-slate-400">

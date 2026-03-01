@@ -254,7 +254,7 @@ export function SetupProvidersPage() {
       <div className="w-full max-w-4xl mx-auto space-y-5">
         <div className="text-center">
           <p className="text-xs font-semibold text-primary tracking-wider mb-2">STEP 2 / 2</p>
-          <h1 className="text-2xl font-bold text-slate-900 mb-2">系统接入初始化</h1>
+          <h1 className="text-2xl font-bold text-foreground mb-2">系统接入初始化</h1>
           <p className="text-sm text-slate-600">此页面保存的是系统全局默认配置。完成后才进入正式后台。</p>
         </div>
 
@@ -265,10 +265,10 @@ export function SetupProvidersPage() {
           <div className="p-3 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-700 text-sm">{notice}</div>
         )}
 
-        <section className="bg-white rounded-xl border border-slate-200 shadow-sm p-5">
+        <section className="bg-card rounded-xl border border-border shadow-sm p-5">
           <div className="flex items-center gap-2 mb-3">
             <Link2 className="w-4 h-4 text-primary" />
-            <h2 className="text-base font-semibold text-slate-900">飞书配置（可选）</h2>
+            <h2 className="text-base font-semibold text-foreground">飞书配置（可选）</h2>
           </div>
           <p className="text-xs text-slate-500 mb-3">首装不预填任何默认值，全部由你手动输入。</p>
           <div className="grid md:grid-cols-2 gap-3">
@@ -293,10 +293,10 @@ export function SetupProvidersPage() {
           </div>
         </section>
 
-        <section className="bg-white rounded-xl border border-slate-200 shadow-sm p-5">
+        <section className="bg-card rounded-xl border border-border shadow-sm p-5">
           <div className="flex items-center gap-2 mb-3">
             <KeyRound className="w-4 h-4 text-primary" />
-            <h2 className="text-base font-semibold text-slate-900">Claude Code 配置（二选一）</h2>
+            <h2 className="text-base font-semibold text-foreground">Claude Code 配置（二选一）</h2>
           </div>
 
           <div className="inline-flex rounded-lg border border-slate-200 p-1 bg-slate-50 mb-4">
@@ -304,7 +304,7 @@ export function SetupProvidersPage() {
               type="button"
               onClick={() => setProviderMode('official')}
               className={`px-3 py-1.5 text-sm rounded-md transition-colors cursor-pointer ${
-                providerMode === 'official' ? 'bg-white text-primary shadow-sm' : 'text-slate-500'
+                providerMode === 'official' ? 'bg-background text-primary shadow-sm' : 'text-slate-500'
               }`}
             >
               官方渠道
@@ -313,7 +313,7 @@ export function SetupProvidersPage() {
               type="button"
               onClick={() => setProviderMode('third_party')}
               className={`px-3 py-1.5 text-sm rounded-md transition-colors cursor-pointer ${
-                providerMode === 'third_party' ? 'bg-white text-primary shadow-sm' : 'text-slate-500'
+                providerMode === 'third_party' ? 'bg-background text-primary shadow-sm' : 'text-slate-500'
               }`}
             >
               第三方渠道
@@ -478,7 +478,7 @@ export function SetupProvidersPage() {
           )}
         </section>
 
-        <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-5 flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+        <div className="bg-card rounded-xl border border-border shadow-sm p-5 flex flex-col md:flex-row md:items-center md:justify-between gap-3">
           <div className="text-sm text-slate-600 flex items-start gap-2">
             <ShieldCheck className="w-4 h-4 text-primary mt-0.5 shrink-0" />
             当前页保存的数据会作为系统全局默认配置，后续可在后台设置页继续修改。

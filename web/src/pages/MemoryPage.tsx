@@ -237,15 +237,15 @@ export function MemoryPage() {
     : '未记录';
 
   return (
-    <div className="min-h-full bg-slate-50 p-4 lg:p-8">
+    <div className="min-h-full bg-background p-4 lg:p-8">
       <div className="max-w-7xl mx-auto space-y-4">
-        <div className="bg-white rounded-xl border border-slate-200 p-6">
+        <div className="bg-card rounded-xl border border-border p-6">
           <div className="flex items-center gap-3 mb-3">
             <div className="p-2 bg-brand-100 rounded-lg">
               <BookOpen className="w-5 h-5 text-primary" />
             </div>
             <div>
-              <h1 className="text-2xl font-bold text-slate-900">记忆管理</h1>
+              <h1 className="text-2xl font-bold text-foreground">记忆管理</h1>
               <p className="text-sm text-slate-500 mt-0.5">
                 管理个人全局记忆、主会话记忆、各会话流记忆，以及可读取的自动记忆文件。
               </p>
@@ -259,7 +259,7 @@ export function MemoryPage() {
 
         <div className="grid grid-cols-1 lg:grid-cols-[320px_1fr] gap-4">
           {(!isMobile || !showContent) && (
-          <div className="bg-white rounded-xl border border-slate-200 p-4">
+          <div className="bg-card rounded-xl border border-border p-4">
             <div className="mb-3">
               <Input
                 type="text"
@@ -296,10 +296,10 @@ export function MemoryPage() {
                             className={`w-full text-left rounded-lg border px-3 py-2 transition-colors ${
                               active
                                 ? 'border-primary bg-brand-50'
-                                : 'border-slate-200 hover:bg-slate-50'
+                                : 'border-border hover:bg-muted/50'
                             }`}
                           >
-                            <div className="text-sm font-medium text-slate-900 truncate">
+                            <div className="text-sm font-medium text-foreground truncate">
                               {source.label}
                             </div>
                             <div className="text-[11px] text-slate-500 truncate mt-0.5">
@@ -329,7 +329,7 @@ export function MemoryPage() {
           )}
 
           {(!isMobile || showContent) && (
-          <div className="bg-white rounded-xl border border-slate-200 p-4 lg:p-6">
+          <div className="bg-card rounded-xl border border-border p-4 lg:p-6">
             {selectedPath ? (
               <>
                 {isMobile && (
@@ -342,7 +342,7 @@ export function MemoryPage() {
                   </button>
                 )}
                 <div className="mb-3">
-                  <div className="text-sm font-semibold text-slate-900 break-all">{selectedPath}</div>
+                  <div className="text-sm font-semibold text-foreground break-all">{selectedPath}</div>
                   <div className="text-xs text-slate-500 mt-1">
                     最近更新时间: {updatedText} · 字节数: {new TextEncoder().encode(content).length} · {fileMeta?.writable ? '可编辑' : '只读'}
                   </div>
@@ -351,7 +351,7 @@ export function MemoryPage() {
                 <Textarea
                   value={content}
                   onChange={(e) => setContent(e.target.value)}
-                  className="min-h-[calc(100dvh-380px)] lg:min-h-[460px] resize-y p-4 font-mono text-sm leading-6 disabled:bg-slate-50"
+                  className="min-h-[calc(100dvh-380px)] lg:min-h-[460px] resize-y p-4 font-mono text-sm leading-6 disabled:bg-muted"
                   placeholder={loadingFile ? '正在加载...' : '此记忆源暂无内容'}
                   disabled={loadingFile || saving || !fileMeta?.writable}
                 />

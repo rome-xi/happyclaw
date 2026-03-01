@@ -19,7 +19,7 @@ export function GroupsPage() {
   }));
 
   return (
-    <div className="min-h-full bg-slate-50 p-4 lg:p-8">
+    <div className="min-h-full bg-background p-4 lg:p-8">
       <div className="max-w-7xl mx-auto">
         <PageHeader
           title="群组管理"

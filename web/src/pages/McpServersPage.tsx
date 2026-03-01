@@ -70,10 +70,10 @@ export function McpServersPage() {
   };
 
   return (
-    <div className="min-h-full bg-slate-50">
+    <div className="min-h-full bg-background">
       <div className="max-w-7xl mx-auto">
         {/* Header */}
-        <div className="bg-white border-b border-slate-200 px-6 py-4">
+        <div className="bg-background border-b border-border px-6 py-4">
           <PageHeader
             title="MCP 服务器"
             subtitle={`共 ${servers.length} 个${syncedServers.length > 0 ? `（含同步 ${syncedServers.length}）` : ''} · 启用 ${enabledCount}`}
@@ -121,7 +121,7 @@ export function McpServersPage() {
               {loading && servers.length === 0 ? (
                 <SkeletonCardList count={3} />
               ) : error ? (
-                <div className="bg-white rounded-xl border border-red-200 p-6 text-center">
+                <div className="bg-card rounded-xl border border-red-200 p-6 text-center">
                   <p className="text-red-600">{error}</p>
                 </div>
               ) : filtered.length === 0 ? (
@@ -134,7 +134,7 @@ export function McpServersPage() {
                 <>
                   {manualServers.length > 0 && (
                     <div>
-                      <h2 className="text-sm font-semibold text-slate-700 mb-3">
+                      <h2 className="text-sm font-semibold text-muted-foreground mb-3">
                         手动添加 ({manualServers.length})
                       </h2>
                       <div className="space-y-2">
@@ -152,7 +152,7 @@ export function McpServersPage() {
 
                   {syncedServers.length > 0 && (
                     <div>
-                      <h2 className="text-sm font-semibold text-slate-700 mb-3">
+                      <h2 className="text-sm font-semibold text-muted-foreground mb-3">
                         宿主机同步 ({syncedServers.length})
                       </h2>
                       <div className="space-y-2">

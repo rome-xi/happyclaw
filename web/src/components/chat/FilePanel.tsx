@@ -208,14 +208,14 @@ function TextEditor({
       onClick={onClose}
     >
       <div
-        className="bg-white rounded-xl shadow-xl w-full max-w-4xl h-[85vh] supports-[height:100dvh]:h-[85dvh] flex flex-col animate-in zoom-in-95 duration-200"
+        className="bg-card rounded-xl shadow-xl w-full max-w-4xl h-[85vh] supports-[height:100dvh]:h-[85dvh] flex flex-col animate-in zoom-in-95 duration-200"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
-        <div className="flex items-center justify-between px-4 py-3 border-b border-slate-200 flex-shrink-0">
+        <div className="flex items-center justify-between px-4 py-3 border-b border-border flex-shrink-0">
           <div className="flex items-center gap-2 min-w-0">
             <FileIcon name={file.name} />
-            <span className="font-medium text-slate-900 text-sm truncate">{file.name}</span>
+            <span className="font-medium text-foreground text-sm truncate">{file.name}</span>
             {dirty && (
               <span className="text-xs text-amber-500 flex-shrink-0">未保存</span>
             )}
@@ -232,7 +232,7 @@ function TextEditor({
             </Button>
             <button
               onClick={onClose}
-              className="text-slate-400 hover:text-slate-600 transition-colors p-2 rounded-md hover:bg-slate-100 cursor-pointer"
+              className="text-slate-400 hover:text-slate-600 transition-colors p-2 rounded-md hover:bg-muted cursor-pointer"
               aria-label="关闭编辑器"
             >
               <X className="w-5 h-5" />
@@ -253,7 +253,7 @@ function TextEditor({
                 setContent(e.target.value);
                 setDirty(true);
               }}
-              className="w-full h-full font-mono text-sm text-slate-800 resize-none bg-slate-50"
+              className="w-full h-full font-mono text-sm text-foreground resize-none bg-muted"
               spellCheck={false}
             />
           )}
@@ -434,16 +434,16 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
   };
 
   return (
-    <div className="w-full h-full border-l border-slate-200 bg-white flex flex-col">
+    <div className="w-full h-full border-l border-border bg-background flex flex-col">
       {/* Header */}
-      <div className="flex items-center justify-between px-4 py-3 border-b border-slate-200">
-        <h3 className="font-semibold text-slate-900 text-sm">工作区文件管理</h3>
+      <div className="flex items-center justify-between px-4 py-3 border-b border-border">
+        <h3 className="font-semibold text-foreground text-sm">工作区文件管理</h3>
         <div className="flex items-center gap-1">
           {canOpenLocalFolder && (
             <button
               onClick={handleOpenLocalFolder}
               disabled={openDirLoading}
-              className="hidden md:inline-flex text-slate-400 hover:text-slate-600 transition-colors p-2 rounded-md hover:bg-slate-100 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+              className="hidden md:inline-flex text-slate-400 hover:text-slate-600 transition-colors p-2 rounded-md hover:bg-muted cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
               title="打开工作区文件夹"
               aria-label="打开工作区文件夹"
             >
@@ -452,7 +452,7 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
           )}
           <button
             onClick={handleRefresh}
-            className="text-slate-400 hover:text-slate-600 transition-colors p-2 rounded-md hover:bg-slate-100 cursor-pointer"
+            className="text-slate-400 hover:text-slate-600 transition-colors p-2 rounded-md hover:bg-muted cursor-pointer"
             title="刷新"
             aria-label="刷新文件列表"
           >
@@ -461,7 +461,7 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
           {onClose && (
             <button
               onClick={onClose}
-              className="text-slate-400 hover:text-slate-600 transition-colors p-2 rounded-md hover:bg-slate-100 cursor-pointer"
+              className="text-slate-400 hover:text-slate-600 transition-colors p-2 rounded-md hover:bg-muted cursor-pointer"
               aria-label="关闭文件面板"
             >
               <X className="w-5 h-5" />
@@ -471,7 +471,7 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
       </div>
 
       {/* Breadcrumb */}
-      <div className="px-4 py-2 border-b border-slate-200 bg-slate-50">
+      <div className="px-4 py-2 border-b border-border bg-muted">
         <div className="flex items-center gap-1 text-sm overflow-x-auto">
           <button
             onClick={() => handleNavigate(-1)}
@@ -518,10 +518,10 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
                   key={item.path}
                   className={`flex items-center gap-2 px-2 py-1.5 rounded-lg transition-colors ${
                     clickable
-                      ? 'hover:bg-slate-100 cursor-pointer'
+                      ? 'hover:bg-muted cursor-pointer'
                       : item.isSystem
-                        ? 'bg-slate-50/60'
-                        : 'hover:bg-slate-50'
+                        ? 'bg-muted/60'
+                        : 'hover:bg-muted/50'
                   }`}
                   onClick={() => handleItemClick(item)}
                 >
@@ -620,7 +620,7 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
       </div>
 
       {/* Footer */}
-      <div className="p-3 border-t border-slate-200 space-y-2">
+      <div className="p-3 border-t border-border space-y-2">
         <Button variant="outline" size="sm" onClick={handleCreateDir} className="w-full">
           <FolderPlus className="w-4 h-4" />
           新建文件夹
