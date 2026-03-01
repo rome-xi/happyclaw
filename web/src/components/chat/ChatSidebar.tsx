@@ -1,6 +1,6 @@
 import { useState, useMemo, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Plus } from 'lucide-react';
+import { Plus, PanelLeftClose } from 'lucide-react';
 import { useChatStore } from '../../stores/chat';
 import { useAuthStore } from '../../stores/auth';
 import { Button } from '@/components/ui/button';
@@ -36,9 +36,10 @@ function groupByDate(items: GroupEntry[]): DateSection[] {
 
 interface ChatSidebarProps {
   className?: string;
+  onToggleCollapse?: () => void;
 }
 
-export function ChatSidebar({ className }: ChatSidebarProps) {
+export function ChatSidebar({ className, onToggleCollapse }: ChatSidebarProps) {
   const [searchQuery, setSearchQuery] = useState('');
   const [createOpen, setCreateOpen] = useState(false);
 
@@ -196,14 +197,23 @@ export function ChatSidebar({ className }: ChatSidebarProps) {
 
       {/* New Chat + Search */}
       <div className="p-3 space-y-2">
-        <Button
-          variant="outline"
-          className="w-full justify-start gap-2"
-          onClick={() => setCreateOpen(true)}
-        >
-          <Plus className="w-4 h-4" />
-          新工作区
-        </Button>
+        <div className="flex gap-2">
+          <Button
+            variant="outline"
+            className="flex-1 justify-start gap-2"
+            onClick={() => setCreateOpen(true)}
+          >
+            <Plus className="w-4 h-4" />
+            新工作区
+          </Button>
+          <button
+            onClick={onToggleCollapse}
+            className="hidden lg:flex items-center p-2 rounded-md border hover:bg-accent text-muted-foreground hover:text-foreground transition-colors"
+            title="折叠侧边栏"
+          >
+            <PanelLeftClose className="w-4 h-4" />
+          </button>
+        </div>
         <SearchInput
           value={searchQuery}
           onChange={setSearchQuery}

@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useRef } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
+import { PanelLeftOpen } from 'lucide-react';
 import { useChatStore } from '../stores/chat';
 import { useAuthStore } from '../stores/auth';
 import { ChatSidebar } from '../components/chat/ChatSidebar';
@@ -41,6 +42,7 @@ export function ChatPage() {
 
   const activeGroupJid = groupFolder ? routeGroupJid : currentGroup;
   const chatViewRef = useRef<HTMLDivElement>(null);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
 
   const handleBackToList = () => {
     navigate('/chat');
@@ -51,17 +53,38 @@ export function ChatPage() {
   return (
     <div className="h-full flex">
       {/* Sidebar - Desktop: always visible, Mobile: visible in list route */}
-      <div className={`${groupFolder ? 'hidden lg:block' : 'block'} w-full lg:w-72 flex-shrink-0`}>
-        <ChatSidebar />
+      <div className={`${groupFolder ? 'hidden lg:block' : 'block'} w-full ${sidebarCollapsed ? 'lg:w-0 lg:overflow-hidden' : 'lg:w-72'} flex-shrink-0 transition-all duration-200`}>
+        <ChatSidebar onToggleCollapse={() => setSidebarCollapsed(true)} />
       </div>
 
       {/* Chat View - Desktop: visible when active group exists, Mobile: only in detail route */}
       {activeGroupJid ? (
         <div ref={chatViewRef} className={`${groupFolder ? 'flex-1' : 'hidden lg:block flex-1'}`}>
-          <ChatView groupJid={activeGroupJid} onBack={handleBackToList} />
+          <ChatView
+            groupJid={activeGroupJid}
+            onBack={handleBackToList}
+            headerLeft={sidebarCollapsed ? (
+              <button
+                onClick={() => setSidebarCollapsed(false)}
+                className="hidden lg:flex p-1.5 -ml-1 rounded-md hover:bg-accent text-muted-foreground hover:text-foreground transition-colors"
+                title="展开侧边栏"
+              >
+                <PanelLeftOpen className="w-4 h-4" />
+              </button>
+            ) : undefined}
+          />
         </div>
       ) : (
-        <div className="hidden lg:flex flex-1 items-center justify-center bg-background">
+        <div className="hidden lg:flex flex-1 items-center justify-center bg-background relative">
+          {sidebarCollapsed && (
+            <button
+              onClick={() => setSidebarCollapsed(false)}
+              className="absolute left-3 top-3 p-1.5 rounded-md border hover:bg-accent text-muted-foreground hover:text-foreground transition-colors"
+              title="展开侧边栏"
+            >
+              <PanelLeftOpen className="w-4 h-4" />
+            </button>
+          )}
           <div className="text-center max-w-sm">
             {/* Logo */}
             <div className="w-16 h-16 rounded-2xl overflow-hidden mx-auto mb-6">

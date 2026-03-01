@@ -49,9 +49,10 @@ type SidebarTab = 'files' | 'env' | 'skills' | 'members';
 interface ChatViewProps {
   groupJid: string;
   onBack?: () => void;
+  headerLeft?: React.ReactNode;
 }
 
-export function ChatView({ groupJid, onBack }: ChatViewProps) {
+export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
   const { mode: displayMode, toggle: toggleDisplayMode } = useDisplayMode();
   const { theme, toggle: toggleTheme } = useTheme();
   const [mobilePanel, setMobilePanel] = useState<SidebarTab | null>(null);
@@ -366,6 +367,7 @@ export function ChatView({ groupJid, onBack }: ChatViewProps) {
             <ArrowLeft className="w-5 h-5 text-slate-600" />
           </button>
         )}
+        {headerLeft}
         <div className="flex-1 min-w-0">
           <h2 className="font-semibold text-slate-900 text-[15px] truncate">{group.name}</h2>
           <div className="flex items-center gap-1.5 text-xs text-slate-500">
