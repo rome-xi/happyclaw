@@ -701,12 +701,24 @@ async function runQuery(
     } catch { /* skip */ }
   }
 
+  const backgroundTaskGuidelines = [
+    '',
+    '## 后台任务',
+    '',
+    '当用户要求执行耗时较长的批量任务（如批量文件处理、大规模数据操作等），',
+    '你应该使用 Task 工具并设置 `run_in_background: true`，让任务在后台运行。',
+    '这样用户无需等待，可以继续与你交流其他事项。',
+    '任务结束时你会自动收到通知，届时在对话中向用户汇报即可。',
+    '告知用户：「已为您在后台启动该任务，完成后我会第一时间反馈。现在有其他问题也可以随时问我。」',
+  ].join('\n');
+
   const systemPromptAppend = [
     globalClaudeMd,
     heartbeatContent,
     memoryRecall,
     outputGuidelines,
     webFetchGuidelines,
+    backgroundTaskGuidelines,
   ].filter(Boolean).join('\n');
 
   // Home containers (admin & member) can access global and memory directories

@@ -274,12 +274,37 @@ async function handleWebUserMessage(
     shared,
   );
 
-  // For home chat, avoid piping into an active Feishu-driven run.
-  // Force a new processing pass so reply channel can be decided correctly.
+  // For home chat, distinguish safe reuse vs restart scenarios:
+  // - User-specific Web home with its own active runner: safe to IPC-inject
+  // - IM-started runner / shared admin home / no active runner: restart so routing and ownership are recalculated
   let pipedToActive = false;
   if (group.is_home) {
-    deps.queue.closeStdin(chatJid);
-    deps.queue.enqueueMessageCheck(chatJid);
+    // web:main is a shared admin home. Its runtime owner is selected from the
+    // latest sender during processGroupMessages, so reusing an existing runner
+    // here can leak another admin's session/memory context.
+    const canReuseHomeRunner = chatJid !== 'web:main' && deps.queue.hasDirectActiveRunner(chatJid);
+    if (canReuseHomeRunner) {
+      // Same channel: container was started by this Web JID → IPC inject
+      const images = attachments?.map((attachment) => ({
+        data: attachment.data,
+        mimeType: attachment.mimeType,
+      }));
+      const intent = analyzeIntent(content);
+      const sendResult = deps.queue.sendMessage(chatJid, formatted, images, intent);
+      if (sendResult === 'sent' || sendResult === 'interrupted_stop' || sendResult === 'interrupted_correction') {
+        pipedToActive = true;
+      } else {
+        // Runner exited between hasDirectActiveRunner check and sendMessage (TOCTOU race).
+        // Message is already in DB — enqueueMessageCheck will pick it up.
+        logger.debug({ chatJid, sendResult }, 'Home same-channel IPC missed, falling back to enqueue');
+        deps.queue.enqueueMessageCheck(chatJid);
+      }
+    } else {
+      // Unsafe to reuse (cross-channel, shared admin home, or no active runner):
+      // keep original closeStdin + restart behavior.
+      deps.queue.closeStdin(chatJid);
+      deps.queue.enqueueMessageCheck(chatJid);
+    }
   } else {
     const images = attachments?.map((attachment) => ({
       data: attachment.data,

@@ -3,6 +3,7 @@ import { api } from '../api/client';
 import { wsManager } from '../api/ws';
 import { useFileStore } from './files';
 import { useAuthStore } from './auth';
+import { showToast, notifyIfHidden, shouldEmitBackgroundTaskNotice } from '../utils/toast';
 import type { GroupInfo, AgentInfo } from '../types';
 
 export type { GroupInfo, AgentInfo };
@@ -603,11 +604,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   sendMessage: async (jid: string, content: string, attachments?: Array<{ data: string; mimeType: string }>) => {
     try {
-      set((s) => {
-        const next = { ...s.streaming };
-        delete next[jid];
-        return { streaming: next };
-      });
+      // streaming 状态由以下 3 条路径正确清理，sendMessage 不应无条件清空：
+      // 1. handleWsNewMessage 收到 is_from_me 消息时
+      // 2. agent_reply WebSocket 事件时
+      // 3. status:interrupted 事件时
 
       const body: { chatJid: string; content: string; attachments?: Array<{ type: 'image'; data: string; mimeType: string }> } = { chatJid: jid, content };
       if (attachments && attachments.length > 0) {
@@ -1043,6 +1043,20 @@ export const useChatStore = create<ChatState>((set, get) => ({
         event.taskStatus === 'completed' ? 'completed' : 'error',
         event.taskSummary,
       );
+
+      // Toast + 浏览器通知（仅限后台任务）
+      // stream-processor 为前台 Task 合成的 task_notification 不带 isBackground 标记，
+      // 仅 SDK 原生的后台完成事件携带 isBackground: true。
+      if (event.isBackground && shouldEmitBackgroundTaskNotice(resolvedTaskId)) {
+        const taskInfo = get().sdkTasks[resolvedTaskId];
+        const desc = (taskInfo?.description || event.taskSummary || '后台任务').slice(0, 60);
+        const status = event.taskStatus === 'completed' ? '已完成' : '失败';
+        if (typeof document === 'undefined' || !document.hidden) {
+          showToast(`${desc} ${status}`, event.taskSummary);
+        }
+        notifyIfHidden(`HappyClaw: ${desc} ${status}`, event.taskSummary);
+      }
+
       // 不落入主对话 streaming
       return;
     }

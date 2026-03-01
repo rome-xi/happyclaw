@@ -34,5 +34,6 @@ export interface StreamEvent {
   taskId?: string;
   taskStatus?: string;
   taskSummary?: string;
+  isBackground?: boolean;
   isTeammate?: boolean;
 }

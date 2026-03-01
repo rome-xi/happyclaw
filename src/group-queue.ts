@@ -136,6 +136,12 @@ export class GroupQueue {
     return shared as ActiveGroupState;
   }
 
+  /** 检查指定 JID 是否有自己直接启动的活跃 runner（非通过 folder 共享匹配） */
+  hasDirectActiveRunner(groupJid: string): boolean {
+    const state = this.groups.get(groupJid);
+    return state?.active === true;
+  }
+
   enqueueMessageCheck(groupJid: string): void {
     if (this.shuttingDown) return;
 

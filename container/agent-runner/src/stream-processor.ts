@@ -582,6 +582,7 @@ export class StreamEventProcessor {
         taskId: message.task_id,
         taskStatus: message.status,
         taskSummary: message.summary,
+        isBackground: true,
       },
     });
     this.cleanupTaskTools(message.task_id);
