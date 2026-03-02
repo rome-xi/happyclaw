@@ -131,14 +131,14 @@ export function canAccessGroup(
  * Check if a user can modify (rename, reset) a group.
  * - Users can modify their own home group.
  * - Users can modify web groups they created.
- * - IM groups are NOT modifiable by non-admin.
+ * - IM groups can be modified by their owner (created_by).
  */
 export function canModifyGroup(
   user: { id: string; role: UserRole },
   group: RegisteredGroup & { jid: string },
 ): boolean {
   if (group.is_home) return group.created_by === user.id;
-  if (!group.jid.startsWith('web:')) return false;
+  if (!group.jid.startsWith('web:')) return group.created_by === user.id;
   return group.created_by === user.id;
 }
 
