@@ -299,12 +299,16 @@ export const TelegramConfigSchema = z
   .object({
     botToken: z.string().max(2000).optional(),
     clearBotToken: z.boolean().optional(),
+    proxyUrl: z.string().max(2000).optional(),
+    clearProxyUrl: z.boolean().optional(),
     enabled: z.boolean().optional(),
   })
   .refine(
     (data) =>
       typeof data.botToken === 'string' ||
       data.clearBotToken === true ||
+      typeof data.proxyUrl === 'string' ||
+      data.clearProxyUrl === true ||
       typeof data.enabled === 'boolean',
     { message: 'At least one config field must be provided' },
   );

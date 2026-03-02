@@ -126,6 +126,7 @@ export interface FeishuProviderPublicConfig {
 
 export interface TelegramProviderConfig {
   botToken: string;
+  proxyUrl?: string;
   enabled?: boolean;
   updatedAt: string | null;
 }
@@ -135,6 +136,7 @@ export type TelegramConfigSource = 'runtime' | 'env' | 'none';
 export interface TelegramProviderPublicConfig {
   hasBotToken: boolean;
   botTokenMasked: string | null;
+  proxyUrl: string;
   enabled: boolean;
   updatedAt: string | null;
   source: TelegramConfigSource;
@@ -171,6 +173,7 @@ interface StoredFeishuProviderConfigV1 {
 
 interface StoredTelegramProviderConfigV1 {
   version: 1;
+  proxyUrl?: string;
   enabled?: boolean;
   updatedAt: string;
   secret: EncryptedSecrets;
@@ -242,6 +245,30 @@ function normalizeFeishuAppId(input: unknown): string {
   if (!value) return '';
   if (value.length > MAX_FIELD_LENGTH) {
     throw new Error('Field too long: appId');
+  }
+  return value;
+}
+
+function normalizeTelegramProxyUrl(input: unknown): string {
+  if (input === undefined || input === null) return '';
+  if (typeof input !== 'string') {
+    throw new Error('Invalid field: proxyUrl');
+  }
+  const value = input.trim();
+  if (!value) return '';
+  if (value.length > MAX_FIELD_LENGTH) {
+    throw new Error('Field too long: proxyUrl');
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error('Invalid field: proxyUrl');
+  }
+  const protocol = parsed.protocol.toLowerCase();
+  if (!['http:', 'https:', 'socks:', 'socks5:'].includes(protocol)) {
+    throw new Error('Invalid field: proxyUrl');
   }
   return value;
 }
@@ -614,6 +641,7 @@ function readStoredTelegramConfig(): TelegramProviderConfig | null {
   const secret = decryptTelegramSecret(stored.secret);
   return {
     botToken: secret.botToken,
+    proxyUrl: normalizeTelegramProxyUrl(stored.proxyUrl ?? ''),
     enabled: stored.enabled,
     updatedAt: stored.updatedAt || null,
   };
@@ -622,9 +650,12 @@ function readStoredTelegramConfig(): TelegramProviderConfig | null {
 function defaultsTelegramFromEnv(): TelegramProviderConfig {
   const raw = {
     botToken: process.env.TELEGRAM_BOT_TOKEN || '',
+    proxyUrl: process.env.TELEGRAM_PROXY_URL || '',
   };
   return {
     botToken: raw.botToken.trim(),
+    proxyUrl: normalizeTelegramProxyUrl(raw.proxyUrl),
+    enabled: true,
     updatedAt: null,
   };
 }
@@ -644,7 +675,7 @@ export function getTelegramProviderConfigWithSource(): {
   }
 
   const fromEnv = defaultsTelegramFromEnv();
-  if (fromEnv.botToken) {
+  if (fromEnv.botToken || fromEnv.proxyUrl) {
     return { config: fromEnv, source: 'env' };
   }
 
@@ -660,12 +691,14 @@ export function saveTelegramProviderConfig(
 ): TelegramProviderConfig {
   const normalized: TelegramProviderConfig = {
     botToken: normalizeSecret(next.botToken, 'botToken'),
+    proxyUrl: normalizeTelegramProxyUrl(next.proxyUrl),
     enabled: next.enabled,
     updatedAt: new Date().toISOString(),
   };
 
   const payload: StoredTelegramProviderConfigV1 = {
     version: 1,
+    proxyUrl: normalized.proxyUrl,
     enabled: normalized.enabled,
     updatedAt: normalized.updatedAt || new Date().toISOString(),
     secret: encryptTelegramSecret({ botToken: normalized.botToken }),
@@ -685,6 +718,7 @@ export function toPublicTelegramProviderConfig(
   return {
     hasBotToken: !!config.botToken,
     botTokenMasked: maskSecret(config.botToken),
+    proxyUrl: config.proxyUrl ?? '',
     enabled: config.enabled !== false,
     updatedAt: config.updatedAt,
     source,

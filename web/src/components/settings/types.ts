@@ -25,6 +25,7 @@ export interface FeishuConfigPublic {
 export interface TelegramConfigPublic {
   hasBotToken: boolean;
   botTokenMasked: string | null;
+  proxyUrl: string;
   enabled: boolean;
   connected: boolean;
   updatedAt: string | null;
