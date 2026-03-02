@@ -850,6 +850,8 @@ async function runQuery(
 
       // SDK 在某些失败场景会返回 error_* subtype 且不抛异常。
       // 不能把这类结果当 success(null)，否则前端会一直停留在"思考中"。
+      // 匹配策略：显式枚举已知的 error subtype，并用 startsWith('error') 兜底未知的未来 error subtype。
+      // 参考 SDK result subtype 约定：error_during_execution、error_max_turns 等均以 'error' 开头。
       if (typeof resultSubtype === 'string' && (resultSubtype === 'error_during_execution' || resultSubtype.startsWith('error'))) {
         const detail = textResult?.trim()
           ? textResult.trim()
@@ -1168,6 +1170,8 @@ process.on('uncaughtException', (err: unknown) => {
     process.exit(0);
   }
   console.error('Uncaught exception:', err);
+  // 尝试输出结构化错误，让主进程能收到错误信息而非仅看到 exit code 1
+  try { writeOutput({ status: 'error', result: null, error: String(err) }); } catch { /* ignore */ }
   process.exit(1);
 });
 

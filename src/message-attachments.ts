@@ -52,6 +52,7 @@ export function normalizeImageAttachment(
   input: ImageAttachmentInput,
   options?: NormalizeOptions,
 ): NormalizedImageAttachment | null {
+  // 历史附件数据可能缺少 type 字段，缺失时默认视为 image
   if ((input.type ?? 'image') !== 'image') return null;
   if (typeof input.data !== 'string' || input.data.length === 0) return null;
 
