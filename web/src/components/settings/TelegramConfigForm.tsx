@@ -76,11 +76,6 @@ export function TelegramConfigForm({ setNotice, setError }: TelegramConfigFormPr
 
       // 回读配置，确保页面展示的是后端实际生效值
       const fresh = await api.get<TelegramConfigPublic>('/api/config/telegram');
-      const expectedProxy = clearProxyUrl ? '' : (proxyUrl.trim() || config?.proxyUrl || '');
-      if ((fresh.proxyUrl || '') !== expectedProxy) {
-        setError('保存已提交，但代理配置未按预期生效，请刷新后重试');
-      }
-
       setConfig(fresh);
       setBotToken('');
       setClearToken(false);

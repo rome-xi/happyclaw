@@ -655,7 +655,6 @@ function defaultsTelegramFromEnv(): TelegramProviderConfig {
   return {
     botToken: raw.botToken.trim(),
     proxyUrl: normalizeTelegramProxyUrl(raw.proxyUrl),
-    enabled: true,
     updatedAt: null,
   };
 }
@@ -675,7 +674,7 @@ export function getTelegramProviderConfigWithSource(): {
   }
 
   const fromEnv = defaultsTelegramFromEnv();
-  if (fromEnv.botToken || fromEnv.proxyUrl) {
+  if (fromEnv.botToken) {
     return { config: fromEnv, source: 'env' };
   }
 
