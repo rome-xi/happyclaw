@@ -74,6 +74,7 @@ import { analyzeIntent } from './intent-analyzer.js';
 import {
   getClaudeProviderConfig as getClaudeProviderConfigForRefresh,
   getFeishuProviderConfigWithSource,
+  getTelegramProviderConfig,
   getTelegramProviderConfigWithSource,
   getUserFeishuConfig,
   getUserTelegramConfig,
@@ -2508,7 +2509,7 @@ async function main(): Promise<void> {
     return false;
   };
 
-  const reloadTelegramConnection = async (config: { botToken: string; enabled?: boolean }): Promise<boolean> => {
+  const reloadTelegramConnection = async (config: { botToken: string; proxyUrl?: string; enabled?: boolean }): Promise<boolean> => {
     // Find admin user
     const adminUsers = listUsers({ status: 'active', role: 'admin', page: 1, pageSize: 1 }).users;
     const adminUser = adminUsers[0];
@@ -2554,8 +2555,16 @@ async function main(): Promise<void> {
     } else {
       await imManager.disconnectUserTelegram(userId);
       const config = getUserTelegramConfig(userId);
+      const globalTelegramConfig = getTelegramProviderConfig();
       if (config && config.enabled !== false && config.botToken) {
-        const connected = await imManager.connectUserTelegram(userId, config, onNewChat, buildIsChatAuthorized(userId), buildOnPairAttempt(userId), handleCommand);
+        const connected = await imManager.connectUserTelegram(
+          userId,
+          { ...config, proxyUrl: globalTelegramConfig.proxyUrl },
+          onNewChat,
+          buildIsChatAuthorized(userId),
+          buildOnPairAttempt(userId),
+          handleCommand,
+        );
         logger.info({ userId, connected }, 'User Telegram connection hot-reloaded');
         return connected;
       }
@@ -2747,10 +2756,14 @@ async function main(): Promise<void> {
     // Determine effective Telegram config: per-user > global (admin only)
     let effectiveTelegram: TelegramConnectConfig | null = null;
     if (userTelegram && userTelegram.botToken) {
-      effectiveTelegram = { botToken: userTelegram.botToken, enabled: userTelegram.enabled };
+      effectiveTelegram = {
+        botToken: userTelegram.botToken,
+        proxyUrl: globalTelegramConfig.config.proxyUrl,
+        enabled: userTelegram.enabled,
+      };
     } else if (user.role === 'admin' && globalTelegramConfig.source !== 'none') {
       const gc = globalTelegramConfig.config;
-      effectiveTelegram = { botToken: gc.botToken, enabled: gc.enabled };
+      effectiveTelegram = { botToken: gc.botToken, proxyUrl: gc.proxyUrl, enabled: gc.enabled };
     }
 
     if (!effectiveFeishu && !effectiveTelegram) continue;

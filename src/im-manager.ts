@@ -31,6 +31,7 @@ export interface FeishuConnectConfig {
 
 export interface TelegramConnectConfig {
   botToken: string;
+  proxyUrl?: string;
   enabled?: boolean;
 }
 
@@ -214,6 +215,7 @@ class IMConnectionManager {
 
     const channel = createTelegramChannel({
       botToken: config.botToken,
+      proxyUrl: config.proxyUrl,
     });
 
     return this.connectChannel(userId, 'telegram', channel, {
