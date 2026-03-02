@@ -88,17 +88,16 @@ export function hasHostExecutionPermission(user: AuthUser): boolean {
 
 /**
  * Check if a user can access (view messages, send messages to) a group.
- * - admin → always true
+ * All users (including admin) follow the same visibility rules:
  * - is_home groups → only the owner (created_by) can access
- * - IM groups (jid does not start with 'web:') → owner-only if owner can be resolved
- * - folder === 'main' → false for non-admin
- * - Web groups → only if created_by matches user.id (null created_by = admin-only)
+ * - IM groups (jid does not start with 'web:') → owner or group_members
+ * - folder === 'main' → only the admin who owns it
+ * - Web groups → created_by matches user.id, or user is in group_members
  */
 export function canAccessGroup(
   user: { id: string; role: UserRole },
   group: RegisteredGroup & { jid: string },
 ): boolean {
-  if (user.role === 'admin') return true;
   if (group.is_home) return group.created_by === user.id;
   // IM groups: check ownership if created_by is set.
   // For legacy rows without created_by, resolve owner from sibling home group.
@@ -118,7 +117,11 @@ export function canAccessGroup(
     // Ownership cannot be resolved for this IM group → deny by default.
     return false;
   }
-  if (group.folder === 'main') return false;
+  // folder === 'main': only accessible by the admin who owns it (via created_by or group_members)
+  if (group.folder === 'main') {
+    if (group.created_by === user.id) return true;
+    return getGroupMemberRole(group.folder, user.id) !== null;
+  }
   if (group.created_by === user.id) return true;
   // Check group_members table for shared workspaces
   return getGroupMemberRole(group.folder, user.id) !== null;
@@ -126,32 +129,29 @@ export function canAccessGroup(
 
 /**
  * Check if a user can modify (rename, reset) a group.
- * - Admin can rename any group (including is_home).
- * - Members can rename their own web groups (not Feishu/Telegram groups).
- * - Feishu groups are NOT modifiable by non-admin.
+ * - Users can modify their own home group.
+ * - Users can modify web groups they created.
+ * - IM groups can be modified by their owner (created_by).
  */
 export function canModifyGroup(
   user: { id: string; role: UserRole },
   group: RegisteredGroup & { jid: string },
 ): boolean {
-  if (user.role === 'admin') return true;
   if (group.is_home) return group.created_by === user.id;
-  if (!group.jid.startsWith('web:')) return false;
-  if (group.folder === 'main') return false;
+  if (!group.jid.startsWith('web:')) return group.created_by === user.id;
   return group.created_by === user.id;
 }
 
 /**
  * Check if a user can manage members (add/remove) of a group.
  * - Home groups cannot have members managed.
- * - Only owner or admin can manage members.
+ * - Only the group creator (owner) can manage members.
  */
 export function canManageGroupMembers(
   user: { id: string; role: UserRole },
   group: RegisteredGroup & { jid: string },
 ): boolean {
   if (group.is_home) return false;
-  if (user.role === 'admin') return true;
   return group.created_by === user.id;
 }
 

@@ -176,7 +176,7 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
     // Host execution groups require admin unless it's the user's own home group
     if (isHost && !isAdmin && !(isHome && group.created_by === user.id)) continue;
 
-    // User isolation: non-admin can only see their own web groups
+    // User isolation: all users only see their own groups + shared groups
     if (!canAccessGroup({ id: user.id, role: user.role }, { ...group, jid })) continue;
 
     visibleEntries.push([jid, group]);

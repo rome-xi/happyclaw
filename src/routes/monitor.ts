@@ -142,7 +142,7 @@ monitorRoutes.get('/status', authMiddleware, async (c) => {
   const isAdmin = hasHostExecutionPermission(authUser);
   const queueStatus = deps.queue.getStatus();
 
-  // Filter groups for non-admin users: only show groups they own, exclude host-mode
+  // 监控页面属于系统管理功能，admin 可见所有群组状态（不受工作区隔离约束）
   const filteredGroups = isAdmin
     ? queueStatus.groups
     : queueStatus.groups.filter((g) => {

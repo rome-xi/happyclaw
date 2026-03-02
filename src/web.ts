@@ -1032,9 +1032,9 @@ function safeBroadcast(
       continue;
     }
 
-    // Group isolation: only allowed users and admins can see this group's events
+    // Group isolation: only allowed users (owner + shared members) can see this group's events
     // allowedUserIds === null means ownership unresolvable → default-deny (admin-only)
-    if (allowedUserIds !== undefined && session.role !== 'admin') {
+    if (allowedUserIds !== undefined) {
       if (allowedUserIds === null || !allowedUserIds.has(session.user_id)) {
         continue;
       }
@@ -1050,7 +1050,8 @@ function safeBroadcast(
 
 /**
  * Get the set of user IDs allowed to receive broadcasts for a group.
- * Includes the owner, all shared members, and always admins (handled in safeBroadcast).
+ * Includes the owner and all shared members. Admin is NOT automatically included
+ * — they must be the owner or a shared member to receive broadcasts.
  *
  * Returns:
  * - Set<string>: allowed user IDs (owner + shared members)
