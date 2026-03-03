@@ -296,6 +296,9 @@ export function initDatabase(): void {
   ensureColumn('agents', 'kind', "TEXT NOT NULL DEFAULT 'task'");
   ensureColumn('registered_groups', 'target_agent_id', 'TEXT');
 
+  // Add index on target_agent_id for fast lookup of IM bindings
+  db.exec('CREATE INDEX IF NOT EXISTS idx_rg_target_agent ON registered_groups(target_agent_id)');
+
   // Migration: remove UNIQUE constraint from registered_groups.folder
   // Multiple groups (web:main + feishu chats) share folder='main' by design.
   // The old UNIQUE constraint caused INSERT OR REPLACE to silently delete
@@ -942,30 +945,25 @@ function parseExecutionMode(raw: string | null, context: string): ExecutionMode 
   return 'container';
 }
 
-export function getRegisteredGroup(
-  jid: string,
-): (RegisteredGroup & { jid: string }) | undefined {
-  const row = db
-    .prepare('SELECT * FROM registered_groups WHERE jid = ?')
-    .get(jid) as
-    | {
-        jid: string;
-        name: string;
-        folder: string;
-        added_at: string;
-        container_config: string | null;
-        execution_mode: string | null;
-        custom_cwd: string | null;
-        init_source_path: string | null;
-        init_git_url: string | null;
-        created_by: string | null;
-        is_home: number;
-        selected_skills: string | null;
-        target_agent_id: string | null;
-      }
-    | undefined;
-  if (!row) return undefined;
+/** Raw row shape from registered_groups table — single source of truth for column mapping. */
+type RegisteredGroupRow = {
+  jid: string;
+  name: string;
+  folder: string;
+  added_at: string;
+  container_config: string | null;
+  execution_mode: string | null;
+  custom_cwd: string | null;
+  init_source_path: string | null;
+  init_git_url: string | null;
+  created_by: string | null;
+  is_home: number;
+  selected_skills: string | null;
+  target_agent_id: string | null;
+};
 
+/** Convert a raw DB row into a RegisteredGroup domain object. */
+function parseGroupRow(row: RegisteredGroupRow): RegisteredGroup & { jid: string } {
   return {
     jid: row.jid,
     name: row.name,
@@ -974,7 +972,7 @@ export function getRegisteredGroup(
     containerConfig: row.container_config
       ? JSON.parse(row.container_config)
       : undefined,
-    executionMode: parseExecutionMode(row.execution_mode, `group ${jid}`),
+    executionMode: parseExecutionMode(row.execution_mode, `group ${row.jid}`),
     customCwd: row.custom_cwd ?? undefined,
     initSourcePath: row.init_source_path ?? undefined,
     initGitUrl: row.init_git_url ?? undefined,
@@ -983,6 +981,16 @@ export function getRegisteredGroup(
     selected_skills: row.selected_skills ? JSON.parse(row.selected_skills) : null,
     target_agent_id: row.target_agent_id ?? undefined,
   };
+}
+
+export function getRegisteredGroup(
+  jid: string,
+): (RegisteredGroup & { jid: string }) | undefined {
+  const row = db
+    .prepare('SELECT * FROM registered_groups WHERE jid = ?')
+    .get(jid) as RegisteredGroupRow | undefined;
+  if (!row) return undefined;
+  return parseGroupRow(row);
 }
 
 export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
@@ -1019,37 +1027,10 @@ export function getJidsByFolder(folder: string): string[] {
 }
 
 export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
-  const rows = db.prepare('SELECT * FROM registered_groups').all() as Array<{
-    jid: string;
-    name: string;
-    folder: string;
-    added_at: string;
-    container_config: string | null;
-    execution_mode: string | null;
-    custom_cwd: string | null;
-    init_source_path: string | null;
-    init_git_url: string | null;
-    created_by: string | null;
-    is_home: number;
-    target_agent_id: string | null;
-  }>;
+  const rows = db.prepare('SELECT * FROM registered_groups').all() as RegisteredGroupRow[];
   const result: Record<string, RegisteredGroup> = {};
   for (const row of rows) {
-    result[row.jid] = {
-      name: row.name,
-      folder: row.folder,
-      added_at: row.added_at,
-      containerConfig: row.container_config
-        ? JSON.parse(row.container_config)
-        : undefined,
-      executionMode: parseExecutionMode(row.execution_mode, `group ${row.jid}`),
-      customCwd: row.custom_cwd ?? undefined,
-      initSourcePath: row.init_source_path ?? undefined,
-      initGitUrl: row.init_git_url ?? undefined,
-      created_by: row.created_by ?? undefined,
-      is_home: row.is_home === 1,
-      target_agent_id: row.target_agent_id ?? undefined,
-    };
+    result[row.jid] = parseGroupRow(row);
   }
   return result;
 }
@@ -1061,34 +1042,8 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
 export function getGroupsByTargetAgent(agentId: string): Array<{ jid: string; group: RegisteredGroup }> {
   const rows = db.prepare(
     'SELECT * FROM registered_groups WHERE target_agent_id = ?',
-  ).all(agentId) as Array<{
-    jid: string;
-    name: string;
-    folder: string;
-    added_at: string;
-    container_config: string | null;
-    execution_mode: string | null;
-    custom_cwd: string | null;
-    init_source_path: string | null;
-    init_git_url: string | null;
-    created_by: string | null;
-    is_home: number;
-    target_agent_id: string | null;
-  }>;
-  return rows.map((row) => ({
-    jid: row.jid,
-    group: {
-      name: row.name,
-      folder: row.folder,
-      added_at: row.added_at,
-      containerConfig: row.container_config ? JSON.parse(row.container_config) : undefined,
-      executionMode: parseExecutionMode(row.execution_mode, `group ${row.jid}`),
-      customCwd: row.custom_cwd ?? undefined,
-      created_by: row.created_by ?? undefined,
-      is_home: row.is_home === 1,
-      target_agent_id: row.target_agent_id ?? undefined,
-    },
-  }));
+  ).all(agentId) as RegisteredGroupRow[];
+  return rows.map((row) => ({ jid: row.jid, group: parseGroupRow(row) }));
 }
 
 /**
@@ -1104,21 +1059,7 @@ export function getUserHomeGroup(
     .prepare(
       'SELECT * FROM registered_groups WHERE is_home = 1 AND created_by = ?',
     )
-    .get(userId) as
-    | {
-        jid: string;
-        name: string;
-        folder: string;
-        added_at: string;
-        container_config: string | null;
-        execution_mode: string | null;
-        custom_cwd: string | null;
-        init_source_path: string | null;
-        init_git_url: string | null;
-        created_by: string | null;
-        is_home: number;
-      }
-    | undefined;
+    .get(userId) as RegisteredGroupRow | undefined;
 
   // Fallback for admin users: all admins share web:main (folder=main).
   // If no exact match, check if the user is an admin and web:main exists.
@@ -1131,27 +1072,12 @@ export function getUserHomeGroup(
         .prepare(
           "SELECT * FROM registered_groups WHERE jid = 'web:main' AND is_home = 1",
         )
-        .get() as typeof row | undefined;
+        .get() as RegisteredGroupRow | undefined;
     }
   }
 
   if (!row) return undefined;
-
-  return {
-    jid: row.jid,
-    name: row.name,
-    folder: row.folder,
-    added_at: row.added_at,
-    containerConfig: row.container_config
-      ? JSON.parse(row.container_config)
-      : undefined,
-    executionMode: parseExecutionMode(row.execution_mode, `group ${row.jid}`),
-    customCwd: row.custom_cwd ?? undefined,
-    initSourcePath: row.init_source_path ?? undefined,
-    initGitUrl: row.init_git_url ?? undefined,
-    created_by: row.created_by ?? undefined,
-    is_home: row.is_home === 1,
-  };
+  return parseGroupRow(row);
 }
 
 /**

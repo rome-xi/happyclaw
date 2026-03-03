@@ -23,6 +23,7 @@ import {
 import { DATA_DIR } from '../config.js';
 import type { SubAgent } from '../types.js';
 import { logger } from '../logger.js';
+import { getChannelType, extractChatId } from '../im-channel.js';
 
 const router = new Hono<{ Variables: Variables }>();
 
@@ -254,7 +255,7 @@ router.get('/:jid/im-groups', authMiddleware, async (c) => {
       jid: j,
       name: g.name,
       bound_agent_id: g.target_agent_id ?? null,
-      channel_type: j.startsWith('feishu:') ? 'feishu' : j.startsWith('telegram:') ? 'telegram' : 'unknown',
+      channel_type: getChannelType(j) ?? 'unknown',
     });
   }
 
@@ -263,7 +264,7 @@ router.get('/:jid/im-groups', authMiddleware, async (c) => {
   if (deps?.getFeishuChatInfo) {
     const feishuCandidates = candidates.filter((g) => g.channel_type === 'feishu');
     const chatInfoPromises = feishuCandidates.map(async (g) => {
-      const chatId = g.jid.slice('feishu:'.length);
+      const chatId = extractChatId(g.jid);
       const info = await deps.getFeishuChatInfo!(user.id, chatId);
       if (info) {
         g.avatar = info.avatar;

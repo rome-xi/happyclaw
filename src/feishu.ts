@@ -641,61 +641,39 @@ export function createFeishuConnection(config: FeishuConnectionConfig): FeishuCo
       return;
     }
 
-    // Check if this IM chat should route to a conversation agent
+    // Store message and broadcast to WebSocket clients
     const agentRouting = resolveEffectiveChatJid?.(chatJid);
+    const targetJid = agentRouting?.effectiveJid ?? chatJid;
+    const targetAgentId = agentRouting?.agentId;
+
+    storeChatMetadata(targetJid, timestamp);
+    storeMessageDirect(
+      messageId,
+      targetJid,
+      senderOpenId,
+      resolvedSenderName,
+      text,
+      timestamp,
+      false,
+      attachmentsJson,
+    );
+    broadcastNewMessage(targetJid, {
+      id: messageId,
+      chat_jid: targetJid,
+      sender: senderOpenId,
+      sender_name: resolvedSenderName,
+      content: text,
+      timestamp,
+      attachments: attachmentsJson,
+    }, targetAgentId);
+
     if (agentRouting) {
-      const { effectiveJid, agentId } = agentRouting;
-      storeChatMetadata(effectiveJid, timestamp);
-      storeMessageDirect(
-        messageId,
-        effectiveJid,
-        senderOpenId,
-        resolvedSenderName,
-        text,
-        timestamp,
-        false,
-        attachmentsJson,
-      );
-
-      broadcastNewMessage(effectiveJid, {
-        id: messageId,
-        chat_jid: effectiveJid,
-        sender: senderOpenId,
-        sender_name: resolvedSenderName,
-        content: text,
-        timestamp,
-        attachments: attachmentsJson,
-      }, agentId);
-
-      onAgentMessage?.(chatJid, agentId);
-
+      onAgentMessage?.(chatJid, agentRouting.agentId);
       logger.info(
-        { chatJid, effectiveJid, agentId, sender: resolvedSenderName, messageId, source },
+        { chatJid, effectiveJid: targetJid, agentId: targetAgentId, sender: resolvedSenderName, messageId, source },
         'Feishu message routed to conversation agent',
       );
     } else {
-      storeChatMetadata(chatJid, timestamp);
-      storeMessageDirect(
-        messageId,
-        chatJid,
-        senderOpenId,
-        resolvedSenderName,
-        text,
-        timestamp,
-        false,
-        attachmentsJson,
-      );
-
-      broadcastNewMessage(chatJid, {
-        id: messageId,
-        chat_jid: chatJid,
-        sender: senderOpenId,
-        sender_name: resolvedSenderName,
-        content: text,
-        timestamp,
-        attachments: attachmentsJson,
-      });
-
       logger.info(
         { chatJid, sender: resolvedSenderName, messageId, source },
         'Feishu message stored',

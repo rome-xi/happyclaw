@@ -66,7 +66,6 @@ import {
   markAllRunningTaskAgentsAsError,
   getSession,
   listAgentsByJid,
-  getGroupsByTargetAgent,
 } from './db.js';
 // feishu.js deprecated exports are no longer needed; imManager handles all connections
 import { imManager } from './im-manager.js';
@@ -129,6 +128,19 @@ const IM_SEND_FAIL_THRESHOLD = 3;
 // Track consecutive IM health check failures per JID for safe auto-unbind
 const imHealthCheckFailCounts = new Map<string, number>();
 const IM_HEALTH_CHECK_FAIL_THRESHOLD = 3;
+
+/** Unbind an IM group from its conversation agent, syncing DB + in-memory cache + failure counters. */
+function unbindImGroup(jid: string, reason: string): void {
+  const group = registeredGroups[jid] ?? getRegisteredGroup(jid);
+  if (!group?.target_agent_id) return;
+  const agentId = group.target_agent_id;
+  const updated = { ...group, target_agent_id: undefined };
+  setRegisteredGroup(jid, updated);
+  registeredGroups[jid] = updated;
+  imSendFailCounts.delete(jid);
+  imHealthCheckFailCounts.delete(jid);
+  logger.info({ jid, agentId }, reason);
+}
 
 function isCursorAfter(candidate: MessageCursor, base: MessageCursor): boolean {
   if (candidate.timestamp > base.timestamp) return true;
@@ -1858,8 +1870,11 @@ async function processAgentConversation(chatJid: string, agentId: string): Promi
         }, agentId);
 
         // Send reply to linked IM channels (Feishu/Telegram groups with target_agent_id)
-        const linkedImGroups = getGroupsByTargetAgent(agentId);
-        for (const { jid: imJid } of linkedImGroups) {
+        // Use in-memory cache instead of DB query — this callback fires per output message
+        const linkedImJids = Object.entries(registeredGroups)
+          .filter(([, g]) => g.target_agent_id === agentId)
+          .map(([jid]) => jid);
+        for (const imJid of linkedImJids) {
           const channelType = getChannelType(imJid);
           if (channelType) {
             imManager.sendMessage(imJid, text).then(() => {
@@ -1869,14 +1884,8 @@ async function processAgentConversation(chatJid: string, agentId: string): Promi
               const count = (imSendFailCounts.get(imJid) ?? 0) + 1;
               imSendFailCounts.set(imJid, count);
               if (count >= IM_SEND_FAIL_THRESHOLD) {
-                imSendFailCounts.delete(imJid);
                 try {
-                  const imGroup = getRegisteredGroup(imJid);
-                  if (imGroup && imGroup.target_agent_id === agentId) {
-                    setRegisteredGroup(imJid, { ...imGroup, target_agent_id: undefined });
-                    registeredGroups[imJid] = { ...imGroup, target_agent_id: undefined };
-                    logger.info({ imJid, agentId, failCount: count }, 'Auto-unbound IM group after consecutive send failures');
-                  }
+                  unbindImGroup(imJid, 'Auto-unbound IM group after consecutive send failures');
                 } catch (unbindErr) {
                   logger.error({ imJid, agentId, unbindErr }, 'Failed to auto-unbind IM group');
                 }
@@ -2264,15 +2273,7 @@ function buildOnNewChat(userId: string, homeFolder: string): (chatJid: string, c
  */
 function buildOnBotRemovedFromGroup(): (chatJid: string) => void {
   return (chatJid: string) => {
-    const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
-    if (!group) return;
-    if (group.target_agent_id) {
-      const updated = { ...group, target_agent_id: undefined };
-      setRegisteredGroup(chatJid, updated);
-      registeredGroups[chatJid] = updated;
-      imSendFailCounts.delete(chatJid);
-      logger.info({ chatJid, agentId: group.target_agent_id }, 'Auto-unbound IM group: bot removed or group disbanded');
-    }
+    unbindImGroup(chatJid, 'Auto-unbound IM group: bot removed or group disbanded');
   };
 }
 
@@ -2972,12 +2973,7 @@ async function checkImBindingsHealth(): Promise<void> {
         const count = (imHealthCheckFailCounts.get(jid) ?? 0) + 1;
         imHealthCheckFailCounts.set(jid, count);
         if (count >= IM_HEALTH_CHECK_FAIL_THRESHOLD) {
-          logger.info({ jid, agentId: group.target_agent_id, failCount: count }, 'IM group not reachable after multiple checks, auto-unbinding');
-          const updated = { ...group, target_agent_id: undefined };
-          setRegisteredGroup(jid, updated);
-          registeredGroups[jid] = updated;
-          imSendFailCounts.delete(jid);
-          imHealthCheckFailCounts.delete(jid);
+          unbindImGroup(jid, 'IM group not reachable after multiple checks, auto-unbinding');
         } else {
           logger.debug({ jid, failCount: count, threshold: IM_HEALTH_CHECK_FAIL_THRESHOLD }, 'IM health check failed, will retry before unbinding');
         }
