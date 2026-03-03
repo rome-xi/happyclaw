@@ -28,6 +28,7 @@ interface GroupState {
   groupFolder: string | null;
   agentId: string | null;
   retryCount: number;
+  retryTimer: ReturnType<typeof setTimeout> | null;
   restarting: boolean;
 }
 
@@ -62,6 +63,7 @@ export class GroupQueue {
         groupFolder: null,
         agentId: null,
         retryCount: 0,
+        retryTimer: null,
         restarting: false,
       };
       this.groups.set(groupJid, state);
@@ -98,6 +100,14 @@ export class GroupQueue {
       { groupJid },
       'Marked group as context overflow - will skip retry backoff',
     );
+  }
+
+  private clearRetryTimer(state: GroupState): void {
+    if (state.retryTimer !== null) {
+      clearTimeout(state.retryTimer);
+      state.retryTimer = null;
+    }
+    state.retryCount = 0;
   }
 
   private isHostMode(groupJid: string): boolean {
@@ -354,6 +364,8 @@ export class GroupQueue {
     const state = this.resolveActiveState(groupJid);
     if (!state) return false;
 
+    this.clearRetryTimer(state);
+
     const inputDir = this.resolveIpcInputDir(state);
     try {
       fs.mkdirSync(inputDir, { recursive: true });
@@ -377,6 +389,7 @@ export class GroupQueue {
     const requestedState = this.getGroup(groupJid);
     requestedState.pendingMessages = false;
     requestedState.pendingTasks = [];
+    this.clearRetryTimer(requestedState);
 
     const activeRunner = this.findActiveRunnerFor(groupJid);
     const targetJid = activeRunner || groupJid;
@@ -384,6 +397,7 @@ export class GroupQueue {
     if (targetJid !== groupJid) {
       state.pendingMessages = false;
       state.pendingTasks = [];
+      this.clearRetryTimer(state);
     }
     this.waitingGroups.delete(groupJid);
     this.waitingGroups.delete(targetJid);
@@ -681,6 +695,12 @@ export class GroupQueue {
   }
 
   private scheduleRetry(groupJid: string, state: GroupState): void {
+    // 清除可能存在的旧定时器（不重置 retryCount，因为这里在递增）
+    if (state.retryTimer !== null) {
+      clearTimeout(state.retryTimer);
+      state.retryTimer = null;
+    }
+
     // 检查是否为上下文溢出错误，如果是则跳过重试
     if (this.contextOverflowGroups.has(groupJid)) {
       logger.warn(
@@ -712,7 +732,8 @@ export class GroupQueue {
       { groupJid, retryCount: state.retryCount, delayMs },
       'Scheduling retry with backoff',
     );
-    setTimeout(() => {
+    state.retryTimer = setTimeout(() => {
+      state.retryTimer = null;
       if (!this.shuttingDown) {
         this.enqueueMessageCheck(groupJid);
       }
@@ -824,6 +845,11 @@ export class GroupQueue {
 
   async shutdown(gracePeriodMs: number): Promise<void> {
     this.shuttingDown = true;
+
+    // 清除所有待执行的重试定时器，防止关闭期间容器重启
+    for (const state of this.groups.values()) {
+      this.clearRetryTimer(state);
+    }
 
     logger.info(
       {
