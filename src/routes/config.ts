@@ -464,11 +464,10 @@ configRoutes.post(
       return c.json({ error: 'OAuth token refresh failed. Please re-login via OAuth.' }, 500);
     }
 
+    // Re-read latest config to avoid overwriting changes made during the async refresh
+    const latestConfig = getClaudeProviderConfig();
     const saved = saveClaudeProviderConfig({
-      anthropicBaseUrl: config.anthropicBaseUrl,
-      anthropicAuthToken: config.anthropicAuthToken,
-      anthropicApiKey: config.anthropicApiKey,
-      claudeCodeOauthToken: config.claudeCodeOauthToken,
+      ...latestConfig,
       claudeOAuthCredentials: refreshed,
     });
 
