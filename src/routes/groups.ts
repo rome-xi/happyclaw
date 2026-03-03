@@ -43,6 +43,8 @@ import {
   getUserById,
   getAgent,
   listUsers,
+  listAgentsByJid,
+  getGroupsByTargetAgent,
 } from '../db.js';
 import { logger } from '../logger.js';
 import {
@@ -675,6 +677,28 @@ groupRoutes.delete('/:jid', authMiddleware, async (c) => {
       { error: 'Insufficient permissions for host execution mode' },
       403,
     );
+  }
+
+  // Block deletion if any conversation agent has active IM bindings
+  const agents = listAgentsByJid(jid);
+  const boundAgents: Array<{ agentId: string; agentName: string; imGroups: Array<{ jid: string; name: string }> }> = [];
+  for (const a of agents) {
+    if (a.kind === 'conversation') {
+      const linked = getGroupsByTargetAgent(a.id);
+      if (linked.length > 0) {
+        boundAgents.push({
+          agentId: a.id,
+          agentName: a.name,
+          imGroups: linked.map(l => ({ jid: l.jid, name: l.group.name })),
+        });
+      }
+    }
+  }
+  if (boundAgents.length > 0) {
+    return c.json({
+      error: '该工作区下有子对话绑定了 IM 群组，请先解绑后再删除。',
+      bound_agents: boundAgents,
+    }, 409);
   }
 
   // Wait for container to fully stop before cleaning up its files

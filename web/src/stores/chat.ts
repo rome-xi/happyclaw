@@ -4,7 +4,7 @@ import { wsManager } from '../api/ws';
 import { useFileStore } from './files';
 import { useAuthStore } from './auth';
 import { showToast, notifyIfHidden, shouldEmitBackgroundTaskNotice } from '../utils/toast';
-import type { GroupInfo, AgentInfo } from '../types';
+import type { GroupInfo, AgentInfo, AvailableImGroup } from '../types';
 
 export type { GroupInfo, AgentInfo };
 
@@ -157,6 +157,10 @@ interface ChatState {
   loadAgentMessages: (jid: string, agentId: string, loadMore?: boolean) => Promise<void>;
   sendAgentMessage: (jid: string, agentId: string, content: string) => void;
   refreshAgentMessages: (jid: string, agentId: string) => Promise<void>;
+  // IM binding actions
+  loadAvailableImGroups: (jid: string) => Promise<AvailableImGroup[]>;
+  bindImGroup: (jid: string, agentId: string, imJid: string) => Promise<boolean>;
+  unbindImGroup: (jid: string, agentId: string, imJid: string) => Promise<boolean>;
 }
 
 const DEFAULT_STREAMING_STATE: StreamingState = {
@@ -899,8 +903,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
           error: null,
         };
       });
-    } catch (err) {
-      set({ error: err instanceof Error ? err.message : String(err) });
+    } catch (err: unknown) {
+      const apiErr = err as { status?: number; body?: Record<string, unknown>; message?: string };
+      if (apiErr.status === 409 && apiErr.body?.bound_agents) {
+        const e = new Error(apiErr.message || 'IM binding conflict') as Error & { boundAgents: unknown };
+        e.boundAgents = apiErr.body.bound_agents;
+        throw e;
+      }
+      set({ error: apiErr.message || (err instanceof Error ? err.message : String(err)) });
     }
   },
 
@@ -1589,6 +1599,44 @@ export const useChatStore = create<ChatState>((set, get) => ({
       }
     } catch (err) {
       set({ error: err instanceof Error ? err.message : String(err) });
+    }
+  },
+
+  // IM binding actions
+  loadAvailableImGroups: async (jid) => {
+    try {
+      const data = await api.get<{ imGroups: AvailableImGroup[] }>(
+        `/api/groups/${encodeURIComponent(jid)}/im-groups`,
+      );
+      return data.imGroups;
+    } catch {
+      return [];
+    }
+  },
+
+  bindImGroup: async (jid, agentId, imJid) => {
+    try {
+      await api.put(
+        `/api/groups/${encodeURIComponent(jid)}/agents/${agentId}/im-binding`,
+        { im_jid: imJid },
+      );
+      // Refresh agents to get updated linked_im_groups
+      get().loadAgents(jid);
+      return true;
+    } catch {
+      return false;
+    }
+  },
+
+  unbindImGroup: async (jid, agentId, imJid) => {
+    try {
+      await api.delete(
+        `/api/groups/${encodeURIComponent(jid)}/agents/${agentId}/im-binding/${encodeURIComponent(imJid)}`,
+      );
+      get().loadAgents(jid);
+      return true;
+    } catch {
+      return false;
     }
   },
 

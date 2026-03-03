@@ -134,6 +134,15 @@ export function ChatSidebar({ className, onToggleCollapse }: ChatSidebarProps) {
       const nextJid = useChatStore.getState().currentGroup;
       const nextFolder = nextJid ? useChatStore.getState().groups[nextJid]?.folder : null;
       navigate(nextFolder ? `/chat/${nextFolder}` : '/chat');
+    } catch (err: unknown) {
+      const typed = err as { boundAgents?: Array<{ agentName: string; imGroups: Array<{ name: string }> }> };
+      if (typed.boundAgents) {
+        const details = typed.boundAgents
+          .map((a) => `「${a.agentName}」→ ${a.imGroups.map((g) => g.name).join('、')}`)
+          .join('\n');
+        alert(`该工作区下有子对话绑定了 IM 群组，请先解绑后再删除：\n${details}`);
+        setDeleteState({ open: false, jid: '', name: '' });
+      }
     } finally {
       setDeleteLoading(false);
     }

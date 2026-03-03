@@ -66,6 +66,7 @@ import {
   markAllRunningTaskAgentsAsError,
   getSession,
   listAgentsByJid,
+  getGroupsByTargetAgent,
 } from './db.js';
 // feishu.js deprecated exports are no longer needed; imManager handles all connections
 import { imManager } from './im-manager.js';
@@ -120,6 +121,10 @@ let shuttingDown = false;
 const queue = new GroupQueue();
 const EMPTY_CURSOR: MessageCursor = { timestamp: '', id: '' };
 const terminalWarmupInFlight = new Set<string>();
+
+// Track consecutive IM send failures per JID for auto-unbind
+const imSendFailCounts = new Map<string, number>();
+const IM_SEND_FAIL_THRESHOLD = 3;
 
 function isCursorAfter(candidate: MessageCursor, base: MessageCursor): boolean {
   if (candidate.timestamp > base.timestamp) return true;
@@ -1594,11 +1599,16 @@ async function processTaskIpc(
         break;
       }
       if (data.jid && data.name && data.folder) {
+        // Inherit created_by from the source group so onNewChat won't re-route
+        const sourceEntry = Object.values(registeredGroups).find(
+          (g) => g.folder === sourceGroup,
+        );
         registerGroup(data.jid, {
           name: data.name,
           folder: data.folder,
           added_at: new Date().toISOString(),
           containerConfig: data.containerConfig,
+          created_by: sourceEntry?.created_by,
         });
       } else {
         logger.warn(
@@ -1842,6 +1852,35 @@ async function processAgentConversation(chatJid: string, agentId: string): Promi
           timestamp,
           is_from_me: true,
         }, agentId);
+
+        // Send reply to linked IM channels (Feishu/Telegram groups with target_agent_id)
+        const linkedImGroups = getGroupsByTargetAgent(agentId);
+        for (const { jid: imJid } of linkedImGroups) {
+          const channelType = getChannelType(imJid);
+          if (channelType) {
+            imManager.sendMessage(imJid, text).then(() => {
+              imSendFailCounts.delete(imJid);
+            }).catch((err) => {
+              logger.warn({ imJid, agentId, err }, 'Failed to send agent reply to linked IM channel');
+              const count = (imSendFailCounts.get(imJid) ?? 0) + 1;
+              imSendFailCounts.set(imJid, count);
+              if (count >= IM_SEND_FAIL_THRESHOLD) {
+                imSendFailCounts.delete(imJid);
+                try {
+                  const imGroup = getRegisteredGroup(imJid);
+                  if (imGroup && imGroup.target_agent_id === agentId) {
+                    setRegisteredGroup(imJid, { ...imGroup, target_agent_id: undefined });
+                    registeredGroups[imJid] = { ...imGroup, target_agent_id: undefined };
+                    logger.info({ imJid, agentId, failCount: count }, 'Auto-unbound IM group after consecutive send failures');
+                  }
+                } catch (unbindErr) {
+                  logger.error({ imJid, agentId, unbindErr }, 'Failed to auto-unbind IM group');
+                }
+              }
+            });
+          }
+        }
+
         commitCursor();
         resetIdleTimer();
       }
@@ -1980,6 +2019,11 @@ async function startMessageLoop(): Promise<void> {
             }
           }
           if (!group) continue;
+
+          // Skip groups with target_agent_id — their messages are routed
+          // to conversation agents at IM ingestion time (feishu.ts/telegram.ts)
+          if (group.target_agent_id) continue;
+
           if (group.is_home) homeFolders.add(group.folder);
 
           // Handle cold-cache/newly-added groups: detect home folders from DB
@@ -2177,6 +2221,10 @@ function buildOnNewChat(userId: string, homeFolder: string): (chatJid: string, c
       // Already owned by this user — nothing to do
       if (existing.created_by === userId) return;
 
+      // Don't override groups that have target_agent_id configured
+      // (manually bound IM groups routing to conversation agents)
+      if (existing.target_agent_id) return;
+
       // Different user's connection now owns this IM app.
       // Re-route the chat to the current user's home folder.
       // This handles the common case where the same Feishu app credentials
@@ -2205,6 +2253,25 @@ function buildOnNewChat(userId: string, homeFolder: string): (chatJid: string, c
   };
 }
 
+/**
+ * Build the onBotRemovedFromGroup callback.
+ * When bot is removed from a Feishu group or the group is disbanded,
+ * clear the target_agent_id binding (if any).
+ */
+function buildOnBotRemovedFromGroup(): (chatJid: string) => void {
+  return (chatJid: string) => {
+    const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
+    if (!group) return;
+    if (group.target_agent_id) {
+      const updated = { ...group, target_agent_id: undefined };
+      setRegisteredGroup(chatJid, updated);
+      registeredGroups[chatJid] = updated;
+      imSendFailCounts.delete(chatJid);
+      logger.info({ chatJid, agentId: group.target_agent_id }, 'Auto-unbound IM group: bot removed or group disbanded');
+    }
+  };
+}
+
 function buildIsChatAuthorized(userId: string): (jid: string) => boolean {
   return (jid) => {
     const group = registeredGroups[jid];
@@ -2225,6 +2292,57 @@ function buildOnPairAttempt(userId: string): (jid: string, chatName: string, cod
 }
 
 /**
+ * Build callback that resolves an IM chatJid to a conversation agent virtual JID.
+ * Returns null if the chatJid has no target_agent_id configured.
+ */
+function buildResolveEffectiveChatJid(): (chatJid: string) => { effectiveJid: string; agentId: string } | null {
+  return (chatJid: string) => {
+    const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
+    if (!group?.target_agent_id) return null;
+    // Construct the virtual JID: web:{folder}#agent:{agentId}
+    const effectiveJid = `web:${group.folder}#agent:${group.target_agent_id}`;
+    return { effectiveJid, agentId: group.target_agent_id };
+  };
+}
+
+/**
+ * Build callback that triggers processAgentConversation when an IM message is routed to an agent.
+ */
+function buildOnAgentMessage(): (baseChatJid: string, agentId: string) => void {
+  return (baseChatJid: string, agentId: string) => {
+    const group = registeredGroups[baseChatJid] ?? getRegisteredGroup(baseChatJid);
+    if (!group) return;
+    // The base chatJid for processAgentConversation is the web: JID of the home folder
+    const homeChatJid = `web:${group.folder}`;
+    const virtualChatJid = `${homeChatJid}#agent:${agentId}`;
+
+    // Fetch pending messages and format them for IPC (same as web.ts agent handler)
+    const sinceCursor = lastAgentTimestamp[virtualChatJid] || EMPTY_CURSOR;
+    const missedMessages = getMessagesSince(virtualChatJid, sinceCursor);
+    const formatted = missedMessages.length > 0
+      ? formatMessages(missedMessages, false)
+      : '';
+
+    // Collect images from the messages
+    const images = collectMessageImages(virtualChatJid, missedMessages);
+    const imagesForAgent = images.length > 0 ? images : undefined;
+
+    // Try to pipe into running agent process first
+    const sendResult = formatted
+      ? queue.sendMessage(virtualChatJid, formatted, imagesForAgent, undefined)
+      : 'no_active';
+    if (sendResult === 'no_active') {
+      // No running process (or no messages to pipe) — start one via processAgentConversation
+      const taskId = `agent-conv:${agentId}:${Date.now()}`;
+      queue.enqueueTask(virtualChatJid, taskId, async () => {
+        await processAgentConversation(homeChatJid, agentId);
+      });
+    }
+    logger.info({ baseChatJid, homeChatJid, agentId, messageCount: missedMessages.length }, 'IM message triggered agent conversation processing');
+  };
+}
+
+/**
  * Connect IM channels for a specific user via imManager.
  * Reads the user's IM config and connects if enabled.
  */
@@ -2240,11 +2358,15 @@ async function connectUserIMChannels(
     const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
     return group?.folder;
   };
+  const resolveEffectiveChatJid = buildResolveEffectiveChatJid();
+  const onAgentMessage = buildOnAgentMessage();
+  const onBotAddedToGroup = buildOnNewChat(userId, homeFolder); // reuse same logic: auto-register
+  const onBotRemovedFromGroup = buildOnBotRemovedFromGroup();
   let feishu = false;
   let telegram = false;
 
   if (feishuConfig && feishuConfig.enabled !== false && feishuConfig.appId && feishuConfig.appSecret) {
-    feishu = await imManager.connectUserFeishu(userId, feishuConfig, onNewChat, ignoreMessagesBefore, handleCommand, resolveGroupFolder);
+    feishu = await imManager.connectUserFeishu(userId, feishuConfig, onNewChat, ignoreMessagesBefore, handleCommand, resolveGroupFolder, resolveEffectiveChatJid, onAgentMessage, onBotAddedToGroup, onBotRemovedFromGroup);
   }
 
   if (telegramConfig && telegramConfig.enabled !== false && telegramConfig.botToken) {
@@ -2492,7 +2614,7 @@ async function main(): Promise<void> {
       const homeGroup = getUserHomeGroup(adminUser.id);
       const homeFolder = homeGroup?.folder || MAIN_GROUP_FOLDER;
       const onNewChat = buildOnNewChat(adminUser.id, homeFolder);
-      const connected = await imManager.connectUserFeishu(adminUser.id, config, onNewChat, Date.now(), handleCommand);
+      const connected = await imManager.connectUserFeishu(adminUser.id, config, onNewChat, Date.now(), handleCommand, undefined, undefined, undefined, buildOnNewChat(adminUser.id, homeFolder), buildOnBotRemovedFromGroup());
       if (connected) {
         syncGroupMetadata().catch((err) =>
           logger.error({ err }, 'Group sync after Feishu reconnect failed'),
@@ -2546,7 +2668,7 @@ async function main(): Promise<void> {
       await imManager.disconnectUserFeishu(userId);
       const config = getUserFeishuConfig(userId);
       if (config && config.enabled !== false && config.appId && config.appSecret) {
-        const connected = await imManager.connectUserFeishu(userId, config, onNewChat, ignoreMessagesBefore, handleCommand);
+        const connected = await imManager.connectUserFeishu(userId, config, onNewChat, ignoreMessagesBefore, handleCommand, undefined, undefined, undefined, buildOnNewChat(userId, homeFolder), buildOnBotRemovedFromGroup());
         logger.info({ userId, connected }, 'User Feishu connection hot-reloaded');
         return connected;
       }
@@ -2600,6 +2722,7 @@ async function main(): Promise<void> {
     isUserFeishuConnected: (userId: string) => imManager.isFeishuConnected(userId),
     isUserTelegramConnected: (userId: string) => imManager.isTelegramConnected(userId),
     processAgentConversation,
+    getFeishuChatInfo: (userId: string, chatId: string) => imManager.getFeishuChatInfo(userId, chatId),
   });
 
   // Clean expired sessions every hour
@@ -2799,6 +2922,41 @@ async function main(): Promise<void> {
     logger.warn(
       'Feishu is not connected. Configure credentials in Settings to enable Feishu sync.',
     );
+  }
+
+  // Periodic health check for IM bindings — detect disbanded groups and auto-unbind
+  const IM_BINDING_HEALTH_CHECK_INTERVAL = 30 * 60 * 1000; // 30 min
+  setInterval(() => {
+    void checkImBindingsHealth();
+  }, IM_BINDING_HEALTH_CHECK_INTERVAL);
+}
+
+async function checkImBindingsHealth(): Promise<void> {
+  const boundEntries: Array<{ jid: string; group: RegisteredGroup }> = [];
+  for (const [jid, group] of Object.entries(registeredGroups)) {
+    if (group.target_agent_id) {
+      boundEntries.push({ jid, group });
+    }
+  }
+
+  if (boundEntries.length === 0) return;
+  logger.debug({ count: boundEntries.length }, 'Running IM binding health check');
+
+  for (const { jid, group } of boundEntries) {
+    try {
+      const info = await imManager.getChatInfo(jid);
+      if (info === null) {
+        // Chat not found — group may be disbanded or Bot removed
+        logger.info({ jid, agentId: group.target_agent_id }, 'IM group not reachable, auto-unbinding');
+        const updated = { ...group, target_agent_id: undefined };
+        setRegisteredGroup(jid, updated);
+        registeredGroups[jid] = updated;
+        imSendFailCounts.delete(jid);
+      }
+    } catch (err) {
+      // API error — could be temporary, don't unbind on single failure
+      logger.debug({ jid, err }, 'IM binding health check failed for group');
+    }
   }
 }
 

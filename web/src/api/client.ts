@@ -2,9 +2,10 @@ import { replaceInApp, stripBasePath, withBasePath } from '../utils/url';
 
 const REQUEST_TIMEOUT_MS = 8000;
 
-interface ApiError {
+export interface ApiError {
   status: number;
   message: string;
+  body?: Record<string, unknown>;
 }
 
 export async function apiFetch<T>(path: string, options?: RequestInit & { timeoutMs?: number }): Promise<T> {
@@ -55,7 +56,7 @@ export async function apiFetch<T>(path: string, options?: RequestInit & { timeou
         replaceInApp('/settings');
       }
     }
-    throw { status: res.status, message: body.error || res.statusText } as ApiError;
+    throw { status: res.status, message: body.error || res.statusText, body } as ApiError;
   }
   if (res.status === 204) return undefined as T;
   return res.json();
