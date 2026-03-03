@@ -178,6 +178,7 @@ const FALLBACK_EVENT_TYPES: Set<StreamEventType> = new Set([
   'text_delta', 'thinking_delta',
   'tool_use_start', 'tool_use_end', 'tool_progress',
   'hook_started', 'hook_progress', 'hook_response',
+  'todo_update',
   'status',
 ]);
 

@@ -1,3 +1,5 @@
+import { Check, Loader2, Circle } from 'lucide-react';
+
 interface TodoItem {
   id: string;
   content: string;
@@ -39,18 +41,11 @@ export function TodoProgressPanel({ todos }: TodoProgressPanelProps) {
           <div key={todo.id} className="flex items-start gap-2 text-xs">
             <span className="flex-shrink-0 mt-0.5">
               {todo.status === 'completed' ? (
-                <svg className="w-3.5 h-3.5 text-brand-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3">
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
-                </svg>
+                <Check className="w-3.5 h-3.5 text-brand-500" strokeWidth={3} />
               ) : todo.status === 'in_progress' ? (
-                <svg className="w-3.5 h-3.5 animate-spin text-primary" viewBox="0 0 24 24" fill="none">
-                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-                </svg>
+                <Loader2 className="w-3.5 h-3.5 animate-spin text-primary" />
               ) : (
-                <svg className="w-3.5 h-3.5 text-muted-foreground" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <circle cx="12" cy="12" r="9" />
-                </svg>
+                <Circle className="w-3.5 h-3.5 text-muted-foreground" />
               )}
             </span>
             <span className={`break-words ${

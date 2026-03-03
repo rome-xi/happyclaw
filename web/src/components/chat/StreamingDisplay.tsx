@@ -39,7 +39,7 @@ function AskUserQuestionCard({ toolInput }: { toolInput: Record<string, unknown>
                   key={oi}
                   className="inline-block px-2.5 py-1 rounded-md text-xs font-medium bg-brand-100 text-primary border border-brand-200"
                 >
-                  {opt.label || opt.value}
+                  {opt.label || opt.value || '—'}
                 </span>
               ))}
             </div>
@@ -306,7 +306,7 @@ export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNamePr
                   </div>
                 )}
                 {askUserTools.map((tool) => (
-                  <AskUserQuestionCard key={tool.toolUseId} toolInput={tool.toolInput!} />
+                  <AskUserQuestionCard key={tool.toolUseId} toolInput={tool.toolInput ?? {}} />
                 ))}
               </div>
             );
@@ -506,7 +506,7 @@ export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNamePr
 
                   {/* AskUserQuestion option cards */}
                   {askUserTools.map((tool) => (
-                    <AskUserQuestionCard key={tool.toolUseId} toolInput={tool.toolInput!} />
+                    <AskUserQuestionCard key={tool.toolUseId} toolInput={tool.toolInput ?? {}} />
                   ))}
                 </div>
               );

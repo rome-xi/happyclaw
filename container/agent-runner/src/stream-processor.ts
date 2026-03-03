@@ -602,6 +602,17 @@ export class StreamEventProcessor {
     return true;
   }
 
+  /** Check if a tool_use was already resolved by the streaming accumulator. */
+  private isPendingResolved(
+    pendingMap: Map<number, { toolUseId: string; resolved: boolean }>,
+    toolUseId: string,
+  ): boolean {
+    for (const pending of pendingMap.values()) {
+      if (pending.toolUseId === toolUseId && pending.resolved) return true;
+    }
+    return false;
+  }
+
   /**
    * Process an assistant message for Skill/Task fallback extraction and pending tracker cleanup.
    */
@@ -613,20 +624,11 @@ export class StreamEventProcessor {
     for (const block of content) {
       if (block.type === 'tool_use' && block.name === 'Skill' && block.id && block.input) {
         const skillName = extractSkillName(block.name, block.input);
-        if (skillName) {
-          let alreadyResolved = false;
-          for (const pending of this.pendingSkillInput.values()) {
-            if (pending.toolUseId === block.id && pending.resolved) {
-              alreadyResolved = true;
-              break;
-            }
-          }
-          if (!alreadyResolved) {
-            this.emit({
-              status: 'stream', result: null,
-              streamEvent: { eventType: 'tool_progress', toolName: 'Skill', toolUseId: block.id, skillName },
-            });
-          }
+        if (skillName && !this.isPendingResolved(this.pendingSkillInput, block.id)) {
+          this.emit({
+            status: 'stream', result: null,
+            streamEvent: { eventType: 'tool_progress', toolName: 'Skill', toolUseId: block.id, skillName },
+          });
         }
       }
     }
@@ -653,14 +655,7 @@ export class StreamEventProcessor {
     // Fallback: extract AskUserQuestion input from complete assistant message
     for (const block of content) {
       if (block.type === 'tool_use' && block.name === 'AskUserQuestion' && block.id && block.input) {
-        let alreadyResolved = false;
-        for (const pending of this.pendingAskUserInput.values()) {
-          if (pending.toolUseId === block.id && pending.resolved) {
-            alreadyResolved = true;
-            break;
-          }
-        }
-        if (!alreadyResolved) {
+        if (!this.isPendingResolved(this.pendingAskUserInput, block.id)) {
           this.emit({
             status: 'stream', result: null,
             streamEvent: {
@@ -677,14 +672,7 @@ export class StreamEventProcessor {
     // Fallback: extract TodoWrite todos from complete assistant message
     for (const block of content) {
       if (block.type === 'tool_use' && block.name === 'TodoWrite' && block.id && block.input) {
-        let alreadyResolved = false;
-        for (const pending of this.pendingTodoInput.values()) {
-          if (pending.toolUseId === block.id && pending.resolved) {
-            alreadyResolved = true;
-            break;
-          }
-        }
-        if (!alreadyResolved) {
+        if (!this.isPendingResolved(this.pendingTodoInput, block.id)) {
           const todoInput = block.input as Record<string, unknown>;
           if (Array.isArray(todoInput.todos)) {
             this.emit({
