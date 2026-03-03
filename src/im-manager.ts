@@ -35,6 +35,16 @@ export interface TelegramConnectConfig {
   enabled?: boolean;
 }
 
+export interface ConnectFeishuOptions {
+  ignoreMessagesBefore?: number;
+  onCommand?: (chatJid: string, command: string) => Promise<string | null>;
+  resolveGroupFolder?: (chatJid: string) => string | undefined;
+  resolveEffectiveChatJid?: (chatJid: string) => { effectiveJid: string; agentId: string } | null;
+  onAgentMessage?: (baseChatJid: string, agentId: string) => void;
+  onBotAddedToGroup?: (chatJid: string, chatName: string) => void;
+  onBotRemovedFromGroup?: (chatJid: string) => void;
+}
+
 class IMConnectionManager {
   private connections = new Map<string, UserIMConnection>();
   private adminUserIds = new Set<string>();
@@ -171,13 +181,7 @@ class IMConnectionManager {
     userId: string,
     config: FeishuConnectConfig,
     onNewChat: (chatJid: string, chatName: string) => void,
-    ignoreMessagesBefore?: number,
-    onCommand?: (chatJid: string, command: string) => Promise<string | null>,
-    resolveGroupFolder?: (chatJid: string) => string | undefined,
-    resolveEffectiveChatJid?: (chatJid: string) => { effectiveJid: string; agentId: string } | null,
-    onAgentMessage?: (baseChatJid: string, agentId: string) => void,
-    onBotAddedToGroup?: (chatJid: string, chatName: string) => void,
-    onBotRemovedFromGroup?: (chatJid: string) => void,
+    options?: ConnectFeishuOptions,
   ): Promise<boolean> {
     if (!config.appId || !config.appSecret) {
       logger.info({ userId }, 'Feishu config empty, skipping connection');
@@ -194,13 +198,13 @@ class IMConnectionManager {
         logger.info({ userId }, 'User Feishu WebSocket connected');
       },
       onNewChat,
-      ignoreMessagesBefore,
-      onCommand,
-      resolveGroupFolder,
-      resolveEffectiveChatJid,
-      onAgentMessage,
-      onBotAddedToGroup,
-      onBotRemovedFromGroup,
+      ignoreMessagesBefore: options?.ignoreMessagesBefore,
+      onCommand: options?.onCommand,
+      resolveGroupFolder: options?.resolveGroupFolder,
+      resolveEffectiveChatJid: options?.resolveEffectiveChatJid,
+      onAgentMessage: options?.onAgentMessage,
+      onBotAddedToGroup: options?.onBotAddedToGroup,
+      onBotRemovedFromGroup: options?.onBotRemovedFromGroup,
     });
   }
 

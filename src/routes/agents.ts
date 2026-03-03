@@ -279,18 +279,17 @@ router.get('/:jid/im-groups', authMiddleware, async (c) => {
   }
 
   // Feishu chat_mode: 'group' = group chat, 'p2p' = private chat
-  // If chat_mode is available, use it directly. If API returned partial data
-  // (has name/avatar but no chat_mode), still include it (likely a group chat
-  // with limited API permissions). Filter out entries with no useful data (P2P).
+  // If chat_mode is available, use it directly. When API data is completely
+  // missing (permissions not enabled), default to keeping the group rather
+  // than filtering it out. Only filter when chat_mode is explicitly 'p2p'.
   const imGroups = candidates
     .filter((g) => {
       if (g.channel_type === 'feishu') {
         if (g.chat_mode === 'p2p') return false;
         // Exclude groups with only the bot (user_count=0 means no real users, just bot)
         if (g.member_count !== undefined && g.member_count < 1) return false;
-        if (g.chat_mode === 'group') return true;
-        // chat_mode missing: keep if API returned a name (group chats have names, P2P don't)
-        return !!g.avatar || g.member_count !== undefined;
+        // chat_mode is 'group' or API data completely missing — keep the group
+        return true;
       }
       return true;
     })

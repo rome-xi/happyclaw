@@ -141,8 +141,11 @@ export function ChatSidebar({ className, onToggleCollapse }: ChatSidebarProps) {
           .map((a) => `「${a.agentName}」→ ${a.imGroups.map((g) => g.name).join('、')}`)
           .join('\n');
         alert(`该工作区下有子对话绑定了 IM 群组，请先解绑后再删除：\n${details}`);
-        setDeleteState({ open: false, jid: '', name: '' });
+      } else {
+        const message = err instanceof Error ? err.message : '未知错误';
+        alert(`删除工作区失败：${message}`);
       }
+      setDeleteState({ open: false, jid: '', name: '' });
     } finally {
       setDeleteLoading(false);
     }

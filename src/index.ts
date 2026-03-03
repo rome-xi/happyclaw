@@ -126,6 +126,10 @@ const terminalWarmupInFlight = new Set<string>();
 const imSendFailCounts = new Map<string, number>();
 const IM_SEND_FAIL_THRESHOLD = 3;
 
+// Track consecutive IM health check failures per JID for safe auto-unbind
+const imHealthCheckFailCounts = new Map<string, number>();
+const IM_HEALTH_CHECK_FAIL_THRESHOLD = 3;
+
 function isCursorAfter(candidate: MessageCursor, base: MessageCursor): boolean {
   if (candidate.timestamp > base.timestamp) return true;
   if (candidate.timestamp < base.timestamp) return false;
@@ -2366,7 +2370,15 @@ async function connectUserIMChannels(
   let telegram = false;
 
   if (feishuConfig && feishuConfig.enabled !== false && feishuConfig.appId && feishuConfig.appSecret) {
-    feishu = await imManager.connectUserFeishu(userId, feishuConfig, onNewChat, ignoreMessagesBefore, handleCommand, resolveGroupFolder, resolveEffectiveChatJid, onAgentMessage, onBotAddedToGroup, onBotRemovedFromGroup);
+    feishu = await imManager.connectUserFeishu(userId, feishuConfig, onNewChat, {
+      ignoreMessagesBefore,
+      onCommand: handleCommand,
+      resolveGroupFolder,
+      resolveEffectiveChatJid,
+      onAgentMessage,
+      onBotAddedToGroup,
+      onBotRemovedFromGroup,
+    });
   }
 
   if (telegramConfig && telegramConfig.enabled !== false && telegramConfig.botToken) {
@@ -2614,7 +2626,12 @@ async function main(): Promise<void> {
       const homeGroup = getUserHomeGroup(adminUser.id);
       const homeFolder = homeGroup?.folder || MAIN_GROUP_FOLDER;
       const onNewChat = buildOnNewChat(adminUser.id, homeFolder);
-      const connected = await imManager.connectUserFeishu(adminUser.id, config, onNewChat, Date.now(), handleCommand, undefined, undefined, undefined, buildOnNewChat(adminUser.id, homeFolder), buildOnBotRemovedFromGroup());
+      const connected = await imManager.connectUserFeishu(adminUser.id, config, onNewChat, {
+        ignoreMessagesBefore: Date.now(),
+        onCommand: handleCommand,
+        onBotAddedToGroup: buildOnNewChat(adminUser.id, homeFolder),
+        onBotRemovedFromGroup: buildOnBotRemovedFromGroup(),
+      });
       if (connected) {
         syncGroupMetadata().catch((err) =>
           logger.error({ err }, 'Group sync after Feishu reconnect failed'),
@@ -2668,7 +2685,12 @@ async function main(): Promise<void> {
       await imManager.disconnectUserFeishu(userId);
       const config = getUserFeishuConfig(userId);
       if (config && config.enabled !== false && config.appId && config.appSecret) {
-        const connected = await imManager.connectUserFeishu(userId, config, onNewChat, ignoreMessagesBefore, handleCommand, undefined, undefined, undefined, buildOnNewChat(userId, homeFolder), buildOnBotRemovedFromGroup());
+        const connected = await imManager.connectUserFeishu(userId, config, onNewChat, {
+          ignoreMessagesBefore,
+          onCommand: handleCommand,
+          onBotAddedToGroup: buildOnNewChat(userId, homeFolder),
+          onBotRemovedFromGroup: buildOnBotRemovedFromGroup(),
+        });
         logger.info({ userId, connected }, 'User Feishu connection hot-reloaded');
         return connected;
       }
@@ -2946,12 +2968,22 @@ async function checkImBindingsHealth(): Promise<void> {
     try {
       const info = await imManager.getChatInfo(jid);
       if (info === null) {
-        // Chat not found — group may be disbanded or Bot removed
-        logger.info({ jid, agentId: group.target_agent_id }, 'IM group not reachable, auto-unbinding');
-        const updated = { ...group, target_agent_id: undefined };
-        setRegisteredGroup(jid, updated);
-        registeredGroups[jid] = updated;
-        imSendFailCounts.delete(jid);
+        // Chat not reachable — could be temporary (connection down, API permission issue)
+        const count = (imHealthCheckFailCounts.get(jid) ?? 0) + 1;
+        imHealthCheckFailCounts.set(jid, count);
+        if (count >= IM_HEALTH_CHECK_FAIL_THRESHOLD) {
+          logger.info({ jid, agentId: group.target_agent_id, failCount: count }, 'IM group not reachable after multiple checks, auto-unbinding');
+          const updated = { ...group, target_agent_id: undefined };
+          setRegisteredGroup(jid, updated);
+          registeredGroups[jid] = updated;
+          imSendFailCounts.delete(jid);
+          imHealthCheckFailCounts.delete(jid);
+        } else {
+          logger.debug({ jid, failCount: count, threshold: IM_HEALTH_CHECK_FAIL_THRESHOLD }, 'IM health check failed, will retry before unbinding');
+        }
+      } else {
+        // Chat is reachable — reset failure counter
+        imHealthCheckFailCounts.delete(jid);
       }
     } catch (err) {
       // API error — could be temporary, don't unbind on single failure
