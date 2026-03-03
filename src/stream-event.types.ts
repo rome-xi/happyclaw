@@ -14,6 +14,7 @@ export type StreamEventType =
   | 'tool_use_start' | 'tool_use_end' | 'tool_progress'
   | 'hook_started' | 'hook_progress' | 'hook_response'
   | 'task_start' | 'task_notification'
+  | 'todo_update'
   | 'status' | 'init';
 
 export interface StreamEvent {
@@ -36,4 +37,6 @@ export interface StreamEvent {
   taskSummary?: string;
   isBackground?: boolean;
   isTeammate?: boolean;
+  toolInput?: Record<string, unknown>;
+  todos?: Array<{ id: string; content: string; status: 'pending' | 'in_progress' | 'completed' }>;
 }

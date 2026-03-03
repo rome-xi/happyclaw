@@ -43,10 +43,12 @@ export interface StreamingState {
     isNested?: boolean;
     skillName?: string;
     toolInputSummary?: string;
+    toolInput?: Record<string, unknown>;
   }>;
   activeHook: { hookName: string; hookEvent: string } | null;
   systemStatus: string | null;
   recentEvents: StreamingTimelineEvent[];
+  todos?: Array<{ id: string; content: string; status: string }>;
 }
 
 function mergeMessagesChronologically(
@@ -416,6 +418,7 @@ function applyStreamEvent(
                 ...t,
                 elapsedSeconds: event.elapsedSeconds,
                 ...(event.skillName ? { skillName: event.skillName } : {}),
+                ...(event.toolInput ? { toolInput: event.toolInput } : {}),
               }
             : t
         );
@@ -458,6 +461,11 @@ function applyStreamEvent(
         'hook',
         `Hook 结束: ${event.hookName || 'unknown'} (${event.hookOutcome || 'success'})`,
       );
+      break;
+    case 'todo_update':
+      if (event.todos) {
+        next.todos = event.todos;
+      }
       break;
     case 'status': {
       next.systemStatus = event.statusText || null;
@@ -1643,7 +1651,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   },
 
-  // 清除流式状态
+  // 清除流式状态（保留仍在运行的后台 SDK Task 的 agentStreaming）
   clearStreaming: (chatJid, options) => {
     set((s) => {
       const next = { ...s.streaming };
@@ -1656,6 +1664,32 @@ export const useChatStore = create<ChatState>((set, get) => ({
       } else {
         delete nextPendingThinking[chatJid];
       }
+
+      // 收集该 chatJid 下仍在运行的 SDK Task
+      const runningTaskIds: string[] = [];
+      for (const [taskId, task] of Object.entries(s.sdkTasks)) {
+        if (task.chatJid === chatJid && task.status === 'running') {
+          runningTaskIds.push(taskId);
+        }
+      }
+
+      // 有运行中的 task 时，保留其 agentStreaming，清理已结束 task 的
+      if (runningTaskIds.length > 0) {
+        const runningSet = new Set(runningTaskIds);
+        const nextAgentStreaming = { ...s.agentStreaming };
+        for (const [taskId, task] of Object.entries(s.sdkTasks)) {
+          if (task.chatJid === chatJid && !runningSet.has(taskId)) {
+            delete nextAgentStreaming[taskId];
+          }
+        }
+        return {
+          waiting: { ...s.waiting, [chatJid]: false },
+          streaming: next,
+          pendingThinking: nextPendingThinking,
+          agentStreaming: nextAgentStreaming,
+        };
+      }
+
       return {
         waiting: { ...s.waiting, [chatJid]: false },
         streaming: next,

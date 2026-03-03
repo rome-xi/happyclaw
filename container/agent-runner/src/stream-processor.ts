@@ -47,6 +47,18 @@ export class StreamEventProcessor {
   private readonly pendingTaskInput = new Map<number, {
     toolUseId: string; inputJson: string; resolved: boolean; isTeammate?: boolean;
   }>();
+
+  // Accumulate AskUserQuestion tool input_json_delta to extract questions/options
+  private readonly pendingAskUserInput = new Map<number, {
+    toolUseId: string; inputJson: string; resolved: boolean;
+    parentToolUseId: string | null; isNested: boolean;
+  }>();
+
+  // Accumulate TodoWrite tool input_json_delta to extract todos
+  private readonly pendingTodoInput = new Map<number, {
+    toolUseId: string; inputJson: string; resolved: boolean;
+    parentToolUseId: string | null; isNested: boolean;
+  }>();
   // Confirmed teammate Tasks (detected via team_name)
   private readonly teammateTaskToolUseIds = new Set<string>();
 
@@ -222,6 +234,26 @@ export class StreamEventProcessor {
       }
     }
 
+    // Track AskUserQuestion tool
+    if (block.name === 'AskUserQuestion' && block.id) {
+      if (typeof blockIndex === 'number') {
+        this.pendingAskUserInput.set(blockIndex, {
+          toolUseId: block.id, inputJson: '', resolved: false,
+          parentToolUseId, isNested,
+        });
+      }
+    }
+
+    // Track TodoWrite tool
+    if (block.name === 'TodoWrite' && block.id) {
+      if (typeof blockIndex === 'number') {
+        this.pendingTodoInput.set(blockIndex, {
+          toolUseId: block.id, inputJson: '', resolved: false,
+          parentToolUseId, isNested,
+        });
+      }
+    }
+
     // Track Task tool
     if (block.name === 'Task' && block.id) {
       this.taskToolUseIds.add(block.id);
@@ -304,6 +336,59 @@ export class StreamEventProcessor {
             skillName: skillMatch[1],
           },
         });
+      }
+    }
+
+    // Accumulate AskUserQuestion input JSON
+    const pendingAsk = this.pendingAskUserInput.get(blockIndex);
+    if (pendingAsk && !pendingAsk.resolved) {
+      pendingAsk.inputJson += partialJson;
+      // Try to parse once we see "questions" field
+      if (pendingAsk.inputJson.includes('"question')) {
+        try {
+          const parsed = JSON.parse(pendingAsk.inputJson);
+          if (parsed.question || parsed.questions) {
+            pendingAsk.resolved = true;
+            this.pendingAskUserInput.delete(blockIndex);
+            this.emit({
+              status: 'stream', result: null,
+              streamEvent: {
+                eventType: 'tool_progress',
+                toolName: 'AskUserQuestion',
+                toolUseId: pendingAsk.toolUseId,
+                parentToolUseId: pendingAsk.parentToolUseId,
+                isNested: pendingAsk.isNested,
+                toolInput: parsed,
+              },
+            });
+          }
+        } catch {
+          // JSON not complete yet, continue accumulating
+        }
+      }
+    }
+
+    // Accumulate TodoWrite input JSON
+    const pendingTodo = this.pendingTodoInput.get(blockIndex);
+    if (pendingTodo && !pendingTodo.resolved) {
+      pendingTodo.inputJson += partialJson;
+      if (pendingTodo.inputJson.includes('"todos"')) {
+        try {
+          const parsed = JSON.parse(pendingTodo.inputJson);
+          if (Array.isArray(parsed.todos)) {
+            pendingTodo.resolved = true;
+            this.pendingTodoInput.delete(blockIndex);
+            this.emit({
+              status: 'stream', result: null,
+              streamEvent: {
+                eventType: 'todo_update',
+                todos: parsed.todos,
+              },
+            });
+          }
+        } catch {
+          // JSON not complete yet, continue accumulating
+        }
       }
     }
 
@@ -565,9 +650,60 @@ export class StreamEventProcessor {
       }
     }
 
+    // Fallback: extract AskUserQuestion input from complete assistant message
+    for (const block of content) {
+      if (block.type === 'tool_use' && block.name === 'AskUserQuestion' && block.id && block.input) {
+        let alreadyResolved = false;
+        for (const pending of this.pendingAskUserInput.values()) {
+          if (pending.toolUseId === block.id && pending.resolved) {
+            alreadyResolved = true;
+            break;
+          }
+        }
+        if (!alreadyResolved) {
+          this.emit({
+            status: 'stream', result: null,
+            streamEvent: {
+              eventType: 'tool_progress',
+              toolName: 'AskUserQuestion',
+              toolUseId: block.id,
+              toolInput: block.input as Record<string, unknown>,
+            },
+          });
+        }
+      }
+    }
+
+    // Fallback: extract TodoWrite todos from complete assistant message
+    for (const block of content) {
+      if (block.type === 'tool_use' && block.name === 'TodoWrite' && block.id && block.input) {
+        let alreadyResolved = false;
+        for (const pending of this.pendingTodoInput.values()) {
+          if (pending.toolUseId === block.id && pending.resolved) {
+            alreadyResolved = true;
+            break;
+          }
+        }
+        if (!alreadyResolved) {
+          const todoInput = block.input as Record<string, unknown>;
+          if (Array.isArray(todoInput.todos)) {
+            this.emit({
+              status: 'stream', result: null,
+              streamEvent: {
+                eventType: 'todo_update',
+                todos: todoInput.todos as Array<{ id: string; content: string; status: 'pending' | 'in_progress' | 'completed' }>,
+              },
+            });
+          }
+        }
+      }
+    }
+
     // Clear pending trackers to avoid memory leaks
     this.pendingSkillInput.clear();
     this.pendingTaskInput.clear();
+    this.pendingAskUserInput.clear();
+    this.pendingTodoInput.clear();
   }
 
   /**

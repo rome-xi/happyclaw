@@ -5,7 +5,53 @@ import { useAuthStore } from '../../stores/auth';
 import { EmojiAvatar } from '../common/EmojiAvatar';
 import { MarkdownRenderer } from './MarkdownRenderer';
 import { TaskInlineCard } from './TaskInlineCard';
+import { TodoProgressPanel } from './TodoProgressPanel';
 import { useDisplayMode } from '../../hooks/useDisplayMode';
+
+/** Render AskUserQuestion options as a visual card (read-only). */
+function AskUserQuestionCard({ toolInput }: { toolInput: Record<string, unknown> }) {
+  // Support both "question" (string) and "questions" (array) formats
+  const questions: Array<{ question: string; options?: Array<{ value: string; label?: string }> }> = [];
+  if (Array.isArray(toolInput.questions)) {
+    for (const q of toolInput.questions) {
+      if (q && typeof q === 'object' && 'question' in q) {
+        questions.push(q as { question: string; options?: Array<{ value: string; label?: string }> });
+      }
+    }
+  } else if (typeof toolInput.question === 'string') {
+    questions.push({
+      question: toolInput.question,
+      options: Array.isArray(toolInput.options) ? toolInput.options : undefined,
+    });
+  }
+
+  if (questions.length === 0) return null;
+
+  return (
+    <div className="mt-2 mb-2 space-y-2">
+      {questions.map((q, qi) => (
+        <div key={qi} className="rounded-lg border border-brand-200 bg-brand-50/30 p-3">
+          <div className="text-sm font-medium text-foreground mb-2">{q.question}</div>
+          {q.options && q.options.length > 0 && (
+            <div className="flex flex-wrap gap-1.5">
+              {q.options.map((opt, oi) => (
+                <span
+                  key={oi}
+                  className="inline-block px-2.5 py-1 rounded-md text-xs font-medium bg-brand-100 text-primary border border-brand-200"
+                >
+                  {opt.label || opt.value}
+                </span>
+              ))}
+            </div>
+          )}
+          <div className="text-[11px] text-muted-foreground mt-2">
+            请在 Agent 终端中回复
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
 
 interface StreamingDisplayProps {
   groupJid: string;
@@ -87,7 +133,8 @@ export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNamePr
     streaming.activeTools.length > 0 ||
     streaming.activeHook ||
     streaming.systemStatus ||
-    streaming.recentEvents.length > 0
+    streaming.recentEvents.length > 0 ||
+    (streaming.todos && streaming.todos.length > 0)
   );
 
   // Waiting but no stream data: show empty AI card with bouncing dots
@@ -219,6 +266,9 @@ export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNamePr
             const pillTools = streaming.activeTools.filter(
               t => !(t.toolName === 'Task' && t.toolUseId && !sdkTasks[t.toolUseId]?.isTeammate)
             );
+            const askUserTools = streaming.activeTools.filter(
+              t => t.toolName === 'AskUserQuestion' && t.toolInput
+            );
             return (
               <div className="mb-2 space-y-1">
                 {inlineTaskTools.map((tool) => (
@@ -255,9 +305,17 @@ export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNamePr
                     })}
                   </div>
                 )}
+                {askUserTools.map((tool) => (
+                  <AskUserQuestionCard key={tool.toolUseId} toolInput={tool.toolInput!} />
+                ))}
               </div>
             );
           })()}
+
+          {/* Todo progress */}
+          {streaming.todos && streaming.todos.length > 0 && (
+            <TodoProgressPanel todos={streaming.todos} />
+          )}
 
           {/* Recent events timeline */}
           {streaming.recentEvents.length > 0 && (
@@ -397,6 +455,9 @@ export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNamePr
               const pillTools = streaming.activeTools.filter(
                 t => !(t.toolName === 'Task' && t.toolUseId && !sdkTasks[t.toolUseId]?.isTeammate)
               );
+              const askUserTools = streaming.activeTools.filter(
+                t => t.toolName === 'AskUserQuestion' && t.toolInput
+              );
 
               return (
                 <div className="mb-2 space-y-1">
@@ -442,9 +503,19 @@ export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNamePr
                       })}
                     </div>
                   )}
+
+                  {/* AskUserQuestion option cards */}
+                  {askUserTools.map((tool) => (
+                    <AskUserQuestionCard key={tool.toolUseId} toolInput={tool.toolInput!} />
+                  ))}
                 </div>
               );
             })()}
+
+            {/* Todo progress */}
+            {streaming.todos && streaming.todos.length > 0 && (
+              <TodoProgressPanel todos={streaming.todos} />
+            )}
 
             {/* Recent events timeline */}
             {streaming.recentEvents.length > 0 && (
