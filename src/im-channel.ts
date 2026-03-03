@@ -29,6 +29,14 @@ export interface IMChannelConnectOpts {
   onCommand?: (chatJid: string, command: string) => Promise<string | null>;
   /** 根据 jid 解析群组 folder，用于下载文件/图片到工作区 */
   resolveGroupFolder?: (jid: string) => string | undefined;
+  /** 将 IM chatJid 解析为 conversation agent 虚拟 JID（如果该群组绑定了 target_agent_id） */
+  resolveEffectiveChatJid?: (chatJid: string) => { effectiveJid: string; agentId: string } | null;
+  /** 当 IM 消息被路由到 conversation agent 后调用，触发 agent 处理 */
+  onAgentMessage?: (baseChatJid: string, agentId: string) => void;
+  /** Bot 被添加到群聊时调用 */
+  onBotAddedToGroup?: (chatJid: string, chatName: string) => void;
+  /** Bot 被移出群聊或群被解散时调用 */
+  onBotRemovedFromGroup?: (chatJid: string) => void;
 }
 
 export interface IMChannel {
@@ -39,6 +47,7 @@ export interface IMChannel {
   setTyping(chatId: string, isTyping: boolean): Promise<void>;
   isConnected(): boolean;
   syncGroups?(): Promise<void>;
+  getChatInfo?(chatId: string): Promise<{ avatar?: string; name?: string; user_count?: string; chat_type?: string; chat_mode?: string } | null>;
 }
 
 // ─── Channel Registry ───────────────────────────────────────────
@@ -85,6 +94,10 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
         ignoreMessagesBefore: opts.ignoreMessagesBefore,
         onCommand: opts.onCommand,
         resolveGroupFolder: opts.resolveGroupFolder,
+        resolveEffectiveChatJid: opts.resolveEffectiveChatJid,
+        onAgentMessage: opts.onAgentMessage,
+        onBotAddedToGroup: opts.onBotAddedToGroup,
+        onBotRemovedFromGroup: opts.onBotRemovedFromGroup,
       });
       if (!connected) {
         inner = null;
@@ -119,6 +132,11 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
     async syncGroups(): Promise<void> {
       if (!inner) return;
       await inner.syncGroups();
+    },
+
+    async getChatInfo(chatId: string) {
+      if (!inner) return null;
+      return inner.getChatInfo(chatId);
     },
   };
 

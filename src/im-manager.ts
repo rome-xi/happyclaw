@@ -35,6 +35,16 @@ export interface TelegramConnectConfig {
   enabled?: boolean;
 }
 
+export interface ConnectFeishuOptions {
+  ignoreMessagesBefore?: number;
+  onCommand?: (chatJid: string, command: string) => Promise<string | null>;
+  resolveGroupFolder?: (chatJid: string) => string | undefined;
+  resolveEffectiveChatJid?: (chatJid: string) => { effectiveJid: string; agentId: string } | null;
+  onAgentMessage?: (baseChatJid: string, agentId: string) => void;
+  onBotAddedToGroup?: (chatJid: string, chatName: string) => void;
+  onBotRemovedFromGroup?: (chatJid: string) => void;
+}
+
 class IMConnectionManager {
   private connections = new Map<string, UserIMConnection>();
   private adminUserIds = new Set<string>();
@@ -171,9 +181,7 @@ class IMConnectionManager {
     userId: string,
     config: FeishuConnectConfig,
     onNewChat: (chatJid: string, chatName: string) => void,
-    ignoreMessagesBefore?: number,
-    onCommand?: (chatJid: string, command: string) => Promise<string | null>,
-    resolveGroupFolder?: (chatJid: string) => string | undefined,
+    options?: ConnectFeishuOptions,
   ): Promise<boolean> {
     if (!config.appId || !config.appSecret) {
       logger.info({ userId }, 'Feishu config empty, skipping connection');
@@ -190,9 +198,13 @@ class IMConnectionManager {
         logger.info({ userId }, 'User Feishu WebSocket connected');
       },
       onNewChat,
-      ignoreMessagesBefore,
-      onCommand,
-      resolveGroupFolder,
+      ignoreMessagesBefore: options?.ignoreMessagesBefore,
+      onCommand: options?.onCommand,
+      resolveGroupFolder: options?.resolveGroupFolder,
+      resolveEffectiveChatJid: options?.resolveEffectiveChatJid,
+      onAgentMessage: options?.onAgentMessage,
+      onBotAddedToGroup: options?.onBotAddedToGroup,
+      onBotRemovedFromGroup: options?.onBotRemovedFromGroup,
     });
   }
 
@@ -335,6 +347,29 @@ class IMConnectionManager {
   /** Get the Telegram channel for a user */
   getTelegramConnection(userId: string): IMChannel | undefined {
     return this.connections.get(userId)?.channels.get('telegram');
+  }
+
+  /** Get chat info from the Feishu API for a specific user's connection */
+  async getFeishuChatInfo(userId: string, chatId: string): Promise<{ avatar?: string; name?: string; user_count?: string; chat_type?: string; chat_mode?: string } | null> {
+    const channel = this.getFeishuConnection(userId);
+    if (!channel?.getChatInfo) return null;
+    return channel.getChatInfo(chatId);
+  }
+
+  /**
+   * Get chat info for an IM group by JID, auto-routing to the correct connection.
+   * Used for health checks to detect disbanded groups.
+   */
+  async getChatInfo(jid: string): Promise<{ avatar?: string; name?: string; user_count?: string; chat_type?: string; chat_mode?: string } | null> {
+    const channelType = getChannelType(jid);
+    if (!channelType) return null;
+
+    const chatId = extractChatId(jid);
+    const channel = this.findChannelForJid(jid, channelType);
+    if (channel?.getChatInfo) {
+      return channel.getChatInfo(chatId);
+    }
+    return null;
   }
 
   /** Get all user IDs with active connections */

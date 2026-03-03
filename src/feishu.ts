@@ -37,6 +37,22 @@ export interface ConnectOptions {
   onCommand?: (chatJid: string, command: string) => Promise<string | null>;
   /** 根据 chatJid 解析群组 folder，用于下载文件/图片到工作区 */
   resolveGroupFolder?: (chatJid: string) => string | undefined;
+  /** 将 IM chatJid 解析为 conversation agent 虚拟 JID */
+  resolveEffectiveChatJid?: (chatJid: string) => { effectiveJid: string; agentId: string } | null;
+  /** 当 IM 消息被路由到 conversation agent 后调用 */
+  onAgentMessage?: (baseChatJid: string, agentId: string) => void;
+  /** Bot 被添加到群聊时调用（自动注册群组） */
+  onBotAddedToGroup?: (chatJid: string, chatName: string) => void;
+  /** Bot 被移出群聊或群被解散时调用（自动解绑 IM 绑定） */
+  onBotRemovedFromGroup?: (chatJid: string) => void;
+}
+
+export interface FeishuChatInfo {
+  avatar?: string;
+  name?: string;
+  user_count?: string;
+  chat_type?: string;
+  chat_mode?: string; // 'p2p' | 'group'
 }
 
 export interface FeishuConnection {
@@ -46,6 +62,7 @@ export interface FeishuConnection {
   sendReaction(chatId: string, isTyping: boolean): Promise<void>;
   isConnected(): boolean;
   syncGroups(): Promise<void>;
+  getChatInfo(chatId: string): Promise<FeishuChatInfo | null>;
 }
 
 // ─── Shared Helpers (pure functions, no instance state) ────────
@@ -504,7 +521,7 @@ export function createFeishuConnection(config: FeishuConnectionConfig): FeishuCo
     payload: IncomingMessagePayload,
     source: 'ws' | 'backfill',
   ): Promise<void> {
-    const { onNewChat, ignoreMessagesBefore, onCommand, resolveGroupFolder } = connectOptions || {};
+    const { onNewChat, ignoreMessagesBefore, onCommand, resolveGroupFolder, resolveEffectiveChatJid, onAgentMessage } = connectOptions || {};
     const {
       chatId,
       messageId,
@@ -624,32 +641,66 @@ export function createFeishuConnection(config: FeishuConnectionConfig): FeishuCo
       return;
     }
 
-    storeChatMetadata(chatJid, timestamp);
-    storeMessageDirect(
-      messageId,
-      chatJid,
-      senderOpenId,
-      resolvedSenderName,
-      text,
-      timestamp,
-      false,
-      attachmentsJson,
-    );
+    // Check if this IM chat should route to a conversation agent
+    const agentRouting = resolveEffectiveChatJid?.(chatJid);
+    if (agentRouting) {
+      const { effectiveJid, agentId } = agentRouting;
+      storeChatMetadata(effectiveJid, timestamp);
+      storeMessageDirect(
+        messageId,
+        effectiveJid,
+        senderOpenId,
+        resolvedSenderName,
+        text,
+        timestamp,
+        false,
+        attachmentsJson,
+      );
 
-    broadcastNewMessage(chatJid, {
-      id: messageId,
-      chat_jid: chatJid,
-      sender: senderOpenId,
-      sender_name: resolvedSenderName,
-      content: text,
-      timestamp,
-      attachments: attachmentsJson,
-    });
+      broadcastNewMessage(effectiveJid, {
+        id: messageId,
+        chat_jid: effectiveJid,
+        sender: senderOpenId,
+        sender_name: resolvedSenderName,
+        content: text,
+        timestamp,
+        attachments: attachmentsJson,
+      }, agentId);
 
-    logger.info(
-      { chatJid, sender: resolvedSenderName, messageId, source },
-      'Feishu message stored',
-    );
+      onAgentMessage?.(chatJid, agentId);
+
+      logger.info(
+        { chatJid, effectiveJid, agentId, sender: resolvedSenderName, messageId, source },
+        'Feishu message routed to conversation agent',
+      );
+    } else {
+      storeChatMetadata(chatJid, timestamp);
+      storeMessageDirect(
+        messageId,
+        chatJid,
+        senderOpenId,
+        resolvedSenderName,
+        text,
+        timestamp,
+        false,
+        attachmentsJson,
+      );
+
+      broadcastNewMessage(chatJid, {
+        id: messageId,
+        chat_jid: chatJid,
+        sender: senderOpenId,
+        sender_name: resolvedSenderName,
+        content: text,
+        timestamp,
+        attachments: attachmentsJson,
+      });
+
+      logger.info(
+        { chatJid, sender: resolvedSenderName, messageId, source },
+        'Feishu message stored',
+      );
+    }
   }
 
   async function backfillChatMessages(chatId: string, sinceMs: number): Promise<void> {
@@ -880,6 +931,40 @@ export function createFeishuConnection(config: FeishuConnectionConfig): FeishuCo
             logger.error({ err }, 'Error handling Feishu message');
           }
         },
+        'im.chat.member.bot.added_v1': async (data) => {
+          try {
+            const chatId = data.chat_id;
+            if (!chatId) return;
+            const chatJid = `feishu:${chatId}`;
+            const chatName = data.name || '飞书群聊';
+            logger.info({ chatJid, chatName }, 'Bot added to Feishu group');
+            connectOptions?.onBotAddedToGroup?.(chatJid, chatName);
+          } catch (err) {
+            logger.error({ err }, 'Error handling bot added to group event');
+          }
+        },
+        'im.chat.member.bot.deleted_v1': async (data) => {
+          try {
+            const chatId = data.chat_id;
+            if (!chatId) return;
+            const chatJid = `feishu:${chatId}`;
+            logger.info({ chatJid }, 'Bot removed from Feishu group');
+            connectOptions?.onBotRemovedFromGroup?.(chatJid);
+          } catch (err) {
+            logger.error({ err }, 'Error handling bot removed from group event');
+          }
+        },
+        'im.chat.disbanded_v1': async (data) => {
+          try {
+            const chatId = data.chat_id;
+            if (!chatId) return;
+            const chatJid = `feishu:${chatId}`;
+            logger.info({ chatJid }, 'Feishu group disbanded');
+            connectOptions?.onBotRemovedFromGroup?.(chatJid);
+          } catch (err) {
+            logger.error({ err }, 'Error handling group disbanded event');
+          }
+        },
       });
 
       // Initialize WebSocket client
@@ -1030,6 +1115,26 @@ export function createFeishuConnection(config: FeishuConnectionConfig): FeishuCo
 
     isConnected(): boolean {
       return wsClient != null;
+    },
+
+    async getChatInfo(chatId: string): Promise<FeishuChatInfo | null> {
+      if (!client) return null;
+      try {
+        const res = await client.im.v1.chat.get({
+          path: { chat_id: chatId },
+        });
+        if (!res.data) return null;
+        return {
+          avatar: res.data.avatar,
+          name: res.data.name,
+          user_count: res.data.user_count,
+          chat_type: res.data.chat_type,
+          chat_mode: res.data.chat_mode,
+        };
+      } catch (err) {
+        logger.warn({ err, chatId }, 'Failed to get Feishu chat info');
+        return null;
+      }
     },
 
     async syncGroups(): Promise<void> {
