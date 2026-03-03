@@ -9,7 +9,7 @@ interface ContainerEnvPanelProps {
   onClose?: () => void;
 }
 
-const MODEL_ENV_KEY = 'HAPPYCLAW_MODEL';
+const MODEL_ENV_KEY = 'ANTHROPIC_MODEL';
 const MODEL_PRESETS = ['opus', 'sonnet', 'haiku'] as const;
 
 export function ContainerEnvPanel({ groupJid, onClose }: ContainerEnvPanelProps) {
@@ -88,10 +88,13 @@ export function ContainerEnvPanel({ groupJid, onClose }: ContainerEnvPanelProps)
   };
 
   const handleClear = async () => {
+    if (!window.confirm('确定要清空所有覆盖配置并重建工作区吗？')) return;
     setClearing(true);
     const ok = await saveConfig(groupJid, {
       anthropicBaseUrl: '',
       anthropicAuthToken: '',
+      anthropicApiKey: '',
+      claudeCodeOauthToken: '',
       customEnv: {},
     });
     setClearing(false);
@@ -190,7 +193,7 @@ export function ContainerEnvPanel({ groupJid, onClose }: ContainerEnvPanelProps)
 
           <div>
             <label className="block text-xs font-medium text-slate-600 mb-1">
-              模型（HAPPYCLAW_MODEL）
+              模型（ANTHROPIC_MODEL）
             </label>
             <div className="space-y-1.5">
               <Input
@@ -199,9 +202,9 @@ export function ContainerEnvPanel({ groupJid, onClose }: ContainerEnvPanelProps)
                 onChange={(e) => setModel(e.target.value)}
                 placeholder="opus / sonnet / haiku 或完整模型 ID"
                 className="px-2.5 py-1.5 text-xs h-auto font-mono"
-                list="happyclaw-model-presets"
+                list="anthropic-model-presets"
               />
-              <datalist id="happyclaw-model-presets">
+              <datalist id="anthropic-model-presets">
                 {MODEL_PRESETS.map((preset) => (
                   <option key={preset} value={preset} />
                 ))}
@@ -220,7 +223,7 @@ export function ContainerEnvPanel({ groupJid, onClose }: ContainerEnvPanelProps)
         {/* Custom Env Vars */}
         <div>
           <div className="flex items-center justify-between mb-2">
-            <label className="text-xs font-medium text-slate-600">自定义环境变量（不含 HAPPYCLAW_MODEL）</label>
+            <label className="text-xs font-medium text-slate-600">自定义环境变量（不含 ANTHROPIC_MODEL）</label>
             <button
               onClick={addCustomEnv}
               className="flex items-center gap-1 text-[11px] text-primary hover:text-primary cursor-pointer"
