@@ -481,34 +481,40 @@ function shouldInterrupt(): boolean {
  * Drain all pending IPC input messages.
  * Returns messages found (with optional images), or empty array.
  */
-function drainIpcInput(): Array<{ text: string; images?: Array<{ data: string; mimeType?: string }> }> {
+interface IpcDrainResult {
+  messages: Array<{ text: string; images?: Array<{ data: string; mimeType?: string }> }>;
+  modeChange?: string; // 'plan' | 'bypassPermissions'
+}
+
+function drainIpcInput(): IpcDrainResult {
+  const result: IpcDrainResult = { messages: [] };
   try {
     const files = fs.readdirSync(IPC_INPUT_DIR)
       .filter(f => f.endsWith('.json'))
       .sort();
 
-    const messages: Array<{ text: string; images?: Array<{ data: string; mimeType?: string }> }> = [];
     for (const file of files) {
       const filePath = path.join(IPC_INPUT_DIR, file);
       try {
         const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
         fs.unlinkSync(filePath);
         if (data.type === 'message' && data.text) {
-          messages.push({
+          result.messages.push({
             text: data.text,
             images: data.images,
           });
+        } else if (data.type === 'set_mode' && data.mode) {
+          result.modeChange = data.mode;
         }
       } catch (err) {
         log(`Failed to process input file ${file}: ${err instanceof Error ? err.message : String(err)}`);
         try { fs.unlinkSync(filePath); } catch { /* ignore */ }
       }
     }
-    return messages;
   } catch (err) {
     log(`IPC drain error: ${err instanceof Error ? err.message : String(err)}`);
-    return [];
   }
+  return result;
 }
 
 /**
@@ -522,7 +528,7 @@ function waitForIpcMessage(): Promise<{ text: string; images?: Array<{ data: str
         resolve(null);
         return;
       }
-      const messages = drainIpcInput();
+      const { messages } = drainIpcInput();
       if (messages.length > 0) {
         // 合并多条消息的文本和图片
         const combinedText = messages.map((m) => m.text).join('\n');
@@ -648,7 +654,7 @@ async function runQuery(
   let closedDuringQuery = false;
   let interruptedDuringQuery = false;
   // queryRef is set just before the for-await loop so pollIpcDuringQuery can call interrupt()
-  let queryRef: { interrupt(): Promise<void> } | null = null;
+  let queryRef: { interrupt(): Promise<void>; setPermissionMode(mode: string): Promise<void> } | null = null;
   const pollIpcDuringQuery = () => {
     if (!ipcPolling) return;
     if (shouldClose()) {
@@ -666,7 +672,13 @@ async function runQuery(
       ipcPolling = false;
       return;
     }
-    const messages = drainIpcInput();
+    const { messages, modeChange } = drainIpcInput();
+    if (modeChange) {
+      log(`Mode change via IPC: ${modeChange}`);
+      queryRef?.setPermissionMode(modeChange).catch((err: unknown) =>
+        log(`setPermissionMode failed: ${err}`),
+      );
+    }
     for (const msg of messages) {
       log(`Piping IPC message into active query (${msg.text.length} chars, ${msg.images?.length || 0} images)`);
       const rejected = stream.push(msg.text, msg.images);
@@ -960,11 +972,11 @@ async function main(): Promise<void> {
   if (containerInput.isScheduledTask) {
     prompt = `[定时任务 - 以下内容由系统自动发送，并非来自用户或群组的直接消息。]\n\n${prompt}`;
   }
-  const pending = drainIpcInput();
-  if (pending.length > 0) {
-    log(`Draining ${pending.length} pending IPC messages into initial prompt`);
-    prompt += '\n' + pending.map((m) => m.text).join('\n');
-    const pendingImages = pending.flatMap((m) => m.images || []);
+  const pendingDrain = drainIpcInput();
+  if (pendingDrain.messages.length > 0) {
+    log(`Draining ${pendingDrain.messages.length} pending IPC messages into initial prompt`);
+    prompt += '\n' + pendingDrain.messages.map((m) => m.text).join('\n');
+    const pendingImages = pendingDrain.messages.flatMap((m) => m.images || []);
     if (pendingImages.length > 0) {
       promptImages = [...(promptImages || []), ...pendingImages];
     }
