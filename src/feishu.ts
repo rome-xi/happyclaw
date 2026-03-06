@@ -60,6 +60,7 @@ export interface FeishuConnection {
   connect(opts: ConnectOptions): Promise<boolean>;
   stop(): Promise<void>;
   sendMessage(chatId: string, text: string, localImagePaths?: string[]): Promise<void>;
+  sendImage(chatId: string, imageBuffer: Buffer, mimeType: string, caption?: string, fileName?: string): Promise<void>;
   sendReaction(chatId: string, isTyping: boolean): Promise<void>;
   isConnected(): boolean;
   syncGroups(): Promise<void>;
@@ -1141,6 +1142,65 @@ export function createFeishuConnection(config: FeishuConnectionConfig): FeishuCo
       } catch (err) {
         logger.error({ err, chatId }, 'Failed to send Feishu card message');
         clearAckReaction();
+      }
+    },
+
+    async sendImage(chatId: string, imageBuffer: Buffer, mimeType: string, caption?: string, _fileName?: string): Promise<void> {
+      if (!client) {
+        logger.warn({ chatId }, 'Feishu client not initialized, skip sending image');
+        return;
+      }
+
+      try {
+        // Step 1: Upload image to Feishu to get image_key
+        const uploadResult = await client.im.image.create({
+          data: {
+            image_type: 'message',
+            image: imageBuffer,
+          },
+        });
+
+        const imageKey = uploadResult?.image_key;
+        if (!imageKey) {
+          logger.error({ chatId }, 'Feishu image upload failed: no image_key returned');
+          return;
+        }
+
+        // Step 2: Send image message
+        const lastMsgId = lastMessageIdByChat.get(chatId);
+        const content = JSON.stringify({ image_key: imageKey });
+
+        if (lastMsgId) {
+          await client.im.message.reply({
+            path: { message_id: lastMsgId },
+            data: { content, msg_type: 'image' },
+          });
+        } else {
+          await client.im.v1.message.create({
+            params: { receive_id_type: 'chat_id' },
+            data: {
+              receive_id: chatId,
+              msg_type: 'image',
+              content,
+            },
+          });
+        }
+
+        // Step 3: If caption provided, send it as a follow-up text message
+        if (caption) {
+          await client.im.v1.message.create({
+            params: { receive_id_type: 'chat_id' },
+            data: {
+              receive_id: chatId,
+              msg_type: 'text',
+              content: JSON.stringify({ text: caption }),
+            },
+          });
+        }
+
+        logger.info({ chatId, imageKey, mimeType, size: imageBuffer.length }, 'Feishu image sent');
+      } catch (err) {
+        logger.error({ err, chatId, mimeType }, 'Failed to send Feishu image');
       }
     },
 

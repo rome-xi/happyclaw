@@ -42,6 +42,7 @@ export interface TelegramConnection {
   connect(opts: TelegramConnectOpts): Promise<void>;
   disconnect(): Promise<void>;
   sendMessage(chatId: string, text: string, localImagePaths?: string[]): Promise<void>;
+  sendImage(chatId: string, imageBuffer: Buffer, mimeType: string, caption?: string, fileName?: string): Promise<void>;
   sendChatAction(chatId: string, action: 'typing'): Promise<void>;
   isConnected(): boolean;
 }
@@ -709,6 +710,54 @@ export function createTelegramConnection(config: TelegramConnectionConfig): Tele
         logger.info({ chatId }, 'Telegram message sent');
       } catch (err) {
         logger.error({ err, chatId }, 'Failed to send Telegram message');
+        throw err;
+      }
+    },
+
+    async sendImage(chatId: string, imageBuffer: Buffer, mimeType: string, caption?: string, fileName?: string): Promise<void> {
+      if (!bot) {
+        logger.warn({ chatId }, 'Telegram bot not initialized, skip sending image');
+        return;
+      }
+
+      const chatIdNum = Number(chatId);
+      if (isNaN(chatIdNum)) {
+        logger.error({ chatId }, 'Invalid Telegram chat ID for image');
+        return;
+      }
+
+      try {
+        // Determine file extension from MIME type
+        const extMap: Record<string, string> = {
+          'image/png': '.png',
+          'image/jpeg': '.jpg',
+          'image/gif': '.gif',
+          'image/webp': '.webp',
+          'image/bmp': '.bmp',
+          'image/tiff': '.tiff',
+        };
+        const ext = extMap[mimeType] || '.png';
+        const effectiveFileName = fileName || `image${ext}`;
+
+        const inputFile = new InputFile(imageBuffer, effectiveFileName);
+
+        // Use sendDocument for non-photo formats (GIF, BMP, TIFF, etc.)
+        // sendPhoto only supports JPEG, PNG, WebP (<10MB)
+        const isPhoto = ['image/png', 'image/jpeg', 'image/webp'].includes(mimeType);
+
+        if (isPhoto) {
+          await bot.api.sendPhoto(chatIdNum, inputFile, {
+            caption: caption || undefined,
+          });
+        } else {
+          await bot.api.sendDocument(chatIdNum, inputFile, {
+            caption: caption || undefined,
+          });
+        }
+
+        logger.info({ chatId, mimeType, size: imageBuffer.length, fileName: effectiveFileName }, 'Telegram image sent');
+      } catch (err) {
+        logger.error({ err, chatId, mimeType }, 'Failed to send Telegram image');
         throw err;
       }
     },

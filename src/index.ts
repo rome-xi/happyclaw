@@ -1795,6 +1795,40 @@ function startIpcWatcher(): void {
                     'Unauthorized IPC message attempt blocked',
                   );
                 }
+              } else if (data.type === 'image' && data.chatJid && data.imageBase64) {
+                // Handle image IPC messages from send_image MCP tool
+                const targetGroup = registeredGroups[data.chatJid];
+                if (canSendCrossGroupMessage(isAdminHome, isHome, sourceGroup, sourceGroupEntry, targetGroup)) {
+                  try {
+                    const imageBuffer = Buffer.from(data.imageBase64, 'base64');
+                    const mimeType = data.mimeType || 'image/png';
+                    const caption = data.caption || undefined;
+                    const fileName = data.fileName || undefined;
+
+                    // Send to IM channel
+                    await imManager.sendImage(data.chatJid, imageBuffer, mimeType, caption, fileName);
+
+                    // Also send to web clients (store as message with attachment)
+                    if (caption) {
+                      await sendMessage(data.chatJid, `📷 ${caption}`);
+                    }
+
+                    logger.info(
+                      { chatJid: data.chatJid, sourceGroup, mimeType, size: imageBuffer.length },
+                      'IPC image sent',
+                    );
+                  } catch (err) {
+                    logger.error(
+                      { chatJid: data.chatJid, sourceGroup, err },
+                      'Failed to process IPC image',
+                    );
+                  }
+                } else {
+                  logger.warn(
+                    { chatJid: data.chatJid, sourceGroup },
+                    'Unauthorized IPC image attempt blocked',
+                  );
+                }
               }
               fs.unlinkSync(filePath);
             } catch (err) {
