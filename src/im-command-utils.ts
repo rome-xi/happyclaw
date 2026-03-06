@@ -1,0 +1,91 @@
+/**
+ * Pure utility functions for IM slash commands.
+ * Extracted from index.ts to enable unit testing without DB/state dependencies.
+ */
+
+// ─── Types ──────────────────────────────────────────────────────
+
+export interface AgentInfo {
+  id: string;
+  name: string;
+  status: string;
+}
+
+export interface WorkspaceInfo {
+  folder: string;
+  name: string;
+  agents: AgentInfo[];
+}
+
+export interface MessageForContext {
+  sender: string;
+  sender_name: string;
+  content: string;
+  is_from_me: boolean;
+}
+
+// ─── Context Formatting ─────────────────────────────────────────
+
+/**
+ * Format recent messages into a compact context summary.
+ * Messages should be in chronological order (oldest first).
+ *
+ * @param messages  Array of messages (oldest first)
+ * @param maxLen    Per-message truncation length
+ * @returns         Formatted text block, or empty string if no displayable messages
+ */
+export function formatContextMessages(
+  messages: MessageForContext[],
+  maxLen = 80,
+): string {
+  if (messages.length === 0) return '';
+
+  const lines: string[] = [];
+  for (const msg of messages) {
+    if (msg.sender === '__system__') continue;
+
+    const who = msg.is_from_me ? '🤖' : `👤${msg.sender_name || ''}`;
+    let text = msg.content || '';
+    if (text.length > maxLen) text = text.slice(0, maxLen) + '…';
+    text = text.replace(/\n/g, ' ');
+    lines.push(`  ${who}: ${text}`);
+  }
+
+  return lines.length > 0 ? '\n\n📋 最近消息:\n' + lines.join('\n') : '';
+}
+
+// ─── List Formatting ────────────────────────────────────────────
+
+/**
+ * Format workspace list with current-position markers.
+ */
+export function formatWorkspaceList(
+  workspaces: WorkspaceInfo[],
+  currentFolder: string,
+  currentAgentId: string | null,
+): string {
+  if (workspaces.length === 0) return '没有可用的工作区';
+
+  const lines: string[] = ['📂 工作区列表：'];
+
+  for (const ws of workspaces) {
+    const isCurrent = ws.folder === currentFolder;
+    const marker = isCurrent ? ' ▶' : '';
+    lines.push(`${marker} ${ws.name} (${ws.folder})`);
+
+    const mainMarker = isCurrent && !currentAgentId ? ' ← 当前' : '';
+    lines.push(`  · 主对话${mainMarker}`);
+
+    for (const agent of ws.agents) {
+      const agentMarker =
+        isCurrent && currentAgentId === agent.id ? ' ← 当前' : '';
+      const statusIcon = agent.status === 'running' ? '🔄' : '';
+      const shortId = agent.id.slice(0, 4);
+      lines.push(`  · ${agent.name} [${shortId}] ${statusIcon}${agentMarker}`);
+    }
+  }
+
+  lines.push('');
+  lines.push('💡 使用 /recall 总结最近对话记录，/clear 重置上下文');
+  return lines.join('\n');
+}
