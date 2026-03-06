@@ -1091,7 +1091,7 @@ configRoutes.delete('/user-im/telegram/paired-chats/:jid', authMiddleware, (c) =
 
 // ─── Local Claude Code detection ──────────────────────────────────
 
-configRoutes.get('/claude/detect-local', authMiddleware, (c) => {
+configRoutes.get('/claude/detect-local', authMiddleware, systemConfigMiddleware, (c) => {
   return c.json(detectLocalClaudeCode());
 });
 
