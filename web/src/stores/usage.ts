@@ -8,7 +8,7 @@ export interface UsageSummary {
   totalCacheCreationTokens: number;
   totalCostUSD: number;
   totalMessages: number;
-  totalSessions: number;
+  totalActiveDays: number;
 }
 
 export interface UsageBreakdown {

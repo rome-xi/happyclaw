@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { STORE_DIR, GROUPS_DIR } from './config.js';
+import { logger } from './logger.js';
 import {
   AgentKind,
   AgentStatus,
@@ -658,21 +659,30 @@ export function storeMessageDirect(
 }
 
 /**
- * Update the token_usage field on the most recent agent message for a chat.
- * Called when usage stream event arrives (after the result message is stored).
+ * Update the token_usage field on a specific agent message, or fall back to
+ * the most recent agent message without token_usage for the given chat.
+ * When msgId is provided, uses precise `WHERE id = ? AND chat_jid = ?` match
+ * to avoid race conditions in concurrent scenarios.
  */
 export function updateLatestMessageTokenUsage(
   chatJid: string,
   tokenUsage: string,
+  msgId?: string,
 ): void {
-  db.prepare(
-    `UPDATE messages SET token_usage = ?
-     WHERE rowid = (
-       SELECT rowid FROM messages
-       WHERE chat_jid = ? AND is_from_me = 1 AND token_usage IS NULL
-       ORDER BY timestamp DESC LIMIT 1
-     )`,
-  ).run(tokenUsage, chatJid);
+  if (msgId) {
+    db.prepare(
+      `UPDATE messages SET token_usage = ? WHERE id = ? AND chat_jid = ?`,
+    ).run(tokenUsage, msgId, chatJid);
+  } else {
+    db.prepare(
+      `UPDATE messages SET token_usage = ?
+       WHERE rowid = (
+         SELECT rowid FROM messages
+         WHERE chat_jid = ? AND is_from_me = 1 AND token_usage IS NULL
+         ORDER BY timestamp DESC LIMIT 1
+       )`,
+    ).run(tokenUsage, chatJid);
+  }
 }
 
 /**
@@ -727,7 +737,7 @@ export function getTokenUsageStats(
   }>;
 
   // Aggregate by date + model
-  const aggregated = new Map<string, {
+  type AggregatedEntry = {
     date: string;
     model: string;
     input_tokens: number;
@@ -736,79 +746,70 @@ export function getTokenUsageStats(
     cache_creation_tokens: number;
     cost_usd: number;
     message_count: number;
-  }>();
+  };
+  const aggregated = new Map<string, AggregatedEntry>();
+
+  function addToAggregated(
+    date: string,
+    model: string,
+    inputTokens: number,
+    outputTokens: number,
+    cacheReadTokens: number,
+    cacheCreationTokens: number,
+    costUsd: number,
+  ): void {
+    const key = `${date}|${model}`;
+    const existing = aggregated.get(key);
+    if (existing) {
+      existing.input_tokens += inputTokens;
+      existing.output_tokens += outputTokens;
+      existing.cache_read_tokens += cacheReadTokens;
+      existing.cache_creation_tokens += cacheCreationTokens;
+      existing.cost_usd += costUsd;
+      existing.message_count += 1;
+    } else {
+      aggregated.set(key, {
+        date,
+        model,
+        input_tokens: inputTokens,
+        output_tokens: outputTokens,
+        cache_read_tokens: cacheReadTokens,
+        cache_creation_tokens: cacheCreationTokens,
+        cost_usd: costUsd,
+        message_count: 1,
+      });
+    }
+  }
 
   for (const row of rows) {
     if (row.model_usage_json) {
       try {
         const modelUsage = JSON.parse(row.model_usage_json) as Record<string, { inputTokens: number; outputTokens: number; costUSD: number }>;
         for (const [model, usage] of Object.entries(modelUsage)) {
-          const key = `${row.date}|${model}`;
-          const existing = aggregated.get(key);
-          if (existing) {
-            existing.input_tokens += usage.inputTokens || 0;
-            existing.output_tokens += usage.outputTokens || 0;
-            existing.cost_usd += usage.costUSD || 0;
-            existing.message_count += 1;
-          } else {
-            aggregated.set(key, {
-              date: row.date,
-              model,
-              input_tokens: usage.inputTokens || 0,
-              output_tokens: usage.outputTokens || 0,
-              cache_read_tokens: 0,
-              cache_creation_tokens: 0,
-              cost_usd: usage.costUSD || 0,
-              message_count: 1,
-            });
-          }
+          addToAggregated(
+            row.date, model,
+            usage.inputTokens || 0, usage.outputTokens || 0,
+            0, 0,
+            usage.costUSD || 0,
+          );
         }
-      } catch {
+      } catch (e) {
+        logger.warn({ date: row.date, error: e }, 'Failed to parse model_usage_json');
         // fallback: use aggregate fields
-        const key = `${row.date}|unknown`;
-        const existing = aggregated.get(key);
-        if (existing) {
-          existing.input_tokens += row.input_tokens || 0;
-          existing.output_tokens += row.output_tokens || 0;
-          existing.cache_read_tokens += row.cache_read_tokens || 0;
-          existing.cache_creation_tokens += row.cache_creation_tokens || 0;
-          existing.cost_usd += row.cost_usd || 0;
-          existing.message_count += 1;
-        } else {
-          aggregated.set(key, {
-            date: row.date,
-            model: 'unknown',
-            input_tokens: row.input_tokens || 0,
-            output_tokens: row.output_tokens || 0,
-            cache_read_tokens: row.cache_read_tokens || 0,
-            cache_creation_tokens: row.cache_creation_tokens || 0,
-            cost_usd: row.cost_usd || 0,
-            message_count: 1,
-          });
-        }
+        addToAggregated(
+          row.date, 'unknown',
+          row.input_tokens || 0, row.output_tokens || 0,
+          row.cache_read_tokens || 0, row.cache_creation_tokens || 0,
+          row.cost_usd || 0,
+        );
       }
     } else {
-      const key = `${row.date}|unknown`;
-      const existing = aggregated.get(key);
-      if (existing) {
-        existing.input_tokens += row.input_tokens || 0;
-        existing.output_tokens += row.output_tokens || 0;
-        existing.cache_read_tokens += row.cache_read_tokens || 0;
-        existing.cache_creation_tokens += row.cache_creation_tokens || 0;
-        existing.cost_usd += row.cost_usd || 0;
-        existing.message_count += 1;
-      } else {
-        aggregated.set(key, {
-          date: row.date,
-          model: 'unknown',
-          input_tokens: row.input_tokens || 0,
-          output_tokens: row.output_tokens || 0,
-          cache_read_tokens: row.cache_read_tokens || 0,
-          cache_creation_tokens: row.cache_creation_tokens || 0,
-          cost_usd: row.cost_usd || 0,
-          message_count: 1,
-        });
-      }
+      addToAggregated(
+        row.date, 'unknown',
+        row.input_tokens || 0, row.output_tokens || 0,
+        row.cache_read_tokens || 0, row.cache_creation_tokens || 0,
+        row.cost_usd || 0,
+      );
     }
   }
 
@@ -828,7 +829,7 @@ export function getTokenUsageSummary(
   totalCacheCreationTokens: number;
   totalCostUSD: number;
   totalMessages: number;
-  totalSessions: number;
+  totalActiveDays: number;
 } {
   const since = new Date();
   since.setDate(since.getDate() - days);
@@ -847,7 +848,7 @@ export function getTokenUsageSummary(
       COALESCE(SUM(json_extract(token_usage, '$.cacheCreationInputTokens')), 0) as total_cache_creation,
       COALESCE(SUM(json_extract(token_usage, '$.costUSD')), 0) as total_cost,
       COUNT(*) as total_messages,
-      COUNT(DISTINCT date(timestamp)) as total_sessions
+      COUNT(DISTINCT date(timestamp)) as total_active_days
     FROM messages
     WHERE token_usage IS NOT NULL AND timestamp >= ?
       ${jidFilter}
@@ -858,7 +859,7 @@ export function getTokenUsageSummary(
     total_cache_creation: number;
     total_cost: number;
     total_messages: number;
-    total_sessions: number;
+    total_active_days: number;
   };
 
   return {
@@ -868,7 +869,7 @@ export function getTokenUsageSummary(
     totalCacheCreationTokens: row.total_cache_creation,
     totalCostUSD: row.total_cost,
     totalMessages: row.total_messages,
-    totalSessions: row.total_sessions,
+    totalActiveDays: row.total_active_days,
   };
 }
 

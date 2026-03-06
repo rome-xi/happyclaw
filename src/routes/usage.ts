@@ -49,7 +49,7 @@ usage.get('/stats', (c) => {
       summary: {
         totalInputTokens: 0, totalOutputTokens: 0,
         totalCacheReadTokens: 0, totalCacheCreationTokens: 0,
-        totalCostUSD: 0, totalMessages: 0, totalSessions: 0,
+        totalCostUSD: 0, totalMessages: 0, totalActiveDays: 0,
       },
       breakdown: [],
       days,

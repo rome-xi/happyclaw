@@ -635,6 +635,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let sentReply = false;
   let lastError = '';
   let cursorCommitted = false;
+  let lastReplyMsgId: string | undefined;
   const queryTaskIds = new Set<string>();
   const lastProcessed = missedMessages[missedMessages.length - 1];
 
@@ -760,9 +761,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           // Persist token usage to the latest agent message
           if (se.eventType === 'usage' && se.usage) {
             try {
-              updateLatestMessageTokenUsage(chatJid, JSON.stringify(se.usage));
+              updateLatestMessageTokenUsage(chatJid, JSON.stringify(se.usage), lastReplyMsgId);
               logger.debug(
-                { chatJid, costUSD: se.usage.costUSD, inputTokens: se.usage.inputTokens },
+                { chatJid, msgId: lastReplyMsgId, costUSD: se.usage.costUSD, inputTokens: se.usage.inputTokens },
                 'Token usage persisted',
               );
             } catch (err) {
@@ -789,7 +790,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             // Stop typing indicator before sending — clears the 4s refresh timer
             // so it doesn't keep firing while the agent stays alive in idle state.
             await setTyping(chatJid, false);
-            await sendMessage(chatJid, text, {
+            lastReplyMsgId = await sendMessage(chatJid, text, {
               sendToIM: shouldReplyToIM,
             });
             sentReply = true;
@@ -1150,7 +1151,7 @@ async function sendMessage(
   jid: string,
   text: string,
   options: SendMessageOptions = {},
-): Promise<void> {
+): Promise<string | undefined> {
   const isIMChannel = getChannelType(jid) !== null;
   const sendToIM = options.sendToIM ?? isIMChannel;
   try {
@@ -1187,8 +1188,10 @@ async function sendMessage(
     });
     logger.info({ jid, length: text.length, sendToIM }, 'Message sent');
     broadcastToWebClients(jid, text);
+    return msgId;
   } catch (err) {
     logger.error({ jid, err }, 'Failed to send message');
+    return undefined;
   }
 }
 
@@ -1836,6 +1839,7 @@ async function processAgentConversation(chatJid: string, agentId: string): Promi
   let cursorCommitted = false;
   let hadError = false;
   let lastError = '';
+  let lastAgentReplyMsgId: string | undefined;
   const lastProcessed = missedMessages[missedMessages.length - 1];
   const commitCursor = (): void => {
     if (cursorCommitted) return;
@@ -1863,7 +1867,7 @@ async function processAgentConversation(chatJid: string, agentId: string): Promi
       // Persist token usage for agent conversations
       if (output.streamEvent.eventType === 'usage' && output.streamEvent.usage) {
         try {
-          updateLatestMessageTokenUsage(virtualChatJid, JSON.stringify(output.streamEvent.usage));
+          updateLatestMessageTokenUsage(virtualChatJid, JSON.stringify(output.streamEvent.usage), lastAgentReplyMsgId);
         } catch (err) {
           logger.warn({ err, chatJid, agentId }, 'Failed to persist agent conversation token usage');
         }
@@ -1877,6 +1881,7 @@ async function processAgentConversation(chatJid: string, agentId: string): Promi
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
       if (text) {
         const msgId = crypto.randomUUID();
+        lastAgentReplyMsgId = msgId;
         const timestamp = new Date().toISOString();
         ensureChatExists(virtualChatJid);
         storeMessageDirect(
