@@ -1304,45 +1304,22 @@ export interface LocalClaudeCodeStatus {
 }
 
 /**
- * Detect if the host machine has a valid ~/.claude/.credentials.json
- * (i.e. user has logged into Claude Code locally).
+ * Read and parse OAuth credentials from ~/.claude/.credentials.json.
+ * Returns the raw oauth object with accessToken, refreshToken, expiresAt, scopes,
+ * or null if the file is missing / invalid / incomplete.
  */
-export function detectLocalClaudeCode(): LocalClaudeCodeStatus {
+function readLocalOAuthCredentials(): {
+  accessToken: string;
+  refreshToken: string;
+  expiresAt?: number;
+  scopes?: string[];
+} | null {
   const homeDir = process.env.HOME || '/root';
   const credFile = path.join(homeDir, '.claude', '.credentials.json');
 
   try {
-    if (!fs.existsSync(credFile)) {
-      return { detected: false, hasCredentials: false, expiresAt: null, accessTokenMasked: null };
-    }
+    if (!fs.existsSync(credFile)) return null;
 
-    const content = JSON.parse(fs.readFileSync(credFile, 'utf-8'));
-    const oauth = content?.claudeAiOauth;
-
-    if (oauth?.accessToken && oauth?.refreshToken) {
-      return {
-        detected: true,
-        hasCredentials: true,
-        expiresAt: typeof oauth.expiresAt === 'number' ? oauth.expiresAt : null,
-        accessTokenMasked: maskSecret(oauth.accessToken),
-      };
-    }
-
-    return { detected: true, hasCredentials: false, expiresAt: null, accessTokenMasked: null };
-  } catch {
-    return { detected: false, hasCredentials: false, expiresAt: null, accessTokenMasked: null };
-  }
-}
-
-/**
- * Read local ~/.claude/.credentials.json and return parsed OAuth credentials.
- * Returns null if not found or invalid.
- */
-export function importLocalClaudeCredentials(): ClaudeOAuthCredentials | null {
-  const homeDir = process.env.HOME || '/root';
-  const credFile = path.join(homeDir, '.claude', '.credentials.json');
-
-  try {
     const content = JSON.parse(fs.readFileSync(credFile, 'utf-8'));
     const oauth = content?.claudeAiOauth;
 
@@ -1350,14 +1327,59 @@ export function importLocalClaudeCredentials(): ClaudeOAuthCredentials | null {
       return {
         accessToken: oauth.accessToken,
         refreshToken: oauth.refreshToken,
-        expiresAt: typeof oauth.expiresAt === 'number' ? oauth.expiresAt : Date.now() + 8 * 3600_000,
-        scopes: Array.isArray(oauth.scopes) ? oauth.scopes : [],
+        expiresAt: typeof oauth.expiresAt === 'number' ? oauth.expiresAt : undefined,
+        scopes: Array.isArray(oauth.scopes) ? oauth.scopes : undefined,
       };
     }
     return null;
   } catch {
     return null;
   }
+}
+
+/**
+ * Detect if the host machine has a valid ~/.claude/.credentials.json
+ * (i.e. user has logged into Claude Code locally).
+ */
+export function detectLocalClaudeCode(): LocalClaudeCodeStatus {
+  const oauth = readLocalOAuthCredentials();
+
+  if (oauth) {
+    return {
+      detected: true,
+      hasCredentials: true,
+      expiresAt: oauth.expiresAt ?? null,
+      accessTokenMasked: maskSecret(oauth.accessToken),
+    };
+  }
+
+  // Check if the file exists at all (detected but no valid credentials)
+  const homeDir = process.env.HOME || '/root';
+  const credFile = path.join(homeDir, '.claude', '.credentials.json');
+  const fileExists = fs.existsSync(credFile);
+
+  return {
+    detected: fileExists,
+    hasCredentials: false,
+    expiresAt: null,
+    accessTokenMasked: null,
+  };
+}
+
+/**
+ * Read local ~/.claude/.credentials.json and return parsed OAuth credentials.
+ * Returns null if not found or invalid.
+ */
+export function importLocalClaudeCredentials(): ClaudeOAuthCredentials | null {
+  const oauth = readLocalOAuthCredentials();
+  if (!oauth) return null;
+
+  return {
+    accessToken: oauth.accessToken,
+    refreshToken: oauth.refreshToken,
+    expiresAt: oauth.expiresAt ?? Date.now() + 8 * 3600_000,
+    scopes: oauth.scopes ?? [],
+  };
 }
 
 // ─── Appearance config (plain JSON, no encryption) ────────────────

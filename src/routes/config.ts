@@ -1111,8 +1111,8 @@ configRoutes.post(
     try {
       const saved = saveClaudeProviderConfig({
         anthropicBaseUrl: current.anthropicBaseUrl,
-        anthropicAuthToken: current.anthropicAuthToken,
-        anthropicApiKey: current.anthropicApiKey,
+        anthropicAuthToken: '',
+        anthropicApiKey: '',
         claudeCodeOauthToken: '',
         claudeOAuthCredentials: creds,
       });
