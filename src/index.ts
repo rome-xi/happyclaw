@@ -469,8 +469,17 @@ function handleStatusCommand(chatJid: string): string {
   return lines.join('\n');
 }
 
+const recallCooldowns = new Map<string, number>();
+
 async function handleRecallCommand(chatJid: string): Promise<string> {
   logger.info({ chatJid }, '/recall command received');
+
+  const now = Date.now();
+  const lastRecall = recallCooldowns.get(chatJid) || 0;
+  if (now - lastRecall < 10000) {
+    return '⏳ 请稍后再试（冷却中）';
+  }
+  recallCooldowns.set(chatJid, now);
 
   const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
   if (!group) {
@@ -528,7 +537,13 @@ async function summarizeWithClaude(transcript: string): Promise<string | null> {
   return new Promise((resolve) => {
     logger.info({ promptLen: prompt.length }, 'summarizeWithClaude: invoking claude CLI via stdin');
 
-    const child = execFile('claude', ['--print', '--model', 'claude-haiku-4-5-20251001'], {
+    const model = process.env.RECALL_MODEL || '';
+    const args = ['--print'];
+    if (model) {
+      args.push('--model', model);
+    }
+
+    const child = execFile('claude', args, {
       timeout: 30000,
       maxBuffer: 1024 * 1024,
       env: { ...process.env, CLAUDECODE: '' },

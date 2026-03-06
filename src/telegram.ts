@@ -413,6 +413,11 @@ export function createTelegramConnection(config: TelegramConnectionConfig): Tele
               // reply 为 null 表示未知命令，继续作为普通消息处理
             } catch (err) {
               logger.error({ jid, cmd: tgSlashMatch[1], err }, 'Telegram slash command failed');
+              try {
+                await ctx.reply('⚠️ 命令执行失败，请稍后重试');
+              } catch (sendErr) {
+                logger.error({ jid, sendErr }, 'Failed to send slash command error feedback');
+              }
               return;
             }
           }

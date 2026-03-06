@@ -645,6 +645,11 @@ export function createFeishuConnection(config: FeishuConnectionConfig): FeishuCo
         // reply 为 null 表示未知命令，继续作为普通消息处理
       } catch (err) {
         logger.error({ chatJid, cmd: slashMatch[1], err }, 'Feishu slash command failed');
+        try {
+          await sendTextToChat(chatId, '⚠️ 命令执行失败，请稍后重试');
+        } catch (sendErr) {
+          logger.error({ chatJid, sendErr }, 'Failed to send slash command error feedback');
+        }
         return;
       }
     }
