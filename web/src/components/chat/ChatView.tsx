@@ -21,6 +21,7 @@ import { GroupSkillsPanel } from './GroupSkillsPanel';
 import { GroupMembersPanel } from './GroupMembersPanel';
 import { AgentTabBar } from './AgentTabBar';
 import { ImBindingDialog } from './ImBindingDialog';
+import { showToast } from '../../utils/toast';
 
 /** Inline elapsed-time counter for running tasks */
 function ElapsedTimer({ startTime }: { startTime: number }) {
@@ -261,10 +262,17 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
     const newMode = permissionMode === 'bypassPermissions' ? 'plan' : 'bypassPermissions';
     setPermissionMode(newMode);
     try {
-      await api.put(`/api/groups/${encodeURIComponent(groupJid)}/mode`, { mode: newMode });
+      const res = await api.put<{ success: boolean; mode: string; applied: boolean }>(
+        `/api/groups/${encodeURIComponent(groupJid)}/mode`, { mode: newMode },
+      );
+      if (res.applied === false) {
+        const label = newMode === 'plan' ? 'Plan' : 'Code';
+        showToast(`已切换到 ${label} 模式`, '容器未运行，模式将在下次启动时生效');
+      }
     } catch {
       // Revert on failure
       setPermissionMode(permissionMode);
+      showToast('模式切换失败', '请稍后重试');
     }
   };
 
