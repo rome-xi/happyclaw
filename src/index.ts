@@ -66,10 +66,17 @@ import {
   markAllRunningTaskAgentsAsError,
   getSession,
   listAgentsByJid,
+  getGroupsByOwner,
+  getMessagesPage,
 } from './db.js';
 // feishu.js deprecated exports are no longer needed; imManager handles all connections
 import { imManager } from './im-manager.js';
 import { getChannelType } from './im-channel.js';
+import {
+  formatContextMessages,
+  formatWorkspaceList,
+  type WorkspaceInfo,
+} from './im-command-utils.js';
 import { analyzeIntent } from './intent-analyzer.js';
 import {
   getClaudeProviderConfig as getClaudeProviderConfigForRefresh,
@@ -318,10 +325,28 @@ async function clearSessionRuntimeFiles(folder: string, agentId?: string): Promi
  * Returns a reply string on success, or null if command not recognized.
  */
 async function handleCommand(chatJid: string, command: string): Promise<string | null> {
-  if (command !== 'clear') return null;
+  const parts = command.split(/\s+/);
+  const cmd = parts[0];
 
+  switch (cmd) {
+    case 'clear':
+      return handleClearCommand(chatJid);
+    case 'list':
+    case 'ls':
+      return handleListCommand(chatJid);
+    case 'status':
+      return handleStatusCommand(chatJid);
+    case 'recall':
+    case 'rc':
+      return handleRecallCommand(chatJid);
+    default:
+      return null;
+  }
+}
+
+async function handleClearCommand(chatJid: string): Promise<string> {
   const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
-  if (!group) return null;
+  if (!group) return '未找到当前工作区';
 
   try {
     await executeSessionReset(chatJid, group.folder, {
@@ -334,6 +359,200 @@ async function handleCommand(chatJid: string, command: string): Promise<string |
     logger.error({ chatJid, err }, 'handleCommand /clear failed');
     return '清除上下文失败，请稍后重试';
   }
+}
+
+/**
+ * Collect all accessible workspaces for a user as pure WorkspaceInfo[].
+ */
+function collectWorkspaces(userId: string): WorkspaceInfo[] {
+  const ownedGroups = getGroupsByOwner(userId);
+  const user = getUserById(userId);
+  const isAdmin = user?.role === 'admin';
+
+  const seen = new Set<string>();
+  const workspaces: WorkspaceInfo[] = [];
+
+  for (const g of ownedGroups) {
+    if (!g.jid.startsWith('web:')) continue;
+    if (seen.has(g.folder)) continue;
+    seen.add(g.folder);
+
+    const agents = listAgentsByJid(g.jid)
+      .filter((a) => a.kind === 'conversation')
+      .map((a) => ({ id: a.id, name: a.name, status: a.status }));
+
+    workspaces.push({ folder: g.folder, name: g.name, agents });
+  }
+
+  if (isAdmin && !seen.has(MAIN_GROUP_FOLDER)) {
+    const agents = listAgentsByJid(DEFAULT_MAIN_JID)
+      .filter((a) => a.kind === 'conversation')
+      .map((a) => ({ id: a.id, name: a.name, status: a.status }));
+    workspaces.push({ folder: MAIN_GROUP_FOLDER, name: DEFAULT_MAIN_NAME, agents });
+  }
+
+  return workspaces;
+}
+
+/**
+ * Find the primary web JID for a folder (the one used for web:xxx groups).
+ */
+function findWebJidForFolder(folder: string): string | null {
+  for (const [jid, group] of Object.entries(registeredGroups)) {
+    if (group.folder === folder && jid.startsWith('web:')) return jid;
+  }
+  const jids = getJidsByFolder(folder);
+  for (const jid of jids) {
+    if (jid.startsWith('web:')) return jid;
+  }
+  return null;
+}
+
+/**
+ * Find the display name for a folder by looking up its web group.
+ */
+function findGroupNameByFolder(folder: string): string {
+  const webJid = findWebJidForFolder(folder);
+  if (webJid) {
+    const group = registeredGroups[webJid] ?? getRegisteredGroup(webJid);
+    if (group) return group.name;
+  }
+  return folder;
+}
+
+/**
+ * Fetch recent messages and format a context summary.
+ */
+function getConversationContext(
+  folder: string,
+  agentId: string | null,
+  count = 5,
+  maxLen = 80,
+): string {
+  const webJid = findWebJidForFolder(folder);
+  if (!webJid) return '';
+
+  const chatJidForMsg = agentId ? `${webJid}#agent:${agentId}` : webJid;
+  const messages = getMessagesPage(chatJidForMsg, undefined, count);
+
+  if (messages.length === 0) return '\n\n📭 该对话暂无消息记录';
+
+  const formatted = formatContextMessages(messages.reverse(), maxLen);
+  return formatted || '\n\n📭 该对话暂无消息记录';
+}
+
+function handleListCommand(chatJid: string): string {
+  const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
+  if (!group) return '当前 IM 未绑定工作区';
+
+  const userId = group.created_by;
+  if (!userId) return '无法确定用户身份';
+
+  const workspaces = collectWorkspaces(userId);
+  if (workspaces.length === 0) return '没有可用的工作区';
+
+  return formatWorkspaceList(workspaces, group.folder, null);
+}
+
+function handleStatusCommand(chatJid: string): string {
+  const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
+  if (!group) return '当前 IM 未绑定工作区';
+
+  const folderName = findGroupNameByFolder(group.folder);
+  const lines = [
+    `📍 当前位置: ${folderName} / 主对话`,
+    `📁 工作区: ${group.folder}`,
+    '',
+    '💡 /list 查看全部 · /recall 总结最近对话',
+  ];
+
+  return lines.join('\n');
+}
+
+async function handleRecallCommand(chatJid: string): Promise<string> {
+  logger.info({ chatJid }, '/recall command received');
+
+  const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
+  if (!group) {
+    logger.warn({ chatJid }, '/recall: no registered group found');
+    return '当前 IM 未绑定工作区';
+  }
+
+  const folderName = findGroupNameByFolder(group.folder);
+  const header = `🧠 ${folderName} / 主对话`;
+
+  // Fetch recent messages for summarization
+  const webJid = findWebJidForFolder(group.folder);
+  if (!webJid) {
+    logger.warn({ chatJid, folder: group.folder }, '/recall: no web JID found for folder');
+    return `${header}\n\n📭 该对话暂无消息记录`;
+  }
+
+  const messages = getMessagesPage(webJid, undefined, 10);
+  logger.info({ chatJid, webJid, messageCount: messages.length }, '/recall: fetched messages');
+
+  if (messages.length === 0) return `${header}\n\n📭 该对话暂无消息记录`;
+
+  // Build chronological transcript
+  const transcript = messages.reverse().map((msg) => {
+    const who = msg.is_from_me ? 'AI' : (msg.sender_name || '用户');
+    const text = (msg.content || '').slice(0, 300);
+    return `${who}: ${text}`;
+  }).join('\n');
+
+  logger.info({ chatJid, transcriptLen: transcript.length }, '/recall: built transcript, calling Claude CLI');
+
+  // Try to summarize via Claude CLI
+  const summary = await summarizeWithClaude(transcript);
+  if (summary) {
+    logger.info({ chatJid, summaryLen: summary.length }, '/recall: summary generated successfully');
+    return `${header}\n\n${summary}`;
+  }
+
+  logger.warn({ chatJid }, '/recall: summary failed, falling back to raw messages');
+
+  // Fallback: raw context if CLI unavailable
+  const context = getConversationContext(group.folder, null, 10, 200);
+  if (!context) return `${header}\n\n📭 该对话暂无消息记录`;
+  return header + context;
+}
+
+/**
+ * Call Claude CLI (`claude --print`) to summarize a conversation transcript.
+ * Uses the same auth mechanism (OAuth / API Key) as normal agent conversations.
+ * Returns null if CLI is unavailable or call fails.
+ */
+async function summarizeWithClaude(transcript: string): Promise<string | null> {
+  const prompt = `请用简洁的中文总结以下对话的要点和进展，重点说明讨论了什么、达成了什么结论、还有什么待办事项。不要逐条翻译，而是提炼核心信息。\n\n${transcript}`;
+
+  return new Promise((resolve) => {
+    logger.info({ promptLen: prompt.length }, 'summarizeWithClaude: invoking claude CLI via stdin');
+
+    const child = execFile('claude', ['--print', '--model', 'claude-haiku-4-5-20251001'], {
+      timeout: 30000,
+      maxBuffer: 1024 * 1024,
+      env: { ...process.env, CLAUDECODE: '' },
+    }, (err, stdout, stderr) => {
+      if (err) {
+        const e = err as Error & { code?: number | string };
+        logger.warn({
+          message: e.message?.slice(0, 200),
+          code: e.code,
+          stderr: stderr?.slice(0, 300),
+          stdout: stdout?.slice(0, 300),
+        }, 'summarizeWithClaude: CLI call failed');
+        resolve(null);
+        return;
+      }
+      const text = stdout.trim();
+      logger.info({ stdoutLen: text.length, stderr: stderr?.trim().slice(0, 200) || '' }, 'summarizeWithClaude: CLI returned');
+      resolve(text || null);
+    });
+
+    // Feed prompt via stdin to avoid arg length limits and special char issues
+    child.stdin?.write(prompt);
+    child.stdin?.end();
+  });
 }
 
 async function setTyping(jid: string, isTyping: boolean): Promise<void> {
