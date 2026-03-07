@@ -604,20 +604,57 @@ export function createFeishuConnection(config: FeishuConnectionConfig): FeishuCo
     let attachmentsJson: string | undefined;
 
     if (extracted.imageKeys && extracted.imageKeys.length > 0) {
-      // 独立图片消息（type='image'）：原有逻辑，下载为 base64 供 Vision
+      // 图片消息：下载后双轨处理
+      // 1. Vision 通道：base64 附件供模型看图
+      // 2. 存盘通道：写入工作区文件，agent 可直接操作（压缩、发送等）
       const attachments = [];
+      const groupFolder = resolveGroupFolder?.(chatJid);
+      const savedPaths: string[] = [];
+
       for (const imageKey of extracted.imageKeys) {
         const imageData = await downloadFeishuImage(messageId, imageKey);
-        if (imageData) {
-          attachments.push({
-            type: 'image',
-            data: imageData.base64,
-            mimeType: imageData.mimeType,
-          });
+        if (!imageData) continue;
+
+        // Vision 附件
+        attachments.push({
+          type: 'image',
+          data: imageData.base64,
+          mimeType: imageData.mimeType,
+        });
+
+        // 存盘：扩展名从 mimeType 推断，对齐文件消息处理逻辑
+        if (groupFolder) {
+          const extMap: Record<string, string> = {
+            'image/jpeg': '.jpg',
+            'image/png': '.png',
+            'image/gif': '.gif',
+            'image/webp': '.webp',
+            'image/bmp': '.bmp',
+            'image/tiff': '.tiff',
+          };
+          const ext = extMap[imageData.mimeType] ?? '.jpg';
+          const fileName = `feishu_img_${imageKey.slice(-8)}${ext}`;
+          try {
+            const relPath = await saveDownloadedFile(
+              groupFolder,
+              'feishu',
+              fileName,
+              Buffer.from(imageData.base64, 'base64'),
+            );
+            if (relPath) savedPaths.push(relPath);
+          } catch (err) {
+            logger.warn({ err, imageKey }, 'Failed to save Feishu image to disk');
+          }
         }
       }
+
       if (attachments.length > 0) {
         attachmentsJson = JSON.stringify(attachments);
+        // 在 content 中添加图片标记 + 磁盘路径，与文件消息保持一致
+        // agent 可通过路径直接操作文件，无需从 DB 解码 base64
+        const pathHints = savedPaths.map(p => `[图片: ${p}]`).join('\n');
+        const imgMarker = pathHints || '[图片]';
+        text = text ? `${imgMarker}\n${text}` : imgMarker;
       }
     } else if (extracted.fileInfos && extracted.fileInfos.length > 0) {
       // 文件消息：下载到磁盘，路径内联替换
