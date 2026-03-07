@@ -1805,13 +1805,8 @@ function startIpcWatcher(): void {
                     const caption = data.caption || undefined;
                     const fileName = data.fileName || undefined;
 
-                    // Send to IM channel
+                    // Send to IM channel (caption is included in the image message itself)
                     await imManager.sendImage(data.chatJid, imageBuffer, mimeType, caption, fileName);
-
-                    // Also send to web clients (store as message with attachment)
-                    if (caption) {
-                      await sendMessage(data.chatJid, `📷 ${caption}`);
-                    }
 
                     logger.info(
                       { chatJid: data.chatJid, sourceGroup, mimeType, size: imageBuffer.length },

@@ -1167,6 +1167,8 @@ export function createFeishuConnection(config: FeishuConnectionConfig): FeishuCo
         }
 
         // Step 2: Send image message
+        // receive_id_type: group chat ids start with "oc_", DM open_ids start with "ou_"
+        const receive_id_type = chatId.startsWith('oc_') ? 'chat_id' : 'open_id';
         const lastMsgId = lastMessageIdByChat.get(chatId);
         const content = JSON.stringify({ image_key: imageKey });
 
@@ -1177,7 +1179,7 @@ export function createFeishuConnection(config: FeishuConnectionConfig): FeishuCo
           });
         } else {
           await client.im.v1.message.create({
-            params: { receive_id_type: 'chat_id' },
+            params: { receive_id_type },
             data: {
               receive_id: chatId,
               msg_type: 'image',
@@ -1189,7 +1191,7 @@ export function createFeishuConnection(config: FeishuConnectionConfig): FeishuCo
         // Step 3: If caption provided, send it as a follow-up text message
         if (caption) {
           await client.im.v1.message.create({
-            params: { receive_id_type: 'chat_id' },
+            params: { receive_id_type },
             data: {
               receive_id: chatId,
               msg_type: 'text',

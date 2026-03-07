@@ -136,8 +136,12 @@ export function createMcpTools(ctx: McpContext): SdkMcpToolDefinition<any>[] {
           : path.join(ctx.workspaceGroup, args.file_path);
 
         // Security: ensure path is within workspace
+        // Use path.sep suffix to prevent prefix-bypass (e.g. /ws/group1 matching /ws/group10/evil.png)
         const resolved = path.resolve(absPath);
-        if (!resolved.startsWith(ctx.workspaceGroup)) {
+        const safeRoot = ctx.workspaceGroup.endsWith(path.sep)
+          ? ctx.workspaceGroup
+          : ctx.workspaceGroup + path.sep;
+        if (resolved !== ctx.workspaceGroup && !resolved.startsWith(safeRoot)) {
           return {
             content: [{ type: 'text' as const, text: `Error: file path must be within workspace directory.` }],
             isError: true,

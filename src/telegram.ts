@@ -741,17 +741,27 @@ export function createTelegramConnection(config: TelegramConnectionConfig): Tele
 
         const inputFile = new InputFile(imageBuffer, effectiveFileName);
 
-        // Use sendDocument for non-photo formats (GIF, BMP, TIFF, etc.)
-        // sendPhoto only supports JPEG, PNG, WebP (<10MB)
+        // Telegram caption limit is 1024 characters; truncate to avoid API errors
+        const CAPTION_MAX = 1024;
+        const safeCaption = caption && caption.length > CAPTION_MAX
+          ? caption.slice(0, CAPTION_MAX - 3) + '...'
+          : (caption || undefined);
+
+        // GIF → sendAnimation (preserves animation); JPEG/PNG/WebP → sendPhoto; others → sendDocument
+        const isGif = mimeType === 'image/gif';
         const isPhoto = ['image/png', 'image/jpeg', 'image/webp'].includes(mimeType);
 
-        if (isPhoto) {
+        if (isGif) {
+          await bot.api.sendAnimation(chatIdNum, inputFile, {
+            caption: safeCaption,
+          });
+        } else if (isPhoto) {
           await bot.api.sendPhoto(chatIdNum, inputFile, {
-            caption: caption || undefined,
+            caption: safeCaption,
           });
         } else {
           await bot.api.sendDocument(chatIdNum, inputFile, {
-            caption: caption || undefined,
+            caption: safeCaption,
           });
         }
 
