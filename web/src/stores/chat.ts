@@ -140,6 +140,7 @@ interface ChatState {
   interruptQuery: (jid: string) => Promise<boolean>;
   resetSession: (jid: string, agentId?: string) => Promise<boolean>;
   clearHistory: (jid: string) => Promise<boolean>;
+  deleteMessage: (jid: string, messageId: string) => Promise<boolean>;
   createFlow: (name: string, options?: { execution_mode?: 'container' | 'host'; custom_cwd?: string; init_source_path?: string; init_git_url?: string }) => Promise<{ jid: string; folder: string } | null>;
   renameFlow: (jid: string, name: string) => Promise<void>;
   deleteFlow: (jid: string) => Promise<void>;
@@ -834,6 +835,22 @@ export const useChatStore = create<ChatState>((set, get) => ({
         const { [jid]: _, ...nextClearing } = s.clearing;
         return { clearing: nextClearing, error: err instanceof Error ? err.message : String(err) };
       });
+      return false;
+    }
+  },
+
+  deleteMessage: async (jid: string, messageId: string) => {
+    try {
+      await api.delete(`/api/groups/${encodeURIComponent(jid)}/messages/${encodeURIComponent(messageId)}`);
+      set((s) => ({
+        messages: {
+          ...s.messages,
+          [jid]: (s.messages[jid] || []).filter((m) => m.id !== messageId),
+        },
+      }));
+      return true;
+    } catch (err) {
+      set({ error: err instanceof Error ? err.message : String(err) });
       return false;
     }
   },

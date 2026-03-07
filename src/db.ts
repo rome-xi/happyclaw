@@ -2716,6 +2716,25 @@ export function deleteMessagesForChatJid(chatJid: string): void {
   db.prepare('DELETE FROM chats WHERE jid = ?').run(chatJid);
 }
 
+export function getMessage(
+  chatJid: string,
+  messageId: string,
+): { id: string; chat_jid: string; sender: string | null; is_from_me: number } | null {
+  const row = db
+    .prepare('SELECT id, chat_jid, sender, is_from_me FROM messages WHERE id = ? AND chat_jid = ?')
+    .get(messageId, chatJid) as
+    | { id: string; chat_jid: string; sender: string | null; is_from_me: number }
+    | undefined;
+  return row ?? null;
+}
+
+export function deleteMessage(chatJid: string, messageId: string): boolean {
+  const result = db
+    .prepare('DELETE FROM messages WHERE id = ? AND chat_jid = ?')
+    .run(messageId, chatJid);
+  return result.changes > 0;
+}
+
 export function isGroupShared(groupFolder: string): boolean {
   const row = db
     .prepare(
