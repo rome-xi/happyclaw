@@ -1182,7 +1182,7 @@ export function createFeishuConnection(config: FeishuConnectionConfig): FeishuCo
       }
     },
 
-    async sendImage(chatId: string, imageBuffer: Buffer, mimeType: string, caption?: string, _fileName?: string): Promise<void> {
+    async sendImage(chatId: string, imageBuffer: Buffer, mimeType: string, caption?: string, _fileName?: string /* Feishu image API has no filename field, intentionally unused */): Promise<void> {
       if (!client) {
         logger.warn({ chatId }, 'Feishu client not initialized, skip sending image');
         return;
@@ -1197,10 +1197,11 @@ export function createFeishuConnection(config: FeishuConnectionConfig): FeishuCo
           },
         });
 
-        const imageKey = uploadResult?.image_key;
+        // SDK 不同版本返回结构不同：新版直接返回 image_key，旧版包在 data 里
+        const imageKey = uploadResult?.image_key ?? (uploadResult as any)?.data?.image_key;
         if (!imageKey) {
           logger.error({ chatId }, 'Feishu image upload failed: no image_key returned');
-          return;
+          throw new Error('Feishu image upload failed: no image_key in response');
         }
 
         // Step 2: Send image message
