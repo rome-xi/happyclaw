@@ -668,7 +668,7 @@ async function runQuery(
   allowedTools: string[] = DEFAULT_ALLOWED_TOOLS,
   disallowedTools?: string[],
   images?: Array<{ data: string; mimeType?: string }>,
-): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean; contextOverflow?: boolean; unrecoverableTranscriptError?: boolean; interruptedDuringQuery: boolean }> {
+): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean; contextOverflow?: boolean; unrecoverableTranscriptError?: boolean; interruptedDuringQuery: boolean; sessionResumeFailed?: boolean }> {
   const stream = new MessageStream();
   const initialRejected = stream.push(prompt, images);
   const emit = (output: ContainerOutput): void => {
@@ -698,6 +698,7 @@ async function runQuery(
     if (shouldInterrupt()) {
       log('Interrupt sentinel detected, interrupting current query');
       interruptedDuringQuery = true;
+      lastInterruptRequestedAt = Date.now();
       queryRef?.interrupt().catch((err: unknown) => log(`Interrupt call failed: ${err}`));
       stream.end();
       ipcPolling = false;
@@ -897,6 +898,12 @@ async function runQuery(
       // 匹配策略：显式枚举已知的 error subtype，并用 startsWith('error') 兜底未知的未来 error subtype。
       // 参考 SDK result subtype 约定：error_during_execution、error_max_turns 等均以 'error' 开头。
       if (typeof resultSubtype === 'string' && (resultSubtype === 'error_during_execution' || resultSubtype.startsWith('error'))) {
+        // If session never initialized (no system/init), resume itself failed — report it
+        // so the caller can retry with a fresh session instead of crashing.
+        if (!newSessionId) {
+          log(`Session resume failed (no init): ${resultSubtype}`);
+          return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery, sessionResumeFailed: true };
+        }
         const detail = textResult?.trim()
           ? textResult.trim()
           : `Claude Code execution failed (${resultSubtype})`;
@@ -981,9 +988,10 @@ async function runQuery(
       return { newSessionId, lastAssistantUuid, closedDuringQuery, unrecoverableTranscriptError: true, interruptedDuringQuery };
     }
 
-    if (interruptedDuringQuery && isInterruptRelatedError(err)) {
-      log(`Ignoring interrupt-related query error: ${errorMessage}`);
-      return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery: true };
+    // 中断导致的 SDK 错误（error_during_execution 等）：正常返回，不抛出
+    if (interruptedDuringQuery) {
+      log(`runQuery error during interrupt (non-fatal): ${errorMessage}`);
+      return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery };
     }
 
     // 其他错误：记录完整堆栈后继续抛出
@@ -1016,7 +1024,7 @@ async function main(): Promise<void> {
   const { isHome, isAdminHome } = normalizeHomeFlags(containerInput);
 
   // Create in-process SDK MCP server (replaces the stdio subprocess)
-  const mcpTools = createMcpTools({
+  const mcpToolsConfig = {
     chatJid: containerInput.chatJid,
     groupFolder: containerInput.groupFolder,
     isHome,
@@ -1025,12 +1033,13 @@ async function main(): Promise<void> {
     workspaceGroup: WORKSPACE_GROUP,
     workspaceGlobal: WORKSPACE_GLOBAL,
     workspaceMemory: WORKSPACE_MEMORY,
-  });
-  const mcpServerConfig = createSdkMcpServer({
+  };
+  const buildMcpServerConfig = () => createSdkMcpServer({
     name: 'happyclaw',
     version: '1.0.0',
-    tools: mcpTools,
+    tools: createMcpTools(mcpToolsConfig),
   });
+  let mcpServerConfig = buildMcpServerConfig();
   const memoryRecallPrompt = buildMemoryRecallPrompt(isHome, isAdminHome);
   fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
 
@@ -1087,6 +1096,16 @@ async function main(): Promise<void> {
       }
       if (queryResult.lastAssistantUuid) {
         resumeAt = queryResult.lastAssistantUuid;
+      }
+
+      // Session resume 失败（SDK 无法恢复旧会话）：清除 session，以新会话重试
+      if (queryResult.sessionResumeFailed) {
+        log(`Session resume failed, retrying with fresh session (old: ${sessionId})`);
+        sessionId = undefined;
+        resumeAt = undefined;
+        // Rebuild MCP server to avoid "Already connected to a transport" error
+        mcpServerConfig = buildMcpServerConfig();
+        continue;
       }
 
       // 不可恢复的转录错误（如超大图片或 MIME 错配被固化在会话历史中）
@@ -1274,9 +1293,9 @@ process.on('unhandledRejection', (reason: unknown) => {
   if (errno?.code === 'EPIPE') {
     process.exit(0);
   }
-  if (isWithinInterruptGraceWindow() && isInterruptRelatedError(reason)) {
-    console.error('Suppressing unhandled rejection during interrupt:', reason);
-    process.exit(0);
+  if (isWithinInterruptGraceWindow()) {
+    console.error('Unhandled rejection during interrupt (non-fatal):', reason);
+    return;
   }
   console.error('Unhandled rejection:', reason);
   process.exit(1);
