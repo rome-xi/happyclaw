@@ -1063,9 +1063,25 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // Direct IM chats reply to themselves. Routed IM messages keep their original
   // source_jid so workspace-bound conversations can reply back to the sender
   // without mirroring every Web reply into IM.
-  const latestSourceJid = missedMessages[missedMessages.length - 1]?.source_jid || chatJid;
+  //
+  // When messages from multiple sources (web + IM) are batched together, only
+  // route replies to IM if ALL messages came from the same IM source. If any
+  // message originated from web, the web user expects replies on web only — do
+  // not broadcast to IM (#99).
   const directImReply = getChannelType(chatJid) !== null;
-  const replySourceImJid = getChannelType(latestSourceJid) ? latestSourceJid : null;
+  let replySourceImJid: string | null = null;
+  if (!directImReply) {
+    // chatJid is a web channel — check if ALL messages share the same IM source
+    const firstSourceJid = missedMessages[0]?.source_jid || chatJid;
+    const allSameImSource = getChannelType(firstSourceJid) !== null &&
+      missedMessages.every((m) => (m.source_jid || chatJid) === firstSourceJid);
+    if (allSameImSource) {
+      replySourceImJid = firstSourceJid;
+    }
+  } else {
+    // chatJid is an IM channel — reply directly
+    replySourceImJid = chatJid;
+  }
 
   const shared = isGroupShared(group.folder);
   const prompt = formatMessages(missedMessages, shared);
@@ -2414,8 +2430,17 @@ async function processAgentConversation(chatJid: string, agentId: string): Promi
   const prompt = formatMessages(missedMessages, false);
   const images = collectMessageImages(virtualChatJid, missedMessages);
   const imagesForAgent = images.length > 0 ? images : undefined;
-  const latestSourceJid = missedMessages[missedMessages.length - 1]?.source_jid || virtualChatJid;
-  const replySourceImJid = getChannelType(latestSourceJid) ? latestSourceJid : null;
+  // Same mixed-source logic as processGroupMessages (#99): only route to IM
+  // when ALL messages share the same IM source.
+  let replySourceImJid: string | null = null;
+  {
+    const firstSourceJid = missedMessages[0]?.source_jid || virtualChatJid;
+    const allSameImSource = getChannelType(firstSourceJid) !== null &&
+      missedMessages.every((m) => (m.source_jid || virtualChatJid) === firstSourceJid);
+    if (allSameImSource) {
+      replySourceImJid = firstSourceJid;
+    }
+  }
 
   // Track idle timer
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
