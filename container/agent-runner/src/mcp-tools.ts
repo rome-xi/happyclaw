@@ -130,6 +130,14 @@ export function createMcpTools(ctx: McpContext): SdkMcpToolDefinition<any>[] {
         caption: z.string().optional().describe('Optional caption text to send with the image'),
       },
       async (args) => {
+        // Web channels don't support direct image sending
+        if (ctx.chatJid.startsWith('web:')) {
+          return {
+            content: [{ type: 'text' as const, text: 'Error: send_image is not supported for Web channels. Images can only be sent to IM channels (Feishu/Telegram).' }],
+            isError: true,
+          };
+        }
+
         // Resolve path relative to workspace
         const absPath = path.isAbsolute(args.file_path)
           ? args.file_path
@@ -196,6 +204,79 @@ export function createMcpTools(ctx: McpContext): SdkMcpToolDefinition<any>[] {
         };
         writeIpcFile(MESSAGES_DIR, data);
         return { content: [{ type: 'text' as const, text: `Image sent: ${path.basename(resolved)} (${mimeType}, ${(stat.size / 1024).toFixed(1)}KB)` }] };
+      },
+    ),
+
+    // --- send_file ---
+    tool(
+      'send_file',
+      `Send a file to the current chat (the user you're talking to) via IM (Feishu/Telegram). The file path is relative to the workspace/group directory.
+Supports: PDF, DOC, XLS, PPT, MP4, etc. Max file size: 30MB.`,
+      {
+        filePath: z.string().describe('File path relative to workspace/group (e.g., "output/report.pdf")'),
+        fileName: z.string().describe('File name to display (e.g., "report.pdf")'),
+      },
+      async (args) => {
+        // Web channels don't support direct file sending
+        if (ctx.chatJid.startsWith('web:')) {
+          return {
+            content: [{ type: 'text' as const, text: 'Error: send_file is not supported for Web channels. Files can only be sent to IM channels (Feishu/Telegram).' }],
+            isError: true,
+          };
+        }
+
+        // Handle both absolute and relative paths
+        let resolvedPath: string;
+        let relativePath: string;
+
+        if (path.isAbsolute(args.filePath)) {
+          // Absolute path provided - validate and convert to relative
+          resolvedPath = path.resolve(args.filePath);
+          const safeRoot = ctx.workspaceGroup.endsWith(path.sep)
+            ? ctx.workspaceGroup
+            : ctx.workspaceGroup + path.sep;
+          if (resolvedPath !== ctx.workspaceGroup && !resolvedPath.startsWith(safeRoot)) {
+            return {
+              content: [{ type: 'text' as const, text: 'Error: file must be within the workspace/group directory.' }],
+              isError: true,
+            };
+          }
+          // Convert to relative path
+          relativePath = path.relative(ctx.workspaceGroup, resolvedPath);
+        } else {
+          // Relative path provided
+          relativePath = args.filePath;
+          resolvedPath = path.resolve(ctx.workspaceGroup, args.filePath);
+          // Validate resolved path is still within workspace
+          const safeRoot = ctx.workspaceGroup.endsWith(path.sep)
+            ? ctx.workspaceGroup
+            : ctx.workspaceGroup + path.sep;
+          if (resolvedPath !== ctx.workspaceGroup && !resolvedPath.startsWith(safeRoot)) {
+            return {
+              content: [{ type: 'text' as const, text: 'Error: file must be within the workspace/group directory.' }],
+              isError: true,
+            };
+          }
+        }
+
+        if (!fs.existsSync(resolvedPath)) {
+          return {
+            content: [{ type: 'text' as const, text: `Error: file not found: ${args.filePath}` }],
+            isError: true,
+          };
+        }
+
+        const data = {
+          type: 'send_file',
+          chatJid: ctx.chatJid,
+          filePath: relativePath,
+          fileName: args.fileName,
+          timestamp: new Date().toISOString(),
+        };
+        writeIpcFile(TASKS_DIR, data);
+        return {
+          content: [{ type: 'text' as const, text: `Sending file "${args.fileName}"...` }],
+        };
       },
     ),
 

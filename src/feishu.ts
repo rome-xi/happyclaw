@@ -1,4 +1,6 @@
 import fs from 'fs';
+import * as fsPromises from 'node:fs/promises';
+import * as path from 'node:path';
 import * as lark from '@larksuiteoapi/node-sdk';
 import {
   setLastGroupSync,
@@ -61,6 +63,7 @@ export interface FeishuConnection {
   stop(): Promise<void>;
   sendMessage(chatId: string, text: string, localImagePaths?: string[]): Promise<void>;
   sendImage(chatId: string, imageBuffer: Buffer, mimeType: string, caption?: string, fileName?: string): Promise<void>;
+  sendFile(chatId: string, filePath: string, fileName: string): Promise<void>;
   sendReaction(chatId: string, isTyping: boolean): Promise<void>;
   isConnected(): boolean;
   syncGroups(): Promise<void>;
@@ -226,6 +229,21 @@ function splitAtParagraphs(text: string, maxLen: number): string[] {
   if (remaining) chunks.push(remaining);
 
   return chunks;
+}
+
+/**
+ * Map file extension to Feishu file type.
+ */
+function getFileType(ext: string): 'opus' | 'mp4' | 'pdf' | 'doc' | 'xls' | 'ppt' | 'stream' {
+  const map: Record<string, 'opus' | 'mp4' | 'pdf' | 'doc' | 'xls' | 'ppt' | 'stream'> = {
+    '.pdf': 'pdf',
+    '.doc': 'doc', '.docx': 'doc',
+    '.xls': 'xls', '.xlsx': 'xls',
+    '.ppt': 'ppt', '.pptx': 'ppt',
+    '.mp4': 'mp4',
+    '.opus': 'opus',
+  };
+  return map[ext.toLowerCase()] || 'stream';
 }
 
 /**
@@ -1240,6 +1258,56 @@ export function createFeishuConnection(config: FeishuConnectionConfig): FeishuCo
         logger.info({ chatId, imageKey, mimeType, size: imageBuffer.length }, 'Feishu image sent');
       } catch (err) {
         logger.error({ err, chatId, mimeType }, 'Failed to send Feishu image');
+        throw err;
+      }
+    },
+
+    async sendFile(chatId: string, filePath: string, fileName: string): Promise<void> {
+      if (!client) {
+        logger.warn({ chatId }, 'Feishu client not initialized, skip sending file');
+        return;
+      }
+
+      try {
+        const buffer = await fsPromises.readFile(filePath);
+
+        // Check file size limit (30MB)
+        const MAX_FILE_SIZE = 30 * 1024 * 1024;
+        if (buffer.length > MAX_FILE_SIZE) {
+          throw new Error(`文件大小超过 30MB 限制 (${(buffer.length / 1024 / 1024).toFixed(2)}MB)`);
+        }
+
+        const ext = path.extname(fileName);
+        const fileType = getFileType(ext);
+
+        // Upload file
+        const uploadResult = await client.im.v1.file.create({
+          data: {
+            file_type: fileType,
+            file_name: fileName,
+            file: buffer,
+          },
+        }) as { data?: { file_key?: string } } | null;
+
+        const fileKey = uploadResult?.data?.file_key;
+        if (!fileKey) {
+          throw new Error('文件上传失败：未返回 file_key');
+        }
+
+        // Send file message
+        const receive_id_type = chatId.startsWith('oc_') ? 'chat_id' : 'open_id';
+        await client.im.v1.message.create({
+          params: { receive_id_type },
+          data: {
+            receive_id: chatId,
+            msg_type: 'file',
+            content: JSON.stringify({ file_key: fileKey }),
+          },
+        });
+
+        logger.info({ chatId, fileName, fileSize: buffer.length }, 'File sent to Feishu');
+      } catch (err) {
+        logger.error({ err, chatId, filePath }, 'Failed to send file to Feishu');
         throw err;
       }
     },
