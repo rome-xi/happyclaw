@@ -1922,7 +1922,7 @@ function startIpcWatcher(): void {
             try {
               const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
               // Pass source group identity to processTaskIpc for authorization
-              await processTaskIpc(data, sourceGroup, isAdminHome);
+              await processTaskIpc(data, sourceGroup, isAdminHome, isHome, sourceGroupEntry);
               fs.unlinkSync(filePath);
             } catch (err) {
               logger.error(
@@ -1987,9 +1987,14 @@ async function processTaskIpc(
     package?: string;
     requestId?: string;
     skillId?: string;
+    // For send_file
+    filePath?: string;
+    fileName?: string;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isAdminHome: boolean, // Whether source is admin home container
+  isHome: boolean, // Whether source is a home container
+  sourceGroupEntry: RegisteredGroup | undefined, // Source group's registered entry
 ): Promise<void> {
   switch (data.type) {
     case 'schedule_task':
@@ -2321,6 +2326,46 @@ async function processTaskIpc(
         );
       } else {
         logger.warn({ data }, 'Invalid uninstall_skill request - missing required fields');
+      }
+      break;
+
+    case 'send_file':
+      if (data.chatJid && data.filePath && data.fileName) {
+        // Cross-group authorization check (same as send_message)
+        const targetGroup = registeredGroups[data.chatJid];
+        if (!canSendCrossGroupMessage(isAdminHome, isHome, sourceGroup, sourceGroupEntry, targetGroup)) {
+          logger.warn(
+            { chatJid: data.chatJid, sourceGroup },
+            'Unauthorized IPC send_file attempt blocked',
+          );
+          break;
+        }
+
+        try {
+          // Resolve to workspace path - IPC sends relative paths from workspace/group
+          const fullPath = path.join(GROUPS_DIR, sourceGroup, data.filePath);
+
+          // Path traversal protection: ensure resolved path stays within workspace
+          const resolvedPath = path.resolve(fullPath);
+          const safeRoot = path.resolve(GROUPS_DIR, sourceGroup) + path.sep;
+          if (!resolvedPath.startsWith(safeRoot)) {
+            logger.warn(
+              { sourceGroup, filePath: data.filePath, resolvedPath },
+              'Path traversal attempt blocked in send_file IPC',
+            );
+            break;
+          }
+
+          await imManager.sendFile(data.chatJid, resolvedPath, data.fileName);
+          logger.info(
+            { sourceGroup, chatJid: data.chatJid, fileName: data.fileName },
+            'File sent via IPC',
+          );
+        } catch (err) {
+          logger.error({ err, data }, 'Failed to send file via IPC');
+        }
+      } else {
+        logger.warn({ data }, 'Invalid send_file request - missing required fields');
       }
       break;
 
