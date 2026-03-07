@@ -849,7 +849,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
         },
       }));
       return true;
-    } catch {
+    } catch (err) {
+      set({ error: err instanceof Error ? err.message : String(err) });
       return false;
     }
   },

@@ -46,6 +46,7 @@ import {
   listAgentsByJid,
   getGroupsByTargetAgent,
   getGroupsByTargetMainJid,
+  getMessage,
   deleteMessage,
 } from '../db.js';
 import { logger } from '../logger.js';
@@ -1118,6 +1119,19 @@ groupRoutes.delete('/:jid/messages/:messageId', authMiddleware, (c) => {
   const authUser = c.get('user') as AuthUser;
   if (!canAccessGroup({ id: authUser.id, role: authUser.role }, group)) {
     return c.json({ error: 'Group not found' }, 404);
+  }
+
+  // Ownership check: admin can delete any message, non-admin can only delete their own
+  const msg = getMessage(jid, messageId);
+  if (!msg) {
+    return c.json({ error: 'Message not found' }, 404);
+  }
+  if (authUser.role !== 'admin') {
+    // AI messages (is_from_me=1) cannot be deleted by non-admin
+    // User messages can only be deleted by the sender
+    if (msg.is_from_me === 1 || (msg.sender && msg.sender !== authUser.id)) {
+      return c.json({ error: 'Permission denied' }, 403);
+    }
   }
 
   const deleted = deleteMessage(jid, messageId);
