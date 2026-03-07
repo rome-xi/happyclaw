@@ -488,12 +488,40 @@ export function createTelegramConnection(config: TelegramConnectionConfig): Tele
           const imageData = await downloadTelegramPhotoAsBase64(photo.file_id, photo.file_size);
 
           let attachmentsJson: string | undefined;
+          let imgMarker = '[图片]';
+
           if (imageData) {
             attachmentsJson = JSON.stringify([{ type: 'image', data: imageData.base64, mimeType: imageData.mimeType }]);
+
+            // 存盘：与飞书图片处理逻辑对齐，agent 可通过路径直接操作文件
+            const groupFolder = opts.resolveGroupFolder?.(jid);
+            if (groupFolder) {
+              const extMap: Record<string, string> = {
+                'image/jpeg': '.jpg',
+                'image/png': '.png',
+                'image/gif': '.gif',
+                'image/webp': '.webp',
+                'image/bmp': '.bmp',
+                'image/tiff': '.tiff',
+              };
+              const ext = extMap[imageData.mimeType] ?? '.jpg';
+              const fileName = `telegram_img_${photo.file_id.slice(-8)}${ext}`;
+              try {
+                const relPath = await saveDownloadedFile(
+                  groupFolder,
+                  'telegram',
+                  fileName,
+                  Buffer.from(imageData.base64, 'base64'),
+                );
+                if (relPath) imgMarker = `[图片: ${relPath}]`;
+              } catch (err) {
+                logger.warn({ err, fileId: photo.file_id }, 'Failed to save Telegram photo to disk');
+              }
+            }
           }
 
           const caption = ctx.message.caption;
-          const text = caption ? `[图片]\n${caption}` : '[图片]';
+          const text = caption ? `${imgMarker}\n${caption}` : imgMarker;
 
           try {
             await ctx.react('👀');
