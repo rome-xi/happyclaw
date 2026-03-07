@@ -415,15 +415,27 @@ async function handleClearCommand(chatJid: string): Promise<string> {
   const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
   if (!group) return '未找到当前工作区';
 
+  // Only agent-bound IM groups support /clear (clears that agent's context).
+  // Main-conversation-bound groups (target_main_jid) should be cleared from Web.
+  if (group.target_main_jid && !group.target_agent_id) {
+    return '当前群组未绑定子对话，请在 Web 端清除上下文';
+  }
+
+  const agentId = group.target_agent_id || undefined;
+
   try {
     await executeSessionReset(chatJid, group.folder, {
       queue,
       sessions,
       broadcast: broadcastNewMessage,
-    });
+      setLastAgentTimestamp: (jid: string, cursor: MessageCursor) => {
+        lastAgentTimestamp[jid] = cursor;
+        saveState();
+      },
+    }, agentId);
     return '已清除对话上下文 ✓';
   } catch (err) {
-    logger.error({ chatJid, err }, 'handleCommand /clear failed');
+    logger.error({ chatJid, agentId, err }, 'handleCommand /clear failed');
     return '清除上下文失败，请稍后重试';
   }
 }

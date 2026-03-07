@@ -657,6 +657,7 @@ function setupWebSocket(server: any): WebSocketServer {
                   queue: deps.queue,
                   sessions: deps.getSessions(),
                   broadcast: broadcastNewMessage,
+                  setLastAgentTimestamp: deps.setLastAgentTimestamp,
                 });
               } catch (err) {
                 logger.error({ chatJid, err }, '/clear command failed');

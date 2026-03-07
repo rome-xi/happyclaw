@@ -138,7 +138,7 @@ interface ChatState {
   sendMessage: (jid: string, content: string, attachments?: Array<{ data: string; mimeType: string }>) => Promise<void>;
   stopGroup: (jid: string) => Promise<boolean>;
   interruptQuery: (jid: string) => Promise<boolean>;
-  resetSession: (jid: string) => Promise<boolean>;
+  resetSession: (jid: string, agentId?: string) => Promise<boolean>;
   clearHistory: (jid: string) => Promise<boolean>;
   createFlow: (name: string, options?: { execution_mode?: 'container' | 'host'; custom_cwd?: string; init_source_path?: string; init_git_url?: string }) => Promise<{ jid: string; folder: string } | null>;
   renameFlow: (jid: string, name: string) => Promise<void>;
@@ -762,14 +762,27 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   },
 
-  resetSession: async (jid: string) => {
+  resetSession: async (jid: string, agentId?: string) => {
     try {
       await api.post<{ success: boolean; dividerMessageId: string }>(
         `/api/groups/${encodeURIComponent(jid)}/reset-session`,
+        agentId ? { agentId } : undefined,
       );
-      get().clearStreaming(jid, { preserveThinking: false });
-      // Refresh messages to pick up the divider message
-      await get().refreshMessages(jid);
+      if (agentId) {
+        // Agent-specific: clear agent streaming and refresh agent messages
+        set((s) => {
+          const nextStreaming = { ...s.agentStreaming };
+          delete nextStreaming[agentId];
+          const nextWaiting = { ...s.agentWaiting };
+          delete nextWaiting[agentId];
+          return { agentStreaming: nextStreaming, agentWaiting: nextWaiting };
+        });
+        await get().loadAgentMessages(jid, agentId);
+      } else {
+        get().clearStreaming(jid, { preserveThinking: false });
+        // Refresh messages to pick up the divider message
+        await get().refreshMessages(jid);
+      }
       return true;
     } catch (err) {
       set({ error: err instanceof Error ? err.message : String(err) });

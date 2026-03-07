@@ -266,8 +266,10 @@ function removeFlowArtifacts(folder: string): void {
   deleteContainerEnvConfig(folder);
 }
 
-function clearSessionJsonlFiles(folder: string): void {
-  const claudeDir = path.join(DATA_DIR, 'sessions', folder, '.claude');
+function clearSessionJsonlFiles(folder: string, agentId?: string): void {
+  const claudeDir = agentId
+    ? path.join(DATA_DIR, 'sessions', folder, 'agents', agentId, '.claude')
+    : path.join(DATA_DIR, 'sessions', folder, '.claude');
   if (!fs.existsSync(claudeDir)) return;
 
   // 保留 settings.json，清除所有其他运行时文件和目录
@@ -801,6 +803,7 @@ groupRoutes.post('/:jid/interrupt', authMiddleware, async (c) => {
 });
 
 // POST /api/groups/:jid/reset-session - 重置会话上下文
+// Optional body: { agentId?: string } — when provided, only reset that agent's session
 groupRoutes.post('/:jid/reset-session', authMiddleware, async (c) => {
   const deps = getWebDeps();
   if (!deps) return c.json({ error: 'Server not initialized' }, 500);
@@ -819,16 +822,37 @@ groupRoutes.post('/:jid/reset-session', authMiddleware, async (c) => {
     );
   }
 
-  // Collect all JIDs sharing the same folder (e.g., web:main + feishu groups)
-  const siblingJids = getJidsByFolder(group.folder);
-
-  // 1. Stop ALL running processes for this folder FIRST and WAIT for them to finish
-  //    to prevent any process from writing session files during cleanup
+  // Read optional agentId from request body
+  let agentId: string | undefined;
   try {
-    await Promise.all(siblingJids.map((j) => deps.queue.stopGroup(j, { force: true })));
+    const body = await c.req.json().catch(() => ({}));
+    if (body && typeof body.agentId === 'string' && body.agentId) {
+      agentId = body.agentId;
+    }
+  } catch { /* no body or invalid JSON — treat as main session reset */ }
+
+  // Validate agentId belongs to this group
+  if (agentId) {
+    const agent = getAgent(agentId);
+    if (!agent || agent.chat_jid !== jid) {
+      return c.json({ error: 'Agent not found' }, 404);
+    }
+  }
+
+  // 1. Stop running processes
+  try {
+    if (agentId) {
+      // Agent-specific: only stop the agent's virtual JID process
+      const virtualJid = `${jid}#agent:${agentId}`;
+      await deps.queue.stopGroup(virtualJid, { force: true });
+    } else {
+      // Main session: stop ALL processes for this folder
+      const siblingJids = getJidsByFolder(group.folder);
+      await Promise.all(siblingJids.map((j) => deps.queue.stopGroup(j, { force: true })));
+    }
   } catch (err) {
     logger.error(
-      { jid, siblingJids, err },
+      { jid, agentId, err },
       'Failed to stop containers before resetting session',
     );
     return c.json(
@@ -838,12 +862,11 @@ groupRoutes.post('/:jid/reset-session', authMiddleware, async (c) => {
   }
 
   // 2. Delete session JSONL files so Claude starts fresh.
-  // Do this before touching DB state to reduce partial-reset failure cases.
   try {
-    clearSessionJsonlFiles(group.folder);
+    clearSessionJsonlFiles(group.folder, agentId);
   } catch (err) {
     logger.error(
-      { jid, folder: group.folder, err },
+      { jid, folder: group.folder, agentId, err },
       'Failed to clear session files during reset',
     );
     return c.json(
@@ -852,13 +875,15 @@ groupRoutes.post('/:jid/reset-session', authMiddleware, async (c) => {
     );
   }
 
-  // 3. Delete session from DB and in-memory cache.
+  // 3. Delete session from DB (and in-memory cache for main session).
   try {
-    deleteSession(group.folder);
-    delete deps.getSessions()[group.folder];
+    deleteSession(group.folder, agentId);
+    if (!agentId) {
+      delete deps.getSessions()[group.folder];
+    }
   } catch (err) {
     logger.error(
-      { jid, folder: group.folder, err },
+      { jid, folder: group.folder, agentId, err },
       'Failed to clear session state during reset',
     );
     return c.json(
@@ -867,14 +892,15 @@ groupRoutes.post('/:jid/reset-session', authMiddleware, async (c) => {
     );
   }
 
-  // 4. Insert system divider message (best-effort).
+  // 4. Insert system divider message into the correct JID (best-effort).
+  const targetJid = agentId ? `${jid}#agent:${agentId}` : jid;
   const dividerMessageId = crypto.randomUUID();
   const timestamp = new Date().toISOString();
   try {
-    ensureChatExists(jid);
+    ensureChatExists(targetJid);
     storeMessageDirect(
       dividerMessageId,
-      jid,
+      targetJid,
       '__system__',
       'system',
       'context_reset',
@@ -882,9 +908,9 @@ groupRoutes.post('/:jid/reset-session', authMiddleware, async (c) => {
       true,
     );
 
-    broadcastNewMessage(jid, {
+    broadcastNewMessage(targetJid, {
       id: dividerMessageId,
-      chat_jid: jid,
+      chat_jid: targetJid,
       sender: '__system__',
       sender_name: 'system',
       content: 'context_reset',
@@ -893,14 +919,27 @@ groupRoutes.post('/:jid/reset-session', authMiddleware, async (c) => {
     });
   } catch (err) {
     logger.warn(
-      { jid, err },
+      { jid, agentId, err },
       'Session reset succeeded but failed to append divider message',
     );
   }
 
+  // 5. Advance lastAgentTimestamp so old messages before the reset are not
+  //    re-sent to the next fresh agent session.
+  if (agentId) {
+    const virtualJid = `${jid}#agent:${agentId}`;
+    deps.setLastAgentTimestamp(virtualJid, { timestamp, id: dividerMessageId });
+  } else {
+    // Main session: advance cursor for ALL sibling JIDs sharing this folder.
+    const siblingJids = getJidsByFolder(group.folder);
+    for (const siblingJid of siblingJids) {
+      deps.setLastAgentTimestamp(siblingJid, { timestamp, id: dividerMessageId });
+    }
+  }
+
   logger.info(
-    { jid, folder: group.folder, siblingJids },
-    'Session reset: cleared session files and stopped all containers for folder',
+    { jid, folder: group.folder, agentId },
+    'Session reset: cleared session files and stopped containers',
   );
 
   return c.json({ success: true, dividerMessageId });

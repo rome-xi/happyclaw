@@ -65,6 +65,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
   const [panelOpen, setPanelOpen] = useState(false);
   const [showResetConfirm, setShowResetConfirm] = useState(false);
   const [resetLoading, setResetLoading] = useState(false);
+  const [resetAgentId, setResetAgentId] = useState<string | null>(null);
   // Desktop: visible controls panel height, mounted controls terminal lifecycle.
   const [terminalVisible, setTerminalVisible] = useState(false);
   const [terminalMounted, setTerminalMounted] = useState(false);
@@ -257,9 +258,10 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
 
   const handleResetSession = async () => {
     setResetLoading(true);
-    await resetSession(groupJid);
+    await resetSession(groupJid, resetAgentId ?? undefined);
     setResetLoading(false);
     setShowResetConfirm(false);
+    setResetAgentId(null);
   };
 
   const togglePermissionMode = async () => {
@@ -566,6 +568,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
                   setScrollTrigger(n => n + 1);
                 }}
                 groupJid={groupJid}
+                onResetSession={() => { setResetAgentId(activeAgentTab); setShowResetConfirm(true); }}
               />
             </>
           ) : activeAgentTab ? (
@@ -723,7 +726,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
               <MessageInput
                 onSend={handleSend}
                 groupJid={groupJid}
-                onResetSession={() => setShowResetConfirm(true)}
+                onResetSession={() => { setResetAgentId(null); setShowResetConfirm(true); }}
                 onToggleTerminal={canUseTerminal ? handleTerminalToggle : undefined}
               />
             </>
@@ -968,7 +971,10 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
         onClose={() => setShowResetConfirm(false)}
         onConfirm={handleResetSession}
         title="清除上下文"
-        message="将清除 Claude 会话上下文并停止运行中的工作区进程，下次发送消息时将开始全新会话。聊天记录不受影响。"
+        message={resetAgentId
+          ? '将清除该子对话的 Claude 会话上下文，下次发送消息时将开始全新会话。聊天记录不受影响。'
+          : '将清除 Claude 会话上下文并停止运行中的工作区进程，下次发送消息时将开始全新会话。聊天记录不受影响。'
+        }
         confirmText="清除"
         confirmVariant="danger"
         loading={resetLoading}
