@@ -133,6 +133,11 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
     }
   };
 
+  const handleContextMenu = (e: React.MouseEvent) => {
+    e.preventDefault();
+    setContextMenu({ x: e.clientX, y: e.clientY });
+  };
+
   // Context overflow system message
   if (message.sender === '__system__' && message.content.startsWith('context_overflow:')) {
     const errorMsg = message.content.replace(/^context_overflow:\s*/, '');
@@ -167,7 +172,7 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
       : (isOtherUser ? (message.sender_name || '用户') : (currentUser?.display_name || currentUser?.username || '我'));
 
     return (
-      <div className="group mb-2 border-b border-border pb-2" onTouchStart={handleTouchStart} onTouchEnd={handleTouchEnd} onTouchMove={handleTouchMove}>
+      <div className="group mb-2 border-b border-border pb-2" onTouchStart={handleTouchStart} onTouchEnd={handleTouchEnd} onTouchMove={handleTouchMove} onContextMenu={handleContextMenu}>
         {/* Sender line — no avatars in compact mode */}
         <div className="flex items-center gap-1.5 mb-1">
           <span className={`text-xs font-semibold ${isAI ? 'text-primary' : 'text-muted-foreground'}`}>{senderName}</span>
@@ -214,7 +219,7 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
           <ImageLightbox images={lightboxState.images} initialIndex={lightboxState.index} onClose={() => setLightboxState(null)} />
         )}
         {contextMenu && (
-          <MessageContextMenu content={message.content} position={contextMenu} onClose={() => setContextMenu(null)} />
+          <MessageContextMenu content={message.content} position={contextMenu} onClose={() => setContextMenu(null)} chatJid={message.chat_jid} messageId={message.id} />
         )}
       </div>
     );
@@ -227,7 +232,7 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
       const otherName = message.sender_name || '用户';
       const initial = otherName[0]?.toUpperCase() || '?';
       return (
-        <div className="group mb-4" onTouchStart={handleTouchStart} onTouchEnd={handleTouchEnd} onTouchMove={handleTouchMove}>
+        <div className="group mb-4" onTouchStart={handleTouchStart} onTouchEnd={handleTouchEnd} onTouchMove={handleTouchMove} onContextMenu={handleContextMenu}>
           <div className="flex items-center gap-2 mb-1.5 lg:hidden">
             <div className="w-6 h-6 rounded-full bg-slate-200 flex items-center justify-center text-xs font-medium text-slate-600 flex-shrink-0">
               {initial}
@@ -292,6 +297,8 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
               content={message.content}
               position={contextMenu}
               onClose={() => setContextMenu(null)}
+              chatJid={message.chat_jid}
+              messageId={message.id}
             />
           )}
         </div>
@@ -301,7 +308,7 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
     // User message (own): right-aligned
     const showSenderLabel = isShared;
     return (
-      <div className="group flex justify-end mb-4" onTouchStart={handleTouchStart} onTouchEnd={handleTouchEnd} onTouchMove={handleTouchMove}>
+      <div className="group flex justify-end mb-4" onTouchStart={handleTouchStart} onTouchEnd={handleTouchEnd} onTouchMove={handleTouchMove} onContextMenu={handleContextMenu}>
         <div className="flex flex-col items-end min-w-0 w-full">
           {showSenderLabel && (
             <span className="text-xs text-muted-foreground font-medium mb-1 mr-1">
@@ -356,6 +363,8 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
             content={message.content}
             position={contextMenu}
             onClose={() => setContextMenu(null)}
+            chatJid={message.chat_jid}
+            messageId={message.id}
           />
         )}
       </div>
@@ -369,7 +378,7 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
   const aiImageUrl = currentUser?.ai_avatar_url;
 
   return (
-    <div className="group mb-4" onTouchStart={handleTouchStart} onTouchEnd={handleTouchEnd} onTouchMove={handleTouchMove}>
+    <div className="group mb-4" onTouchStart={handleTouchStart} onTouchEnd={handleTouchEnd} onTouchMove={handleTouchMove} onContextMenu={handleContextMenu}>
       {/* Mobile: compact avatar + name row */}
       <div className="flex items-center gap-2 mb-1.5 lg:hidden">
         <EmojiAvatar imageUrl={aiImageUrl} emoji={aiEmoji} color={aiColor} fallbackChar={senderName[0]} size="sm" />
@@ -441,6 +450,8 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
           content={message.content}
           position={contextMenu}
           onClose={() => setContextMenu(null)}
+          chatJid={message.chat_jid}
+          messageId={message.id}
         />
       )}
     </div>

@@ -46,6 +46,7 @@ import {
   listAgentsByJid,
   getGroupsByTargetAgent,
   getGroupsByTargetMainJid,
+  deleteMessage,
 } from '../db.js';
 import { logger } from '../logger.js';
 import {
@@ -1103,6 +1104,28 @@ groupRoutes.get('/:jid/messages', authMiddleware, async (c) => {
   const hasMore = rows.length > limit;
   const messages = hasMore ? rows.slice(0, limit) : rows;
   return c.json({ messages, hasMore });
+});
+
+// DELETE /api/groups/:jid/messages/:messageId - 删除单条消息
+groupRoutes.delete('/:jid/messages/:messageId', authMiddleware, (c) => {
+  const jid = c.req.param('jid');
+  const messageId = c.req.param('messageId');
+  const group = getRegisteredGroup(jid);
+  if (!group) {
+    return c.json({ error: 'Group not found' }, 404);
+  }
+
+  const authUser = c.get('user') as AuthUser;
+  if (!canAccessGroup({ id: authUser.id, role: authUser.role }, group)) {
+    return c.json({ error: 'Group not found' }, 404);
+  }
+
+  const deleted = deleteMessage(jid, messageId);
+  if (!deleted) {
+    return c.json({ error: 'Message not found' }, 404);
+  }
+
+  return c.json({ success: true });
 });
 
 // GET /api/groups/:jid/env - 获取容器环境变量配置

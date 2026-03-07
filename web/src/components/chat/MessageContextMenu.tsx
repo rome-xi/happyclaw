@@ -1,15 +1,19 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { Copy, FileText } from 'lucide-react';
+import { Copy, FileText, Trash2 } from 'lucide-react';
+import { useChatStore } from '../../stores/chat';
 
 interface MessageContextMenuProps {
   content: string;
   position: { x: number; y: number };
   onClose: () => void;
+  chatJid?: string;
+  messageId?: string;
 }
 
-export function MessageContextMenu({ content, position, onClose }: MessageContextMenuProps) {
+export function MessageContextMenu({ content, position, onClose, chatJid, messageId }: MessageContextMenuProps) {
   const menuRef = useRef<HTMLDivElement>(null);
+  const [confirmDelete, setConfirmDelete] = useState(false);
 
   useEffect(() => {
     const menu = menuRef.current;
@@ -56,6 +60,17 @@ export function MessageContextMenu({ content, position, onClose }: MessageContex
 
   const handleCopyMarkdown = () => copyToClipboard(content);
 
+  const handleDelete = async () => {
+    if (!confirmDelete) {
+      setConfirmDelete(true);
+      return;
+    }
+    if (chatJid && messageId) {
+      await useChatStore.getState().deleteMessage(chatJid, messageId);
+    }
+    onClose();
+  };
+
   return createPortal(
     <div className="fixed inset-0 z-[60]" onClick={onClose}>
       <div
@@ -79,6 +94,22 @@ export function MessageContextMenu({ content, position, onClose }: MessageContex
           <FileText className="w-4 h-4 text-slate-400" />
           复制 Markdown
         </button>
+        {chatJid && messageId && (
+          <>
+            <div className="mx-3 border-t border-border" />
+            <button
+              onClick={handleDelete}
+              className={`w-full flex items-center gap-3 px-4 py-2.5 text-sm transition-colors ${
+                confirmDelete
+                  ? 'text-red-600 bg-red-50 hover:bg-red-100'
+                  : 'text-red-500 hover:bg-muted/50 active:bg-muted'
+              }`}
+            >
+              <Trash2 className="w-4 h-4" />
+              {confirmDelete ? '确认删除' : '删除消息'}
+            </button>
+          </>
+        )}
       </div>
     </div>,
     document.body
