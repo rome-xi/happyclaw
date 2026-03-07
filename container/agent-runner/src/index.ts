@@ -698,11 +698,10 @@ async function runQuery(
     if (shouldInterrupt()) {
       log('Interrupt sentinel detected, interrupting current query');
       interruptedDuringQuery = true;
-      setInterruptInProgress(true);
+      lastInterruptRequestedAt = Date.now();
       queryRef?.interrupt().catch((err: unknown) => log(`Interrupt call failed: ${err}`));
       stream.end();
       ipcPolling = false;
-      setTimeout(() => setInterruptInProgress(false), 5000);
       return;
     }
     const { messages, modeChange } = drainIpcInput();
@@ -977,12 +976,6 @@ async function runQuery(
     ipcPolling = false;
     const errorMessage = err instanceof Error ? err.message : String(err);
 
-    // 中断导致的 SDK 错误（error_during_execution 等）：正常返回，不抛出
-    if (interruptedDuringQuery) {
-      log(`runQuery error during interrupt (non-fatal): ${errorMessage}`);
-      return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery };
-    }
-
     // 检测上下文溢出错误
     if (isContextOverflowError(errorMessage)) {
       log(`Context overflow detected: ${errorMessage}`);
@@ -995,9 +988,10 @@ async function runQuery(
       return { newSessionId, lastAssistantUuid, closedDuringQuery, unrecoverableTranscriptError: true, interruptedDuringQuery };
     }
 
-    if (interruptedDuringQuery && isInterruptRelatedError(err)) {
-      log(`Ignoring interrupt-related query error: ${errorMessage}`);
-      return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery: true };
+    // 中断导致的 SDK 错误（error_during_execution 等）：正常返回，不抛出
+    if (interruptedDuringQuery) {
+      log(`runQuery error during interrupt (non-fatal): ${errorMessage}`);
+      return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery };
     }
 
     // 其他错误：记录完整堆栈后继续抛出
@@ -1294,17 +1288,14 @@ process.on('uncaughtException', (err: unknown) => {
   process.exit(1);
 });
 
-let _interruptInProgress = false;
-export function setInterruptInProgress(v: boolean): void { _interruptInProgress = v; }
-
 process.on('unhandledRejection', (reason: unknown) => {
   const errno = reason as NodeJS.ErrnoException;
   if (errno?.code === 'EPIPE') {
     process.exit(0);
   }
-  if (isWithinInterruptGraceWindow() && isInterruptRelatedError(reason)) {
-    console.error('Suppressing unhandled rejection during interrupt:', reason);
-    process.exit(0);
+  if (isWithinInterruptGraceWindow()) {
+    console.error('Unhandled rejection during interrupt (non-fatal):', reason);
+    return;
   }
   console.error('Unhandled rejection:', reason);
   process.exit(1);
