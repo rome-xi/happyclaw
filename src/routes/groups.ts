@@ -831,6 +831,14 @@ groupRoutes.post('/:jid/reset-session', authMiddleware, async (c) => {
     }
   } catch { /* no body or invalid JSON — treat as main session reset */ }
 
+  // Validate agentId belongs to this group
+  if (agentId) {
+    const agent = getAgent(agentId);
+    if (!agent || agent.chat_jid !== jid) {
+      return c.json({ error: 'Agent not found' }, 404);
+    }
+  }
+
   // 1. Stop running processes
   try {
     if (agentId) {

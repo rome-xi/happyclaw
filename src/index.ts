@@ -428,6 +428,10 @@ async function handleClearCommand(chatJid: string): Promise<string> {
       queue,
       sessions,
       broadcast: broadcastNewMessage,
+      setLastAgentTimestamp: (jid: string, cursor: MessageCursor) => {
+        lastAgentTimestamp[jid] = cursor;
+        saveState();
+      },
     }, agentId);
     return '已清除对话上下文 ✓';
   } catch (err) {

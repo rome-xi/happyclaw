@@ -8,7 +8,7 @@ import path from 'path';
 import { deleteSession, getJidsByFolder, storeMessageDirect, ensureChatExists } from './db.js';
 import { DATA_DIR } from './config.js';
 import { logger } from './logger.js';
-import type { NewMessage } from './types.js';
+import type { NewMessage, MessageCursor } from './types.js';
 
 // ─── Types ──────────────────────────────────────────────────────
 
@@ -16,6 +16,7 @@ export interface CommandDeps {
   queue: { stopGroup(jid: string, opts?: { force?: boolean }): Promise<void> };
   sessions: Record<string, string>;
   broadcast: (jid: string, msg: NewMessage & { is_from_me: boolean }) => void;
+  setLastAgentTimestamp: (jid: string, cursor: MessageCursor) => void;
 }
 
 // ─── Session file cleanup (mirrors groups.ts clearSessionJsonlFiles) ────
@@ -89,6 +90,18 @@ export async function executeSessionReset(
     timestamp,
     is_from_me: true,
   });
+
+  // 5. Advance lastAgentTimestamp so old messages before the reset are not
+  //    re-sent to the next fresh agent session.
+  if (agentId) {
+    const virtualJid = `web:${folder}#agent:${agentId}`;
+    deps.setLastAgentTimestamp(virtualJid, { timestamp, id: dividerMessageId });
+  } else {
+    const siblingJids = getJidsByFolder(folder);
+    for (const siblingJid of siblingJids) {
+      deps.setLastAgentTimestamp(siblingJid, { timestamp, id: dividerMessageId });
+    }
+  }
 
   logger.info({ chatJid, folder, agentId }, 'Session reset via /clear command');
 }
