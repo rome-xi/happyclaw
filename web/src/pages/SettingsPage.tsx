@@ -117,7 +117,6 @@ export function SettingsPage() {
       {/* Mobile header */}
       <div
         className="lg:hidden sticky top-0 z-10 flex items-center bg-background border-b border-border px-4 h-12"
-        data-settings-swipe-ignore="true"
       >
         <button
           onClick={() => setNavOpen(true)}
