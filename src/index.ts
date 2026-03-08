@@ -69,6 +69,7 @@ import {
   listAgentsByJid,
   getGroupsByOwner,
   getMessagesPage,
+  addGroupMember,
 } from './db.js';
 // feishu.js deprecated exports are no longer needed; imManager handles all connections
 import { imManager } from './im-manager.js';
@@ -406,6 +407,8 @@ async function handleCommand(chatJid: string, command: string): Promise<string |
     case 'bind':
     case 'switch':
       return handleBindCommand(chatJid, rawArgs);
+    case 'new':
+      return handleNewCommand(chatJid, rawArgs);
     default:
       return null;
   }
@@ -634,6 +637,50 @@ function handleBindCommand(chatJid: string, rawSpec: string): string {
   imSendFailCounts.delete(chatJid);
   imHealthCheckFailCounts.delete(chatJid);
   return `已切换到 ${resolved.display}\n🔁 回复策略: source_only`;
+}
+
+function handleNewCommand(chatJid: string, rawName: string): string {
+  const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
+  if (!group) return '当前 IM 未绑定工作区';
+  const userId = group.created_by;
+  if (!userId) return '无法确定当前聊天所属用户';
+
+  const name = rawName.trim();
+  if (!name) return '用法: /new <工作区名称>';
+  if (name.length > 50) return '名称过长（最多 50 字符）';
+
+  // Create a new workspace (same pattern as routes/groups.ts POST)
+  const newJid = `web:${crypto.randomUUID()}`;
+  const folder = `flow-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  const now = new Date().toISOString();
+
+  const newGroup: RegisteredGroup = {
+    name,
+    folder,
+    added_at: now,
+    executionMode: 'container',
+    created_by: userId,
+  };
+
+  // Register the workspace
+  registerGroup(newJid, newGroup);
+  ensureChatExists(newJid);
+  updateChatName(newJid, name);
+  addGroupMember(folder, userId, 'owner', userId);
+
+  // Bind the current IM group to the new workspace's main conversation
+  const updated: RegisteredGroup = {
+    ...group,
+    target_main_jid: newJid,
+    target_agent_id: undefined,
+    reply_policy: 'source_only',
+  };
+  setRegisteredGroup(chatJid, updated);
+  registeredGroups[chatJid] = updated;
+  imSendFailCounts.delete(chatJid);
+  imHealthCheckFailCounts.delete(chatJid);
+
+  return `工作区「${name}」已创建并绑定\n📁 ${folder}\n🔁 回复策略: source_only\n\n发送 /unbind 可解绑回默认工作区`;
 }
 
 const recallCooldowns = new Map<string, number>();
@@ -2907,6 +2954,27 @@ function buildOnBotRemovedFromGroup(): (chatJid: string) => void {
   };
 }
 
+/**
+ * Build Telegram-specific bot-added-to-group handler.
+ * Auto-registers the group (via buildOnNewChat) then sends a welcome message
+ * guiding the user to bind or create a workspace.
+ */
+function buildTelegramBotAddedHandler(userId: string, homeFolder: string): (chatJid: string, chatName: string) => void {
+  const onNewChat = buildOnNewChat(userId, homeFolder);
+  return (chatJid: string, chatName: string) => {
+    onNewChat(chatJid, chatName);
+    const welcome =
+      `已加入「${chatName}」！当前绑定到默认工作区。\n\n` +
+      `/new <名称> — 新建工作区并绑定此群\n` +
+      `/bind <工作区> — 绑定到已有工作区\n` +
+      `/list — 查看所有工作区\n\n` +
+      `也可以直接发消息，我会在默认工作区回复。`;
+    imManager.sendMessage(chatJid, welcome).catch((err) =>
+      logger.warn({ chatJid, err }, 'Failed to send Telegram group welcome message'),
+    );
+  };
+}
+
 function buildIsChatAuthorized(userId: string): (jid: string) => boolean {
   return (jid) => {
     const group = registeredGroups[jid];
@@ -3032,7 +3100,21 @@ async function connectUserIMChannels(
   }
 
   if (telegramConfig && telegramConfig.enabled !== false && telegramConfig.botToken) {
-    telegram = await imManager.connectUserTelegram(userId, telegramConfig, onNewChat, buildIsChatAuthorized(userId), buildOnPairAttempt(userId), handleCommand, resolveGroupFolder);
+    telegram = await imManager.connectUserTelegram(
+      userId,
+      telegramConfig,
+      onNewChat,
+      buildIsChatAuthorized(userId),
+      buildOnPairAttempt(userId),
+      {
+        onCommand: handleCommand,
+        resolveGroupFolder,
+        resolveEffectiveChatJid,
+        onAgentMessage,
+        onBotAddedToGroup: buildTelegramBotAddedHandler(userId, homeFolder),
+        onBotRemovedFromGroup,
+      },
+    );
   }
 
   return { feishu, telegram };
@@ -3313,7 +3395,21 @@ async function main(): Promise<void> {
       const homeGroup = getUserHomeGroup(adminUser.id);
       const homeFolder = homeGroup?.folder || MAIN_GROUP_FOLDER;
       const onNewChat = buildOnNewChat(adminUser.id, homeFolder);
-      const connected = await imManager.connectUserTelegram(adminUser.id, config, onNewChat, buildIsChatAuthorized(adminUser.id), buildOnPairAttempt(adminUser.id), handleCommand);
+      const connected = await imManager.connectUserTelegram(
+        adminUser.id,
+        config,
+        onNewChat,
+        buildIsChatAuthorized(adminUser.id),
+        buildOnPairAttempt(adminUser.id),
+        {
+          onCommand: handleCommand,
+          resolveGroupFolder: (chatJid) => resolveEffectiveFolder(chatJid),
+          resolveEffectiveChatJid: buildResolveEffectiveChatJid(),
+          onAgentMessage: buildOnAgentMessage(),
+          onBotAddedToGroup: buildTelegramBotAddedHandler(adminUser.id, homeFolder),
+          onBotRemovedFromGroup: buildOnBotRemovedFromGroup(),
+        },
+      );
       return connected;
     }
     logger.info('Telegram channel disabled via hot-reload');
@@ -3357,7 +3453,14 @@ async function main(): Promise<void> {
           onNewChat,
           buildIsChatAuthorized(userId),
           buildOnPairAttempt(userId),
-          handleCommand,
+          {
+            onCommand: handleCommand,
+            resolveGroupFolder: (chatJid: string) => resolveEffectiveFolder(chatJid),
+            resolveEffectiveChatJid: buildResolveEffectiveChatJid(),
+            onAgentMessage: buildOnAgentMessage(),
+            onBotAddedToGroup: buildTelegramBotAddedHandler(userId, homeFolder),
+            onBotRemovedFromGroup: buildOnBotRemovedFromGroup(),
+          },
         );
         logger.info({ userId, connected }, 'User Telegram connection hot-reloaded');
         return connected;

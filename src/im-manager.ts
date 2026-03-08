@@ -262,8 +262,14 @@ class IMConnectionManager {
     onNewChat: (chatJid: string, chatName: string) => void,
     isChatAuthorized?: (jid: string) => boolean,
     onPairAttempt?: (jid: string, chatName: string, code: string) => Promise<boolean>,
-    onCommand?: (chatJid: string, command: string) => Promise<string | null>,
-    resolveGroupFolder?: (jid: string) => string | undefined,
+    options?: {
+      onCommand?: (chatJid: string, command: string) => Promise<string | null>;
+      resolveGroupFolder?: (jid: string) => string | undefined;
+      resolveEffectiveChatJid?: (chatJid: string) => { effectiveJid: string; agentId: string | null } | null;
+      onAgentMessage?: (baseChatJid: string, agentId: string) => void;
+      onBotAddedToGroup?: (chatJid: string, chatName: string) => void;
+      onBotRemovedFromGroup?: (chatJid: string) => void;
+    },
   ): Promise<boolean> {
     if (!config.botToken) {
       logger.info({ userId }, 'Telegram config empty, skipping connection');
@@ -282,8 +288,12 @@ class IMConnectionManager {
       onNewChat,
       isChatAuthorized,
       onPairAttempt,
-      onCommand,
-      resolveGroupFolder,
+      onCommand: options?.onCommand,
+      resolveGroupFolder: options?.resolveGroupFolder,
+      resolveEffectiveChatJid: options?.resolveEffectiveChatJid,
+      onAgentMessage: options?.onAgentMessage,
+      onBotAddedToGroup: options?.onBotAddedToGroup,
+      onBotRemovedFromGroup: options?.onBotRemovedFromGroup,
     });
   }
 

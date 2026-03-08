@@ -189,6 +189,10 @@ export function createTelegramChannel(config: TelegramConnectionConfig): IMChann
           onPairAttempt: opts.onPairAttempt,
           onCommand: opts.onCommand,
           resolveGroupFolder: opts.resolveGroupFolder,
+          resolveEffectiveChatJid: opts.resolveEffectiveChatJid,
+          onAgentMessage: opts.onAgentMessage,
+          onBotAddedToGroup: opts.onBotAddedToGroup,
+          onBotRemovedFromGroup: opts.onBotRemovedFromGroup,
         });
         return inner.isConnected();
       } catch (err) {
