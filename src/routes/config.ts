@@ -311,6 +311,23 @@ configRoutes.put(
       );
     }
 
+    // Detect silent discard: user sent anthropicAuthToken/clearAnthropicAuthToken
+    // but we're in official mode (no baseUrl), so shouldUpdateThirdPartyToken is false
+    if (
+      changedFields.length === 0 &&
+      !hasOfficialSecretChanges &&
+      (typeof validation.data.anthropicAuthToken === 'string' ||
+        validation.data.clearAnthropicAuthToken === true)
+    ) {
+      return c.json(
+        {
+          error:
+            '当前为官方 API 模式，无法更新第三方 Auth Token。请先切换到第三方模式或选择一个第三方 Profile',
+        },
+        400,
+      );
+    }
+
     if (changedFields.length === 0) {
       return c.json({ error: 'No secret changes provided' }, 400);
     }
@@ -677,6 +694,9 @@ configRoutes.delete(
       );
       if (!target) {
         return c.json({ error: '未找到指定第三方配置' }, 404);
+      }
+      if (before.profiles.length <= 1) {
+        return c.json({ error: '至少需要保留一个第三方配置' }, 400);
       }
       if (before.activeProfileId === profileId) {
         return c.json(
