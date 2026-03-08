@@ -11,6 +11,9 @@ import {
   ClaudeConfigSchema,
   ClaudeSecretsSchema,
   ClaudeCustomEnvSchema,
+  ClaudeThirdPartyProfileCreateSchema,
+  ClaudeThirdPartyProfilePatchSchema,
+  ClaudeThirdPartyProfileSecretsSchema,
   FeishuConfigSchema,
   TelegramConfigSchema,
   RegistrationConfigSchema,
@@ -21,7 +24,15 @@ import {
   getClaudeProviderConfig,
   toPublicClaudeProviderConfig,
   saveClaudeProviderConfig,
+  saveClaudeOfficialProviderSecrets,
   appendClaudeConfigAudit,
+  listClaudeThirdPartyProfiles,
+  toPublicClaudeThirdPartyProfile,
+  createClaudeThirdPartyProfile,
+  updateClaudeThirdPartyProfile,
+  updateClaudeThirdPartyProfileSecret,
+  activateClaudeThirdPartyProfile,
+  deleteClaudeThirdPartyProfile,
   getGlobalClaudeCustomEnv,
   saveGlobalClaudeCustomEnv,
   getFeishuProviderConfig,
@@ -72,6 +83,50 @@ function createTelegramApiAgent(proxyUrl?: string): HttpsAgent | ProxyAgent {
 
 function destroyTelegramApiAgent(agent: HttpsAgent | ProxyAgent): void {
   agent.destroy();
+}
+
+interface ClaudeApplyResultPayload {
+  success: boolean;
+  stoppedCount: number;
+  failedCount: number;
+  error?: string;
+}
+
+async function applyClaudeConfigToAllGroups(
+  actor: string,
+  metadata?: Record<string, unknown>,
+): Promise<ClaudeApplyResultPayload> {
+  if (!deps) {
+    throw new Error('Server not initialized');
+  }
+
+  const groupJids = Object.keys(deps.getRegisteredGroups());
+  const results = await Promise.allSettled(
+    groupJids.map((jid) => deps.queue.stopGroup(jid)),
+  );
+  const failedCount = results.filter((r) => r.status === 'rejected').length;
+  const stoppedCount = groupJids.length - failedCount;
+
+  appendClaudeConfigAudit(actor, 'apply_to_all_flows', ['queue.stopGroup'], {
+    stoppedCount,
+    failedCount,
+    ...(metadata || {}),
+  });
+
+  if (failedCount > 0) {
+    return {
+      success: false,
+      stoppedCount,
+      failedCount,
+      error: `${failedCount} container(s) failed to stop`,
+    };
+  }
+
+  return {
+    success: true,
+    stoppedCount,
+    failedCount: 0,
+  };
 }
 
 // --- Routes ---
@@ -126,14 +181,28 @@ configRoutes.put(
     const keepAuthToken = newBaseUrl ? current.anthropicAuthToken : '';
 
     try {
-      const saved = saveClaudeProviderConfig({
-        anthropicBaseUrl: newBaseUrl,
-        anthropicAuthToken: keepAuthToken,
-        anthropicApiKey: current.anthropicApiKey,
-        claudeCodeOauthToken: current.claudeCodeOauthToken,
-        claudeOAuthCredentials: current.claudeOAuthCredentials,
-      });
-      appendClaudeConfigAudit(actor, 'update_base_url', ['anthropicBaseUrl']);
+      const saved = saveClaudeProviderConfig(
+        {
+          anthropicBaseUrl: newBaseUrl,
+          anthropicAuthToken: keepAuthToken,
+          anthropicApiKey: current.anthropicApiKey,
+          claudeCodeOauthToken: current.claudeCodeOauthToken,
+          claudeOAuthCredentials: current.claudeOAuthCredentials,
+          happyclawModel:
+            validation.data.happyclawModel !== undefined
+              ? validation.data.happyclawModel
+              : current.happyclawModel,
+        },
+        {
+          mode: newBaseUrl ? 'third_party' : 'official',
+        },
+      );
+      appendClaudeConfigAudit(actor, 'update_base_url', [
+        'anthropicBaseUrl',
+        ...(validation.data.happyclawModel !== undefined
+          ? ['happyclawModel']
+          : []),
+      ]);
       return c.json(toPublicClaudeProviderConfig(saved));
     } catch (err) {
       const message =
@@ -188,41 +257,75 @@ configRoutes.put(
     const actor = (c.get('user') as AuthUser).username;
     const current = getClaudeProviderConfig();
 
-    const next = { ...current };
     const changedFields: string[] = [];
-
-    if (typeof validation.data.anthropicAuthToken === 'string') {
-      next.anthropicAuthToken = validation.data.anthropicAuthToken;
-      changedFields.push('anthropicAuthToken:set');
-    } else if (validation.data.clearAnthropicAuthToken === true) {
-      next.anthropicAuthToken = '';
-      changedFields.push('anthropicAuthToken:clear');
-    }
+    const nextOfficial = {
+      anthropicApiKey: current.anthropicApiKey,
+      claudeCodeOauthToken: current.claudeCodeOauthToken,
+      claudeOAuthCredentials: current.claudeOAuthCredentials,
+    };
+    let hasOfficialSecretChanges = false;
 
     if (typeof validation.data.anthropicApiKey === 'string') {
-      next.anthropicApiKey = validation.data.anthropicApiKey;
+      nextOfficial.anthropicApiKey = validation.data.anthropicApiKey;
       changedFields.push('anthropicApiKey:set');
+      hasOfficialSecretChanges = true;
     } else if (validation.data.clearAnthropicApiKey === true) {
-      next.anthropicApiKey = '';
+      nextOfficial.anthropicApiKey = '';
       changedFields.push('anthropicApiKey:clear');
+      hasOfficialSecretChanges = true;
     }
 
     if (typeof validation.data.claudeCodeOauthToken === 'string') {
-      next.claudeCodeOauthToken = validation.data.claudeCodeOauthToken;
+      nextOfficial.claudeCodeOauthToken = validation.data.claudeCodeOauthToken;
       changedFields.push('claudeCodeOauthToken:set');
+      hasOfficialSecretChanges = true;
     } else if (validation.data.clearClaudeCodeOauthToken === true) {
-      next.claudeCodeOauthToken = '';
+      nextOfficial.claudeCodeOauthToken = '';
       changedFields.push('claudeCodeOauthToken:clear');
+      hasOfficialSecretChanges = true;
     }
 
     if (validation.data.claudeOAuthCredentials) {
-      next.claudeOAuthCredentials = validation.data.claudeOAuthCredentials;
-      // When setting full credentials, clear the legacy single-token field
-      next.claudeCodeOauthToken = '';
+      nextOfficial.claudeOAuthCredentials =
+        validation.data.claudeOAuthCredentials;
+      nextOfficial.claudeCodeOauthToken = '';
       changedFields.push('claudeOAuthCredentials:set');
+      hasOfficialSecretChanges = true;
     } else if (validation.data.clearClaudeOAuthCredentials === true) {
-      next.claudeOAuthCredentials = null;
+      nextOfficial.claudeOAuthCredentials = null;
       changedFields.push('claudeOAuthCredentials:clear');
+      hasOfficialSecretChanges = true;
+    }
+
+    const shouldUpdateThirdPartyToken =
+      !hasOfficialSecretChanges &&
+      current.anthropicBaseUrl &&
+      (typeof validation.data.anthropicAuthToken === 'string' ||
+        validation.data.clearAnthropicAuthToken === true);
+
+    if (shouldUpdateThirdPartyToken) {
+      changedFields.push(
+        typeof validation.data.anthropicAuthToken === 'string'
+          ? 'anthropicAuthToken:set'
+          : 'anthropicAuthToken:clear',
+      );
+    }
+
+    // Detect silent discard: user sent anthropicAuthToken/clearAnthropicAuthToken
+    // but we're in official mode (no baseUrl), so shouldUpdateThirdPartyToken is false
+    if (
+      changedFields.length === 0 &&
+      !hasOfficialSecretChanges &&
+      (typeof validation.data.anthropicAuthToken === 'string' ||
+        validation.data.clearAnthropicAuthToken === true)
+    ) {
+      return c.json(
+        {
+          error:
+            '当前为官方 API 模式，无法更新第三方 Auth Token。请先切换到第三方模式或选择一个第三方 Profile',
+        },
+        400,
+      );
     }
 
     if (changedFields.length === 0) {
@@ -230,13 +333,32 @@ configRoutes.put(
     }
 
     try {
-      const saved = saveClaudeProviderConfig({
-        anthropicBaseUrl: next.anthropicBaseUrl,
-        anthropicAuthToken: next.anthropicAuthToken,
-        anthropicApiKey: next.anthropicApiKey,
-        claudeCodeOauthToken: next.claudeCodeOauthToken,
-        claudeOAuthCredentials: next.claudeOAuthCredentials,
-      });
+      let saved = current;
+
+      if (hasOfficialSecretChanges) {
+        saved = saveClaudeOfficialProviderSecrets(nextOfficial, {
+          activateOfficial: !current.anthropicBaseUrl,
+        });
+      }
+
+      if (shouldUpdateThirdPartyToken) {
+        saved = saveClaudeProviderConfig(
+          {
+            anthropicBaseUrl: current.anthropicBaseUrl,
+            anthropicAuthToken:
+              typeof validation.data.anthropicAuthToken === 'string'
+                ? validation.data.anthropicAuthToken
+                : '',
+            anthropicApiKey: current.anthropicApiKey,
+            claudeCodeOauthToken: current.claudeCodeOauthToken,
+            claudeOAuthCredentials: current.claudeOAuthCredentials,
+            happyclawModel: current.happyclawModel,
+          },
+          {
+            mode: 'third_party',
+          },
+        );
+      }
 
       // Update .credentials.json in all session directories when credentials change
       if (validation.data.claudeOAuthCredentials) {
@@ -260,30 +382,349 @@ configRoutes.post(
   authMiddleware,
   systemConfigMiddleware,
   async (c) => {
-    if (!deps) return c.json({ error: 'Server not initialized' }, 500);
-
     const actor = (c.get('user') as AuthUser).username;
-    const groupJids = Object.keys(deps.getRegisteredGroups());
-    const results = await Promise.allSettled(
-      groupJids.map((jid) => deps!.queue.stopGroup(jid)),
-    );
-    const failedCount = results.filter((r) => r.status === 'rejected').length;
-    appendClaudeConfigAudit(actor, 'apply_to_all_flows', ['queue.stopGroup'], {
-      stoppedCount: groupJids.length - failedCount,
-      failedCount,
-    });
-    if (failedCount > 0) {
+    try {
+      const result = await applyClaudeConfigToAllGroups(actor);
+      if (!result.success) {
+        return c.json(result, 207);
+      }
+      return c.json(result);
+    } catch (err) {
+      logger.error({ err }, 'Failed to apply Claude config to all groups');
+      return c.json({ error: 'Server not initialized' }, 500);
+    }
+  },
+);
+
+configRoutes.get(
+  '/claude/third-party/profiles',
+  authMiddleware,
+  systemConfigMiddleware,
+  (c) => {
+    try {
+      const state = listClaudeThirdPartyProfiles();
+      return c.json({
+        activeProfileId: state.activeProfileId,
+        profiles: state.profiles.map((profile) =>
+          toPublicClaudeThirdPartyProfile(profile),
+        ),
+      });
+    } catch (err) {
+      logger.error({ err }, 'Failed to load Claude third-party profiles');
       return c.json(
-        {
-          success: false,
-          stoppedCount: groupJids.length - failedCount,
-          failedCount,
-          error: `${failedCount} container(s) failed to stop`,
-        },
-        207,
+        { error: 'Failed to load Claude third-party profiles' },
+        500,
       );
     }
-    return c.json({ success: true, stoppedCount: groupJids.length });
+  },
+);
+
+configRoutes.post(
+  '/claude/third-party/profiles',
+  authMiddleware,
+  systemConfigMiddleware,
+  async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const validation = ClaudeThirdPartyProfileCreateSchema.safeParse(body);
+    if (!validation.success) {
+      return c.json(
+        { error: 'Invalid request body', details: validation.error.format() },
+        400,
+      );
+    }
+
+    const actor = (c.get('user') as AuthUser).username;
+    try {
+      const profile = createClaudeThirdPartyProfile(validation.data);
+      appendClaudeConfigAudit(
+        actor,
+        'create_third_party_profile',
+        [
+          'name',
+          'anthropicBaseUrl',
+          'anthropicAuthToken:set',
+          'happyclawModel',
+        ],
+        {
+          profileId: profile.id,
+          profileName: profile.name,
+        },
+      );
+      return c.json(toPublicClaudeThirdPartyProfile(profile));
+    } catch (err) {
+      const message =
+        err instanceof Error
+          ? err.message
+          : 'Invalid Claude third-party profile payload';
+      logger.warn({ err }, 'Invalid Claude third-party profile payload');
+      return c.json({ error: message }, 400);
+    }
+  },
+);
+
+configRoutes.patch(
+  '/claude/third-party/profiles/:id',
+  authMiddleware,
+  systemConfigMiddleware,
+  async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const validation = ClaudeThirdPartyProfilePatchSchema.safeParse(body);
+    if (!validation.success) {
+      return c.json(
+        { error: 'Invalid request body', details: validation.error.format() },
+        400,
+      );
+    }
+
+    const actor = (c.get('user') as AuthUser).username;
+    const profileId = c.req.param('id');
+    const changedFields: string[] = [];
+    if (validation.data.name !== undefined) changedFields.push('name');
+    if (validation.data.anthropicBaseUrl !== undefined) {
+      changedFields.push('anthropicBaseUrl');
+    }
+    if (validation.data.happyclawModel !== undefined) {
+      changedFields.push('happyclawModel');
+    }
+
+    try {
+      // Check if updating the active profile
+      const currentState = listClaudeThirdPartyProfiles();
+      const isActiveProfile = currentState.activeProfileId === profileId;
+
+      const profile = updateClaudeThirdPartyProfile(profileId, validation.data);
+      appendClaudeConfigAudit(
+        actor,
+        'update_third_party_profile',
+        changedFields,
+        {
+          profileId: profile.id,
+          profileName: profile.name,
+        },
+      );
+
+      // If updated the active profile, apply to all running containers
+      if (isActiveProfile) {
+        const applyResult = await applyClaudeConfigToAllGroups(actor, {
+          trigger: 'update_active_profile',
+          profileId: profile.id,
+          profileName: profile.name,
+          changedFields,
+        });
+
+        return c.json({
+          profile: toPublicClaudeThirdPartyProfile(profile),
+          applied: applyResult,
+        });
+      }
+
+      return c.json(toPublicClaudeThirdPartyProfile(profile));
+    } catch (err) {
+      const message =
+        err instanceof Error
+          ? err.message
+          : 'Invalid Claude third-party profile payload';
+      logger.warn({ err }, 'Invalid Claude third-party profile patch payload');
+      return c.json({ error: message }, 400);
+    }
+  },
+);
+
+configRoutes.put(
+  '/claude/third-party/profiles/:id/secrets',
+  authMiddleware,
+  systemConfigMiddleware,
+  async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const validation = ClaudeThirdPartyProfileSecretsSchema.safeParse(body);
+    if (!validation.success) {
+      return c.json(
+        { error: 'Invalid request body', details: validation.error.format() },
+        400,
+      );
+    }
+
+    const actor = (c.get('user') as AuthUser).username;
+    const profileId = c.req.param('id');
+    const changedFields = [
+      validation.data.clearAnthropicAuthToken
+        ? 'anthropicAuthToken:clear'
+        : 'anthropicAuthToken:set',
+    ];
+
+    try {
+      // Check if updating the active profile
+      const currentState = listClaudeThirdPartyProfiles();
+      const isActiveProfile = currentState.activeProfileId === profileId;
+
+      const profile = updateClaudeThirdPartyProfileSecret(
+        profileId,
+        validation.data,
+      );
+      appendClaudeConfigAudit(
+        actor,
+        'update_third_party_profile_secrets',
+        changedFields,
+        {
+          profileId: profile.id,
+          profileName: profile.name,
+        },
+      );
+
+      // If updated the active profile secrets, apply to all running containers
+      if (isActiveProfile) {
+        const applyResult = await applyClaudeConfigToAllGroups(actor, {
+          trigger: 'update_active_profile_secrets',
+          profileId: profile.id,
+          profileName: profile.name,
+          changedFields,
+        });
+
+        return c.json({
+          profile: toPublicClaudeThirdPartyProfile(profile),
+          applied: applyResult,
+        });
+      }
+
+      return c.json(toPublicClaudeThirdPartyProfile(profile));
+    } catch (err) {
+      const message =
+        err instanceof Error
+          ? err.message
+          : 'Invalid Claude third-party profile secret payload';
+      logger.warn({ err }, 'Invalid Claude third-party profile secret payload');
+      return c.json({ error: message }, 400);
+    }
+  },
+);
+
+configRoutes.post(
+  '/claude/third-party/profiles/:id/activate',
+  authMiddleware,
+  systemConfigMiddleware,
+  async (c) => {
+    const actor = (c.get('user') as AuthUser).username;
+    const profileId = c.req.param('id');
+
+    try {
+      const currentState = listClaudeThirdPartyProfiles();
+      const previousActiveId = currentState.activeProfileId;
+      const currentActive = currentState.profiles.find(
+        (profile) => profile.id === currentState.activeProfileId,
+      );
+      const nextActive = currentState.profiles.find(
+        (profile) => profile.id === profileId,
+      );
+      if (!nextActive) {
+        return c.json({ error: '未找到指定第三方配置' }, 404);
+      }
+      if (previousActiveId === profileId) {
+        return c.json({
+          success: true,
+          alreadyActive: true,
+          activeProfileId: profileId,
+          profile: toPublicClaudeThirdPartyProfile(nextActive),
+          stoppedCount: 0,
+          failedCount: 0,
+          error: undefined,
+        });
+      }
+
+      activateClaudeThirdPartyProfile(profileId);
+      appendClaudeConfigAudit(
+        actor,
+        'activate_third_party_profile',
+        ['activeProfileId'],
+        {
+          profileId: nextActive.id,
+          profileName: nextActive.name,
+          previousProfileId: previousActiveId,
+          previousProfileName: currentActive?.name ?? null,
+        },
+      );
+
+      const applyResult = await applyClaudeConfigToAllGroups(actor, {
+        trigger: 'activate_third_party_profile',
+        profileId: nextActive.id,
+        profileName: nextActive.name,
+        previousProfileId: previousActiveId,
+      });
+
+      const fresh = listClaudeThirdPartyProfiles();
+      const active = fresh.profiles.find(
+        (profile) => profile.id === fresh.activeProfileId,
+      );
+      return c.json(
+        {
+          success: applyResult.success,
+          activeProfileId: fresh.activeProfileId,
+          profile: active ? toPublicClaudeThirdPartyProfile(active) : null,
+          stoppedCount: applyResult.stoppedCount,
+          failedCount: applyResult.failedCount,
+          error: applyResult.error,
+        },
+        applyResult.success ? 200 : 207,
+      );
+    } catch (err) {
+      const message =
+        err instanceof Error
+          ? err.message
+          : 'Failed to activate Claude third-party profile';
+      logger.warn({ err }, 'Failed to activate Claude third-party profile');
+      if (message.includes('未找到指定第三方配置')) {
+        return c.json({ error: message }, 404);
+      }
+      return c.json({ error: message }, 400);
+    }
+  },
+);
+
+configRoutes.delete(
+  '/claude/third-party/profiles/:id',
+  authMiddleware,
+  systemConfigMiddleware,
+  (c) => {
+    const actor = (c.get('user') as AuthUser).username;
+    const profileId = c.req.param('id');
+
+    try {
+      const before = listClaudeThirdPartyProfiles();
+      const target = before.profiles.find(
+        (profile) => profile.id === profileId,
+      );
+      if (!target) {
+        return c.json({ error: '未找到指定第三方配置' }, 404);
+      }
+      if (before.profiles.length <= 1) {
+        return c.json({ error: '至少需要保留一个第三方配置' }, 400);
+      }
+      if (before.activeProfileId === profileId) {
+        return c.json(
+          { error: '当前激活配置不可删除，请先切换到其他配置' },
+          400,
+        );
+      }
+
+      const result = deleteClaudeThirdPartyProfile(profileId);
+      appendClaudeConfigAudit(
+        actor,
+        'delete_third_party_profile',
+        ['profile'],
+        {
+          profileId: result.deletedProfileId,
+          profileName: target.name,
+          activeProfileId: result.activeProfileId,
+        },
+      );
+      return c.json(result);
+    } catch (err) {
+      const message =
+        err instanceof Error
+          ? err.message
+          : 'Failed to delete Claude third-party profile';
+      logger.warn({ err }, 'Failed to delete Claude third-party profile');
+      return c.json({ error: message }, 400);
+    }
   },
 );
 
@@ -317,7 +758,9 @@ configRoutes.post(
   (c) => {
     const state = randomBytes(32).toString('hex');
     const codeVerifier = randomBytes(32).toString('base64url');
-    const codeChallenge = createHash('sha256').update(codeVerifier).digest('base64url');
+    const codeChallenge = createHash('sha256')
+      .update(codeVerifier)
+      .digest('base64url');
 
     oauthFlows.set(state, {
       codeVerifier,
@@ -334,7 +777,10 @@ configRoutes.post(
       code_challenge_method: 'S256',
     });
 
-    return c.json({ authorizeUrl: `${OAUTH_AUTHORIZE_URL}?${params.toString()}`, state });
+    return c.json({
+      authorizeUrl: `${OAUTH_AUTHORIZE_URL}?${params.toString()}`,
+      state,
+    });
   },
 );
 
@@ -368,10 +814,11 @@ configRoutes.post(
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-          'Accept': 'application/json, text/plain, */*',
-          'Referer': 'https://claude.ai/',
-          'Origin': 'https://claude.ai',
+          'User-Agent':
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+          Accept: 'application/json, text/plain, */*',
+          Referer: 'https://claude.ai/',
+          Origin: 'https://claude.ai',
         },
         body: JSON.stringify({
           grant_type: 'authorization_code',
@@ -385,8 +832,14 @@ configRoutes.post(
 
       if (!tokenResp.ok) {
         const errText = await tokenResp.text().catch(() => '');
-        logger.warn({ status: tokenResp.status, body: errText }, 'OAuth token exchange failed');
-        return c.json({ error: `Token exchange failed: ${tokenResp.status}` }, 400);
+        logger.warn(
+          { status: tokenResp.status, body: errText },
+          'OAuth token exchange failed',
+        );
+        return c.json(
+          { error: `Token exchange failed: ${tokenResp.status}` },
+          400,
+        );
       }
 
       const tokenData = (await tokenResp.json()) as {
@@ -402,7 +855,6 @@ configRoutes.post(
       }
 
       const actor = (c.get('user') as AuthUser).username;
-      const current = getClaudeProviderConfig();
 
       // Build full OAuth credentials when refresh_token is available
       let oauthCredentials: ClaudeOAuthCredentials | null = null;
@@ -419,14 +871,16 @@ configRoutes.post(
         };
       }
 
-      const saved = saveClaudeProviderConfig({
-        anthropicBaseUrl: current.anthropicBaseUrl,
-        anthropicAuthToken: '',
-        anthropicApiKey: '',
-        // When we have full credentials, clear the legacy token field
-        claudeCodeOauthToken: oauthCredentials ? '' : tokenData.access_token,
-        claudeOAuthCredentials: oauthCredentials,
-      });
+      const saved = saveClaudeOfficialProviderSecrets(
+        {
+          anthropicApiKey: '',
+          claudeCodeOauthToken: oauthCredentials ? '' : tokenData.access_token,
+          claudeOAuthCredentials: oauthCredentials,
+        },
+        {
+          activateOfficial: true,
+        },
+      );
 
       // Write .credentials.json to all session directories
       if (oauthCredentials) {
@@ -435,15 +889,18 @@ configRoutes.post(
       }
 
       appendClaudeConfigAudit(actor, 'oauth_login', [
-        oauthCredentials ? 'claudeOAuthCredentials:set' : 'claudeCodeOauthToken:set',
-        'anthropicAuthToken:clear',
+        oauthCredentials
+          ? 'claudeOAuthCredentials:set'
+          : 'claudeCodeOauthToken:set',
         'anthropicApiKey:clear',
+        'providerMode:official',
       ]);
 
       return c.json(toPublicClaudeProviderConfig(saved));
     } catch (err) {
       logger.error({ err }, 'OAuth token exchange error');
-      const message = err instanceof Error ? err.message : 'OAuth token exchange failed';
+      const message =
+        err instanceof Error ? err.message : 'OAuth token exchange failed';
       return c.json({ error: message }, 500);
     }
   },
@@ -467,15 +924,24 @@ configRoutes.post(
 
     const refreshed = await refreshOAuthCredentials(creds);
     if (!refreshed) {
-      return c.json({ error: 'OAuth token refresh failed. Please re-login via OAuth.' }, 500);
+      return c.json(
+        { error: 'OAuth token refresh failed. Please re-login via OAuth.' },
+        500,
+      );
     }
 
     // Re-read latest config to avoid overwriting changes made during the async refresh
     const latestConfig = getClaudeProviderConfig();
-    const saved = saveClaudeProviderConfig({
-      ...latestConfig,
-      claudeOAuthCredentials: refreshed,
-    });
+    const saved = saveClaudeOfficialProviderSecrets(
+      {
+        anthropicApiKey: latestConfig.anthropicApiKey,
+        claudeCodeOauthToken: '',
+        claudeOAuthCredentials: refreshed,
+      },
+      {
+        activateOfficial: !latestConfig.anthropicBaseUrl,
+      },
+    );
 
     updateAllSessionCredentials(saved);
     deps?.queue?.closeAllActiveForCredentialRefresh();
@@ -546,7 +1012,10 @@ configRoutes.put(
         }
       }
 
-      return c.json({ ...toPublicFeishuProviderConfig(saved, 'runtime'), connected });
+      return c.json({
+        ...toPublicFeishuProviderConfig(saved, 'runtime'),
+        connected,
+      });
     } catch (err) {
       const message =
         err instanceof Error ? err.message : 'Invalid Feishu config payload';
@@ -617,7 +1086,10 @@ configRoutes.put(
         }
       }
 
-      return c.json({ ...toPublicTelegramProviderConfig(saved, 'runtime'), connected });
+      return c.json({
+        ...toPublicTelegramProviderConfig(saved, 'runtime'),
+        connected,
+      });
     } catch (err) {
       const message =
         err instanceof Error ? err.message : 'Invalid Telegram config payload';
@@ -649,7 +1121,8 @@ configRoutes.post(
         },
       });
 
-      let me: { username?: string; id: number; first_name: string } | null = null;
+      let me: { username?: string; id: number; first_name: string } | null =
+        null;
       let lastErr: unknown = null;
       for (let i = 0; i < 3; i++) {
         try {
@@ -662,7 +1135,9 @@ configRoutes.post(
         }
       }
       if (!me) {
-        throw lastErr instanceof Error ? lastErr : new Error('Telegram API request failed');
+        throw lastErr instanceof Error
+          ? lastErr
+          : new Error('Telegram API request failed');
       }
 
       return c.json({
@@ -681,7 +1156,6 @@ configRoutes.post(
     }
   },
 );
-
 
 // ─── Registration config ─────────────────────────────────────────
 
@@ -734,19 +1208,14 @@ configRoutes.put(
 
 // ─── Appearance config ────────────────────────────────────────────
 
-configRoutes.get(
-  '/appearance',
-  authMiddleware,
-  systemConfigMiddleware,
-  (c) => {
-    try {
-      return c.json(getAppearanceConfig());
-    } catch (err) {
-      logger.error({ err }, 'Failed to load appearance config');
-      return c.json({ error: 'Failed to load appearance config' }, 500);
-    }
-  },
-);
+configRoutes.get('/appearance', authMiddleware, systemConfigMiddleware, (c) => {
+  try {
+    return c.json(getAppearanceConfig());
+  } catch (err) {
+    logger.error({ err }, 'Failed to load appearance config');
+    return c.json({ error: 'Failed to load appearance config' }, 500);
+  }
+});
 
 configRoutes.put(
   '/appearance',
@@ -794,19 +1263,14 @@ configRoutes.get('/appearance/public', (c) => {
 
 // ─── System settings ───────────────────────────────────────────────
 
-configRoutes.get(
-  '/system',
-  authMiddleware,
-  systemConfigMiddleware,
-  (c) => {
-    try {
-      return c.json(getSystemSettings());
-    } catch (err) {
-      logger.error({ err }, 'Failed to load system settings');
-      return c.json({ error: 'Failed to load system settings' }, 500);
-    }
-  },
-);
+configRoutes.get('/system', authMiddleware, systemConfigMiddleware, (c) => {
+  try {
+    return c.json(getSystemSettings());
+  } catch (err) {
+    logger.error({ err }, 'Failed to load system settings');
+    return c.json({ error: 'Failed to load system settings' }, 500);
+  }
+});
 
 configRoutes.put(
   '/system',
@@ -827,9 +1291,7 @@ configRoutes.put(
       return c.json(saved);
     } catch (err) {
       const message =
-        err instanceof Error
-          ? err.message
-          : 'Invalid system settings payload';
+        err instanceof Error ? err.message : 'Invalid system settings payload';
       logger.warn({ err }, 'Invalid system settings payload');
       return c.json({ error: message }, 400);
     }
@@ -915,7 +1377,10 @@ configRoutes.put('/user-im/feishu', authMiddleware, async (c) => {
       try {
         await deps.reloadUserIMConfig(user.id, 'feishu');
       } catch (err) {
-        logger.warn({ err, userId: user.id }, 'Failed to hot-reload user Feishu connection');
+        logger.warn(
+          { err, userId: user.id },
+          'Failed to hot-reload user Feishu connection',
+        );
       }
     }
 
@@ -988,7 +1453,10 @@ configRoutes.put('/user-im/telegram', authMiddleware, async (c) => {
       try {
         await deps.reloadUserIMConfig(user.id, 'telegram');
       } catch (err) {
-        logger.warn({ err, userId: user.id }, 'Failed to hot-reload user Telegram connection');
+        logger.warn(
+          { err, userId: user.id },
+          'Failed to hot-reload user Telegram connection',
+        );
       }
     }
 
@@ -1037,28 +1505,36 @@ configRoutes.post('/user-im/telegram/test', authMiddleware, async (c) => {
   }
 });
 
-configRoutes.post('/user-im/telegram/pairing-code', authMiddleware, async (c) => {
-  const user = c.get('user') as AuthUser;
-  const config = getUserTelegramConfig(user.id);
-  if (!config?.botToken) {
-    return c.json({ error: 'Telegram bot token not configured' }, 400);
-  }
+configRoutes.post(
+  '/user-im/telegram/pairing-code',
+  authMiddleware,
+  async (c) => {
+    const user = c.get('user') as AuthUser;
+    const config = getUserTelegramConfig(user.id);
+    if (!config?.botToken) {
+      return c.json({ error: 'Telegram bot token not configured' }, 400);
+    }
 
-  try {
-    const { generatePairingCode } = await import('../telegram-pairing.js');
-    const result = generatePairingCode(user.id);
-    return c.json(result);
-  } catch (err) {
-    const message = err instanceof Error ? err.message : 'Failed to generate pairing code';
-    logger.warn({ err }, 'Failed to generate pairing code');
-    return c.json({ error: message }, 500);
-  }
-});
+    try {
+      const { generatePairingCode } = await import('../telegram-pairing.js');
+      const result = generatePairingCode(user.id);
+      return c.json(result);
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'Failed to generate pairing code';
+      logger.warn({ err }, 'Failed to generate pairing code');
+      return c.json({ error: message }, 500);
+    }
+  },
+);
 
 // List Telegram paired chats for the current user
 configRoutes.get('/user-im/telegram/paired-chats', authMiddleware, (c) => {
   const user = c.get('user') as AuthUser;
-  const groups = (deps?.getRegisteredGroups() ?? {}) as Record<string, { name: string; added_at: string; created_by?: string }>;
+  const groups = (deps?.getRegisteredGroups() ?? {}) as Record<
+    string,
+    { name: string; added_at: string; created_by?: string }
+  >;
   const chats: Array<{ jid: string; name: string; addedAt: string }> = [];
   for (const [jid, group] of Object.entries(groups)) {
     if (jid.startsWith('telegram:') && group.created_by === user.id) {
@@ -1069,35 +1545,44 @@ configRoutes.get('/user-im/telegram/paired-chats', authMiddleware, (c) => {
 });
 
 // Remove (unpair) a Telegram chat
-configRoutes.delete('/user-im/telegram/paired-chats/:jid', authMiddleware, (c) => {
-  const user = c.get('user') as AuthUser;
-  const jid = decodeURIComponent(c.req.param('jid'));
+configRoutes.delete(
+  '/user-im/telegram/paired-chats/:jid',
+  authMiddleware,
+  (c) => {
+    const user = c.get('user') as AuthUser;
+    const jid = decodeURIComponent(c.req.param('jid'));
 
-  if (!jid.startsWith('telegram:')) {
-    return c.json({ error: 'Invalid Telegram chat JID' }, 400);
-  }
+    if (!jid.startsWith('telegram:')) {
+      return c.json({ error: 'Invalid Telegram chat JID' }, 400);
+    }
 
-  const groups = deps?.getRegisteredGroups() ?? {};
-  const group = groups[jid];
-  if (!group) {
-    return c.json({ error: 'Chat not found' }, 404);
-  }
-  if (group.created_by !== user.id) {
-    return c.json({ error: 'Not authorized to remove this chat' }, 403);
-  }
+    const groups = deps?.getRegisteredGroups() ?? {};
+    const group = groups[jid];
+    if (!group) {
+      return c.json({ error: 'Chat not found' }, 404);
+    }
+    if (group.created_by !== user.id) {
+      return c.json({ error: 'Not authorized to remove this chat' }, 403);
+    }
 
-  deleteRegisteredGroup(jid);
-  deleteChatHistory(jid);
-  delete groups[jid];
-  logger.info({ jid, userId: user.id }, 'Telegram chat unpaired');
-  return c.json({ success: true });
-});
+    deleteRegisteredGroup(jid);
+    deleteChatHistory(jid);
+    delete groups[jid];
+    logger.info({ jid, userId: user.id }, 'Telegram chat unpaired');
+    return c.json({ success: true });
+  },
+);
 
 // ─── Local Claude Code detection ──────────────────────────────────
 
-configRoutes.get('/claude/detect-local', authMiddleware, systemConfigMiddleware, (c) => {
-  return c.json(detectLocalClaudeCode());
-});
+configRoutes.get(
+  '/claude/detect-local',
+  authMiddleware,
+  systemConfigMiddleware,
+  (c) => {
+    return c.json(detectLocalClaudeCode());
+  },
+);
 
 configRoutes.post(
   '/claude/import-local',
@@ -1110,24 +1595,31 @@ configRoutes.post(
     }
 
     const actor = (c.get('user') as AuthUser).username;
-    const current = getClaudeProviderConfig();
 
     try {
-      const saved = saveClaudeProviderConfig({
-        anthropicBaseUrl: current.anthropicBaseUrl,
-        anthropicAuthToken: '',
-        anthropicApiKey: '',
-        claudeCodeOauthToken: '',
-        claudeOAuthCredentials: creds,
-      });
+      const saved = saveClaudeOfficialProviderSecrets(
+        {
+          anthropicApiKey: '',
+          claudeCodeOauthToken: '',
+          claudeOAuthCredentials: creds,
+        },
+        {
+          activateOfficial: true,
+        },
+      );
 
       updateAllSessionCredentials(saved);
       deps?.queue?.closeAllActiveForCredentialRefresh();
-      appendClaudeConfigAudit(actor, 'import_local_cc', ['claudeOAuthCredentials:import_local']);
+      appendClaudeConfigAudit(actor, 'import_local_cc', [
+        'claudeOAuthCredentials:import_local',
+      ]);
 
       return c.json(toPublicClaudeProviderConfig(saved));
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Failed to import local credentials';
+      const message =
+        err instanceof Error
+          ? err.message
+          : 'Failed to import local credentials';
       logger.warn({ err }, 'Failed to import local Claude Code credentials');
       return c.json({ error: message }, 500);
     }
