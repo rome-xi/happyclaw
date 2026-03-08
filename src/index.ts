@@ -725,18 +725,41 @@ async function handleRecallCommand(chatJid: string): Promise<string> {
     return '当前 IM 未绑定工作区';
   }
 
-  const folderName = findGroupNameByFolder(group.folder);
-  const header = `🧠 ${folderName} / 主对话`;
+  // Resolve binding target — use bound workspace/agent if present
+  let targetJid: string | undefined;
+  let targetFolder: string;
+  let targetAgentId: string | null = null;
+  let headerName: string;
 
-  // Fetch recent messages for summarization
-  const webJid = findWebJidForFolder(group.folder);
-  if (!webJid) {
-    logger.warn({ chatJid, folder: group.folder }, '/recall: no web JID found for folder');
+  if (group.target_agent_id) {
+    const agent = getAgent(group.target_agent_id);
+    const parent = agent ? (registeredGroups[agent.chat_jid] ?? getRegisteredGroup(agent.chat_jid)) : null;
+    const workspaceName = parent?.name || parent?.folder || group.folder;
+    headerName = `${workspaceName} / ${agent?.name || group.target_agent_id}`;
+    targetFolder = parent?.folder || group.folder;
+    targetAgentId = group.target_agent_id;
+    targetJid = agent ? `${agent.chat_jid}#agent:${group.target_agent_id}` : undefined;
+  } else if (group.target_main_jid) {
+    const target = registeredGroups[group.target_main_jid] ?? getRegisteredGroup(group.target_main_jid);
+    headerName = `${target?.name || group.target_main_jid} / 主对话`;
+    targetFolder = target?.folder || group.folder;
+    targetJid = group.target_main_jid;
+  } else {
+    headerName = `${findGroupNameByFolder(group.folder)} / 主对话`;
+    targetFolder = group.folder;
+    targetJid = findWebJidForFolder(group.folder) ?? undefined;
+  }
+
+  const header = `🧠 ${headerName}`;
+
+  if (!targetJid) {
+    logger.warn({ chatJid, targetFolder }, '/recall: no JID found for target');
     return `${header}\n\n📭 该对话暂无消息记录`;
   }
 
-  const messages = getMessagesPage(webJid, undefined, 10);
-  logger.info({ chatJid, webJid, messageCount: messages.length }, '/recall: fetched messages');
+  // Fetch recent messages for summarization
+  const messages = getMessagesPage(targetJid, undefined, 10);
+  logger.info({ chatJid, targetJid, messageCount: messages.length }, '/recall: fetched messages');
 
   if (messages.length === 0) return `${header}\n\n📭 该对话暂无消息记录`;
 
@@ -759,7 +782,7 @@ async function handleRecallCommand(chatJid: string): Promise<string> {
   logger.warn({ chatJid }, '/recall: summary failed, falling back to raw messages');
 
   // Fallback: raw context if CLI unavailable
-  const context = getConversationContext(group.folder, null, 10, 200);
+  const context = getConversationContext(targetFolder, targetAgentId, 10, 200);
   if (!context) return `${header}\n\n📭 该对话暂无消息记录`;
   return header + context;
 }
