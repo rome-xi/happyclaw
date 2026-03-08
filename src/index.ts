@@ -405,7 +405,6 @@ async function handleCommand(chatJid: string, command: string): Promise<string |
     case 'unbind':
       return handleUnbindCommand(chatJid);
     case 'bind':
-    case 'switch':
       return handleBindCommand(chatJid, rawArgs);
     case 'new':
       return handleNewCommand(chatJid, rawArgs);
@@ -493,8 +492,10 @@ function resolveBindingTarget(
   if (!workspace) return null;
 
   if (!agentSpec || agentSpec === 'main' || agentSpec === '主对话') {
+    const mainJid = findWebJidForFolder(workspace.folder);
+    if (!mainJid) return null;
     return {
-      target_main_jid: `web:${workspace.folder}`,
+      target_main_jid: mainJid,
       display: `${workspace.name} / 主对话`,
     };
   }
@@ -574,13 +575,36 @@ function handleStatusCommand(chatJid: string): string {
   const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
   if (!group) return '当前 IM 未绑定工作区';
 
-  const folderName = findGroupNameByFolder(group.folder);
+  // Show binding-aware status
+  let locationLine: string;
+  let folderLine: string;
+  if (group.target_agent_id) {
+    const agent = getAgent(group.target_agent_id);
+    const parent = agent ? (registeredGroups[agent.chat_jid] ?? getRegisteredGroup(agent.chat_jid)) : null;
+    const workspaceName = parent?.name || parent?.folder || group.folder;
+    locationLine = `📍 当前位置: ${workspaceName} / ${agent?.name || group.target_agent_id}`;
+    folderLine = `📁 工作区: ${parent?.folder || group.folder}`;
+  } else if (group.target_main_jid) {
+    const target = registeredGroups[group.target_main_jid] ?? getRegisteredGroup(group.target_main_jid);
+    locationLine = `📍 当前位置: ${target?.name || group.target_main_jid} / 主对话`;
+    folderLine = `📁 工作区: ${target?.folder || group.folder}`;
+  } else {
+    const folderName = findGroupNameByFolder(group.folder);
+    locationLine = `📍 当前位置: ${folderName} / 主对话`;
+    folderLine = `📁 工作区: ${group.folder}`;
+  }
+
+  const policyLine = (group.target_main_jid || group.target_agent_id)
+    ? `🔁 回复策略: ${group.reply_policy || 'source_only'}`
+    : null;
+
   const lines = [
-    `📍 当前位置: ${folderName} / 主对话`,
-    `📁 工作区: ${group.folder}`,
+    locationLine,
+    folderLine,
+    policyLine,
     '',
     '💡 /list 查看全部 · /recall 总结最近对话',
-  ];
+  ].filter(Boolean);
 
   return lines.join('\n');
 }
