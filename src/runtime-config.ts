@@ -9,6 +9,7 @@ const MAX_FIELD_LENGTH = 2000;
 const CURRENT_CONFIG_VERSION = 3;
 const DEFAULT_THIRD_PARTY_PROFILE_ID = 'default';
 const DEFAULT_THIRD_PARTY_PROFILE_NAME = '默认第三方';
+const OFFICIAL_CLAUDE_PROFILE_ID = '__official__';
 
 const CLAUDE_CONFIG_DIR = path.join(DATA_DIR, 'config');
 const CLAUDE_CONFIG_FILE = path.join(CLAUDE_CONFIG_DIR, 'claude-provider.json');
@@ -25,7 +26,10 @@ const CLAUDE_CUSTOM_ENV_FILE = path.join(
   'claude-custom-env.json',
 );
 const FEISHU_CONFIG_FILE = path.join(CLAUDE_CONFIG_DIR, 'feishu-provider.json');
-const TELEGRAM_CONFIG_FILE = path.join(CLAUDE_CONFIG_DIR, 'telegram-provider.json');
+const TELEGRAM_CONFIG_FILE = path.join(
+  CLAUDE_CONFIG_DIR,
+  'telegram-provider.json',
+);
 const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const RESERVED_CLAUDE_ENV_KEYS = new Set([
   'CLAUDE_CODE_OAUTH_TOKEN',
@@ -79,6 +83,8 @@ const DANGEROUS_ENV_VARS = new Set([
 ]);
 const MAX_CUSTOM_ENV_ENTRIES = 50;
 const MAX_THIRD_PARTY_PROFILES = 20;
+
+type ClaudeProviderMode = 'official' | 'third_party';
 
 export interface ClaudeOAuthCredentials {
   accessToken: string;
@@ -246,7 +252,8 @@ interface ClaudeStoredStateV3Resolved {
 }
 
 interface ClaudeStoredProfileResolved {
-  profile: ClaudeThirdPartyProfile;
+  mode: ClaudeProviderMode;
+  profile: ClaudeThirdPartyProfile | null;
   officialSecrets: SecretPayload;
   officialUpdatedAt: string | null;
 }
@@ -487,9 +494,15 @@ function decryptSecrets(secrets: EncryptedSecrets): SecretPayload {
     ),
   };
   // Restore OAuth credentials if present
-  if (parsed.claudeOAuthCredentials && typeof parsed.claudeOAuthCredentials === 'object') {
+  if (
+    parsed.claudeOAuthCredentials &&
+    typeof parsed.claudeOAuthCredentials === 'object'
+  ) {
     const creds = parsed.claudeOAuthCredentials as Record<string, unknown>;
-    if (typeof creds.accessToken === 'string' && typeof creds.refreshToken === 'string') {
+    if (
+      typeof creds.accessToken === 'string' &&
+      typeof creds.refreshToken === 'string'
+    ) {
       result.claudeOAuthCredentials = {
         accessToken: creds.accessToken,
         refreshToken: creds.refreshToken,
@@ -552,7 +565,9 @@ function readLegacyConfig(
   );
 }
 
-function toStoredProfile(profile: ClaudeThirdPartyProfile): StoredClaudeThirdPartyProfileV1 {
+function toStoredProfile(
+  profile: ClaudeThirdPartyProfile,
+): StoredClaudeThirdPartyProfileV1 {
   return {
     id: normalizeProfileId(profile.id),
     name: normalizeProfileName(profile.name),
@@ -560,7 +575,10 @@ function toStoredProfile(profile: ClaudeThirdPartyProfile): StoredClaudeThirdPar
     happyclawModel: normalizeModel(profile.happyclawModel),
     updatedAt: profile.updatedAt || new Date().toISOString(),
     secrets: encryptSecrets({
-      anthropicAuthToken: normalizeSecret(profile.anthropicAuthToken, 'anthropicAuthToken'),
+      anthropicAuthToken: normalizeSecret(
+        profile.anthropicAuthToken,
+        'anthropicAuthToken',
+      ),
       anthropicApiKey: '',
       claudeCodeOauthToken: '',
       claudeOAuthCredentials: null,
@@ -568,7 +586,9 @@ function toStoredProfile(profile: ClaudeThirdPartyProfile): StoredClaudeThirdPar
   };
 }
 
-function fromStoredProfile(stored: StoredClaudeThirdPartyProfileV1): ClaudeThirdPartyProfile {
+function fromStoredProfile(
+  stored: StoredClaudeThirdPartyProfileV1,
+): ClaudeThirdPartyProfile {
   const secrets = decryptSecrets(stored.secrets);
   return {
     id: normalizeProfileId(stored.id),
@@ -580,15 +600,55 @@ function fromStoredProfile(stored: StoredClaudeThirdPartyProfileV1): ClaudeThird
   };
 }
 
-function makeDefaultThirdPartyProfile(config: ClaudeProviderConfig): ClaudeThirdPartyProfile {
+function makeDefaultThirdPartyProfile(
+  config: ClaudeProviderConfig,
+): ClaudeThirdPartyProfile {
   return {
     id: DEFAULT_THIRD_PARTY_PROFILE_ID,
     name: DEFAULT_THIRD_PARTY_PROFILE_NAME,
     anthropicBaseUrl: config.anthropicBaseUrl,
     anthropicAuthToken: config.anthropicAuthToken,
-    happyclawModel: normalizeModel(config.happyclawModel || process.env.HAPPYCLAW_MODEL || ''),
+    happyclawModel: normalizeModel(
+      config.happyclawModel || process.env.HAPPYCLAW_MODEL || '',
+    ),
     updatedAt: config.updatedAt || new Date().toISOString(),
   };
+}
+
+function normalizeOfficialSecrets(input: SecretPayload): SecretPayload {
+  return {
+    anthropicAuthToken: '',
+    anthropicApiKey: normalizeSecret(
+      input.anthropicApiKey ?? '',
+      'anthropicApiKey',
+    ),
+    claudeCodeOauthToken: normalizeSecret(
+      input.claudeCodeOauthToken ?? '',
+      'claudeCodeOauthToken',
+    ),
+    claudeOAuthCredentials: input.claudeOAuthCredentials ?? null,
+  };
+}
+
+function isOfficialClaudeMode(activeProfileId: string): boolean {
+  return activeProfileId === OFFICIAL_CLAUDE_PROFILE_ID;
+}
+
+function buildOfficialClaudeProviderConfig(
+  officialSecrets: SecretPayload,
+  officialUpdatedAt: string | null,
+): ClaudeProviderConfig {
+  return buildConfig(
+    {
+      anthropicBaseUrl: '',
+      anthropicAuthToken: '',
+      anthropicApiKey: officialSecrets.anthropicApiKey,
+      claudeCodeOauthToken: officialSecrets.claudeCodeOauthToken,
+      claudeOAuthCredentials: officialSecrets.claudeOAuthCredentials ?? null,
+      happyclawModel: '',
+    },
+    officialUpdatedAt,
+  );
 }
 
 function normalizeStoredState(
@@ -599,12 +659,19 @@ function normalizeStoredState(
     .slice(0, MAX_THIRD_PARTY_PROFILES)
     .map((profile) => toStoredProfile(profile));
 
-  const hasActive = normalizedProfiles.some((item) => item.id === state.activeProfileId);
-  const activeProfileId = hasActive
-    ? state.activeProfileId
-    : (normalizedProfiles[0]?.id ?? DEFAULT_THIRD_PARTY_PROFILE_ID);
+  const officialSecrets = normalizeOfficialSecrets(state.officialSecrets);
+  const officialMode = isOfficialClaudeMode(state.activeProfileId);
 
   if (normalizedProfiles.length === 0) {
+    if (officialMode) {
+      return {
+        activeProfileId: OFFICIAL_CLAUDE_PROFILE_ID,
+        profiles: [],
+        officialSecrets,
+        officialUpdatedAt: state.officialUpdatedAt,
+      };
+    }
+
     const defaultProfile = toStoredProfile(
       makeDefaultThirdPartyProfile({
         anthropicBaseUrl: '',
@@ -619,28 +686,24 @@ function normalizeStoredState(
     return {
       activeProfileId: defaultProfile.id,
       profiles: [defaultProfile],
-      officialSecrets: {
-        anthropicAuthToken: '',
-        anthropicApiKey: state.officialSecrets.anthropicApiKey,
-        claudeCodeOauthToken: state.officialSecrets.claudeCodeOauthToken,
-        claudeOAuthCredentials: state.officialSecrets.claudeOAuthCredentials ?? null,
-      },
+      officialSecrets,
       officialUpdatedAt: state.officialUpdatedAt,
     };
   }
 
+  const hasActive = normalizedProfiles.some(
+    (item) => item.id === state.activeProfileId,
+  );
+  const activeProfileId = officialMode
+    ? OFFICIAL_CLAUDE_PROFILE_ID
+    : hasActive
+      ? state.activeProfileId
+      : normalizedProfiles[0].id;
+
   return {
     activeProfileId,
     profiles: normalizedProfiles,
-    officialSecrets: {
-      anthropicAuthToken: '',
-      anthropicApiKey: normalizeSecret(state.officialSecrets.anthropicApiKey ?? '', 'anthropicApiKey'),
-      claudeCodeOauthToken: normalizeSecret(
-        state.officialSecrets.claudeCodeOauthToken ?? '',
-        'claudeCodeOauthToken',
-      ),
-      claudeOAuthCredentials: state.officialSecrets.claudeOAuthCredentials ?? null,
-    },
+    officialSecrets,
     officialUpdatedAt: state.officialUpdatedAt,
   };
 }
@@ -665,7 +728,9 @@ function readStoredState(): ClaudeStoredStateV3Resolved | null {
       return normalizeStoredState({
         activeProfileId:
           typeof v3.activeProfileId === 'string'
-            ? normalizeProfileId(v3.activeProfileId)
+            ? isOfficialClaudeMode(v3.activeProfileId)
+              ? OFFICIAL_CLAUDE_PROFILE_ID
+              : normalizeProfileId(v3.activeProfileId)
             : DEFAULT_THIRD_PARTY_PROFILE_ID,
         profiles: profiles as StoredClaudeThirdPartyProfileV1[],
         officialSecrets,
@@ -687,7 +752,9 @@ function readStoredState(): ClaudeStoredStateV3Resolved | null {
         },
         v2.updatedAt || null,
       );
-      const profile = toStoredProfile(makeDefaultThirdPartyProfile(legacyConfig));
+      const profile = toStoredProfile(
+        makeDefaultThirdPartyProfile(legacyConfig),
+      );
       return normalizeStoredState({
         activeProfileId: profile.id,
         profiles: [profile],
@@ -735,7 +802,8 @@ function writeStoredState(state: ClaudeStoredStateV3Resolved): void {
         anthropicAuthToken: '',
         anthropicApiKey: normalized.officialSecrets.anthropicApiKey,
         claudeCodeOauthToken: normalized.officialSecrets.claudeCodeOauthToken,
-        claudeOAuthCredentials: normalized.officialSecrets.claudeOAuthCredentials,
+        claudeOAuthCredentials:
+          normalized.officialSecrets.claudeOAuthCredentials,
       }),
     },
   };
@@ -746,10 +814,33 @@ function writeStoredState(state: ClaudeStoredStateV3Resolved): void {
   fs.renameSync(tmp, CLAUDE_CONFIG_FILE);
 }
 
-function resolveActiveProfile(state: ClaudeStoredStateV3Resolved): ClaudeStoredProfileResolved {
-  const active = state.profiles.find((item) => item.id === state.activeProfileId) || state.profiles[0];
+function resolveActiveProfile(
+  state: ClaudeStoredStateV3Resolved,
+): ClaudeStoredProfileResolved {
+  if (isOfficialClaudeMode(state.activeProfileId)) {
+    return {
+      mode: 'official',
+      profile: null,
+      officialSecrets: state.officialSecrets,
+      officialUpdatedAt: state.officialUpdatedAt,
+    };
+  }
+
+  const active =
+    state.profiles.find((item) => item.id === state.activeProfileId) ||
+    state.profiles[0];
+  if (!active) {
+    return {
+      mode: 'official',
+      profile: null,
+      officialSecrets: state.officialSecrets,
+      officialUpdatedAt: state.officialUpdatedAt,
+    };
+  }
+
   const profile = fromStoredProfile(active);
   return {
+    mode: 'third_party',
     profile,
     officialSecrets: state.officialSecrets,
     officialUpdatedAt: state.officialUpdatedAt,
@@ -760,13 +851,21 @@ function readStoredConfig(): ClaudeProviderConfig | null {
   const state = readStoredState();
   if (!state) return null;
   const resolved = resolveActiveProfile(state);
+  if (resolved.mode === 'official' || !resolved.profile) {
+    return buildOfficialClaudeProviderConfig(
+      resolved.officialSecrets,
+      resolved.officialUpdatedAt,
+    );
+  }
+
   return buildConfig(
     {
       anthropicBaseUrl: resolved.profile.anthropicBaseUrl,
       anthropicAuthToken: resolved.profile.anthropicAuthToken,
       anthropicApiKey: resolved.officialSecrets.anthropicApiKey,
       claudeCodeOauthToken: resolved.officialSecrets.claudeCodeOauthToken,
-      claudeOAuthCredentials: resolved.officialSecrets.claudeOAuthCredentials ?? null,
+      claudeOAuthCredentials:
+        resolved.officialSecrets.claudeOAuthCredentials ?? null,
       happyclawModel: resolved.profile.happyclawModel,
     },
     resolved.profile.updatedAt || resolved.officialUpdatedAt,
@@ -893,7 +992,9 @@ export function toPublicFeishuProviderConfig(
 
 // ========== Telegram Provider Config ==========
 
-function encryptTelegramSecret(payload: TelegramSecretPayload): EncryptedSecrets {
+function encryptTelegramSecret(
+  payload: TelegramSecretPayload,
+): EncryptedSecrets {
   const key = getOrCreateEncryptionKey();
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
@@ -909,7 +1010,9 @@ function encryptTelegramSecret(payload: TelegramSecretPayload): EncryptedSecrets
   };
 }
 
-function decryptTelegramSecret(secrets: EncryptedSecrets): TelegramSecretPayload {
+function decryptTelegramSecret(
+  secrets: EncryptedSecrets,
+): TelegramSecretPayload {
   const key = getOrCreateEncryptionKey();
   const iv = Buffer.from(secrets.iv, 'base64');
   const tag = Buffer.from(secrets.tag, 'base64');
@@ -1079,7 +1182,8 @@ export function toPublicClaudeProviderConfig(
     anthropicApiKeyMasked: maskSecret(config.anthropicApiKey),
     claudeCodeOauthTokenMasked: maskSecret(config.claudeCodeOauthToken),
     hasClaudeOAuthCredentials: !!config.claudeOAuthCredentials,
-    claudeOAuthCredentialsExpiresAt: config.claudeOAuthCredentials?.expiresAt ?? null,
+    claudeOAuthCredentialsExpiresAt:
+      config.claudeOAuthCredentials?.expiresAt ?? null,
     claudeOAuthCredentialsAccessTokenMasked: config.claudeOAuthCredentials
       ? maskSecret(config.claudeOAuthCredentials.accessToken)
       : null,
@@ -1121,6 +1225,7 @@ export function getClaudeProviderConfig(): ClaudeProviderConfig {
 
 export function saveClaudeProviderConfig(
   next: Omit<ClaudeProviderConfig, 'updatedAt'>,
+  options?: { mode?: ClaudeProviderMode },
 ): ClaudeProviderConfig {
   const normalized = buildConfig(next, new Date().toISOString());
   const errors = validateClaudeProviderConfig(normalized);
@@ -1128,35 +1233,67 @@ export function saveClaudeProviderConfig(
     throw new Error(errors.join('；'));
   }
 
+  const mode =
+    options?.mode ?? (normalized.anthropicBaseUrl ? 'third_party' : 'official');
   const existing = readStoredState();
-  const baseState: ClaudeStoredStateV3Resolved =
-    existing || {
-      activeProfileId: DEFAULT_THIRD_PARTY_PROFILE_ID,
-      profiles: [
-        toStoredProfile(
-          makeDefaultThirdPartyProfile({
-            anthropicBaseUrl: normalized.anthropicBaseUrl,
-            anthropicAuthToken: normalized.anthropicAuthToken,
-            anthropicApiKey: normalized.anthropicApiKey,
-            claudeCodeOauthToken: normalized.claudeCodeOauthToken,
-            claudeOAuthCredentials: normalized.claudeOAuthCredentials,
-            happyclawModel: normalized.happyclawModel,
-            updatedAt: normalized.updatedAt,
-          }),
-        ),
-      ],
-      officialSecrets: {
-        anthropicAuthToken: '',
-        anthropicApiKey: '',
-        claudeCodeOauthToken: '',
-        claudeOAuthCredentials: null,
-      },
-      officialUpdatedAt: normalized.updatedAt,
-    };
+  const baseState: ClaudeStoredStateV3Resolved = existing || {
+    activeProfileId:
+      mode === 'official'
+        ? OFFICIAL_CLAUDE_PROFILE_ID
+        : DEFAULT_THIRD_PARTY_PROFILE_ID,
+    profiles:
+      mode === 'official'
+        ? []
+        : [
+            toStoredProfile(
+              makeDefaultThirdPartyProfile({
+                anthropicBaseUrl: normalized.anthropicBaseUrl,
+                anthropicAuthToken: normalized.anthropicAuthToken,
+                anthropicApiKey: normalized.anthropicApiKey,
+                claudeCodeOauthToken: normalized.claudeCodeOauthToken,
+                claudeOAuthCredentials: normalized.claudeOAuthCredentials,
+                happyclawModel: normalized.happyclawModel,
+                updatedAt: normalized.updatedAt,
+              }),
+            ),
+          ],
+    officialSecrets: {
+      anthropicAuthToken: '',
+      anthropicApiKey: '',
+      claudeCodeOauthToken: '',
+      claudeOAuthCredentials: null,
+    },
+    officialUpdatedAt: normalized.updatedAt,
+  };
 
-  const activeId = baseState.activeProfileId;
+  if (mode === 'official') {
+    const officialSecrets = normalizeOfficialSecrets({
+      anthropicAuthToken: '',
+      anthropicApiKey: normalized.anthropicApiKey,
+      claudeCodeOauthToken: normalized.claudeCodeOauthToken,
+      claudeOAuthCredentials: normalized.claudeOAuthCredentials,
+    });
+
+    writeStoredState({
+      ...baseState,
+      activeProfileId: OFFICIAL_CLAUDE_PROFILE_ID,
+      officialSecrets,
+      officialUpdatedAt: normalized.updatedAt,
+    });
+
+    return buildOfficialClaudeProviderConfig(
+      officialSecrets,
+      normalized.updatedAt,
+    );
+  }
+
+  const activeId = isOfficialClaudeMode(baseState.activeProfileId)
+    ? null
+    : baseState.activeProfileId;
   const activeStored =
-    baseState.profiles.find((item) => item.id === activeId) || baseState.profiles[0];
+    (activeId
+      ? baseState.profiles.find((item) => item.id === activeId)
+      : undefined) || baseState.profiles[0];
 
   const activeProfile = activeStored
     ? fromStoredProfile(activeStored)
@@ -1179,16 +1316,56 @@ export function saveClaudeProviderConfig(
   writeStoredState({
     activeProfileId: updatedProfile.id,
     profiles: updatedProfiles,
-    officialSecrets: {
+    officialSecrets: normalizeOfficialSecrets({
       anthropicAuthToken: '',
       anthropicApiKey: normalized.anthropicApiKey,
       claudeCodeOauthToken: normalized.claudeCodeOauthToken,
       claudeOAuthCredentials: normalized.claudeOAuthCredentials,
-    },
+    }),
     officialUpdatedAt: normalized.updatedAt,
   });
 
   return normalized;
+}
+
+export function saveClaudeOfficialProviderSecrets(
+  next: Pick<
+    ClaudeProviderConfig,
+    'anthropicApiKey' | 'claudeCodeOauthToken' | 'claudeOAuthCredentials'
+  >,
+  options?: { activateOfficial?: boolean },
+): ClaudeProviderConfig {
+  const updatedAt = new Date().toISOString();
+  const officialSecrets = normalizeOfficialSecrets({
+    anthropicAuthToken: '',
+    anthropicApiKey: next.anthropicApiKey,
+    claudeCodeOauthToken: next.claudeCodeOauthToken,
+    claudeOAuthCredentials: next.claudeOAuthCredentials,
+  });
+
+  const existing = readStoredState();
+  const baseState: ClaudeStoredStateV3Resolved = existing || {
+    activeProfileId: OFFICIAL_CLAUDE_PROFILE_ID,
+    profiles: [],
+    officialSecrets: {
+      anthropicAuthToken: '',
+      anthropicApiKey: '',
+      claudeCodeOauthToken: '',
+      claudeOAuthCredentials: null,
+    },
+    officialUpdatedAt: null,
+  };
+
+  writeStoredState({
+    ...baseState,
+    activeProfileId: options?.activateOfficial
+      ? OFFICIAL_CLAUDE_PROFILE_ID
+      : baseState.activeProfileId,
+    officialSecrets,
+    officialUpdatedAt: updatedAt,
+  });
+
+  return getClaudeProviderConfig();
 }
 
 export function listClaudeThirdPartyProfiles(): {
@@ -1256,7 +1433,10 @@ export function createClaudeThirdPartyProfile(input: {
     id: randomProfileId(),
     name: normalizeProfileName(input.name),
     anthropicBaseUrl: normalizeBaseUrl(input.anthropicBaseUrl),
-    anthropicAuthToken: normalizeSecret(input.anthropicAuthToken, 'anthropicAuthToken'),
+    anthropicAuthToken: normalizeSecret(
+      input.anthropicAuthToken,
+      'anthropicAuthToken',
+    ),
     happyclawModel: normalizeModel(input.happyclawModel ?? ''),
     updatedAt: now,
   };
@@ -1267,7 +1447,8 @@ export function createClaudeThirdPartyProfile(input: {
       anthropicAuthToken: profile.anthropicAuthToken,
       anthropicApiKey: state.officialSecrets.anthropicApiKey,
       claudeCodeOauthToken: state.officialSecrets.claudeCodeOauthToken,
-      claudeOAuthCredentials: state.officialSecrets.claudeOAuthCredentials ?? null,
+      claudeOAuthCredentials:
+        state.officialSecrets.claudeOAuthCredentials ?? null,
       happyclawModel: profile.happyclawModel,
     },
     now,
@@ -1279,7 +1460,8 @@ export function createClaudeThirdPartyProfile(input: {
 
   writeStoredState({
     ...state,
-    activeProfileId: state.profiles.length === 0 ? profile.id : state.activeProfileId,
+    activeProfileId:
+      state.profiles.length === 0 ? profile.id : state.activeProfileId,
     profiles: [...state.profiles, toStoredProfile(profile)],
   });
 
@@ -1304,7 +1486,10 @@ export function updateClaudeThirdPartyProfile(
   const decoded = fromStoredProfile(current);
   const next: ClaudeThirdPartyProfile = {
     ...decoded,
-    name: patch.name !== undefined ? normalizeProfileName(patch.name) : decoded.name,
+    name:
+      patch.name !== undefined
+        ? normalizeProfileName(patch.name)
+        : decoded.name,
     anthropicBaseUrl:
       patch.anthropicBaseUrl !== undefined
         ? normalizeBaseUrl(patch.anthropicBaseUrl)
@@ -1322,7 +1507,8 @@ export function updateClaudeThirdPartyProfile(
       anthropicAuthToken: next.anthropicAuthToken,
       anthropicApiKey: state.officialSecrets.anthropicApiKey,
       claudeCodeOauthToken: state.officialSecrets.claudeCodeOauthToken,
-      claudeOAuthCredentials: state.officialSecrets.claudeOAuthCredentials ?? null,
+      claudeOAuthCredentials:
+        state.officialSecrets.claudeOAuthCredentials ?? null,
       happyclawModel: next.happyclawModel,
     },
     next.updatedAt,
@@ -1376,7 +1562,8 @@ export function updateClaudeThirdPartyProfileSecret(
       anthropicAuthToken: next.anthropicAuthToken,
       anthropicApiKey: state.officialSecrets.anthropicApiKey,
       claudeCodeOauthToken: state.officialSecrets.claudeCodeOauthToken,
-      claudeOAuthCredentials: state.officialSecrets.claudeOAuthCredentials ?? null,
+      claudeOAuthCredentials:
+        state.officialSecrets.claudeOAuthCredentials ?? null,
       happyclawModel: next.happyclawModel,
     },
     next.updatedAt,
@@ -1396,7 +1583,9 @@ export function updateClaudeThirdPartyProfileSecret(
   return next;
 }
 
-export function activateClaudeThirdPartyProfile(profileId: string): ClaudeProviderConfig {
+export function activateClaudeThirdPartyProfile(
+  profileId: string,
+): ClaudeProviderConfig {
   const state = readStoredState();
   if (!state) throw new Error('Claude 配置不存在');
 
@@ -1595,7 +1784,10 @@ export function saveContainerEnvConfig(
     const cleanEnv: Record<string, string> = {};
     for (const [k, v] of Object.entries(sanitized.customEnv)) {
       if (DANGEROUS_ENV_VARS.has(k)) {
-        logger.warn({ key: k }, 'Rejected dangerous env variable in saveContainerEnvConfig');
+        logger.warn(
+          { key: k },
+          'Rejected dangerous env variable in saveContainerEnvConfig',
+        );
         continue;
       }
       cleanEnv[k] = sanitizeEnvValue(v);
@@ -1793,7 +1985,9 @@ export function writeCredentialsFile(
 /**
  * Update .credentials.json in all existing session directories + host ~/.claude/
  */
-export function updateAllSessionCredentials(config: ClaudeProviderConfig): void {
+export function updateAllSessionCredentials(
+  config: ClaudeProviderConfig,
+): void {
   if (!config.claudeOAuthCredentials) return;
 
   const sessionsDir = path.join(DATA_DIR, 'sessions');
@@ -1805,7 +1999,10 @@ export function updateAllSessionCredentials(config: ClaudeProviderConfig): void 
         try {
           writeCredentialsFile(claudeDir, config);
         } catch (err) {
-          logger.warn({ err, folder }, 'Failed to write .credentials.json for session');
+          logger.warn(
+            { err, folder },
+            'Failed to write .credentials.json for session',
+          );
         }
       }
       // Also update sub-agent session dirs
@@ -1813,11 +2010,17 @@ export function updateAllSessionCredentials(config: ClaudeProviderConfig): void 
       if (fs.existsSync(agentsDir) && fs.statSync(agentsDir).isDirectory()) {
         for (const agentId of fs.readdirSync(agentsDir)) {
           const agentClaudeDir = path.join(agentsDir, agentId, '.claude');
-          if (fs.existsSync(agentClaudeDir) && fs.statSync(agentClaudeDir).isDirectory()) {
+          if (
+            fs.existsSync(agentClaudeDir) &&
+            fs.statSync(agentClaudeDir).isDirectory()
+          ) {
             try {
               writeCredentialsFile(agentClaudeDir, config);
             } catch (err) {
-              logger.warn({ err, folder, agentId }, 'Failed to write .credentials.json for agent session');
+              logger.warn(
+                { err, folder, agentId },
+                'Failed to write .credentials.json for agent session',
+              );
             }
           }
         }
@@ -1829,7 +2032,10 @@ export function updateAllSessionCredentials(config: ClaudeProviderConfig): void 
 
   // Host mode: update ~/.claude/.credentials.json
   const homeClaudeDir = path.join(process.env.HOME || '/root', '.claude');
-  if (fs.existsSync(homeClaudeDir) && fs.statSync(homeClaudeDir).isDirectory()) {
+  if (
+    fs.existsSync(homeClaudeDir) &&
+    fs.statSync(homeClaudeDir).isDirectory()
+  ) {
     try {
       writeCredentialsFile(homeClaudeDir, config);
     } catch (err) {
@@ -1850,10 +2056,11 @@ export async function refreshOAuthCredentials(
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-        'Accept': 'application/json, text/plain, */*',
-        'Referer': 'https://claude.ai/',
-        'Origin': 'https://claude.ai',
+        'User-Agent':
+          'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        Accept: 'application/json, text/plain, */*',
+        Referer: 'https://claude.ai/',
+        Origin: 'https://claude.ai',
       },
       body: JSON.stringify({
         grant_type: 'refresh_token',
@@ -1864,7 +2071,10 @@ export async function refreshOAuthCredentials(
 
     if (!resp.ok) {
       const errText = await resp.text().catch(() => '');
-      logger.warn({ status: resp.status, body: errText }, 'OAuth token refresh failed');
+      logger.warn(
+        { status: resp.status, body: errText },
+        'OAuth token refresh failed',
+      );
       return null;
     }
 
@@ -1928,7 +2138,8 @@ function readLocalOAuthCredentials(): {
       return {
         accessToken: oauth.accessToken,
         refreshToken: oauth.refreshToken,
-        expiresAt: typeof oauth.expiresAt === 'number' ? oauth.expiresAt : undefined,
+        expiresAt:
+          typeof oauth.expiresAt === 'number' ? oauth.expiresAt : undefined,
         scopes: Array.isArray(oauth.scopes) ? oauth.scopes : undefined,
       };
     }
@@ -1985,10 +2196,7 @@ export function importLocalClaudeCredentials(): ClaudeOAuthCredentials | null {
 
 // ─── Appearance config (plain JSON, no encryption) ────────────────
 
-const APPEARANCE_CONFIG_FILE = path.join(
-  CLAUDE_CONFIG_DIR,
-  'appearance.json',
-);
+const APPEARANCE_CONFIG_FILE = path.join(CLAUDE_CONFIG_DIR, 'appearance.json');
 
 export interface AppearanceConfig {
   appName: string;
@@ -2040,7 +2248,8 @@ export function getAppearanceConfig(): AppearanceConfig {
 }
 
 export function saveAppearanceConfig(
-  next: Partial<Pick<AppearanceConfig, 'appName'>> & Omit<AppearanceConfig, 'appName'>,
+  next: Partial<Pick<AppearanceConfig, 'appName'>> &
+    Omit<AppearanceConfig, 'appName'>,
 ): AppearanceConfig {
   const existing = getAppearanceConfig();
   const config = {
@@ -2136,7 +2345,9 @@ export function saveUserFeishuConfig(
   return normalized;
 }
 
-export function getUserTelegramConfig(userId: string): UserTelegramConfig | null {
+export function getUserTelegramConfig(
+  userId: string,
+): UserTelegramConfig | null {
   const filePath = path.join(userImDir(userId), 'telegram.json');
   try {
     if (!fs.existsSync(filePath)) return null;
@@ -2185,7 +2396,10 @@ export function saveUserTelegramConfig(
 
 // ─── System settings (plain JSON, no encryption) ─────────────────
 
-const SYSTEM_SETTINGS_FILE = path.join(CLAUDE_CONFIG_DIR, 'system-settings.json');
+const SYSTEM_SETTINGS_FILE = path.join(
+  CLAUDE_CONFIG_DIR,
+  'system-settings.json',
+);
 
 export interface SystemSettings {
   containerTimeout: number;
@@ -2236,15 +2450,18 @@ function readSystemSettingsFromFile(): SystemSettings | null {
         ? raw.idleTimeout
         : DEFAULT_SYSTEM_SETTINGS.idleTimeout,
     containerMaxOutputSize:
-      typeof raw.containerMaxOutputSize === 'number' && raw.containerMaxOutputSize > 0
+      typeof raw.containerMaxOutputSize === 'number' &&
+      raw.containerMaxOutputSize > 0
         ? raw.containerMaxOutputSize
         : DEFAULT_SYSTEM_SETTINGS.containerMaxOutputSize,
     maxConcurrentContainers:
-      typeof raw.maxConcurrentContainers === 'number' && raw.maxConcurrentContainers > 0
+      typeof raw.maxConcurrentContainers === 'number' &&
+      raw.maxConcurrentContainers > 0
         ? raw.maxConcurrentContainers
         : DEFAULT_SYSTEM_SETTINGS.maxConcurrentContainers,
     maxConcurrentHostProcesses:
-      typeof raw.maxConcurrentHostProcesses === 'number' && raw.maxConcurrentHostProcesses > 0
+      typeof raw.maxConcurrentHostProcesses === 'number' &&
+      raw.maxConcurrentHostProcesses > 0
         ? raw.maxConcurrentHostProcesses
         : DEFAULT_SYSTEM_SETTINGS.maxConcurrentHostProcesses,
     maxLoginAttempts:
@@ -2256,7 +2473,8 @@ function readSystemSettingsFromFile(): SystemSettings | null {
         ? raw.loginLockoutMinutes
         : DEFAULT_SYSTEM_SETTINGS.loginLockoutMinutes,
     maxConcurrentScripts:
-      typeof raw.maxConcurrentScripts === 'number' && raw.maxConcurrentScripts > 0
+      typeof raw.maxConcurrentScripts === 'number' &&
+      raw.maxConcurrentScripts > 0
         ? raw.maxConcurrentScripts
         : DEFAULT_SYSTEM_SETTINGS.maxConcurrentScripts,
     scriptTimeout:
@@ -2268,15 +2486,42 @@ function readSystemSettingsFromFile(): SystemSettings | null {
 
 function buildEnvFallbackSettings(): SystemSettings {
   return {
-    containerTimeout: parseIntEnv(process.env.CONTAINER_TIMEOUT, DEFAULT_SYSTEM_SETTINGS.containerTimeout),
-    idleTimeout: parseIntEnv(process.env.IDLE_TIMEOUT, DEFAULT_SYSTEM_SETTINGS.idleTimeout),
-    containerMaxOutputSize: parseIntEnv(process.env.CONTAINER_MAX_OUTPUT_SIZE, DEFAULT_SYSTEM_SETTINGS.containerMaxOutputSize),
-    maxConcurrentContainers: parseIntEnv(process.env.MAX_CONCURRENT_CONTAINERS, DEFAULT_SYSTEM_SETTINGS.maxConcurrentContainers),
-    maxConcurrentHostProcesses: parseIntEnv(process.env.MAX_CONCURRENT_HOST_PROCESSES, DEFAULT_SYSTEM_SETTINGS.maxConcurrentHostProcesses),
-    maxLoginAttempts: parseIntEnv(process.env.MAX_LOGIN_ATTEMPTS, DEFAULT_SYSTEM_SETTINGS.maxLoginAttempts),
-    loginLockoutMinutes: parseIntEnv(process.env.LOGIN_LOCKOUT_MINUTES, DEFAULT_SYSTEM_SETTINGS.loginLockoutMinutes),
-    maxConcurrentScripts: parseIntEnv(process.env.MAX_CONCURRENT_SCRIPTS, DEFAULT_SYSTEM_SETTINGS.maxConcurrentScripts),
-    scriptTimeout: parseIntEnv(process.env.SCRIPT_TIMEOUT, DEFAULT_SYSTEM_SETTINGS.scriptTimeout),
+    containerTimeout: parseIntEnv(
+      process.env.CONTAINER_TIMEOUT,
+      DEFAULT_SYSTEM_SETTINGS.containerTimeout,
+    ),
+    idleTimeout: parseIntEnv(
+      process.env.IDLE_TIMEOUT,
+      DEFAULT_SYSTEM_SETTINGS.idleTimeout,
+    ),
+    containerMaxOutputSize: parseIntEnv(
+      process.env.CONTAINER_MAX_OUTPUT_SIZE,
+      DEFAULT_SYSTEM_SETTINGS.containerMaxOutputSize,
+    ),
+    maxConcurrentContainers: parseIntEnv(
+      process.env.MAX_CONCURRENT_CONTAINERS,
+      DEFAULT_SYSTEM_SETTINGS.maxConcurrentContainers,
+    ),
+    maxConcurrentHostProcesses: parseIntEnv(
+      process.env.MAX_CONCURRENT_HOST_PROCESSES,
+      DEFAULT_SYSTEM_SETTINGS.maxConcurrentHostProcesses,
+    ),
+    maxLoginAttempts: parseIntEnv(
+      process.env.MAX_LOGIN_ATTEMPTS,
+      DEFAULT_SYSTEM_SETTINGS.maxLoginAttempts,
+    ),
+    loginLockoutMinutes: parseIntEnv(
+      process.env.LOGIN_LOCKOUT_MINUTES,
+      DEFAULT_SYSTEM_SETTINGS.loginLockoutMinutes,
+    ),
+    maxConcurrentScripts: parseIntEnv(
+      process.env.MAX_CONCURRENT_SCRIPTS,
+      DEFAULT_SYSTEM_SETTINGS.maxConcurrentScripts,
+    ),
+    scriptTimeout: parseIntEnv(
+      process.env.SCRIPT_TIMEOUT,
+      DEFAULT_SYSTEM_SETTINGS.scriptTimeout,
+    ),
   };
 }
 
@@ -2298,12 +2543,19 @@ export function getSystemSettings(): SystemSettings {
       const settings = readSystemSettingsFromFile();
       if (settings) {
         _settingsCache = settings;
-        try { _settingsMtimeMs = fs.statSync(SYSTEM_SETTINGS_FILE).mtimeMs; } catch { /* ignore */ }
+        try {
+          _settingsMtimeMs = fs.statSync(SYSTEM_SETTINGS_FILE).mtimeMs;
+        } catch {
+          /* ignore */
+        }
         return settings;
       }
     }
   } catch (err) {
-    logger.warn({ err }, 'Failed to read system settings, falling back to env/defaults');
+    logger.warn(
+      { err },
+      'Failed to read system settings, falling back to env/defaults',
+    );
   }
 
   // 2. Fall back to env vars, then hardcoded defaults
@@ -2313,29 +2565,36 @@ export function getSystemSettings(): SystemSettings {
   return settings;
 }
 
-export function saveSystemSettings(partial: Partial<SystemSettings>): SystemSettings {
+export function saveSystemSettings(
+  partial: Partial<SystemSettings>,
+): SystemSettings {
   const existing = getSystemSettings();
   const merged: SystemSettings = { ...existing, ...partial };
 
   // Range validation
-  if (merged.containerTimeout < 60000) merged.containerTimeout = 60000;           // min 1 min
-  if (merged.containerTimeout > 86400000) merged.containerTimeout = 86400000;     // max 24 hours
+  if (merged.containerTimeout < 60000) merged.containerTimeout = 60000; // min 1 min
+  if (merged.containerTimeout > 86400000) merged.containerTimeout = 86400000; // max 24 hours
   if (merged.idleTimeout < 60000) merged.idleTimeout = 60000;
   if (merged.idleTimeout > 86400000) merged.idleTimeout = 86400000;
-  if (merged.containerMaxOutputSize < 1048576) merged.containerMaxOutputSize = 1048576;   // min 1MB
-  if (merged.containerMaxOutputSize > 104857600) merged.containerMaxOutputSize = 104857600; // max 100MB
+  if (merged.containerMaxOutputSize < 1048576)
+    merged.containerMaxOutputSize = 1048576; // min 1MB
+  if (merged.containerMaxOutputSize > 104857600)
+    merged.containerMaxOutputSize = 104857600; // max 100MB
   if (merged.maxConcurrentContainers < 1) merged.maxConcurrentContainers = 1;
-  if (merged.maxConcurrentContainers > 100) merged.maxConcurrentContainers = 100;
-  if (merged.maxConcurrentHostProcesses < 1) merged.maxConcurrentHostProcesses = 1;
-  if (merged.maxConcurrentHostProcesses > 50) merged.maxConcurrentHostProcesses = 50;
+  if (merged.maxConcurrentContainers > 100)
+    merged.maxConcurrentContainers = 100;
+  if (merged.maxConcurrentHostProcesses < 1)
+    merged.maxConcurrentHostProcesses = 1;
+  if (merged.maxConcurrentHostProcesses > 50)
+    merged.maxConcurrentHostProcesses = 50;
   if (merged.maxLoginAttempts < 1) merged.maxLoginAttempts = 1;
   if (merged.maxLoginAttempts > 100) merged.maxLoginAttempts = 100;
   if (merged.loginLockoutMinutes < 1) merged.loginLockoutMinutes = 1;
-  if (merged.loginLockoutMinutes > 1440) merged.loginLockoutMinutes = 1440;       // max 24 hours
+  if (merged.loginLockoutMinutes > 1440) merged.loginLockoutMinutes = 1440; // max 24 hours
   if (merged.maxConcurrentScripts < 1) merged.maxConcurrentScripts = 1;
   if (merged.maxConcurrentScripts > 50) merged.maxConcurrentScripts = 50;
-  if (merged.scriptTimeout < 5000) merged.scriptTimeout = 5000;                   // min 5s
-  if (merged.scriptTimeout > 600000) merged.scriptTimeout = 600000;               // max 10 min
+  if (merged.scriptTimeout < 5000) merged.scriptTimeout = 5000; // min 5s
+  if (merged.scriptTimeout > 600000) merged.scriptTimeout = 600000; // max 10 min
 
   fs.mkdirSync(CLAUDE_CONFIG_DIR, { recursive: true });
   const tmp = `${SYSTEM_SETTINGS_FILE}.tmp`;
@@ -2344,7 +2603,11 @@ export function saveSystemSettings(partial: Partial<SystemSettings>): SystemSett
 
   // Update in-memory cache immediately
   _settingsCache = merged;
-  try { _settingsMtimeMs = fs.statSync(SYSTEM_SETTINGS_FILE).mtimeMs; } catch { /* ignore */ }
+  try {
+    _settingsMtimeMs = fs.statSync(SYSTEM_SETTINGS_FILE).mtimeMs;
+  } catch {
+    /* ignore */
+  }
 
   return merged;
 }
