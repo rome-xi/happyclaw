@@ -615,21 +615,6 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
   if (!existing) return c.json({ error: 'Group not found' }, 404);
 
   const authUser = c.get('user') as AuthUser;
-  if (!canModifyGroup({ id: authUser.id, role: authUser.role }, existing)) {
-    return c.json({ error: 'Group not found' }, 404);
-  }
-
-  // Non-web JIDs (feishu/telegram) cannot be renamed by non-admin
-  if (!jid.startsWith('web:') && authUser.role !== 'admin') {
-    return c.json({ error: 'This group cannot be edited' }, 403);
-  }
-
-  if (isHostExecutionGroup(existing) && !hasHostExecutionPermission(authUser)) {
-    return c.json(
-      { error: 'Insufficient permissions for host execution mode' },
-      403,
-    );
-  }
 
   const body = await c.req.json().catch(() => ({}));
   const validation = GroupPatchSchema.safeParse(body);
@@ -646,6 +631,25 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
   // 至少需要提供一个字段
   if (!name && selected_skills === undefined && is_pinned === undefined) {
     return c.json({ error: 'No fields to update' }, 400);
+  }
+
+  // Pin/unpin only requires canAccessGroup (it's a per-user preference)
+  const isPinOnly = is_pinned !== undefined && !name && selected_skills === undefined;
+  if (isPinOnly) {
+    if (!canAccessGroup({ id: authUser.id, role: authUser.role }, { ...existing, jid })) {
+      return c.json({ error: 'Group not found' }, 404);
+    }
+  } else {
+    // Name/skills changes require canModifyGroup (owner only)
+    if (!canModifyGroup({ id: authUser.id, role: authUser.role }, { ...existing, jid })) {
+      return c.json({ error: 'Group not found' }, 404);
+    }
+    if (!jid.startsWith('web:') && authUser.role !== 'admin') {
+      return c.json({ error: 'This group cannot be edited' }, 403);
+    }
+    if (isHostExecutionGroup(existing) && !hasHostExecutionPermission(authUser)) {
+      return c.json({ error: 'Insufficient permissions for host execution mode' }, 403);
+    }
   }
 
   // Handle pin/unpin (per-user, separate table)
