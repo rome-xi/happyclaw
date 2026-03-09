@@ -543,7 +543,7 @@ scripts/                      # 构建辅助脚本
 
 **实现原理**：连接飞书时通过 Bot Info API 获取 bot 的 `open_id`，收到群消息后检查 `mentions[].id.open_id` 是否包含 bot。如果 bot 未被 @mention 且该群 `require_mention=true`，则静默丢弃该消息。
 
-**前置条件**：飞书应用需要 `im:message:readonly` 权限（接收群里所有消息），否则平台层只推送 @消息，应用层控制无意义。
+**前置条件**：飞书应用需要 `im:message.group_msg` 敏感权限（实时接收群里所有消息）。`im:message:readonly` 仅控制 REST API 读取历史消息，不影响 WebSocket 实时推送。没有 `im:message.group_msg` 权限时，平台层只推送 @消息，`require_mention=false` 无法生效。
 
 ## 9. 环境变量
 
