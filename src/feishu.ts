@@ -1031,8 +1031,8 @@ export function createFeishuConnection(config: FeishuConnectionConfig): FeishuCo
           method: 'GET',
           url: '/open-apis/bot/v3/info/',
         });
-        const info = botInfoRes as { data?: { bot?: { open_id?: string } } };
-        botOpenId = info?.data?.bot?.open_id || '';
+        const info = botInfoRes as { bot?: { open_id?: string }; data?: { bot?: { open_id?: string } } };
+        botOpenId = info?.bot?.open_id || info?.data?.bot?.open_id || '';
         if (botOpenId) {
           logger.info({ botOpenId }, 'Fetched bot open_id for mention detection');
         } else {
