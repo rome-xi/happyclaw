@@ -2998,18 +2998,17 @@ async function processAgentConversation(
   const prompt = formatMessages(missedMessages, false);
   const images = collectMessageImages(virtualChatJid, missedMessages);
   const imagesForAgent = images.length > 0 ? images : undefined;
-  // Same mixed-source logic as processGroupMessages (#99): only route to IM
-  // when ALL messages share the same IM source.
+  // For agent conversations, route reply to IM based on the most recent
+  // message's source.  Unlike the main conversation (#99), agent conversations
+  // are explicitly bound to IM groups, so the user expects replies to go back
+  // to the IM channel they last messaged from — even if older messages in
+  // the batch originated from the web (e.g. after a /clear).
   let replySourceImJid: string | null = null;
   {
-    const firstSourceJid = missedMessages[0]?.source_jid || virtualChatJid;
-    const allSameImSource =
-      getChannelType(firstSourceJid) !== null &&
-      missedMessages.every(
-        (m) => (m.source_jid || virtualChatJid) === firstSourceJid,
-      );
-    if (allSameImSource) {
-      replySourceImJid = firstSourceJid;
+    const lastSourceJid =
+      missedMessages[missedMessages.length - 1]?.source_jid;
+    if (lastSourceJid && getChannelType(lastSourceJid) !== null) {
+      replySourceImJid = lastSourceJid;
     }
   }
 
@@ -3691,26 +3690,50 @@ function buildOnAgentMessage(): (baseChatJid: string, agentId: string) => void {
     const homeChatJid = `web:${folder}`;
     const virtualChatJid = `${homeChatJid}#agent:${agentId}`;
 
-    // Fetch pending messages and format them for IPC (same as web.ts agent handler)
+    // Fetch pending messages
     const sinceCursor = lastAgentTimestamp[virtualChatJid] || EMPTY_CURSOR;
     const missedMessages = getMessagesSince(virtualChatJid, sinceCursor);
-    const formatted =
-      missedMessages.length > 0 ? formatMessages(missedMessages, false) : '';
 
-    // Collect images from the messages
-    const images = collectMessageImages(virtualChatJid, missedMessages);
-    const imagesForAgent = images.length > 0 ? images : undefined;
+    // IM messages must force-restart the agent process so reply routing
+    // (replySourceImJid) is recalculated from the latest batch.  This mirrors
+    // the home-folder force-restart for the main conversation.
+    const lastSourceJid =
+      missedMessages[missedMessages.length - 1]?.source_jid;
+    const isImSource =
+      !!lastSourceJid && getChannelType(lastSourceJid) !== null;
 
-    // Try to pipe into running agent process first
-    const sendResult = formatted
-      ? queue.sendMessage(virtualChatJid, formatted, imagesForAgent, undefined)
-      : 'no_active';
-    if (sendResult === 'no_active') {
-      // No running process (or no messages to pipe) — start one via processAgentConversation
-      const taskId = `agent-conv:${agentId}:${Date.now()}`;
+    if (isImSource) {
+      // Force close running process then enqueue fresh start.
+      // Use a stable taskId so rapid-fire IM messages deduplicate into a
+      // single queued restart instead of N separate restarts.
+      queue.closeStdin(virtualChatJid);
+      const taskId = `agent-im-restart:${agentId}`;
       queue.enqueueTask(virtualChatJid, taskId, async () => {
         await processAgentConversation(homeChatJid, agentId);
       });
+    } else {
+      // Web-origin: try to pipe into running agent process
+      const formatted =
+        missedMessages.length > 0
+          ? formatMessages(missedMessages, false)
+          : '';
+      const images = collectMessageImages(virtualChatJid, missedMessages);
+      const imagesForAgent = images.length > 0 ? images : undefined;
+
+      const sendResult = formatted
+        ? queue.sendMessage(
+            virtualChatJid,
+            formatted,
+            imagesForAgent,
+            undefined,
+          )
+        : 'no_active';
+      if (sendResult === 'no_active') {
+        const taskId = `agent-conv:${agentId}:${Date.now()}`;
+        queue.enqueueTask(virtualChatJid, taskId, async () => {
+          await processAgentConversation(homeChatJid, agentId);
+        });
+      }
     }
     logger.info(
       {
