@@ -203,7 +203,7 @@ export function SetupProvidersPage() {
       if (feishuAppId.trim() || feishuAppSecret.trim()) {
         const payload: Record<string, string> = { appId: feishuAppId.trim() };
         if (feishuAppSecret.trim()) payload.appSecret = feishuAppSecret.trim();
-        await api.put('/api/config/feishu', payload);
+        await api.put('/api/config/user-im/feishu', payload);
       }
 
       if (providerMode === 'official') {

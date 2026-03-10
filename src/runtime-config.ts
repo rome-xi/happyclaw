@@ -2363,6 +2363,7 @@ export interface UserFeishuConfig {
 
 export interface UserTelegramConfig {
   botToken: string;
+  proxyUrl?: string;
   enabled?: boolean;
   updatedAt: string | null;
 }
@@ -2457,6 +2458,7 @@ export function getUserTelegramConfig(
     const secret = decryptTelegramSecret(stored.secret);
     return {
       botToken: secret.botToken,
+      proxyUrl: normalizeTelegramProxyUrl(stored.proxyUrl ?? ''),
       enabled: stored.enabled,
       updatedAt: stored.updatedAt || null,
     };
@@ -2470,14 +2472,19 @@ export function saveUserTelegramConfig(
   userId: string,
   next: Omit<UserTelegramConfig, 'updatedAt'>,
 ): UserTelegramConfig {
+  const normalizedProxyUrl = next.proxyUrl
+    ? normalizeTelegramProxyUrl(next.proxyUrl)
+    : '';
   const normalized: UserTelegramConfig = {
     botToken: normalizeSecret(next.botToken, 'botToken'),
+    proxyUrl: normalizedProxyUrl || undefined,
     enabled: next.enabled,
     updatedAt: new Date().toISOString(),
   };
 
   const payload: StoredTelegramProviderConfigV1 = {
     version: 1,
+    proxyUrl: normalizedProxyUrl || undefined,
     enabled: normalized.enabled,
     updatedAt: normalized.updatedAt || new Date().toISOString(),
     secret: encryptTelegramSecret({ botToken: normalized.botToken }),

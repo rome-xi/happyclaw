@@ -257,7 +257,8 @@ StreamEvent 类型以 `shared/stream-event.ts` 为单一真相源，构建时通
 - 每个用户可独立配置飞书、Telegram 和 QQ 连接（存储在 `data/config/user-im/{userId}/feishu.json`、`telegram.json`、`qq.json`）
 - `feishu.ts`、`telegram.ts`、`qq.ts` 均为工厂模式（`createFeishuConnection()`、`createTelegramConnection()`、`createQQConnection()`），返回无状态的连接实例
 - 系统启动时 `loadState()` 遍历所有用户，加载已保存的 IM 配置并建立连接
-- 管理员的系统级飞书/Telegram 配置（`data/config/feishu-provider.json`）绑定到 admin 用户的连接
+- 首次启动时自动迁移系统级 IM 配置到 admin 的 per-user 配置（`migrateSystemIMToPerUser()`）
+- 系统级 API（`/api/config/feishu`、`/api/config/telegram`）已标记 deprecated，新代码应使用 `/api/config/user-im/*`
 - 收到 IM 消息时，通过 `onNewChat` 回调自动注册到该用户的主容器（`home-{userId}`）
 - 支持热重连（`ignoreMessagesBefore` 过滤渠道关闭期间的堆积消息）
 - 优雅关闭时 `disconnectAll()` 批量断开所有连接
@@ -408,14 +409,15 @@ scripts/                      # 构建辅助脚本
 - `GET|PUT /api/config/claude` · `PUT /api/config/claude/secrets`
 - `GET|PUT /api/config/claude/custom-env`
 - `POST /api/config/claude/test`（连通性测试） · `POST /api/config/claude/apply`（应用到所有容器）
-- `GET|PUT /api/config/feishu`
-- `GET|PUT /api/config/telegram` · `POST /api/config/telegram/test`（系统级 Telegram 配置）
+- `GET|PUT /api/config/feishu`（**deprecated**，使用 `/api/config/user-im/feishu` 代替）
+- `GET|PUT /api/config/telegram` · `POST /api/config/telegram/test`（**deprecated**，使用 `/api/config/user-im/telegram` 代替）
 - `GET|PUT /api/config/appearance` · `GET /api/config/appearance/public`（外观配置，public 端点无需认证）
 - `GET|PUT /api/config/system` — 系统运行参数（容器超时、并发限制等），需要 `manage_system_config` 权限
-- `GET|PUT /api/config/user-im/feishu`（用户级飞书 IM 配置，每个用户独立）
-- `GET|PUT /api/config/user-im/telegram`（用户级 Telegram IM 配置）
-- `POST /api/config/user-im/telegram/test`（Telegram Bot Token 连通性测试）
-- `GET|PUT /api/config/user-im/qq`（用户级 QQ IM 配置）
+- `GET /api/config/user-im/status`（所有渠道连接状态，含 QQ）
+- `GET|PUT /api/config/user-im/feishu`（用户级飞书 IM 配置，GET 返回 `connected` 字段）
+- `GET|PUT /api/config/user-im/telegram`（用户级 Telegram IM 配置，GET 返回 `connected`、`effectiveProxyUrl`、`proxySource`，PUT 支持 `proxyUrl`/`clearProxyUrl`）
+- `POST /api/config/user-im/telegram/test`（Telegram Bot Token 连通性测试，使用 per-user proxyUrl）
+- `GET|PUT /api/config/user-im/qq`（用户级 QQ IM 配置，GET 返回 `connected` 字段）
 - `POST /api/config/user-im/qq/test`（QQ 凭据连通性测试）
 - `POST /api/config/user-im/qq/pairing-code`（生成 QQ 配对码）
 - `GET /api/config/user-im/qq/paired-chats`（已配对的 QQ 聊天列表）

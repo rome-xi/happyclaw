@@ -91,6 +91,8 @@ import {
   getSystemSettings,
   refreshOAuthCredentials,
   saveClaudeProviderConfig as saveClaudeProviderConfigForRefresh,
+  saveUserFeishuConfig,
+  saveUserTelegramConfig,
   updateAllSessionCredentials,
 } from './runtime-config.js';
 import type {
@@ -999,6 +1001,83 @@ interface SendMessageOptions {
   sendToIM?: boolean;
   /** Pre-computed local image paths to attach to IM messages. Avoids redundant filesystem scans. */
   localImagePaths?: string[];
+}
+
+/**
+ * One-time migration: copy system-level IM config → admin's per-user config.
+ * Safe to call repeatedly — writes a flag file after first successful run.
+ */
+function migrateSystemIMToPerUser(): void {
+  const flagFile = path.join(DATA_DIR, 'config', '.im-config-migrated');
+  if (fs.existsSync(flagFile)) return;
+
+  try {
+    // Find first admin user
+    const adminResult = listUsers({
+      status: 'active',
+      role: 'admin',
+      page: 1,
+      pageSize: 1,
+    });
+    const admin = adminResult.users[0];
+    if (!admin) {
+      // No admin yet (fresh install) — nothing to migrate
+      return;
+    }
+
+    let migratedFeishu = false;
+    let migratedTelegram = false;
+
+    // Feishu: copy system config → admin per-user (if admin has no per-user config)
+    const existingUserFeishu = getUserFeishuConfig(admin.id);
+    if (!existingUserFeishu) {
+      const { config: sysFeishu, source: feishuSource } =
+        getFeishuProviderConfigWithSource();
+      if (feishuSource !== 'none' && sysFeishu.appId && sysFeishu.appSecret) {
+        saveUserFeishuConfig(admin.id, {
+          appId: sysFeishu.appId,
+          appSecret: sysFeishu.appSecret,
+          enabled: sysFeishu.enabled,
+        });
+        migratedFeishu = true;
+      }
+    }
+
+    // Telegram: copy system config → admin per-user (if admin has no per-user config)
+    const existingUserTelegram = getUserTelegramConfig(admin.id);
+    if (!existingUserTelegram) {
+      const { config: sysTelegram, source: telegramSource } =
+        getTelegramProviderConfigWithSource();
+      if (telegramSource !== 'none' && sysTelegram.botToken) {
+        saveUserTelegramConfig(admin.id, {
+          botToken: sysTelegram.botToken,
+          proxyUrl: sysTelegram.proxyUrl,
+          enabled: sysTelegram.enabled,
+        });
+        migratedTelegram = true;
+      }
+    }
+
+    // Write flag file (even if nothing was migrated — to avoid re-checking)
+    fs.mkdirSync(path.dirname(flagFile), { recursive: true });
+    fs.writeFileSync(flagFile, new Date().toISOString() + '\n', 'utf-8');
+
+    if (migratedFeishu || migratedTelegram) {
+      logger.info(
+        {
+          adminId: admin.id,
+          feishu: migratedFeishu,
+          telegram: migratedTelegram,
+        },
+        'Migrated system-level IM config to admin per-user config',
+      );
+    }
+  } catch (err) {
+    logger.warn(
+      { err },
+      'Failed to migrate system-level IM config (non-fatal)',
+    );
+  }
 }
 
 function loadState(): void {
@@ -3920,6 +3999,9 @@ async function main(): Promise<void> {
     logger.warn({ err }, 'Failed to mark stale running tasks at startup');
   }
 
+  // Migrate system-level IM config → admin's per-user config (one-time)
+  migrateSystemIMToPerUser();
+
   loadState();
 
   // --- Channel reload helpers (hot-reload on config save) ---
@@ -4133,7 +4215,10 @@ async function main(): Promise<void> {
       if (config && config.enabled !== false && config.botToken) {
         const connected = await imManager.connectUserTelegram(
           userId,
-          { ...config, proxyUrl: globalTelegramConfig.proxyUrl },
+          {
+            ...config,
+            proxyUrl: config.proxyUrl || globalTelegramConfig.proxyUrl,
+          },
           onNewChat,
           buildIsChatAuthorized(userId),
           buildOnPairAttempt(userId),
@@ -4219,6 +4304,9 @@ async function main(): Promise<void> {
     processAgentConversation,
     getFeishuChatInfo: (userId: string, chatId: string) =>
       imManager.getFeishuChatInfo(userId, chatId),
+    clearImFailCounts: (jid: string) => {
+      imHealthCheckFailCounts.delete(jid);
+    },
   });
 
   // Clean expired sessions every hour
@@ -4396,7 +4484,7 @@ async function main(): Promise<void> {
     if (userTelegram && userTelegram.botToken) {
       effectiveTelegram = {
         botToken: userTelegram.botToken,
-        proxyUrl: globalTelegramConfig.config.proxyUrl,
+        proxyUrl: userTelegram.proxyUrl || globalTelegramConfig.config.proxyUrl,
         enabled: userTelegram.enabled,
       };
     } else if (

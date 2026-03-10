@@ -5,7 +5,15 @@ import { Agent as HttpsAgent } from 'node:https';
 import { ProxyAgent } from 'proxy-agent';
 import { Hono } from 'hono';
 import type { Variables } from '../web-context.js';
-import { deleteRegisteredGroup, deleteChatHistory } from '../db.js';
+import { canAccessGroup, getWebDeps } from '../web-context.js';
+import { getChannelType } from '../im-channel.js';
+import {
+  deleteRegisteredGroup,
+  deleteChatHistory,
+  getRegisteredGroup,
+  setRegisteredGroup,
+  getAgent,
+} from '../db.js';
 import { authMiddleware, systemConfigMiddleware } from '../middleware/auth.js';
 import {
   ClaudeConfigSchema,
@@ -62,7 +70,7 @@ import {
   importLocalClaudeCredentials,
 } from '../runtime-config.js';
 import type { ClaudeOAuthCredentials } from '../runtime-config.js';
-import type { AuthUser } from '../types.js';
+import type { AuthUser, RegisteredGroup } from '../types.js';
 import { hasPermission } from '../permissions.js';
 import { logger } from '../logger.js';
 
@@ -976,7 +984,38 @@ configRoutes.post(
   },
 );
 
+// ─── Helpers ────────────────────────────────────────────────────
+
+const _deprecationLogged = new Set<string>();
+function logDeprecationOnce(endpoint: string, replacement: string): void {
+  if (_deprecationLogged.has(endpoint)) return;
+  logger.warn(`Deprecated: ${endpoint} — use ${replacement} instead`);
+  _deprecationLogged.add(endpoint);
+}
+
+function resolveProxyInfo(
+  userProxy: string,
+  sysProxy: string,
+): { effectiveProxyUrl: string; proxySource: 'user' | 'system' | 'none' } {
+  return {
+    effectiveProxyUrl: userProxy || sysProxy,
+    proxySource: userProxy ? 'user' : sysProxy ? 'system' : 'none',
+  };
+}
+
+/** Persist a RegisteredGroup update and sync to the in-memory cache. */
+function applyBindingUpdate(imJid: string, updated: RegisteredGroup): void {
+  setRegisteredGroup(imJid, updated);
+  const webDeps = getWebDeps();
+  if (webDeps) {
+    const groups = webDeps.getRegisteredGroups();
+    if (groups[imJid]) groups[imJid] = updated;
+    webDeps.clearImFailCounts?.(imJid);
+  }
+}
+
 configRoutes.get('/feishu', authMiddleware, systemConfigMiddleware, (c) => {
+  logDeprecationOnce('GET /api/config/feishu', 'GET /api/config/user-im/feishu');
   try {
     const { config, source } = getFeishuProviderConfigWithSource();
     const pub = toPublicFeishuProviderConfig(config, source);
@@ -1049,6 +1088,7 @@ configRoutes.put(
 // ─── Telegram config ─────────────────────────────────────────────
 
 configRoutes.get('/telegram', authMiddleware, systemConfigMiddleware, (c) => {
+  logDeprecationOnce('GET /api/config/telegram', 'GET /api/config/user-im/telegram');
   try {
     const { config, source } = getTelegramProviderConfigWithSource();
     const pub = toPublicTelegramProviderConfig(config, source);
@@ -1326,6 +1366,7 @@ configRoutes.get('/user-im/status', authMiddleware, (c) => {
   return c.json({
     feishu: deps?.isUserFeishuConnected?.(user.id) ?? false,
     telegram: deps?.isUserTelegramConnected?.(user.id) ?? false,
+    qq: deps?.isUserQQConnected?.(user.id) ?? false,
   });
 });
 
@@ -1335,6 +1376,7 @@ configRoutes.get('/user-im/feishu', authMiddleware, (c) => {
   const user = c.get('user') as AuthUser;
   try {
     const config = getUserFeishuConfig(user.id);
+    const connected = deps?.isUserFeishuConnected?.(user.id) ?? false;
     if (!config) {
       return c.json({
         appId: '',
@@ -1342,9 +1384,13 @@ configRoutes.get('/user-im/feishu', authMiddleware, (c) => {
         appSecretMasked: null,
         enabled: false,
         updatedAt: null,
+        connected,
       });
     }
-    return c.json(toPublicFeishuProviderConfig(config, 'runtime'));
+    return c.json({
+      ...toPublicFeishuProviderConfig(config, 'runtime'),
+      connected,
+    });
   } catch (err) {
     logger.error({ err }, 'Failed to load user Feishu config');
     return c.json({ error: 'Failed to load user Feishu config' }, 500);
@@ -1405,7 +1451,11 @@ configRoutes.put('/user-im/feishu', authMiddleware, async (c) => {
       }
     }
 
-    return c.json(toPublicFeishuProviderConfig(saved, 'runtime'));
+    const connected = deps?.isUserFeishuConnected?.(user.id) ?? false;
+    return c.json({
+      ...toPublicFeishuProviderConfig(saved, 'runtime'),
+      connected,
+    });
   } catch (err) {
     const message =
       err instanceof Error ? err.message : 'Invalid Feishu config payload';
@@ -1418,15 +1468,28 @@ configRoutes.get('/user-im/telegram', authMiddleware, (c) => {
   const user = c.get('user') as AuthUser;
   try {
     const config = getUserTelegramConfig(user.id);
+    const connected = deps?.isUserTelegramConnected?.(user.id) ?? false;
+    const globalConfig = getTelegramProviderConfig();
+    const userProxy = config?.proxyUrl || '';
+    const sysProxy = globalConfig.proxyUrl || '';
+    const proxy = resolveProxyInfo(userProxy, sysProxy);
     if (!config) {
       return c.json({
         hasBotToken: false,
         botTokenMasked: null,
         enabled: false,
         updatedAt: null,
+        connected,
+        proxyUrl: '',
+        ...proxy,
       });
     }
-    return c.json(toPublicTelegramProviderConfig(config, 'runtime'));
+    return c.json({
+      ...toPublicTelegramProviderConfig(config, 'runtime'),
+      connected,
+      proxyUrl: userProxy,
+      ...proxy,
+    });
   } catch (err) {
     logger.error({ err }, 'Failed to load user Telegram config');
     return c.json({ error: 'Failed to load user Telegram config' }, 500);
@@ -1447,6 +1510,7 @@ configRoutes.put('/user-im/telegram', authMiddleware, async (c) => {
   const current = getUserTelegramConfig(user.id);
   const next = {
     botToken: current?.botToken || '',
+    proxyUrl: current?.proxyUrl || '',
     enabled: current?.enabled ?? true,
     updatedAt: current?.updatedAt || null,
   };
@@ -1455,6 +1519,11 @@ configRoutes.put('/user-im/telegram', authMiddleware, async (c) => {
     if (botToken) next.botToken = botToken;
   } else if (validation.data.clearBotToken === true) {
     next.botToken = '';
+  }
+  if (typeof validation.data.proxyUrl === 'string') {
+    next.proxyUrl = validation.data.proxyUrl.trim();
+  } else if (validation.data.clearProxyUrl === true) {
+    next.proxyUrl = '';
   }
   if (typeof validation.data.enabled === 'boolean') {
     next.enabled = validation.data.enabled;
@@ -1466,6 +1535,7 @@ configRoutes.put('/user-im/telegram', authMiddleware, async (c) => {
   try {
     const saved = saveUserTelegramConfig(user.id, {
       botToken: next.botToken,
+      proxyUrl: next.proxyUrl || undefined,
       enabled: next.enabled,
     });
 
@@ -1481,7 +1551,15 @@ configRoutes.put('/user-im/telegram', authMiddleware, async (c) => {
       }
     }
 
-    return c.json(toPublicTelegramProviderConfig(saved, 'runtime'));
+    const connected = deps?.isUserTelegramConnected?.(user.id) ?? false;
+    const userProxy = saved.proxyUrl || '';
+    const sysProxy = getTelegramProviderConfig().proxyUrl || '';
+    return c.json({
+      ...toPublicTelegramProviderConfig(saved, 'runtime'),
+      connected,
+      proxyUrl: userProxy,
+      ...resolveProxyInfo(userProxy, sysProxy),
+    });
   } catch (err) {
     const message =
       err instanceof Error ? err.message : 'Invalid Telegram config payload';
@@ -1498,7 +1576,8 @@ configRoutes.post('/user-im/telegram/test', authMiddleware, async (c) => {
   }
 
   const globalTelegramConfig = getTelegramProviderConfig();
-  const agent = createTelegramApiAgent(globalTelegramConfig.proxyUrl);
+  const effectiveProxy = config.proxyUrl || globalTelegramConfig.proxyUrl;
+  const agent = createTelegramApiAgent(effectiveProxy);
   try {
     const { Bot } = await import('grammy');
     const testBot = new Bot(config.botToken, {
@@ -1606,6 +1685,7 @@ configRoutes.get('/user-im/qq', authMiddleware, (c) => {
   const user = c.get('user') as AuthUser;
   try {
     const config = getUserQQConfig(user.id);
+    const connected = deps?.isUserQQConnected?.(user.id) ?? false;
     if (!config) {
       return c.json({
         appId: '',
@@ -1613,6 +1693,7 @@ configRoutes.get('/user-im/qq', authMiddleware, (c) => {
         appSecretMasked: null,
         enabled: false,
         updatedAt: null,
+        connected,
       });
     }
     return c.json({
@@ -1621,6 +1702,7 @@ configRoutes.get('/user-im/qq', authMiddleware, (c) => {
       appSecretMasked: maskQQAppSecret(config.appSecret),
       enabled: config.enabled ?? false,
       updatedAt: config.updatedAt,
+      connected,
     });
   } catch (err) {
     logger.error({ err }, 'Failed to load user QQ config');
@@ -1679,12 +1761,14 @@ configRoutes.put('/user-im/qq', authMiddleware, async (c) => {
       }
     }
 
+    const connected = deps?.isUserQQConnected?.(user.id) ?? false;
     return c.json({
       appId: saved.appId,
       hasAppSecret: !!saved.appSecret,
       appSecretMasked: maskQQAppSecret(saved.appSecret),
       enabled: saved.enabled ?? false,
       updatedAt: saved.updatedAt,
+      connected,
     });
   } catch (err) {
     const message =
@@ -1826,6 +1910,113 @@ configRoutes.delete('/user-im/qq/paired-chats/:jid', authMiddleware, (c) => {
   delete groups[jid];
   logger.info({ jid, userId: user.id }, 'QQ chat unpaired');
   return c.json({ success: true });
+});
+
+// ─── IM Binding management (bindings panoramic page) ────────────
+
+configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
+  const imJid = decodeURIComponent(c.req.param('imJid'));
+  const user = c.get('user') as AuthUser;
+
+  // Validate IM JID
+  const channelType = getChannelType(imJid);
+  if (!channelType) {
+    return c.json({ error: 'Invalid IM JID' }, 400);
+  }
+
+  const imGroup = getRegisteredGroup(imJid);
+  if (!imGroup) {
+    return c.json({ error: 'IM group not found' }, 404);
+  }
+  if (!canAccessGroup(user, { ...imGroup, jid: imJid })) {
+    return c.json({ error: 'Forbidden' }, 403);
+  }
+
+  const body = await c.req.json().catch(() => ({}));
+
+  // Unbind mode
+  if (body.unbind === true) {
+    const updated: RegisteredGroup = {
+      ...imGroup,
+      target_main_jid: undefined,
+      target_agent_id: undefined,
+    };
+    applyBindingUpdate(imJid, updated);
+    logger.info({ imJid, userId: user.id }, 'IM group unbound (bindings page)');
+    return c.json({ success: true });
+  }
+
+  // Bind to agent
+  if (typeof body.target_agent_id === 'string' && body.target_agent_id.trim()) {
+    const agentId = body.target_agent_id.trim();
+    const agent = getAgent(agentId);
+    if (!agent) {
+      return c.json({ error: 'Agent not found' }, 404);
+    }
+    if (agent.kind !== 'conversation') {
+      return c.json({ error: 'Only conversation agents can bind IM groups' }, 400);
+    }
+    // Check user can access the workspace that owns this agent
+    const ownerGroup = getRegisteredGroup(agent.chat_jid);
+    if (!ownerGroup || !canAccessGroup(user, { ...ownerGroup, jid: agent.chat_jid })) {
+      return c.json({ error: 'Forbidden' }, 403);
+    }
+
+    const force = body.force === true;
+    const replyPolicy = body.reply_policy === 'mirror' ? 'mirror' : 'source_only';
+    const hasConflict =
+      (imGroup.target_agent_id && imGroup.target_agent_id !== agentId) ||
+      !!imGroup.target_main_jid;
+    if (hasConflict && !force) {
+      return c.json({ error: 'IM group is already bound elsewhere' }, 409);
+    }
+
+    const updated: RegisteredGroup = {
+      ...imGroup,
+      target_agent_id: agentId,
+      target_main_jid: undefined,
+      reply_policy: replyPolicy,
+    };
+    applyBindingUpdate(imJid, updated);
+    logger.info({ imJid, agentId, userId: user.id }, 'IM group bound to agent (bindings page)');
+    return c.json({ success: true });
+  }
+
+  // Bind to workspace main conversation
+  if (typeof body.target_main_jid === 'string' && body.target_main_jid.trim()) {
+    const targetMainJid = body.target_main_jid.trim();
+    const targetGroup = getRegisteredGroup(targetMainJid);
+    if (!targetGroup) {
+      return c.json({ error: 'Target workspace not found' }, 404);
+    }
+    if (!canAccessGroup(user, { ...targetGroup, jid: targetMainJid })) {
+      return c.json({ error: 'Forbidden' }, 403);
+    }
+    if (targetGroup.is_home) {
+      return c.json({ error: 'Home workspace main conversation uses default IM routing' }, 400);
+    }
+
+    const force = body.force === true;
+    const replyPolicy = body.reply_policy === 'mirror' ? 'mirror' : 'source_only';
+    const hasConflict =
+      !!imGroup.target_agent_id ||
+      (imGroup.target_main_jid && imGroup.target_main_jid !== targetMainJid);
+    if (hasConflict && !force) {
+      return c.json({ error: 'IM group is already bound elsewhere' }, 409);
+    }
+
+    const updated: RegisteredGroup = {
+      ...imGroup,
+      target_main_jid: targetMainJid,
+      target_agent_id: undefined,
+      reply_policy: replyPolicy,
+    };
+    applyBindingUpdate(imJid, updated);
+    logger.info({ imJid, targetMainJid, userId: user.id }, 'IM group bound to workspace (bindings page)');
+    return c.json({ success: true });
+  }
+
+  return c.json({ error: 'Must provide target_main_jid, target_agent_id, or unbind' }, 400);
 });
 
 // ─── Local Claude Code detection ──────────────────────────────────
