@@ -1711,7 +1711,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             }
 
             // Optional mirror mode for explicitly bound IM channels
-            const webJid = `web:${effectiveGroup.folder}`;
+            const webJid = chatJid.startsWith('web:')
+              ? chatJid
+              : `web:${effectiveGroup.folder}`;
             for (const [imJid, g] of Object.entries(registeredGroups)) {
               if (
                 g.target_main_jid !== webJid ||
@@ -3650,7 +3652,24 @@ function buildResolveEffectiveChatJid(): (
 
     // Main conversation binding
     if (group.target_main_jid) {
-      return { effectiveJid: group.target_main_jid, agentId: null };
+      let effectiveJid = group.target_main_jid;
+      // Legacy fallback: old bindings stored web:${folder} instead of actual JID.
+      // Resolve to the real registered JID so messages are stored correctly.
+      if (
+        !registeredGroups[effectiveJid] &&
+        !getRegisteredGroup(effectiveJid) &&
+        effectiveJid.startsWith('web:')
+      ) {
+        const folder = effectiveJid.slice(4);
+        const jids = getJidsByFolder(folder);
+        for (const j of jids) {
+          if (j.startsWith('web:')) {
+            effectiveJid = j;
+            break;
+          }
+        }
+      }
+      return { effectiveJid, agentId: null };
     }
 
     return null;

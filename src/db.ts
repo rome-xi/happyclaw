@@ -563,7 +563,39 @@ export function initDatabase(): void {
     })();
   }
 
-  const SCHEMA_VERSION = '21';
+  // v22: Fix target_main_jid that used folder-based JID (web:${folder})
+  // instead of actual registered group JID (web:${uuid}).
+  // Only affects non-home workspaces where folder != uuid.
+  if (curVer && parseInt(curVer, 10) < 22) {
+    const rows = db
+      .prepare(
+        "SELECT jid, target_main_jid FROM registered_groups WHERE target_main_jid IS NOT NULL AND target_main_jid != ''",
+      )
+      .all() as Array<{ jid: string; target_main_jid: string }>;
+    for (const row of rows) {
+      const targetJid = row.target_main_jid;
+      // Check if target_main_jid is a real registered group JID
+      const exists = db
+        .prepare('SELECT 1 FROM registered_groups WHERE jid = ?')
+        .get(targetJid);
+      if (exists) continue;
+      // Not a valid JID — try to resolve via folder
+      if (!targetJid.startsWith('web:')) continue;
+      const folder = targetJid.slice(4);
+      const candidates = db
+        .prepare(
+          "SELECT jid FROM registered_groups WHERE folder = ? AND jid LIKE 'web:%'",
+        )
+        .all(folder) as Array<{ jid: string }>;
+      if (candidates.length === 1) {
+        db.prepare(
+          'UPDATE registered_groups SET target_main_jid = ? WHERE jid = ?',
+        ).run(candidates[0].jid, row.jid);
+      }
+    }
+  }
+
+  const SCHEMA_VERSION = '22';
   db.prepare(
     'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
   ).run('schema_version', SCHEMA_VERSION);
