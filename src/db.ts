@@ -2856,6 +2856,15 @@ export function deleteCompletedTaskAgents(beforeTimestamp: string): number {
   return result.changes;
 }
 
+export function getRunningTaskAgentsByChat(chatJid: string): SubAgent[] {
+  const rows = db
+    .prepare(
+      "SELECT * FROM agents WHERE chat_jid = ? AND kind = 'task' AND status = 'running'",
+    )
+    .all(chatJid) as Array<Record<string, unknown>>;
+  return rows.map(mapAgentRow);
+}
+
 export function markRunningTaskAgentsAsError(chatJid: string): number {
   const now = new Date().toISOString();
   const result = db

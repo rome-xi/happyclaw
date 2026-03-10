@@ -1310,6 +1310,16 @@ async function main(): Promise<void> {
  * 这类错误通常发生在结果已输出之后，属于"收尾写入失败"，
  * 不应把整个 host query 标记为启动失败（code 1）。
  */
+process.on('SIGTERM', () => {
+  log('Received SIGTERM, exiting gracefully');
+  process.exit(0);
+});
+
+process.on('SIGINT', () => {
+  log('Received SIGINT, exiting gracefully');
+  process.exit(0);
+});
+
 process.on('uncaughtException', (err: unknown) => {
   const errno = err as NodeJS.ErrnoException;
   if (errno?.code === 'EPIPE') {

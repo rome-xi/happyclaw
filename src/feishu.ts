@@ -694,7 +694,7 @@ export function createFeishuConnection(
 
     const extracted = extractMessageContent(messageType, rawContent);
     let text = extracted.text;
-    if (!text && !extracted.imageKeys && !extracted.fileInfos?.length) {
+    if (!text?.trim() && !extracted.imageKeys && !extracted.fileInfos?.length) {
       logger.info(
         { messageId, messageType },
         'No text or image content, skipping',

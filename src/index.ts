@@ -64,6 +64,7 @@ import {
   updateAgentStatus,
   updateAgentInfo,
   deleteCompletedTaskAgents,
+  getRunningTaskAgentsByChat,
   markRunningTaskAgentsAsError,
   markAllRunningTaskAgentsAsError,
   getSession,
@@ -1802,12 +1803,25 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   const isErrorExit = output.status === 'error' || hadError;
   if (isErrorExit) {
     try {
+      // 先获取 running agents（广播需要 agent 详情），再批量标记 error
+      const runningAgents = getRunningTaskAgentsByChat(chatJid);
       const marked = markRunningTaskAgentsAsError(chatJid);
       if (marked > 0) {
         logger.info(
           { chatJid, marked },
           'Marked remaining running task agents as error',
         );
+        for (const agent of runningAgents) {
+          broadcastAgentStatus(
+            chatJid,
+            agent.id,
+            'error',
+            agent.name,
+            agent.prompt,
+            '容器超时或异常退出',
+            agent.kind,
+          );
+        }
       }
     } catch (err) {
       logger.warn({ chatJid, err }, 'Failed to mark running task agents');
