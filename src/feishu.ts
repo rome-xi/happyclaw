@@ -387,6 +387,7 @@ export function createFeishuConnection(
   const ackReactionByChat = new Map<string, string>();
   const typingReactionByChat = new Map<string, string>();
   const knownChatIds = new Set<string>();
+  const chatTypeById = new Map<string, string>(); // chatId → 'group' | 'p2p'
   const lastCreateTimeByChat = new Map<string, number>();
 
   let client: lark.Client | null = null;
@@ -402,8 +403,9 @@ export function createFeishuConnection(
   let disconnectedSince: number | null = null;
   let healthTimer: NodeJS.Timeout | null = null;
 
-  function rememberChatProgress(chatId: string, createTimeMs: number): void {
+  function rememberChatProgress(chatId: string, createTimeMs: number, chatType?: string): void {
     knownChatIds.add(chatId);
+    if (chatType) chatTypeById.set(chatId, chatType);
     const prev = lastCreateTimeByChat.get(chatId) || 0;
     if (createTimeMs > prev) {
       lastCreateTimeByChat.set(chatId, createTimeMs);
@@ -829,7 +831,7 @@ export function createFeishuConnection(
 
     const resolvedCreateTimeMs = createTimeMs > 0 ? createTimeMs : Date.now();
     const timestamp = new Date(resolvedCreateTimeMs).toISOString();
-    rememberChatProgress(chatId, resolvedCreateTimeMs);
+    rememberChatProgress(chatId, resolvedCreateTimeMs, chatType);
 
     // ── 斜杠指令：拦截已知 /xxx 命令，不进入消息流 ──
     // 群聊中 @机器人 后跟斜杠命令，mention 替换后文本为 "@botname /cmd"，
@@ -1023,7 +1025,7 @@ export function createFeishuConnection(
             createTimeMs: toEpochMs(item.create_time),
             messageType: item.msg_type || item.message_type || '',
             content: item.body?.content || item.content || '',
-            chatType: item.chat_type,
+            chatType: item.chat_type || chatTypeById.get(chatId) || 'group',
             mentions: item.mentions,
             senderOpenId,
           };
