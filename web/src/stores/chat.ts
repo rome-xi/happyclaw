@@ -481,6 +481,9 @@ function applyStreamEvent(
         next.todos = event.todos;
       }
       break;
+    case 'mode_change':
+      // Handled at ChatView level via onModeChange callback
+      break;
     case 'status': {
       next.systemStatus = event.statusText || null;
       if (event.statusText) {

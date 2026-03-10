@@ -79,11 +79,12 @@ import { getChannelType } from './im-channel.js';
 import {
   formatContextMessages,
   formatWorkspaceList,
+  formatSystemStatus,
+  resolveLocationInfo,
   type WorkspaceInfo,
 } from './im-command-utils.js';
 import { analyzeIntent } from './intent-analyzer.js';
 import {
-  getClaudeProviderConfig as getClaudeProviderConfigForRefresh,
   getFeishuProviderConfigWithSource,
   getTelegramProviderConfig,
   getTelegramProviderConfigWithSource,
@@ -91,8 +92,6 @@ import {
   getUserTelegramConfig,
   getUserQQConfig,
   getSystemSettings,
-  refreshOAuthCredentials,
-  saveClaudeProviderConfig as saveClaudeProviderConfigForRefresh,
   saveUserFeishuConfig,
   saveUserTelegramConfig,
   updateAllSessionCredentials,
@@ -666,68 +665,49 @@ function handleStatusCommand(chatJid: string): string {
   const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
   if (!group) return '当前 IM 未绑定工作区';
 
-  // Show binding-aware status
-  let locationLine: string;
-  let folderLine: string;
-  if (group.target_agent_id) {
-    const agent = getAgent(group.target_agent_id);
-    const parent = agent
-      ? (registeredGroups[agent.chat_jid] ?? getRegisteredGroup(agent.chat_jid))
-      : null;
-    const workspaceName = parent?.name || parent?.folder || group.folder;
-    locationLine = `📍 当前位置: ${workspaceName} / ${agent?.name || group.target_agent_id}`;
-    folderLine = `📁 工作区: ${parent?.folder || group.folder}`;
-  } else if (group.target_main_jid) {
-    const target =
-      registeredGroups[group.target_main_jid] ??
-      getRegisteredGroup(group.target_main_jid);
-    locationLine = `📍 当前位置: ${target?.name || group.target_main_jid} / 主对话`;
-    folderLine = `📁 工作区: ${target?.folder || group.folder}`;
-  } else {
-    const folderName = findGroupNameByFolder(group.folder);
-    locationLine = `📍 当前位置: ${folderName} / 主对话`;
-    folderLine = `📁 工作区: ${group.folder}`;
-  }
+  const lookupGroup = (jid: string) => registeredGroups[jid] ?? getRegisteredGroup(jid);
+  const location = resolveLocationInfo(group, lookupGroup, getAgent, findGroupNameByFolder);
 
-  const policyLine =
-    group.target_main_jid || group.target_agent_id
-      ? `🔁 回复策略: ${group.reply_policy || 'source_only'}`
-      : null;
+  const queueStatus = queue.getStatus();
+  const settings = getSystemSettings();
 
-  const lines = [
-    locationLine,
-    folderLine,
-    policyLine,
-    '',
-    '💡 /list 查看全部 · /recall 总结最近对话',
-  ].filter(Boolean);
+  // Check if the current group's folder is active or queued
+  const groupState = queueStatus.groups.find(g => {
+    const rg = lookupGroup(g.jid);
+    return rg?.folder === location.folder;
+  });
+  const isActive = !!groupState?.active;
+  const queuePosition = !isActive && queueStatus.waitingGroupJids.includes(chatJid)
+    ? queueStatus.waitingGroupJids.indexOf(chatJid) + 1
+    : null;
 
-  return lines.join('\n');
+  return formatSystemStatus(
+    location,
+    {
+      activeContainerCount: queueStatus.activeContainerCount,
+      activeHostProcessCount: queueStatus.activeHostProcessCount,
+      maxContainers: settings.maxConcurrentContainers,
+      maxHostProcesses: settings.maxConcurrentHostProcesses,
+      waitingCount: queueStatus.waitingCount,
+      waitingGroupJids: queueStatus.waitingGroupJids,
+    },
+    isActive,
+    queuePosition,
+  );
 }
 
 function handleWhereCommand(chatJid: string): string {
   const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
   if (!group) return '当前 IM 未绑定工作区';
 
-  const policySuffix = `\n🔁 回复策略: ${group.reply_policy || 'source_only'}`;
+  const lookupGroup = (jid: string) => registeredGroups[jid] ?? getRegisteredGroup(jid);
+  const location = resolveLocationInfo(group, lookupGroup, getAgent, findGroupNameByFolder);
 
-  if (group.target_agent_id) {
-    const agent = getAgent(group.target_agent_id);
-    const parent = agent
-      ? (registeredGroups[agent.chat_jid] ?? getRegisteredGroup(agent.chat_jid))
-      : null;
-    const workspaceName = parent?.name || parent?.folder || group.folder;
-    return `📍 当前绑定: ${workspaceName} / ${agent?.name || group.target_agent_id}${policySuffix}`;
+  const lines = [`📍 当前绑定: ${location.locationLine}`];
+  if (location.replyPolicy) {
+    lines.push(`🔁 回复策略: ${location.replyPolicy}`);
   }
-
-  if (group.target_main_jid) {
-    const target =
-      registeredGroups[group.target_main_jid] ??
-      getRegisteredGroup(group.target_main_jid);
-    return `📍 当前绑定: ${target?.name || group.target_main_jid} / 主对话${policySuffix}`;
-  }
-
-  return `📍 当前绑定: ${group.name} / 主对话${policySuffix}`;
+  return lines.join('\n');
 }
 
 function handleUnbindCommand(chatJid: string): string {
@@ -4375,44 +4355,6 @@ async function main(): Promise<void> {
       }
     },
     60 * 60 * 1000,
-  );
-
-  // OAuth token auto-refresh (every 5 minutes)
-  setInterval(
-    async () => {
-      try {
-        const config = getClaudeProviderConfigForRefresh();
-        const creds = config.claudeOAuthCredentials;
-        if (!creds) return;
-
-        const timeToExpiry = creds.expiresAt - Date.now();
-        if (timeToExpiry > 2 * 60 * 60 * 1000) return; // >2h to expiry, skip
-
-        logger.info(
-          { expiresIn: Math.round(timeToExpiry / 1000) },
-          'OAuth token expiring soon, refreshing...',
-        );
-        const refreshed = await refreshOAuthCredentials(creds);
-        if (refreshed) {
-          const current = getClaudeProviderConfigForRefresh();
-          const saved = saveClaudeProviderConfigForRefresh({
-            ...current,
-            claudeOAuthCredentials: refreshed,
-          });
-          updateAllSessionCredentials(saved);
-          const closed = queue.closeAllActiveForCredentialRefresh();
-          logger.info(
-            { closedContainers: closed },
-            'OAuth token refreshed successfully',
-          );
-        } else {
-          logger.warn('OAuth token refresh failed');
-        }
-      } catch (err) {
-        logger.error({ err }, 'OAuth auto-refresh error');
-      }
-    },
-    5 * 60 * 1000,
   );
 
   await ensureDockerRunning();

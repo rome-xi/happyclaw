@@ -728,8 +728,14 @@ async function runQuery(
   };
   setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
 
-  // Create the StreamEventProcessor
-  const processor = new StreamEventProcessor(emit, log);
+  // Create the StreamEventProcessor with mode change callback
+  const processor = new StreamEventProcessor(emit, log, (newMode) => {
+    currentPermissionMode = newMode as PermissionMode;
+    log(`Auto mode switch on ${newMode === 'plan' ? 'EnterPlanMode' : 'ExitPlanMode'} detection`);
+    queryRef?.setPermissionMode(newMode as PermissionMode).catch((err: unknown) =>
+      log(`setPermissionMode failed: ${err}`),
+    );
+  });
 
   let newSessionId: string | undefined;
   let lastAssistantUuid: string | undefined;
