@@ -27,7 +27,7 @@ export function FeishuChannelCard({ setNotice, setError }: FeishuChannelCardProp
   const [saving, setSaving] = useState(false);
   const [toggling, setToggling] = useState(false);
 
-  const enabled = config?.enabled ?? true;
+  const enabled = config?.enabled ?? false;
 
   const loadConfig = useCallback(async () => {
     setLoading(true);

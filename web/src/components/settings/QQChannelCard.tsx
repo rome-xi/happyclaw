@@ -31,7 +31,7 @@ export function QQChannelCard({ setNotice, setError }: QQChannelCardProps) {
   const [testing, setTesting] = useState(false);
   const [toggling, setToggling] = useState(false);
 
-  const enabled = config?.enabled ?? true;
+  const enabled = config?.enabled ?? false;
 
   const pairing = usePairingCode({
     endpoint: '/api/config/user-im/qq/pairing-code',

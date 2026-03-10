@@ -152,5 +152,7 @@ export function useImBindings() {
     loadTargets();
   }, [loadBindings, loadTargets]);
 
-  return { bindings, loading, targets, targetsLoading, reload, rebind, error };
+  const clearError = useCallback(() => setError(null), []);
+
+  return { bindings, loading, targets, targetsLoading, reload, rebind, error, clearError };
 }

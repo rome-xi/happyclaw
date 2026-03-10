@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useEffect } from 'react';
 import { Loader2, FolderOpen, MessageSquare, RotateCcw } from 'lucide-react';
 import {
   Dialog,
@@ -32,6 +32,11 @@ export function BindingTargetDialog({
   selecting,
 }: BindingTargetDialogProps) {
   const [filter, setFilter] = useState('');
+
+  // Clear filter when dialog closes to avoid stale search state on reopen
+  useEffect(() => {
+    if (!open) setFilter('');
+  }, [open]);
 
   const filtered = useMemo(() => {
     if (!filter.trim()) return targets;

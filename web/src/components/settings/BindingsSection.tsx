@@ -12,7 +12,7 @@ import type { BindingTarget } from './hooks/useImBindings';
 type ChannelFilter = 'all' | 'feishu' | 'telegram' | 'qq';
 
 export function BindingsSection() {
-  const { bindings, loading, targets, targetsLoading, reload, rebind, error: hookError } = useImBindings();
+  const { bindings, loading, targets, targetsLoading, reload, rebind, error: hookError, clearError: clearHookError } = useImBindings();
   const [localError, setLocalError] = useState<string | null>(null);
   const errorMsg = localError || hookError;
   const [search, setSearch] = useState('');
@@ -96,16 +96,24 @@ export function BindingsSection() {
     else setLocalError(err);
   }, [rebindGroup, rebind]);
 
-  const handleRestoreDefault = useCallback(async () => {
+  const [restoreConfirmGroup, setRestoreConfirmGroup] = useState<AvailableImGroup | null>(null);
+
+  const handleRestoreDefault = useCallback(() => {
     if (!rebindGroup) return;
-    const imJid = rebindGroup.jid;
-    setSelectingKey('restore');
+    setRestoreConfirmGroup(rebindGroup);
+    setRebindGroup(null);
+  }, [rebindGroup]);
+
+  const confirmRestoreDefault = useCallback(async () => {
+    if (!restoreConfirmGroup) return;
+    const imJid = restoreConfirmGroup.jid;
+    setRestoreConfirmGroup(null);
+    setActioningJid(imJid);
     setLocalError(null);
     const err = await rebind(imJid, { unbind: true });
-    setSelectingKey(null);
-    if (!err) setRebindGroup(null);
-    else setLocalError(err);
-  }, [rebindGroup, rebind]);
+    setActioningJid(null);
+    if (err) setLocalError(err);
+  }, [restoreConfirmGroup, rebind]);
 
   return (
     <div className="p-4 lg:p-8">
@@ -136,7 +144,7 @@ export function BindingsSection() {
         {errorMsg && (
           <div className="bg-red-50 border border-red-200 text-red-700 text-sm rounded-lg px-4 py-2.5 flex items-center justify-between">
             <span>{errorMsg}</span>
-            <button onClick={() => setLocalError(null)} className="text-red-400 hover:text-red-600 ml-2 text-xs">✕</button>
+            <button onClick={() => { setLocalError(null); clearHookError(); }} className="text-red-400 hover:text-red-600 ml-2 text-xs">✕</button>
           </div>
         )}
 
@@ -223,6 +231,16 @@ export function BindingsSection() {
         title="确认解绑"
         message={unbindGroup ? `解绑后，「${unbindGroup.name}」的消息将恢复默认路由到主工作区。确认解绑？` : ''}
         confirmText="解绑"
+      />
+
+      {/* Restore default confirm dialog */}
+      <ConfirmDialog
+        open={!!restoreConfirmGroup}
+        onClose={() => setRestoreConfirmGroup(null)}
+        onConfirm={confirmRestoreDefault}
+        title="恢复默认路由"
+        message={restoreConfirmGroup ? `确认将「${restoreConfirmGroup.name}」恢复为默认路由（消息发送到主工作区）？` : ''}
+        confirmText="恢复默认"
       />
     </div>
   );
