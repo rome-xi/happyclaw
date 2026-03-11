@@ -319,7 +319,14 @@ export function initDatabase(): void {
     'reply_policy',
     "TEXT DEFAULT 'source_only'",
   );
-  ensureColumn('registered_groups', 'require_mention', 'INTEGER DEFAULT 1');
+  ensureColumn('registered_groups', 'require_mention', 'INTEGER DEFAULT 0');
+  ensureColumn('registered_groups', 'mcp_mode', "TEXT DEFAULT 'inherit'");
+  ensureColumn('registered_groups', 'selected_mcps', 'TEXT');
+  ensureColumn(
+    'registered_groups',
+    'activation_mode',
+    "TEXT DEFAULT 'auto'",
+  );
   ensureColumn('messages', 'token_usage', 'TEXT');
 
   // Add index on target_agent_id for fast lookup of IM bindings
@@ -563,7 +570,39 @@ export function initDatabase(): void {
     })();
   }
 
-  const SCHEMA_VERSION = '21';
+  // v22: Fix target_main_jid that used folder-based JID (web:${folder})
+  // instead of actual registered group JID (web:${uuid}).
+  // Only affects non-home workspaces where folder != uuid.
+  if (curVer && parseInt(curVer, 10) < 22) {
+    const rows = db
+      .prepare(
+        "SELECT jid, target_main_jid FROM registered_groups WHERE target_main_jid IS NOT NULL AND target_main_jid != ''",
+      )
+      .all() as Array<{ jid: string; target_main_jid: string }>;
+    for (const row of rows) {
+      const targetJid = row.target_main_jid;
+      // Check if target_main_jid is a real registered group JID
+      const exists = db
+        .prepare('SELECT 1 FROM registered_groups WHERE jid = ?')
+        .get(targetJid);
+      if (exists) continue;
+      // Not a valid JID — try to resolve via folder
+      if (!targetJid.startsWith('web:')) continue;
+      const folder = targetJid.slice(4);
+      const candidates = db
+        .prepare(
+          "SELECT jid FROM registered_groups WHERE folder = ? AND jid LIKE 'web:%'",
+        )
+        .all(folder) as Array<{ jid: string }>;
+      if (candidates.length === 1) {
+        db.prepare(
+          'UPDATE registered_groups SET target_main_jid = ? WHERE jid = ?',
+        ).run(candidates[0].jid, row.jid);
+      }
+    }
+  }
+
+  const SCHEMA_VERSION = '23';
   db.prepare(
     'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
   ).run('schema_version', SCHEMA_VERSION);
@@ -1274,6 +1313,9 @@ type RegisteredGroupRow = {
   target_main_jid: string | null;
   reply_policy: string | null;
   require_mention: number;
+  activation_mode: string | null;
+  mcp_mode: string | null;
+  selected_mcps: string | null;
 };
 
 /** Convert a raw DB row into a RegisteredGroup domain object. */
@@ -1301,7 +1343,25 @@ function parseGroupRow(
     target_main_jid: row.target_main_jid ?? undefined,
     reply_policy: row.reply_policy === 'mirror' ? 'mirror' : 'source_only',
     require_mention: row.require_mention === 1,
+    activation_mode: parseActivationMode(row.activation_mode),
+    mcp_mode: row.mcp_mode === 'custom' ? 'custom' : 'inherit',
+    selected_mcps: row.selected_mcps ? JSON.parse(row.selected_mcps) : null,
   };
+}
+
+const VALID_ACTIVATION_MODES = new Set([
+  'auto',
+  'always',
+  'when_mentioned',
+  'disabled',
+]);
+
+function parseActivationMode(
+  raw: string | null,
+): 'auto' | 'always' | 'when_mentioned' | 'disabled' {
+  if (raw && VALID_ACTIVATION_MODES.has(raw))
+    return raw as 'auto' | 'always' | 'when_mentioned' | 'disabled';
+  return 'auto';
 }
 
 export function getRegisteredGroup(
@@ -1316,8 +1376,8 @@ export function getRegisteredGroup(
 
 export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
   db.prepare(
-    `INSERT OR REPLACE INTO registered_groups (jid, name, folder, added_at, container_config, execution_mode, custom_cwd, init_source_path, init_git_url, created_by, is_home, selected_skills, target_agent_id, target_main_jid, reply_policy, require_mention)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT OR REPLACE INTO registered_groups (jid, name, folder, added_at, container_config, execution_mode, custom_cwd, init_source_path, init_git_url, created_by, is_home, selected_skills, target_agent_id, target_main_jid, reply_policy, require_mention, activation_mode, mcp_mode, selected_mcps)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     jid,
     group.name,
@@ -1334,7 +1394,10 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
     group.target_agent_id ?? null,
     group.target_main_jid ?? null,
     group.reply_policy ?? 'source_only',
-    group.require_mention !== false ? 1 : 0,
+    group.require_mention === true ? 1 : 0,
+    group.activation_mode ?? 'auto',
+    group.mcp_mode ?? 'inherit',
+    group.selected_mcps ? JSON.stringify(group.selected_mcps) : null,
   );
 }
 
@@ -1348,6 +1411,16 @@ export function getJidsByFolder(folder: string): string[] {
     .prepare('SELECT jid FROM registered_groups WHERE folder = ?')
     .all(folder) as Array<{ jid: string }>;
   return rows.map((r) => r.jid);
+}
+
+/** Check if any registered group uses container execution mode (efficient targeted query). */
+export function hasContainerModeGroups(): boolean {
+  const row = db
+    .prepare(
+      "SELECT 1 FROM registered_groups WHERE execution_mode = 'container' OR execution_mode IS NULL LIMIT 1",
+    )
+    .get();
+  return row !== undefined;
 }
 
 export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
@@ -2812,6 +2885,15 @@ export function deleteCompletedTaskAgents(beforeTimestamp: string): number {
     )
     .run(beforeTimestamp);
   return result.changes;
+}
+
+export function getRunningTaskAgentsByChat(chatJid: string): SubAgent[] {
+  const rows = db
+    .prepare(
+      "SELECT * FROM agents WHERE chat_jid = ? AND kind = 'task' AND status = 'running'",
+    )
+    .all(chatJid) as Array<Record<string, unknown>>;
+  return rows.map(mapAgentRow);
 }
 
 export function markRunningTaskAgentsAsError(chatJid: string): number {

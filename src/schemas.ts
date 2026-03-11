@@ -192,6 +192,9 @@ export const GroupPatchSchema = z.object({
     .nullable()
     .optional(),
   is_pinned: z.boolean().optional(),
+  activation_mode: z
+    .enum(['auto', 'always', 'when_mentioned', 'disabled'])
+    .optional(),
 });
 
 export const LoginSchema = z.object({

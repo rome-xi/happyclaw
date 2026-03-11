@@ -16,6 +16,7 @@ import {
 } from './im-downloader.js';
 import { broadcastNewMessage } from './web.js';
 import { detectImageMimeType } from './image-detector.js';
+import { analyzeIntent } from './intent-analyzer.js';
 
 // ─── FeishuConnection Interface ────────────────────────────────
 
@@ -52,6 +53,11 @@ export interface ConnectOptions {
   onBotRemovedFromGroup?: (chatJid: string) => void;
   /** 群聊消息过滤：bot 未被 @mention 时调用，返回 true 则处理，false 则丢弃 */
   shouldProcessGroupMessage?: (chatJid: string) => boolean;
+  /** 中断 fast-path：消息到达时立即检测中断意图，绕过轮询延迟直接触发中断 */
+  onInterruptRequest?: (
+    chatJid: string,
+    intent: 'stop' | 'correction',
+  ) => void;
 }
 
 export interface FeishuChatInfo {
@@ -82,6 +88,10 @@ export interface FeishuConnection {
   isConnected(): boolean;
   syncGroups(): Promise<void>;
   getChatInfo(chatId: string): Promise<FeishuChatInfo | null>;
+  /** Get the underlying Lark SDK client (for streaming cards) */
+  getLarkClient(): lark.Client | null;
+  /** Get the last received message ID for a chat (for reply threading) */
+  getLastMessageId(chatId: string): string | undefined;
 }
 
 // ─── Shared Helpers (pure functions, no instance state) ────────
@@ -238,7 +248,65 @@ function extractMessageContent(
       }
     }
 
-    // Ignore other message types (audio, etc.)
+    if (messageType === 'sticker') {
+      const stickerDesc =
+        parsed.description || parsed.sticker_id || '表情包';
+      return { text: `[表情包: ${stickerDesc}]` };
+    }
+
+    if (messageType === 'audio') {
+      const duration = parsed.duration
+        ? `${Math.round(parsed.duration / 1000)}s`
+        : '';
+      return { text: `[语音消息${duration ? ': ' + duration : ''}]` };
+    }
+
+    if (messageType === 'share_chat') {
+      const chatName = parsed.chat_name || parsed.chat_id || '未知群聊';
+      return { text: `[分享群聊: ${chatName}]` };
+    }
+
+    if (messageType === 'share_user') {
+      const userName = parsed.user_name || parsed.user_id || '未知用户';
+      return { text: `[分享用户: ${userName}]` };
+    }
+
+    if (messageType === 'merge_forward') {
+      // 合并转发消息：递归提取子消息内容，格式化为引用块
+      const items = parsed.message_list || parsed.items || [];
+      if (!Array.isArray(items) || items.length === 0) {
+        return { text: '[合并转发消息]' };
+      }
+      const lines: string[] = ['[合并转发消息]:'];
+      for (const item of items.slice(0, 20)) {
+        const sender = item.sender_name || item.sender || '未知';
+        const body = item.body?.content || item.content || '';
+        let text = '';
+        try {
+          const subType = item.msg_type || item.message_type || 'text';
+          const sub = extractMessageContent(subType, body);
+          text = sub.text || '';
+        } catch {
+          text = typeof body === 'string' ? body : '';
+        }
+        if (text) {
+          lines.push(`> ${sender}: ${text.split('\n')[0].slice(0, 200)}`);
+        }
+      }
+      if (items.length > 20) {
+        lines.push(`> ... 共 ${items.length} 条消息`);
+      }
+      return { text: lines.join('\n') };
+    }
+
+    if (messageType === 'system') {
+      const body = parsed.body || parsed.content || '';
+      const systemText =
+        typeof body === 'string' ? body : JSON.stringify(body);
+      return { text: `[系统消息: ${systemText.slice(0, 200)}]` };
+    }
+
+    // Ignore other unknown message types
     return { text: '' };
   } catch (err) {
     logger.warn(
@@ -387,6 +455,7 @@ export function createFeishuConnection(
   const ackReactionByChat = new Map<string, string>();
   const typingReactionByChat = new Map<string, string>();
   const knownChatIds = new Set<string>();
+  const chatTypeById = new Map<string, string>(); // chatId → 'group' | 'p2p'
   const lastCreateTimeByChat = new Map<string, number>();
 
   let client: lark.Client | null = null;
@@ -402,8 +471,9 @@ export function createFeishuConnection(
   let disconnectedSince: number | null = null;
   let healthTimer: NodeJS.Timeout | null = null;
 
-  function rememberChatProgress(chatId: string, createTimeMs: number): void {
+  function rememberChatProgress(chatId: string, createTimeMs: number, chatType?: string): void {
     knownChatIds.add(chatId);
+    if (chatType) chatTypeById.set(chatId, chatType);
     const prev = lastCreateTimeByChat.get(chatId) || 0;
     if (createTimeMs > prev) {
       lastCreateTimeByChat.set(chatId, createTimeMs);
@@ -650,6 +720,7 @@ export function createFeishuConnection(
       resolveEffectiveChatJid,
       onAgentMessage,
       shouldProcessGroupMessage,
+      onInterruptRequest,
     } = connectOptions || {};
     const {
       chatId,
@@ -692,7 +763,7 @@ export function createFeishuConnection(
 
     const extracted = extractMessageContent(messageType, rawContent);
     let text = extracted.text;
-    if (!text && !extracted.imageKeys && !extracted.fileInfos?.length) {
+    if (!text?.trim() && !extracted.imageKeys && !extracted.fileInfos?.length) {
       logger.info(
         { messageId, messageType },
         'No text or image content, skipping',
@@ -816,20 +887,11 @@ export function createFeishuConnection(
       }
     }
 
-    if (source === 'ws') {
-      addReaction(messageId, 'OnIt')
-        .then((reactionId) => {
-          if (reactionId) {
-            ackReactionByChat.set(chatId, `${messageId}:${reactionId}`);
-          }
-        })
-        .catch(() => {});
-    }
     lastMessageIdByChat.set(chatId, messageId);
 
     const resolvedCreateTimeMs = createTimeMs > 0 ? createTimeMs : Date.now();
     const timestamp = new Date(resolvedCreateTimeMs).toISOString();
-    rememberChatProgress(chatId, resolvedCreateTimeMs);
+    rememberChatProgress(chatId, resolvedCreateTimeMs, chatType);
 
     // ── 斜杠指令：拦截已知 /xxx 命令，不进入消息流 ──
     // 群聊中 @机器人 后跟斜杠命令，mention 替换后文本为 "@botname /cmd"，
@@ -889,9 +951,33 @@ export function createFeishuConnection(
       }
     }
 
+    // ── Ack Reaction：确认已收到消息（在 mention 过滤之后，避免对未处理的消息加表情） ──
+    if (source === 'ws') {
+      addReaction(messageId, 'OnIt')
+        .then((reactionId) => {
+          if (reactionId) {
+            ackReactionByChat.set(chatId, `${messageId}:${reactionId}`);
+          }
+        })
+        .catch(() => {});
+    }
+
     // Store message and broadcast to WebSocket clients
     const agentRouting = resolveEffectiveChatJid?.(chatJid);
     const targetJid = agentRouting?.effectiveJid ?? chatJid;
+
+    // ── 中断 fast-path：消息到达时立即检测中断意图，绕过 2s 轮询延迟 ──
+    // 使用路由后的 targetJid 确保中断命中正确的 queue key
+    if (onInterruptRequest && text.length <= 50) {
+      const intent = analyzeIntent(text);
+      if (intent !== 'continue') {
+        onInterruptRequest(targetJid, intent);
+        logger.info(
+          { chatJid, targetJid, messageId, intent },
+          'Interrupt fast-path triggered from Feishu',
+        );
+      }
+    }
     const targetAgentId = agentRouting?.agentId;
 
     storeChatMetadata(targetJid, timestamp);
@@ -1023,7 +1109,7 @@ export function createFeishuConnection(
             createTimeMs: toEpochMs(item.create_time),
             messageType: item.msg_type || item.message_type || '',
             content: item.body?.content || item.content || '',
-            chatType: item.chat_type,
+            chatType: item.chat_type || chatTypeById.get(chatId) || 'group',
             mentions: item.mentions,
             senderOpenId,
           };
@@ -1182,8 +1268,8 @@ export function createFeishuConnection(
           method: 'GET',
           url: '/open-apis/bot/v3/info/',
         });
-        const info = botInfoRes as { data?: { bot?: { open_id?: string } } };
-        botOpenId = info?.data?.bot?.open_id || '';
+        const info = botInfoRes as { bot?: { open_id?: string }; data?: { bot?: { open_id?: string } } };
+        botOpenId = info?.bot?.open_id || info?.data?.bot?.open_id || '';
         if (botOpenId) {
           logger.info(
             { botOpenId },
@@ -1651,6 +1737,14 @@ export function createFeishuConnection(
       } catch (err) {
         logger.error({ err }, 'Failed to sync Feishu groups');
       }
+    },
+
+    getLarkClient(): lark.Client | null {
+      return client;
+    },
+
+    getLastMessageId(chatId: string): string | undefined {
+      return lastMessageIdByChat.get(chatId);
     },
   };
 

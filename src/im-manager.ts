@@ -17,6 +17,7 @@ import {
 import type { FeishuConnectionConfig } from './feishu.js';
 import type { TelegramConnectionConfig } from './telegram.js';
 import type { QQConnectionConfig } from './qq.js';
+import type { StreamingCardController } from './feishu-streaming-card.js';
 import { getRegisteredGroup, getJidsByFolder } from './db.js';
 import { logger } from './logger.js';
 
@@ -54,6 +55,10 @@ export interface ConnectFeishuOptions {
   onBotAddedToGroup?: (chatJid: string, chatName: string) => void;
   onBotRemovedFromGroup?: (chatJid: string) => void;
   shouldProcessGroupMessage?: (chatJid: string) => boolean;
+  onInterruptRequest?: (
+    chatJid: string,
+    intent: 'stop' | 'correction',
+  ) => void;
 }
 
 class IMConnectionManager {
@@ -210,6 +215,22 @@ class IMConnectionManager {
   }
 
   /**
+   * Create a streaming card session for an IM chat (Feishu only).
+   * Returns undefined for non-Feishu channels or if not supported.
+   */
+  createStreamingSession(jid: string): StreamingCardController | undefined {
+    const channelType = getChannelType(jid);
+    if (channelType !== 'feishu') return undefined;
+
+    const chatId = extractChatId(jid);
+    const channel = this.findChannelForJid(jid, channelType);
+    if (channel?.createStreamingSession) {
+      return channel.createStreamingSession(chatId);
+    }
+    return undefined;
+  }
+
+  /**
    * Find the appropriate IMChannel for a given JID, using group ownership lookup
    * and sibling fallback.
    */
@@ -282,6 +303,7 @@ class IMConnectionManager {
       onBotAddedToGroup: options?.onBotAddedToGroup,
       onBotRemovedFromGroup: options?.onBotRemovedFromGroup,
       shouldProcessGroupMessage: options?.shouldProcessGroupMessage,
+      onInterruptRequest: options?.onInterruptRequest,
     });
   }
 
@@ -307,6 +329,10 @@ class IMConnectionManager {
       onAgentMessage?: (baseChatJid: string, agentId: string) => void;
       onBotAddedToGroup?: (chatJid: string, chatName: string) => void;
       onBotRemovedFromGroup?: (chatJid: string) => void;
+      onInterruptRequest?: (
+        chatJid: string,
+        intent: 'stop' | 'correction',
+      ) => void;
     },
   ): Promise<boolean> {
     if (!config.botToken) {
@@ -332,6 +358,7 @@ class IMConnectionManager {
       onAgentMessage: options?.onAgentMessage,
       onBotAddedToGroup: options?.onBotAddedToGroup,
       onBotRemovedFromGroup: options?.onBotRemovedFromGroup,
+      onInterruptRequest: options?.onInterruptRequest,
     });
   }
 
@@ -355,6 +382,10 @@ class IMConnectionManager {
         chatJid: string,
       ) => { effectiveJid: string; agentId: string | null } | null;
       onAgentMessage?: (baseChatJid: string, agentId: string) => void;
+      onInterruptRequest?: (
+        chatJid: string,
+        intent: 'stop' | 'correction',
+      ) => void;
     },
   ): Promise<boolean> {
     if (!config.appId || !config.appSecret) {
@@ -378,6 +409,7 @@ class IMConnectionManager {
       resolveGroupFolder: options?.resolveGroupFolder,
       resolveEffectiveChatJid: options?.resolveEffectiveChatJid,
       onAgentMessage: options?.onAgentMessage,
+      onInterruptRequest: options?.onInterruptRequest,
     });
   }
 
