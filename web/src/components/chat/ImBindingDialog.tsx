@@ -102,10 +102,10 @@ export function ImBindingDialog({ open, groupJid, agentId, agent, onClose }: ImB
       if (ok) {
         await reloadGroups();
       } else {
-        showToast('绑定失败', 'error');
+        showToast('绑定失败');
       }
     } catch {
-      showToast('绑定失败', 'error');
+      showToast('绑定失败');
     }
     setActionLoading(null);
   };
@@ -122,10 +122,10 @@ export function ImBindingDialog({ open, groupJid, agentId, agent, onClose }: ImB
       if (ok) {
         await reloadGroups();
       } else {
-        showToast('解绑失败', 'error');
+        showToast('解绑失败');
       }
     } catch {
-      showToast('解绑失败', 'error');
+      showToast('解绑失败');
     }
     setActionLoading(null);
   };
@@ -157,10 +157,10 @@ export function ImBindingDialog({ open, groupJid, agentId, agent, onClose }: ImB
       if (ok) {
         await reloadGroups();
       } else {
-        showToast('换绑失败', 'error');
+        showToast('换绑失败');
       }
     } catch {
-      showToast('换绑失败', 'error');
+      showToast('换绑失败');
     }
     setActionLoading(null);
   };
