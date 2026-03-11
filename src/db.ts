@@ -320,6 +320,11 @@ export function initDatabase(): void {
     "TEXT DEFAULT 'source_only'",
   );
   ensureColumn('registered_groups', 'require_mention', 'INTEGER DEFAULT 1');
+  ensureColumn(
+    'registered_groups',
+    'activation_mode',
+    "TEXT DEFAULT 'auto'",
+  );
   ensureColumn('messages', 'token_usage', 'TEXT');
 
   // Add index on target_agent_id for fast lookup of IM bindings
@@ -595,7 +600,7 @@ export function initDatabase(): void {
     }
   }
 
-  const SCHEMA_VERSION = '22';
+  const SCHEMA_VERSION = '23';
   db.prepare(
     'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
   ).run('schema_version', SCHEMA_VERSION);
@@ -1306,6 +1311,7 @@ type RegisteredGroupRow = {
   target_main_jid: string | null;
   reply_policy: string | null;
   require_mention: number;
+  activation_mode: string | null;
 };
 
 /** Convert a raw DB row into a RegisteredGroup domain object. */
@@ -1333,7 +1339,23 @@ function parseGroupRow(
     target_main_jid: row.target_main_jid ?? undefined,
     reply_policy: row.reply_policy === 'mirror' ? 'mirror' : 'source_only',
     require_mention: row.require_mention === 1,
+    activation_mode: parseActivationMode(row.activation_mode),
   };
+}
+
+const VALID_ACTIVATION_MODES = new Set([
+  'auto',
+  'always',
+  'when_mentioned',
+  'disabled',
+]);
+
+function parseActivationMode(
+  raw: string | null,
+): 'auto' | 'always' | 'when_mentioned' | 'disabled' {
+  if (raw && VALID_ACTIVATION_MODES.has(raw))
+    return raw as 'auto' | 'always' | 'when_mentioned' | 'disabled';
+  return 'auto';
 }
 
 export function getRegisteredGroup(
@@ -1348,8 +1370,8 @@ export function getRegisteredGroup(
 
 export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
   db.prepare(
-    `INSERT OR REPLACE INTO registered_groups (jid, name, folder, added_at, container_config, execution_mode, custom_cwd, init_source_path, init_git_url, created_by, is_home, selected_skills, target_agent_id, target_main_jid, reply_policy, require_mention)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT OR REPLACE INTO registered_groups (jid, name, folder, added_at, container_config, execution_mode, custom_cwd, init_source_path, init_git_url, created_by, is_home, selected_skills, target_agent_id, target_main_jid, reply_policy, require_mention, activation_mode)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     jid,
     group.name,
@@ -1367,6 +1389,7 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
     group.target_main_jid ?? null,
     group.reply_policy ?? 'source_only',
     group.require_mention !== false ? 1 : 0,
+    group.activation_mode ?? 'auto',
   );
 }
 

@@ -77,6 +77,12 @@ import {
 import { imManager } from './im-manager.js';
 import { getChannelType } from './im-channel.js';
 import {
+  registerStreamingSession,
+  unregisterStreamingSession,
+  hasActiveStreamingSession,
+  abortAllStreamingSessions,
+} from './feishu-streaming-card.js';
+import {
   formatContextMessages,
   formatWorkspaceList,
   formatSystemStatus,
@@ -958,6 +964,12 @@ async function summarizeWithClaude(transcript: string): Promise<string | null> {
 }
 
 async function setTyping(jid: string, isTyping: boolean): Promise<void> {
+  // Skip Feishu Reaction when a streaming card is active — the card itself
+  // serves as a live typing indicator.
+  if (isTyping && hasActiveStreamingSession(jid)) {
+    broadcastTyping(jid, isTyping);
+    return;
+  }
   await imManager.setTyping(jid, isTyping);
   broadcastTyping(jid, isTyping);
 }
@@ -1345,6 +1357,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   }
   if (!group) return true;
 
+  // activation_mode === 'disabled' 时忽略所有消息（DM 和群聊）
+  if (group.activation_mode === 'disabled') {
+    logger.debug({ chatJid }, 'Group activation_mode is disabled, skipping');
+    return true;
+  }
+
   const resolved = resolveEffectiveGroup(group);
   let effectiveGroup = resolved.effectiveGroup;
   let isHome = resolved.isHome;
@@ -1435,6 +1453,17 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   const queryTaskIds = new Set<string>();
   const lastProcessed = missedMessages[missedMessages.length - 1];
 
+  // ── Feishu Streaming Card ──
+  // Create a streaming session for Feishu channels (typing-machine effect).
+  // Non-Feishu channels get undefined → all streaming logic is no-op.
+  const streamingSessionJid = replySourceImJid ?? chatJid;
+  const streamingSession = imManager.createStreamingSession(streamingSessionJid);
+  let streamingAccumulatedText = '';
+  if (streamingSession) {
+    registerStreamingSession(streamingSessionJid, streamingSession);
+    logger.debug({ chatJid }, 'Streaming card session created for Feishu');
+  }
+
   const pickRunningTaskForNotification = (): string | null => {
     const runningInQuery = Array.from(queryTaskIds)
       .map((id) => getAgent(id))
@@ -1474,6 +1503,16 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         // 流式事件处理 - 广播 WebSocket + 持久化 SDK Task 生命周期到 DB
         if (result.status === 'stream' && result.streamEvent) {
           broadcastStreamEvent(chatJid, result.streamEvent);
+
+          // ── Feed text_delta into Feishu streaming card ──
+          if (
+            streamingSession &&
+            result.streamEvent.eventType === 'text_delta' &&
+            result.streamEvent.text
+          ) {
+            streamingAccumulatedText += result.streamEvent.text;
+            streamingSession.append(streamingAccumulatedText);
+          }
 
           // Persist SDK Task lifecycle to DB so tabs survive page refresh
           const se = result.streamEvent;
@@ -1667,13 +1706,42 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               text,
               effectiveGroup.folder,
             );
+
+            // ── Complete Feishu streaming card ──
+            // If a streaming card is active, finalize it with the complete text.
+            // The card replaces the normal IM sendMessage for the Feishu channel.
+            let streamingCardHandledIM = false;
+            if (streamingSession?.isActive()) {
+              try {
+                await streamingSession.complete(text);
+                streamingCardHandledIM = true;
+                logger.debug(
+                  { chatJid },
+                  'Streaming card completed with final text',
+                );
+              } catch (err) {
+                logger.warn(
+                  { err, chatJid },
+                  'Streaming card complete failed, falling back to static message',
+                );
+                // Fall through to normal sendMessage
+              }
+            }
+
+            // For direct IM Feishu chats, if streaming card handled the reply,
+            // still store in DB + broadcast to web, but skip IM send.
+            const skipImSend = streamingCardHandledIM && directImReply;
             lastReplyMsgId = await sendMessage(chatJid, text, {
-              sendToIM: directImReply,
+              sendToIM: directImReply && !skipImSend,
               localImagePaths,
             });
 
+            // For routed IM (web JID with IM source), skip the source channel
+            // if streaming card handled it, but still relay to it otherwise.
             if (replySourceImJid && replySourceImJid !== chatJid) {
-              sendImWithFailTracking(replySourceImJid, text, localImagePaths);
+              if (!streamingCardHandledIM) {
+                sendImWithFailTracking(replySourceImJid, text, localImagePaths);
+              }
             }
 
             // Optional mirror mode for explicitly bound IM channels
@@ -1716,6 +1784,20 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   await setTyping(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
+
+  // ── Streaming card cleanup ──
+  if (streamingSession) {
+    if (streamingSession.isActive()) {
+      // Agent finished without a visible result.result (e.g., error or interrupt)
+      if (hadError || output.status === 'error') {
+        await streamingSession.abort('处理出错').catch(() => {});
+      } else {
+        // Edge case: agent completed with no text output — dispose silently
+        streamingSession.dispose();
+      }
+    }
+    unregisterStreamingSession(streamingSessionJid);
+  }
 
   // 不可恢复的转录错误（如超大图片/MIME 错配被固化在会话历史中）：无论是否已有回复，都必须重置会话
   const errorForReset = [lastError, output.error].filter(Boolean).join(' ');
@@ -3731,8 +3813,39 @@ function buildOnAgentMessage(): (baseChatJid: string, agentId: string) => void {
  */
 function shouldProcessGroupMessage(chatJid: string): boolean {
   const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
-  // require_mention defaults to true; if false → process all messages
-  return group?.require_mention === false;
+  if (!group) return false;
+
+  // activation_mode 优先于 require_mention
+  const mode = group.activation_mode ?? 'auto';
+  switch (mode) {
+    case 'always':
+      return true; // 群聊不需要 @bot
+    case 'when_mentioned':
+      return false; // 必须 @bot
+    case 'disabled':
+      return false; // 忽略所有消息（在调用方处理 disabled 的 DM 忽略）
+    case 'auto':
+    default:
+      // 兼容旧行为：require_mention defaults to true; if false → process all messages
+      return group.require_mention === false;
+  }
+}
+
+/**
+ * 中断 fast-path 回调：IM 消息到达时立即触发中断，绕过 2s 轮询延迟。
+ * 模块级函数，所有 IM 连接共享。
+ */
+function handleIMInterruptRequest(
+  chatJid: string,
+  intent: 'stop' | 'correction',
+): void {
+  const interrupted = queue.interruptQuery(chatJid);
+  if (interrupted) {
+    logger.info(
+      { chatJid, intent },
+      'Interrupt fast-path: query interrupted immediately',
+    );
+  }
 }
 
 /**
@@ -3755,6 +3868,7 @@ async function connectUserIMChannels(
   const onAgentMessage = buildOnAgentMessage();
   const onBotAddedToGroup = buildOnNewChat(userId, homeFolder); // reuse same logic: auto-register
   const onBotRemovedFromGroup = buildOnBotRemovedFromGroup();
+
   let feishu = false;
   let telegram = false;
   let qq = false;
@@ -3778,6 +3892,7 @@ async function connectUserIMChannels(
         onBotAddedToGroup,
         onBotRemovedFromGroup,
         shouldProcessGroupMessage,
+        onInterruptRequest: handleIMInterruptRequest,
       },
     );
   }
@@ -3800,6 +3915,7 @@ async function connectUserIMChannels(
         onAgentMessage,
         onBotAddedToGroup: buildTelegramBotAddedHandler(userId, homeFolder),
         onBotRemovedFromGroup,
+        onInterruptRequest: handleIMInterruptRequest,
       },
     );
   }
@@ -3821,6 +3937,7 @@ async function connectUserIMChannels(
         resolveGroupFolder,
         resolveEffectiveChatJid,
         onAgentMessage,
+        onInterruptRequest: handleIMInterruptRequest,
       },
     );
   }
@@ -4046,6 +4163,13 @@ async function main(): Promise<void> {
     } catch (err) {
       logger.warn({ err }, 'Error shutting down terminals');
     }
+    // Abort all active streaming cards before disconnecting IM,
+    // so users see "服务维护中" instead of a stuck "生成中..." card.
+    try {
+      await abortAllStreamingSessions('服务维护中');
+    } catch (err) {
+      logger.warn({ err }, 'Error aborting streaming sessions');
+    }
     try {
       await imManager.disconnectAll();
     } catch (err) {
@@ -4113,6 +4237,7 @@ async function main(): Promise<void> {
           onBotAddedToGroup: buildOnNewChat(adminUser.id, homeFolder),
           onBotRemovedFromGroup: buildOnBotRemovedFromGroup(),
           shouldProcessGroupMessage,
+          onInterruptRequest: handleIMInterruptRequest,
         },
       );
       if (connected) {
@@ -4171,6 +4296,7 @@ async function main(): Promise<void> {
             homeFolder,
           ),
           onBotRemovedFromGroup: buildOnBotRemovedFromGroup(),
+          onInterruptRequest: handleIMInterruptRequest,
         },
       );
       return connected;
@@ -4215,6 +4341,7 @@ async function main(): Promise<void> {
             onBotAddedToGroup: buildOnNewChat(userId, homeFolder),
             onBotRemovedFromGroup: buildOnBotRemovedFromGroup(),
             shouldProcessGroupMessage,
+            onInterruptRequest: handleIMInterruptRequest,
           },
         );
         logger.info(
@@ -4247,6 +4374,7 @@ async function main(): Promise<void> {
             onAgentMessage: buildOnAgentMessage(),
             onBotAddedToGroup: buildTelegramBotAddedHandler(userId, homeFolder),
             onBotRemovedFromGroup: buildOnBotRemovedFromGroup(),
+            onInterruptRequest: handleIMInterruptRequest,
           },
         );
         logger.info(
@@ -4279,6 +4407,7 @@ async function main(): Promise<void> {
               resolveEffectiveFolder(chatJid),
             resolveEffectiveChatJid: buildResolveEffectiveChatJid(),
             onAgentMessage: buildOnAgentMessage(),
+            onInterruptRequest: handleIMInterruptRequest,
           },
         );
         logger.info({ userId, connected }, 'User QQ connection hot-reloaded');

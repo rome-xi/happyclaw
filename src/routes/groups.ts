@@ -153,6 +153,7 @@ interface GroupPayloadItem {
   member_count?: number;
   selected_skills?: string[] | null;
   pinned_at?: string;
+  activation_mode?: 'auto' | 'always' | 'when_mentioned' | 'disabled';
 }
 
 function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
@@ -261,6 +262,7 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
       member_count: isShared ? memberInfo?.count : undefined,
       selected_skills: group.selected_skills ?? null,
       pinned_at: pins[jid] || undefined,
+      activation_mode: group.activation_mode ?? 'auto',
     };
   }
 
@@ -679,17 +681,30 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
     return c.json({ error: 'Invalid request body' }, 400);
   }
 
-  const { name: rawName, selected_skills, is_pinned } = validation.data;
+  const {
+    name: rawName,
+    selected_skills,
+    is_pinned,
+    activation_mode,
+  } = validation.data;
   const name = rawName ? normalizeGroupName(rawName) : undefined;
 
   // 至少需要提供一个字段
-  if (!name && selected_skills === undefined && is_pinned === undefined) {
+  if (
+    !name &&
+    selected_skills === undefined &&
+    is_pinned === undefined &&
+    activation_mode === undefined
+  ) {
     return c.json({ error: 'No fields to update' }, 400);
   }
 
   // Pin/unpin only requires canAccessGroup (it's a per-user preference)
   const isPinOnly =
-    is_pinned !== undefined && !name && selected_skills === undefined;
+    is_pinned !== undefined &&
+    !name &&
+    selected_skills === undefined &&
+    activation_mode === undefined;
   if (isPinOnly) {
     if (
       !canAccessGroup(
@@ -731,8 +746,12 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
     unpinGroup(authUser.id, jid);
   }
 
-  // Update registered group if name or skills changed
-  if (name || selected_skills !== undefined) {
+  // Update registered group if name, skills, or activation_mode changed
+  if (
+    name ||
+    selected_skills !== undefined ||
+    activation_mode !== undefined
+  ) {
     const updated: RegisteredGroup = {
       name: name || existing.name,
       folder: existing.folder,
@@ -740,12 +759,22 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
       containerConfig: existing.containerConfig,
       executionMode: existing.executionMode,
       customCwd: existing.customCwd,
+      initSourcePath: existing.initSourcePath,
+      initGitUrl: existing.initGitUrl,
       created_by: existing.created_by,
       is_home: existing.is_home,
       selected_skills:
         selected_skills !== undefined
           ? (selected_skills ?? null)
           : existing.selected_skills,
+      target_agent_id: existing.target_agent_id,
+      target_main_jid: existing.target_main_jid,
+      reply_policy: existing.reply_policy,
+      require_mention: existing.require_mention,
+      activation_mode:
+        activation_mode !== undefined
+          ? activation_mode
+          : existing.activation_mode,
     };
 
     setRegisteredGroup(jid, updated);
