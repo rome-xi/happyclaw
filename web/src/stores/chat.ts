@@ -1009,6 +1009,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
         return;
       }
       set((s) => {
+        // Guard: if streaming was already cleared (agent reply received),
+        // ignore late-arriving stream events to prevent "thinking" reappearing.
+        if (!s.agentStreaming[agentId] && s.agentWaiting[agentId] === false) {
+          return s;
+        }
         const prev = s.agentStreaming[agentId] || { ...DEFAULT_STREAMING_STATE };
         const next = { ...prev };
         applyStreamEvent(event, prev, next, 8000);
