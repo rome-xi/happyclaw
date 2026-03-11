@@ -206,8 +206,8 @@ function resolveEffectiveFolder(chatJid: string): string | undefined {
 }
 
 /**
- * Resolve the effective group for a non-home group by finding its sibling home
- * group or falling back to the owner's home group execution mode.
+ * Resolve the effective group for a non-home group by finding its sibling home group.
+ * Non-home groups use their own executionMode/customCwd — no owner fallback.
  * Populates registeredGroups cache as a side-effect.
  */
 function resolveEffectiveGroup(group: RegisteredGroup): {
@@ -230,22 +230,6 @@ function resolveEffectiveGroup(group: RegisteredGroup): {
           is_home: true,
         },
         isHome: true,
-      };
-    }
-  }
-
-  // Sub-workspace fallback: inherit owner's home group execution mode
-  if (group.created_by) {
-    const ownerHome = getUserHomeGroup(group.created_by);
-    if (ownerHome?.is_home) {
-      return {
-        effectiveGroup: {
-          ...group,
-          executionMode: ownerHome.executionMode,
-          customCwd: ownerHome.customCwd || group.customCwd,
-          created_by: group.created_by,
-        },
-        isHome: false,
       };
     }
   }
