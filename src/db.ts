@@ -319,7 +319,7 @@ export function initDatabase(): void {
     'reply_policy',
     "TEXT DEFAULT 'source_only'",
   );
-  ensureColumn('registered_groups', 'require_mention', 'INTEGER DEFAULT 1');
+  ensureColumn('registered_groups', 'require_mention', 'INTEGER DEFAULT 0');
   ensureColumn(
     'registered_groups',
     'activation_mode',
@@ -1388,7 +1388,7 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
     group.target_agent_id ?? null,
     group.target_main_jid ?? null,
     group.reply_policy ?? 'source_only',
-    group.require_mention !== false ? 1 : 0,
+    group.require_mention === true ? 1 : 0,
     group.activation_mode ?? 'auto',
   );
 }
