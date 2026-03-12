@@ -266,6 +266,69 @@ function resolveOwnerHomeFolder(group: RegisteredGroup): string {
   return group.folder;
 }
 
+/**
+ * Write usage records from a usage event to the database.
+ * Handles both modelUsage (per-model breakdown) and legacy flat format.
+ * When modelUsage is present, root-level cache tokens are assigned to the first model entry.
+ */
+function writeUsageRecords(opts: {
+  userId: string;
+  groupFolder: string;
+  messageId?: string;
+  agentId?: string;
+  usage: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadInputTokens: number;
+    cacheCreationInputTokens: number;
+    costUSD: number;
+    durationMs: number;
+    numTurns: number;
+    modelUsage?: Record<string, { inputTokens: number; outputTokens: number; costUSD: number }>;
+  };
+}): void {
+  const { userId, groupFolder, messageId, agentId, usage } = opts;
+  if (usage.modelUsage) {
+    const models = Object.entries(usage.modelUsage);
+    let cacheReadAssigned = false;
+    for (const [model, mu] of models) {
+      insertUsageRecord({
+        userId,
+        groupFolder,
+        agentId,
+        messageId,
+        model,
+        inputTokens: mu.inputTokens,
+        outputTokens: mu.outputTokens,
+        // Assign root-level cache tokens to the first model entry
+        cacheReadInputTokens: cacheReadAssigned ? 0 : usage.cacheReadInputTokens,
+        cacheCreationInputTokens: cacheReadAssigned ? 0 : usage.cacheCreationInputTokens,
+        costUSD: mu.costUSD,
+        durationMs: usage.durationMs,
+        numTurns: usage.numTurns,
+        source: 'agent',
+      });
+      cacheReadAssigned = true;
+    }
+  } else {
+    insertUsageRecord({
+      userId,
+      groupFolder,
+      agentId,
+      messageId,
+      model: 'unknown',
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
+      cacheReadInputTokens: usage.cacheReadInputTokens,
+      cacheCreationInputTokens: usage.cacheCreationInputTokens,
+      costUSD: usage.costUSD,
+      durationMs: usage.durationMs,
+      numTurns: usage.numTurns,
+      source: 'agent',
+    });
+  }
+}
+
 /** Send a message to an IM channel with automatic fail-count tracking and auto-unbind. */
 function extractLocalImImagePaths(
   text: string,
@@ -1750,41 +1813,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               );
 
               // Write to usage_records + usage_daily_summary
-              const usageUserId = effectiveGroup.created_by || 'system';
-              const usageFolder = effectiveGroup.folder;
-              if (se.usage.modelUsage) {
-                for (const [model, mu] of Object.entries(se.usage.modelUsage)) {
-                  insertUsageRecord({
-                    userId: usageUserId,
-                    groupFolder: usageFolder,
-                    messageId: lastReplyMsgId,
-                    model,
-                    inputTokens: mu.inputTokens,
-                    outputTokens: mu.outputTokens,
-                    cacheReadInputTokens: 0,
-                    cacheCreationInputTokens: 0,
-                    costUSD: mu.costUSD,
-                    durationMs: se.usage.durationMs,
-                    numTurns: se.usage.numTurns,
-                    source: 'agent',
-                  });
-                }
-              } else {
-                insertUsageRecord({
-                  userId: usageUserId,
-                  groupFolder: usageFolder,
-                  messageId: lastReplyMsgId,
-                  model: 'unknown',
-                  inputTokens: se.usage.inputTokens,
-                  outputTokens: se.usage.outputTokens,
-                  cacheReadInputTokens: se.usage.cacheReadInputTokens,
-                  cacheCreationInputTokens: se.usage.cacheCreationInputTokens,
-                  costUSD: se.usage.costUSD,
-                  durationMs: se.usage.durationMs,
-                  numTurns: se.usage.numTurns,
-                  source: 'agent',
-                });
-              }
+              writeUsageRecords({
+                userId: effectiveGroup.created_by || 'system',
+                groupFolder: effectiveGroup.folder,
+                messageId: lastReplyMsgId,
+                usage: se.usage,
+              });
 
               logger.debug(
                 {
@@ -3279,46 +3313,15 @@ async function processAgentConversation(
 
           // Write to usage_records + usage_daily_summary
           // Sub-Agent 的 effectiveGroup 可能没有 created_by，从父群组继承
-          const agentUsageUserId = effectiveGroup.created_by
-            || registeredGroups[chatJid]?.created_by
-            || 'system';
-          const agentUsageFolder = effectiveGroup.folder;
-          const agentUsage = output.streamEvent.usage;
-          if (agentUsage.modelUsage) {
-            for (const [model, mu] of Object.entries(agentUsage.modelUsage)) {
-              insertUsageRecord({
-                userId: agentUsageUserId,
-                groupFolder: agentUsageFolder,
-                agentId,
-                messageId: lastAgentReplyMsgId,
-                model,
-                inputTokens: mu.inputTokens,
-                outputTokens: mu.outputTokens,
-                cacheReadInputTokens: 0,
-                cacheCreationInputTokens: 0,
-                costUSD: mu.costUSD,
-                durationMs: agentUsage.durationMs,
-                numTurns: agentUsage.numTurns,
-                source: 'agent',
-              });
-            }
-          } else {
-            insertUsageRecord({
-              userId: agentUsageUserId,
-              groupFolder: agentUsageFolder,
-              agentId,
-              messageId: lastAgentReplyMsgId,
-              model: 'unknown',
-              inputTokens: agentUsage.inputTokens,
-              outputTokens: agentUsage.outputTokens,
-              cacheReadInputTokens: agentUsage.cacheReadInputTokens,
-              cacheCreationInputTokens: agentUsage.cacheCreationInputTokens,
-              costUSD: agentUsage.costUSD,
-              durationMs: agentUsage.durationMs,
-              numTurns: agentUsage.numTurns,
-              source: 'agent',
-            });
-          }
+          writeUsageRecords({
+            userId: effectiveGroup.created_by
+              || registeredGroups[chatJid]?.created_by
+              || 'system',
+            groupFolder: effectiveGroup.folder,
+            agentId,
+            messageId: lastAgentReplyMsgId,
+            usage: output.streamEvent.usage,
+          });
         } catch (err) {
           logger.warn(
             { err, chatJid, agentId },
