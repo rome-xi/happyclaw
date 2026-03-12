@@ -8,6 +8,7 @@ import type { Variables } from '../web-context.js';
 import type { AuthUser } from '../types.js';
 import { authMiddleware } from '../middleware/auth.js';
 import { DATA_DIR } from '../config.js';
+import { checkMcpServerLimit } from '../billing.js';
 
 // --- Types ---
 
@@ -135,6 +136,17 @@ mcpServersRoutes.post('/', authMiddleware, async (c) => {
       },
       400,
     );
+  }
+
+  // Billing: check MCP server limit
+  const existingServers = await readMcpServersFile(authUser.id);
+  const currentCount = Object.keys(existingServers.servers).length;
+  if (!existingServers.servers[id]) {
+    // Only check limit for new servers, not updates
+    const limit = checkMcpServerLimit(authUser.id, authUser.role, currentCount);
+    if (!limit.allowed) {
+      return c.json({ error: limit.reason }, 403);
+    }
   }
 
   const isHttpType = type === 'http' || type === 'sse';

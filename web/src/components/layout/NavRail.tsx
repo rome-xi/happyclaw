@@ -1,21 +1,22 @@
+import { useMemo } from 'react';
 import { NavLink, useNavigate } from 'react-router-dom';
-import { MessageSquare, Clock, Activity, Settings, LogOut, BarChart3 } from 'lucide-react';
+import { LogOut } from 'lucide-react';
 import { useAuthStore } from '../../stores/auth';
+import { useBillingStore } from '../../stores/billing';
 import { EmojiAvatar } from '../common/EmojiAvatar';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
-
-const navItems = [
-  { path: '/chat', icon: MessageSquare, label: '工作台' },
-  { path: '/tasks', icon: Clock, label: '任务' },
-  { path: '/usage', icon: BarChart3, label: '用量' },
-  { path: '/monitor', icon: Activity, label: '监控' },
-  { path: '/settings', icon: Settings, label: '设置' },
-];
+import { baseNavItems } from './nav-items';
 
 export function NavRail() {
   const user = useAuthStore((s) => s.user);
   const logout = useAuthStore((s) => s.logout);
   const navigate = useNavigate();
+  const billingEnabled = useBillingStore((s) => s.billingEnabled);
+
+  const navItems = useMemo(
+    () => baseNavItems.filter((item) => !item.requiresBilling || billingEnabled),
+    [billingEnabled],
+  );
 
   const userInitial = (user?.display_name || user?.username || '?')[0].toUpperCase();
 

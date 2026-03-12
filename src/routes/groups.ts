@@ -8,6 +8,7 @@ import {
   ContainerEnvSchema,
 } from '../schemas.js';
 import type { AuthUser, RegisteredGroup, ExecutionMode } from '../types.js';
+import { checkGroupLimit } from '../billing.js';
 import { DATA_DIR, GROUPS_DIR } from '../config.js';
 import {
   isHostExecutionGroup,
@@ -380,6 +381,12 @@ groupRoutes.post('/', authMiddleware, async (c) => {
   const initSourcePath = validation.data.init_source_path;
   const initGitUrl = validation.data.init_git_url;
   const authUser = c.get('user') as AuthUser;
+
+  // Billing: check group limit
+  const groupLimit = checkGroupLimit(authUser.id, authUser.role);
+  if (!groupLimit.allowed) {
+    return c.json({ error: groupLimit.reason }, 403);
+  }
 
   // 互斥校验：init_source_path 和 init_git_url 不能同时指定
   if (initSourcePath && initGitUrl) {

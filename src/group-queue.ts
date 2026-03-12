@@ -54,6 +54,9 @@ export class GroupQueue {
     null;
   private onMaxRetriesExceededFn: ((groupJid: string) => void) | null = null;
   private onContainerExitFn: ((groupJid: string) => void) | null = null;
+  private userConcurrentLimitFn:
+    | ((groupJid: string) => { allowed: boolean })
+    | null = null;
 
   private getGroup(groupJid: string): GroupState {
     let state = this.groups.get(groupJid);
@@ -96,6 +99,12 @@ export class GroupQueue {
     this.onContainerExitFn = fn;
   }
 
+  setUserConcurrentLimitChecker(
+    fn: (groupJid: string) => { allowed: boolean },
+  ): void {
+    this.userConcurrentLimitFn = fn;
+  }
+
   /**
    * 标记 group 发生了上下文溢出错误，跳过指数退避重试
    */
@@ -135,10 +144,18 @@ export class GroupQueue {
 
   private hasCapacityFor(groupJid: string): boolean {
     const isHost = this.isHostMode(groupJid);
-    return isHost
+    const systemCapacity = isHost
       ? this.activeHostProcessCount <
           getSystemSettings().maxConcurrentHostProcesses
       : this.activeContainerCount < getSystemSettings().maxConcurrentContainers;
+    if (!systemCapacity) return false;
+
+    // User-level concurrent container limit (billing)
+    if (this.userConcurrentLimitFn) {
+      const result = this.userConcurrentLimitFn(groupJid);
+      if (!result.allowed) return false;
+    }
+    return true;
   }
 
   private resolveActiveState(groupJid: string): ActiveGroupState | null {

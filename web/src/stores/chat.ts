@@ -231,6 +231,16 @@ function pickSdkTaskAliasTarget(
   return pool[0] || null;
 }
 
+function isTerminalSystemMessage(message: Pick<Message, 'sender' | 'content'>): boolean {
+  if (message.sender === '__billing__') return true;
+  return message.sender === '__system__' && (
+    message.content.startsWith('agent_error:') ||
+    message.content.startsWith('agent_max_retries:') ||
+    message.content.startsWith('context_overflow:') ||
+    message.content === 'query_interrupted'
+  );
+}
+
 function clearSdkTaskCleanupTimer(taskId: string): void {
   const timer = sdkTaskCleanupTimers.get(taskId);
   if (timer) {
@@ -628,15 +638,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           const agentReplied = data.messages.some(
             (m) => m.is_from_me && m.sender !== '__system__',
           );
-          const hasSystemError = data.messages.some(
-            (m) => m.sender === '__system__' &&
-              (
-                m.content.startsWith('agent_error:') ||
-                m.content.startsWith('agent_max_retries:') ||
-                m.content.startsWith('context_overflow:') ||
-                m.content === 'query_interrupted'
-              )
-          );
+          const hasSystemError = data.messages.some((m) => isTerminalSystemMessage(m));
 
           // Transfer pending thinking to thinkingCache
           let nextThinkingCache = s.thinkingCache;
@@ -701,16 +703,25 @@ export const useChatStore = create<ChatState>((set, get) => ({
           is_from_me: false,
           attachments: body.attachments ? JSON.stringify(body.attachments) : undefined,
         };
-        set((s) => ({
-          messages: {
-            ...s.messages,
-            [jid]: (s.messages[jid] || []).some((m) => m.id === msg.id)
-              ? (s.messages[jid] || [])
-              : [...(s.messages[jid] || []), msg],
-          },
-          waiting: { ...s.waiting, [jid]: true },
-          error: null,
-        }));
+        set((s) => {
+          const merged = mergeMessagesChronologically(
+            s.messages[jid] || [],
+            [msg],
+          );
+          const latest = merged.length > 0 ? merged[merged.length - 1] : null;
+          const shouldWait =
+            !!latest &&
+            latest.is_from_me === false &&
+            !isTerminalSystemMessage(latest);
+          return {
+            messages: {
+              ...s.messages,
+              [jid]: merged,
+            },
+            waiting: { ...s.waiting, [jid]: shouldWait },
+            error: null,
+          };
+        });
       }
     } catch (err) {
       set({ error: err instanceof Error ? err.message : String(err) });
@@ -1348,12 +1359,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const updated = alreadyExists ? existing : [...existing, msg];
 
       const isAgentReply = msg.is_from_me && msg.sender !== '__system__';
-      const isSystemError =
-        msg.sender === '__system__' &&
-        (msg.content.startsWith('agent_error:') ||
-          msg.content.startsWith('agent_max_retries:') ||
-          msg.content.startsWith('context_overflow:') ||
-          msg.content === 'query_interrupted');
+      const isSystemError = isTerminalSystemMessage(msg);
 
       if (isAgentReply || isSystemError) {
         // Agent 回复或系统错误：立即清除流式状态和等待标志，转移 thinking 缓存

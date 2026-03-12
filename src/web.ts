@@ -48,6 +48,11 @@ import browseRoutes from './routes/browse.js';
 import agentRoutes from './routes/agents.js';
 import mcpServersRoutes from './routes/mcp-servers.js';
 import { usage as usageRoutes } from './routes/usage.js';
+import billingRoutes from './routes/billing.js';
+import {
+  checkBillingAccess,
+  formatBillingAccessDeniedMessage,
+} from './billing.js';
 
 // Database and types (only for handleWebUserMessage and broadcast)
 import {
@@ -61,6 +66,7 @@ import {
   getGroupMembers,
   getAgent,
   isGroupShared,
+  getUserById,
 } from './db.js';
 import { isSessionExpired } from './auth.js';
 import type {
@@ -71,7 +77,7 @@ import type {
   StreamEvent,
   UserRole,
 } from './types.js';
-import { WEB_PORT, SESSION_COOKIE_NAME } from './config.js';
+import { WEB_PORT, SESSION_COOKIE_NAME, ASSISTANT_NAME } from './config.js';
 import { logger } from './logger.js';
 import { analyzeIntent } from './intent-analyzer.js';
 import { executeSessionReset } from './commands.js';
@@ -162,6 +168,7 @@ app.route('/api/mcp-servers', mcpServersRoutes);
 app.route('/api/groups', agentRoutes); // Agent routes under /api/groups/:jid/agents
 app.route('/api', monitorRoutes);
 app.route('/api/usage', usageRoutes);
+app.route('/api/billing', billingRoutes);
 
 // --- POST /api/messages ---
 
@@ -272,6 +279,39 @@ async function handleWebUserMessage(
     is_from_me: false,
     attachments: attachmentsStr,
   });
+
+  if (group.created_by) {
+    const owner = getUserById(group.created_by);
+    if (owner && owner.role !== 'admin') {
+      const accessResult = checkBillingAccess(group.created_by, owner.role);
+      if (!accessResult.allowed) {
+        const sysMsg = formatBillingAccessDeniedMessage(accessResult);
+        const sysMsgId = `sys_quota_${Date.now()}`;
+        const sysTimestamp = new Date().toISOString();
+        storeMessageDirect(
+          sysMsgId,
+          chatJid,
+          '__billing__',
+          ASSISTANT_NAME,
+          sysMsg,
+          sysTimestamp,
+          true,
+        );
+        broadcastNewMessage(chatJid, {
+          id: sysMsgId,
+          chat_jid: chatJid,
+          sender: '__billing__',
+          sender_name: ASSISTANT_NAME,
+          content: sysMsg,
+          timestamp: sysTimestamp,
+          is_from_me: true,
+        });
+        deps.setLastAgentTimestamp(chatJid, { timestamp, id: messageId });
+        deps.advanceGlobalCursor({ timestamp, id: messageId });
+        return { ok: true, messageId, timestamp };
+      }
+    }
+  }
 
   const shared = !group.is_home && isGroupShared(group.folder);
   const formatted = deps.formatMessages(
@@ -1209,6 +1249,20 @@ export function broadcastStreamEvent(
     ? { type: 'stream_event', chatJid: jid, event, agentId }
     : { type: 'stream_event', chatJid: jid, event };
   safeBroadcast(msg, isHostGroupJid(chatJid), allowedUserIds);
+}
+
+export function broadcastBillingUpdate(
+  userId: string,
+  usage: import('./types.js').BillingAccessResult,
+): void {
+  const msg: WsMessageOut = {
+    type: 'billing_update',
+    userId,
+    usage,
+  };
+  // Send only to the specific user
+  const allowedUserIds = new Set([userId]);
+  safeBroadcast(msg, false, allowedUserIds);
 }
 
 export function broadcastAgentStatus(

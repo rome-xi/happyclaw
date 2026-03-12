@@ -72,6 +72,8 @@ import {
   getGroupsByOwner,
   getMessagesPage,
   addGroupMember,
+  cleanupOldDailyUsage,
+  cleanupOldBillingAuditLog,
 } from './db.js';
 // feishu.js deprecated exports are no longer needed; imManager handles all connections
 import { imManager } from './im-manager.js';
@@ -110,6 +112,16 @@ import type {
 import { GroupQueue } from './group-queue.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import {
+  checkBillingAccessFresh,
+  formatBillingAccessDeniedMessage,
+  updateUsage,
+  deductUsageCost,
+  checkAndExpireSubscriptions,
+  isBillingEnabled,
+  getUserConcurrentContainerLimit,
+  reconcileMonthlyUsage,
+} from './billing.js';
+import {
   AgentStatus,
   MessageCursor,
   NewMessage,
@@ -124,6 +136,7 @@ import {
   broadcastTyping,
   broadcastStreamEvent,
   broadcastAgentStatus,
+  broadcastBillingUpdate,
   shutdownTerminals,
   shutdownWebServer,
 } from './web.js';
@@ -384,6 +397,31 @@ function sendSystemMessage(jid: string, type: string, detail: string): void {
     timestamp,
     is_from_me: true,
   });
+}
+
+function sendBillingDeniedMessage(jid: string, content: string): string {
+  const msgId = `sys_quota_${Date.now()}`;
+  const timestamp = new Date().toISOString();
+  ensureChatExists(jid);
+  storeMessageDirect(
+    msgId,
+    jid,
+    '__billing__',
+    ASSISTANT_NAME,
+    content,
+    timestamp,
+    true,
+  );
+  broadcastNewMessage(jid, {
+    id: msgId,
+    chat_jid: jid,
+    sender: '__billing__',
+    sender_name: ASSISTANT_NAME,
+    content,
+    timestamp,
+    is_from_me: true,
+  });
+  return msgId;
 }
 
 function getSessionClaudeDir(folder: string, agentId?: string): string {
@@ -1494,6 +1532,32 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     cursorCommitted = true;
   };
 
+  if (effectiveGroup.created_by) {
+    const owner = getUserById(effectiveGroup.created_by);
+    if (owner && owner.role !== 'admin') {
+      const accessResult = checkBillingAccessFresh(
+        effectiveGroup.created_by,
+        owner.role,
+      );
+      if (!accessResult.allowed) {
+        const sysMsg = formatBillingAccessDeniedMessage(accessResult);
+        sendBillingDeniedMessage(chatJid, sysMsg);
+        commitCursor();
+        await setTyping(chatJid, false);
+        logger.info(
+          {
+            chatJid,
+            userId: effectiveGroup.created_by,
+            reason: accessResult.reason,
+            blockType: accessResult.blockType,
+          },
+          'Billing access denied inside processGroupMessages',
+        );
+        return true;
+      }
+    }
+  }
+
   const output = await runAgent(
     effectiveGroup,
     prompt,
@@ -1666,6 +1730,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                 chatJid,
                 JSON.stringify(se.usage),
                 lastReplyMsgId,
+                se.usage.costUSD,
               );
               logger.debug(
                 {
@@ -1676,6 +1741,43 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                 },
                 'Token usage persisted',
               );
+
+              // Update billing monthly usage
+              const ownerGroup = registeredGroups[chatJid];
+              if (ownerGroup?.created_by && se.usage.costUSD) {
+                try {
+                  const effective = updateUsage(
+                    ownerGroup.created_by,
+                    se.usage.costUSD,
+                    se.usage.inputTokens || 0,
+                    se.usage.outputTokens || 0,
+                  );
+                  deductUsageCost(
+                    ownerGroup.created_by,
+                    se.usage.costUSD,
+                    lastReplyMsgId || chatJid,
+                    effective,
+                  );
+                  // Broadcast real-time billing update to the user
+                  const owner = getUserById(ownerGroup.created_by);
+                  if (owner && owner.role !== 'admin') {
+                    const freshAccess = checkBillingAccessFresh(
+                      ownerGroup.created_by,
+                      owner.role,
+                    );
+                    if (freshAccess.usage) {
+                      broadcastBillingUpdate(ownerGroup.created_by, {
+                        ...freshAccess,
+                      });
+                    }
+                  }
+                } catch (billingErr) {
+                  logger.warn(
+                    { err: billingErr, chatJid },
+                    'Failed to update billing usage',
+                  );
+                }
+              }
             } catch (err) {
               logger.warn({ err, chatJid }, 'Failed to persist token usage');
             }
@@ -3391,6 +3493,55 @@ async function startMessageLoop(): Promise<void> {
             }
           }
 
+          // Billing quota check before processing
+          if (group.created_by) {
+            const owner = getUserById(group.created_by);
+            if (owner && owner.role !== 'admin') {
+              const accessResult = checkBillingAccessFresh(
+                group.created_by,
+                owner.role,
+              );
+              if (!accessResult.allowed) {
+                logger.info(
+                  {
+                    chatJid,
+                    userId: group.created_by,
+                    reason: accessResult.reason,
+                    blockType: accessResult.blockType,
+                    exceededWindow: accessResult.exceededWindow,
+                  },
+                  'Billing access denied, blocking message processing',
+                );
+                const sysMsg = formatBillingAccessDeniedMessage(accessResult);
+                sendBillingDeniedMessage(chatJid, sysMsg);
+
+                // Notify IM channel if the message came from an IM source
+                const lastSourceJid =
+                  groupMessages[groupMessages.length - 1]?.source_jid;
+                const imSourceJid = lastSourceJid || chatJid;
+                if (getChannelType(imSourceJid)) {
+                  imManager
+                    .sendMessage(imSourceJid, sysMsg)
+                    .catch((err) =>
+                      logger.warn(
+                        { err, jid: imSourceJid },
+                        'Failed to send quota exceeded notice to IM',
+                      ),
+                    );
+                }
+
+                // Advance cursor past these messages so they aren't re-processed
+                const lastMsg = groupMessages[groupMessages.length - 1];
+                lastAgentTimestamp[chatJid] = {
+                  timestamp: lastMsg.timestamp,
+                  id: lastMsg.id,
+                };
+                saveState();
+                continue;
+              }
+            }
+          }
+
           // Pull all messages since lastAgentTimestamp to preserve full context.
           const allPending = getMessagesSince(
             chatJid,
@@ -4468,6 +4619,59 @@ async function main(): Promise<void> {
     60 * 60 * 1000,
   );
 
+  // Billing: check expired subscriptions every hour
+  setInterval(
+    () => {
+      checkAndExpireSubscriptions();
+    },
+    60 * 60 * 1000,
+  );
+
+  // Billing: reconcile monthly usage every 6 hours
+  setInterval(
+    () => {
+      if (!isBillingEnabled()) return;
+      try {
+        const month = new Date().toISOString().slice(0, 7);
+        // Reconcile all non-admin users with pagination
+        let page = 1;
+        const pageSize = 200;
+        // eslint-disable-next-line no-constant-condition
+        while (true) {
+          const batch = listUsers({ status: 'active', pageSize, page });
+          for (const u of batch.users) {
+            if (u.role === 'admin') continue;
+            reconcileMonthlyUsage(u.id, month);
+          }
+          if (batch.users.length < pageSize) break;
+          page++;
+        }
+      } catch (err) {
+        logger.error({ err }, 'Failed to run monthly usage reconciliation');
+      }
+    },
+    6 * 60 * 60 * 1000,
+  );
+
+  // Billing: cleanup old daily_usage and billing_audit_log every 24 hours
+  setInterval(
+    () => {
+      try {
+        const deletedDaily = cleanupOldDailyUsage();
+        const deletedAudit = cleanupOldBillingAuditLog();
+        if (deletedDaily > 0 || deletedAudit > 0) {
+          logger.info(
+            { deletedDaily, deletedAudit },
+            'Cleaned up old billing data',
+          );
+        }
+      } catch (err) {
+        logger.error({ err }, 'Failed to cleanup old billing data');
+      }
+    },
+    24 * 60 * 60 * 1000,
+  );
+
   await ensureDockerRunning();
 
   queue.setProcessMessagesFn(processGroupMessages);
@@ -4507,6 +4711,24 @@ async function main(): Promise<void> {
       `${name} 处理失败，已达最大重试次数`,
     );
     setTyping(groupJid, false);
+  });
+  // Billing: user-level concurrent container limit
+  queue.setUserConcurrentLimitChecker((groupJid: string) => {
+    if (!isBillingEnabled()) return { allowed: true };
+    const group = registeredGroups[groupJid];
+    if (!group?.created_by) return { allowed: true };
+    const owner = getUserById(group.created_by);
+    if (!owner || owner.role === 'admin') return { allowed: true };
+    const limit = getUserConcurrentContainerLimit(owner.id, owner.role);
+    if (limit == null) return { allowed: true };
+    // Count active containers for this user
+    let userActive = 0;
+    for (const [jid, g] of Object.entries(registeredGroups)) {
+      if (g.created_by === owner.id && queue.hasDirectActiveRunner(jid)) {
+        userActive++;
+      }
+    }
+    return { allowed: userActive < limit };
   });
   startSchedulerLoop({
     registeredGroups: () => registeredGroups,
