@@ -74,6 +74,7 @@ import {
   addGroupMember,
   cleanupOldDailyUsage,
   cleanupOldBillingAuditLog,
+  insertUsageRecord,
 } from './db.js';
 // feishu.js deprecated exports are no longer needed; imManager handles all connections
 import { imManager } from './im-manager.js';
@@ -263,6 +264,69 @@ function resolveOwnerHomeFolder(group: RegisteredGroup): string {
     return getUserHomeGroup(group.created_by)?.folder || group.folder;
   }
   return group.folder;
+}
+
+/**
+ * Write usage records from a usage event to the database.
+ * Handles both modelUsage (per-model breakdown) and legacy flat format.
+ * When modelUsage is present, root-level cache tokens are assigned to the first model entry.
+ */
+function writeUsageRecords(opts: {
+  userId: string;
+  groupFolder: string;
+  messageId?: string;
+  agentId?: string;
+  usage: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadInputTokens: number;
+    cacheCreationInputTokens: number;
+    costUSD: number;
+    durationMs: number;
+    numTurns: number;
+    modelUsage?: Record<string, { inputTokens: number; outputTokens: number; costUSD: number }>;
+  };
+}): void {
+  const { userId, groupFolder, messageId, agentId, usage } = opts;
+  if (usage.modelUsage) {
+    const models = Object.entries(usage.modelUsage);
+    let cacheReadAssigned = false;
+    for (const [model, mu] of models) {
+      insertUsageRecord({
+        userId,
+        groupFolder,
+        agentId,
+        messageId,
+        model,
+        inputTokens: mu.inputTokens,
+        outputTokens: mu.outputTokens,
+        // Assign root-level cache tokens to the first model entry
+        cacheReadInputTokens: cacheReadAssigned ? 0 : usage.cacheReadInputTokens,
+        cacheCreationInputTokens: cacheReadAssigned ? 0 : usage.cacheCreationInputTokens,
+        costUSD: mu.costUSD,
+        durationMs: usage.durationMs,
+        numTurns: usage.numTurns,
+        source: 'agent',
+      });
+      cacheReadAssigned = true;
+    }
+  } else {
+    insertUsageRecord({
+      userId,
+      groupFolder,
+      agentId,
+      messageId,
+      model: 'unknown',
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
+      cacheReadInputTokens: usage.cacheReadInputTokens,
+      cacheCreationInputTokens: usage.cacheCreationInputTokens,
+      costUSD: usage.costUSD,
+      durationMs: usage.durationMs,
+      numTurns: usage.numTurns,
+      source: 'agent',
+    });
+  }
 }
 
 /** Send a message to an IM channel with automatic fail-count tracking and auto-unbind. */
@@ -694,21 +758,28 @@ function handleStatusCommand(chatJid: string): string {
   const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
   if (!group) return '当前 IM 未绑定工作区';
 
-  const lookupGroup = (jid: string) => registeredGroups[jid] ?? getRegisteredGroup(jid);
-  const location = resolveLocationInfo(group, lookupGroup, getAgent, findGroupNameByFolder);
+  const lookupGroup = (jid: string) =>
+    registeredGroups[jid] ?? getRegisteredGroup(jid);
+  const location = resolveLocationInfo(
+    group,
+    lookupGroup,
+    getAgent,
+    findGroupNameByFolder,
+  );
 
   const queueStatus = queue.getStatus();
   const settings = getSystemSettings();
 
   // Check if the current group's folder is active or queued
-  const groupState = queueStatus.groups.find(g => {
+  const groupState = queueStatus.groups.find((g) => {
     const rg = lookupGroup(g.jid);
     return rg?.folder === location.folder;
   });
   const isActive = !!groupState?.active;
-  const queuePosition = !isActive && queueStatus.waitingGroupJids.includes(chatJid)
-    ? queueStatus.waitingGroupJids.indexOf(chatJid) + 1
-    : null;
+  const queuePosition =
+    !isActive && queueStatus.waitingGroupJids.includes(chatJid)
+      ? queueStatus.waitingGroupJids.indexOf(chatJid) + 1
+      : null;
 
   return formatSystemStatus(
     location,
@@ -729,8 +800,14 @@ function handleWhereCommand(chatJid: string): string {
   const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
   if (!group) return '当前 IM 未绑定工作区';
 
-  const lookupGroup = (jid: string) => registeredGroups[jid] ?? getRegisteredGroup(jid);
-  const location = resolveLocationInfo(group, lookupGroup, getAgent, findGroupNameByFolder);
+  const lookupGroup = (jid: string) =>
+    registeredGroups[jid] ?? getRegisteredGroup(jid);
+  const location = resolveLocationInfo(
+    group,
+    lookupGroup,
+    getAgent,
+    findGroupNameByFolder,
+  );
 
   const lines = [`📍 当前绑定: ${location.locationLine}`];
   if (location.replyPolicy) {
@@ -1496,7 +1573,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // Create a streaming session for Feishu channels (typing-machine effect).
   // Non-Feishu channels get undefined → all streaming logic is no-op.
   const streamingSessionJid = replySourceImJid ?? chatJid;
-  const streamingSession = imManager.createStreamingSession(streamingSessionJid);
+  const streamingSession =
+    imManager.createStreamingSession(streamingSessionJid);
   let streamingAccumulatedText = '';
   if (streamingSession) {
     registerStreamingSession(streamingSessionJid, streamingSession);
@@ -1724,7 +1802,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             }
           }
 
-          // Persist token usage to the latest agent message
+          // Persist token usage to the latest agent message + usage_records
           if (se.eventType === 'usage' && se.usage) {
             try {
               updateLatestMessageTokenUsage(
@@ -1733,6 +1811,15 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                 lastReplyMsgId,
                 se.usage.costUSD,
               );
+
+              // Write to usage_records + usage_daily_summary
+              writeUsageRecords({
+                userId: effectiveGroup.created_by || 'system',
+                groupFolder: effectiveGroup.folder,
+                messageId: lastReplyMsgId,
+                usage: se.usage,
+              });
+
               logger.debug(
                 {
                   chatJid,
@@ -3165,8 +3252,7 @@ async function processAgentConversation(
   // the batch originated from the web (e.g. after a /clear).
   let replySourceImJid: string | null = null;
   {
-    const lastSourceJid =
-      missedMessages[missedMessages.length - 1]?.source_jid;
+    const lastSourceJid = missedMessages[missedMessages.length - 1]?.source_jid;
     if (lastSourceJid && getChannelType(lastSourceJid) !== null) {
       replySourceImJid = lastSourceJid;
     }
@@ -3224,6 +3310,18 @@ async function processAgentConversation(
             JSON.stringify(output.streamEvent.usage),
             lastAgentReplyMsgId,
           );
+
+          // Write to usage_records + usage_daily_summary
+          // Sub-Agent 的 effectiveGroup 可能没有 created_by，从父群组继承
+          writeUsageRecords({
+            userId: effectiveGroup.created_by
+              || registeredGroups[chatJid]?.created_by
+              || 'system',
+            groupFolder: effectiveGroup.folder,
+            agentId,
+            messageId: lastAgentReplyMsgId,
+            usage: output.streamEvent.usage,
+          });
         } catch (err) {
           logger.warn(
             { err, chatJid, agentId },
@@ -3918,8 +4016,7 @@ function buildOnAgentMessage(): (baseChatJid: string, agentId: string) => void {
     // IM messages must force-restart the agent process so reply routing
     // (replySourceImJid) is recalculated from the latest batch.  This mirrors
     // the home-folder force-restart for the main conversation.
-    const lastSourceJid =
-      missedMessages[missedMessages.length - 1]?.source_jid;
+    const lastSourceJid = missedMessages[missedMessages.length - 1]?.source_jid;
     const isImSource =
       !!lastSourceJid && getChannelType(lastSourceJid) !== null;
 
@@ -3935,9 +4032,7 @@ function buildOnAgentMessage(): (baseChatJid: string, agentId: string) => void {
     } else {
       // Web-origin: try to pipe into running agent process
       const formatted =
-        missedMessages.length > 0
-          ? formatMessages(missedMessages, false)
-          : '';
+        missedMessages.length > 0 ? formatMessages(missedMessages, false) : '';
       const images = collectMessageImages(virtualChatJid, missedMessages);
       const imagesForAgent = images.length > 0 ? images : undefined;
 
