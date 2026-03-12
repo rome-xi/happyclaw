@@ -3278,7 +3278,10 @@ async function processAgentConversation(
           );
 
           // Write to usage_records + usage_daily_summary
-          const agentUsageUserId = effectiveGroup.created_by || 'system';
+          // Sub-Agent 的 effectiveGroup 可能没有 created_by，从父群组继承
+          const agentUsageUserId = effectiveGroup.created_by
+            || registeredGroups[chatJid]?.created_by
+            || 'system';
           const agentUsageFolder = effectiveGroup.folder;
           const agentUsage = output.streamEvent.usage;
           if (agentUsage.modelUsage) {
