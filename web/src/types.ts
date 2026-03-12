@@ -17,6 +17,7 @@ export interface GroupInfo {
   created_by?: string;
   selected_skills?: string[] | null;
   pinned_at?: string;
+  activation_mode?: 'auto' | 'always' | 'when_mentioned' | 'disabled';
 }
 
 export interface AgentInfo {
