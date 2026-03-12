@@ -72,8 +72,9 @@ export function UsagePage() {
     return `过去 ${days} 天的 Token 用量和费用`;
   }, [dataRange, days]);
 
-  // Aggregate daily data for chart
+  // Aggregate daily data for chart — fill all dates in the selected period
   const dailyData = useMemo(() => {
+    // Aggregate breakdown by date
     const byDate = new Map<string, { date: string; input: number; output: number; cacheRead: number; cost: number; messages: number }>();
     for (const row of breakdown) {
       const existing = byDate.get(row.date);
@@ -94,8 +95,25 @@ export function UsagePage() {
         });
       }
     }
-    return Array.from(byDate.values()).sort((a, b) => a.date.localeCompare(b.date));
-  }, [breakdown]);
+
+    // Generate complete date range for the selected period
+    const result: typeof Array.prototype = [];
+    const today = new Date();
+    for (let i = days - 1; i >= 0; i--) {
+      const d = new Date(today);
+      d.setDate(d.getDate() - i);
+      const dateStr = d.toISOString().slice(0, 10); // YYYY-MM-DD
+      result.push(byDate.get(dateStr) || {
+        date: dateStr,
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cost: 0,
+        messages: 0,
+      });
+    }
+    return result;
+  }, [breakdown, days]);
 
   // Model breakdown for pie chart
   const modelData = useMemo(() => {
@@ -390,7 +408,7 @@ export function UsagePage() {
             )}
 
             {/* Empty State */}
-            {dailyData.length === 0 && !loading && (
+            {summary.totalMessages === 0 && !loading && (
               <div className="bg-card rounded-xl border border-border p-12 text-center">
                 <Zap className="w-12 h-12 text-muted-foreground mx-auto mb-4" />
                 <h3 className="text-lg font-semibold text-foreground mb-2">暂无用量数据</h3>
