@@ -3410,11 +3410,25 @@ async function startMessageLoop(): Promise<void> {
           // This prevents IM messages from being piped into an active web:main
           // container (whose onOutput callback wouldn't route replies to IM).
           if (homeFolders.has(group.folder)) {
-            queue.closeStdin(chatJid);
-            logger.debug(
-              { chatJid },
-              'Home-folder message received, forcing stdin close before enqueue',
-            );
+            // Only close the active runner's stdin if it is handling user
+            // messages (not a scheduled task).  Sending the _close sentinel to
+            // a running task container prematurely terminates the task, which
+            // causes its reply to be swallowed or delivered to the wrong IM
+            // context.  When the runner is a task, simply enqueue the message
+            // check; GroupQueue will start it once the task finishes.
+            // See GitHub issue riba2534/happyclaw#151.
+            if (!queue.isActiveRunnerTask(chatJid)) {
+              queue.closeStdin(chatJid);
+              logger.debug(
+                { chatJid },
+                'Home-folder message received, forcing stdin close before enqueue',
+              );
+            } else {
+              logger.debug(
+                { chatJid },
+                'Home-folder message received while scheduled task is running; deferring until task completes',
+              );
+            }
             queue.enqueueMessageCheck(chatJid);
             continue;
           }
