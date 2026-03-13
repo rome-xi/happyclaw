@@ -25,6 +25,8 @@ const BASE_RETRY_MS = 5000;
 
 interface GroupState {
   active: boolean;
+  /** True when the active runner is executing a scheduled task (not user messages). */
+  activeRunnerIsTask: boolean;
   pendingMessages: boolean;
   pendingTasks: QueuedTask[];
   process: ChildProcess | null;
@@ -54,12 +56,16 @@ export class GroupQueue {
     null;
   private onMaxRetriesExceededFn: ((groupJid: string) => void) | null = null;
   private onContainerExitFn: ((groupJid: string) => void) | null = null;
+  private userConcurrentLimitFn:
+    | ((groupJid: string) => { allowed: boolean })
+    | null = null;
 
   private getGroup(groupJid: string): GroupState {
     let state = this.groups.get(groupJid);
     if (!state) {
       state = {
         active: false,
+        activeRunnerIsTask: false,
         pendingMessages: false,
         pendingTasks: [],
         process: null,
@@ -94,6 +100,12 @@ export class GroupQueue {
 
   setOnContainerExit(fn: (groupJid: string) => void): void {
     this.onContainerExitFn = fn;
+  }
+
+  setUserConcurrentLimitChecker(
+    fn: (groupJid: string) => { allowed: boolean },
+  ): void {
+    this.userConcurrentLimitFn = fn;
   }
 
   /**
@@ -135,10 +147,18 @@ export class GroupQueue {
 
   private hasCapacityFor(groupJid: string): boolean {
     const isHost = this.isHostMode(groupJid);
-    return isHost
+    const systemCapacity = isHost
       ? this.activeHostProcessCount <
           getSystemSettings().maxConcurrentHostProcesses
       : this.activeContainerCount < getSystemSettings().maxConcurrentContainers;
+    if (!systemCapacity) return false;
+
+    // User-level concurrent container limit (billing)
+    if (this.userConcurrentLimitFn) {
+      const result = this.userConcurrentLimitFn(groupJid);
+      if (!result.allowed) return false;
+    }
+    return true;
   }
 
   private resolveActiveState(groupJid: string): ActiveGroupState | null {
@@ -156,6 +176,16 @@ export class GroupQueue {
   hasDirectActiveRunner(groupJid: string): boolean {
     const state = this.groups.get(groupJid);
     return state?.active === true;
+  }
+
+  /**
+   * Returns true if the active runner for this group (or its serialization
+   * sibling) is currently executing a scheduled task rather than user messages.
+   * Used by the message loop to avoid prematurely interrupting task containers.
+   */
+  isActiveRunnerTask(groupJid: string): boolean {
+    const state = this.resolveActiveState(groupJid);
+    return state?.activeRunnerIsTask === true;
   }
 
   enqueueMessageCheck(groupJid: string): void {
@@ -290,6 +320,21 @@ export class GroupQueue {
   ): SendMessageResult {
     const state = this.resolveActiveState(groupJid);
     if (!state) return 'no_active';
+
+    // If the active runner is a scheduled task (not a user-message handler),
+    // do NOT pipe user messages into it.  The task container has no knowledge
+    // of the user conversation context, so any IPC message injected here would
+    // be silently consumed (or confusingly processed) by the task agent and the
+    // reply would never reach the user.  Returning 'no_active' causes the
+    // caller to enqueue a fresh message-processing run that will execute once
+    // the task finishes.  See GitHub issue riba2534/happyclaw#151.
+    if (state.activeRunnerIsTask) {
+      logger.debug(
+        { groupJid },
+        'Active runner is a scheduled task; deferring user message until task completes',
+      );
+      return 'no_active';
+    }
 
     if (intent === 'stop') {
       this.interruptQuery(groupJid);
@@ -628,6 +673,7 @@ export class GroupQueue {
     const state = this.getGroup(groupJid);
     const isHostMode = this.isHostMode(groupJid);
     state.active = true;
+    state.activeRunnerIsTask = false;
     state.pendingMessages = false;
     this.waitingGroups.delete(groupJid);
     this.activeCount++;
@@ -689,6 +735,7 @@ export class GroupQueue {
     const state = this.getGroup(groupJid);
     const isHostMode = this.isHostMode(groupJid);
     state.active = true;
+    state.activeRunnerIsTask = true;
     this.waitingGroups.delete(groupJid);
     this.activeCount++;
     if (isHostMode) {
@@ -713,6 +760,7 @@ export class GroupQueue {
       logger.error({ groupJid, taskId: task.id, err }, 'Error running task');
     } finally {
       state.active = false;
+      state.activeRunnerIsTask = false;
       state.process = null;
       state.containerName = null;
       state.displayName = null;

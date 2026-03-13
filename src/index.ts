@@ -72,6 +72,9 @@ import {
   getGroupsByOwner,
   getMessagesPage,
   addGroupMember,
+  cleanupOldDailyUsage,
+  cleanupOldBillingAuditLog,
+  insertUsageRecord,
 } from './db.js';
 // feishu.js deprecated exports are no longer needed; imManager handles all connections
 import { imManager } from './im-manager.js';
@@ -110,12 +113,23 @@ import type {
 import { GroupQueue } from './group-queue.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import {
+  checkBillingAccessFresh,
+  formatBillingAccessDeniedMessage,
+  updateUsage,
+  deductUsageCost,
+  checkAndExpireSubscriptions,
+  isBillingEnabled,
+  getUserConcurrentContainerLimit,
+  reconcileMonthlyUsage,
+} from './billing.js';
+import {
   AgentStatus,
   MessageCursor,
   NewMessage,
   RegisteredGroup,
 } from './types.js';
 import { logger } from './logger.js';
+import { stripAgentInternalTags } from './utils.js';
 import { normalizeImageAttachments } from './message-attachments.js';
 import {
   startWebServer,
@@ -124,6 +138,7 @@ import {
   broadcastTyping,
   broadcastStreamEvent,
   broadcastAgentStatus,
+  broadcastBillingUpdate,
   shutdownTerminals,
   shutdownWebServer,
 } from './web.js';
@@ -249,6 +264,69 @@ function resolveOwnerHomeFolder(group: RegisteredGroup): string {
     return getUserHomeGroup(group.created_by)?.folder || group.folder;
   }
   return group.folder;
+}
+
+/**
+ * Write usage records from a usage event to the database.
+ * Handles both modelUsage (per-model breakdown) and legacy flat format.
+ * When modelUsage is present, root-level cache tokens are assigned to the first model entry.
+ */
+function writeUsageRecords(opts: {
+  userId: string;
+  groupFolder: string;
+  messageId?: string;
+  agentId?: string;
+  usage: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadInputTokens: number;
+    cacheCreationInputTokens: number;
+    costUSD: number;
+    durationMs: number;
+    numTurns: number;
+    modelUsage?: Record<string, { inputTokens: number; outputTokens: number; costUSD: number }>;
+  };
+}): void {
+  const { userId, groupFolder, messageId, agentId, usage } = opts;
+  if (usage.modelUsage) {
+    const models = Object.entries(usage.modelUsage);
+    let cacheReadAssigned = false;
+    for (const [model, mu] of models) {
+      insertUsageRecord({
+        userId,
+        groupFolder,
+        agentId,
+        messageId,
+        model,
+        inputTokens: mu.inputTokens,
+        outputTokens: mu.outputTokens,
+        // Assign root-level cache tokens to the first model entry
+        cacheReadInputTokens: cacheReadAssigned ? 0 : usage.cacheReadInputTokens,
+        cacheCreationInputTokens: cacheReadAssigned ? 0 : usage.cacheCreationInputTokens,
+        costUSD: mu.costUSD,
+        durationMs: usage.durationMs,
+        numTurns: usage.numTurns,
+        source: 'agent',
+      });
+      cacheReadAssigned = true;
+    }
+  } else {
+    insertUsageRecord({
+      userId,
+      groupFolder,
+      agentId,
+      messageId,
+      model: 'unknown',
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
+      cacheReadInputTokens: usage.cacheReadInputTokens,
+      cacheCreationInputTokens: usage.cacheCreationInputTokens,
+      costUSD: usage.costUSD,
+      durationMs: usage.durationMs,
+      numTurns: usage.numTurns,
+      source: 'agent',
+    });
+  }
 }
 
 /** Send a message to an IM channel with automatic fail-count tracking and auto-unbind. */
@@ -384,6 +462,31 @@ function sendSystemMessage(jid: string, type: string, detail: string): void {
     timestamp,
     is_from_me: true,
   });
+}
+
+function sendBillingDeniedMessage(jid: string, content: string): string {
+  const msgId = `sys_quota_${Date.now()}`;
+  const timestamp = new Date().toISOString();
+  ensureChatExists(jid);
+  storeMessageDirect(
+    msgId,
+    jid,
+    '__billing__',
+    ASSISTANT_NAME,
+    content,
+    timestamp,
+    true,
+  );
+  broadcastNewMessage(jid, {
+    id: msgId,
+    chat_jid: jid,
+    sender: '__billing__',
+    sender_name: ASSISTANT_NAME,
+    content,
+    timestamp,
+    is_from_me: true,
+  });
+  return msgId;
 }
 
 function getSessionClaudeDir(folder: string, agentId?: string): string {
@@ -655,21 +758,28 @@ function handleStatusCommand(chatJid: string): string {
   const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
   if (!group) return '当前 IM 未绑定工作区';
 
-  const lookupGroup = (jid: string) => registeredGroups[jid] ?? getRegisteredGroup(jid);
-  const location = resolveLocationInfo(group, lookupGroup, getAgent, findGroupNameByFolder);
+  const lookupGroup = (jid: string) =>
+    registeredGroups[jid] ?? getRegisteredGroup(jid);
+  const location = resolveLocationInfo(
+    group,
+    lookupGroup,
+    getAgent,
+    findGroupNameByFolder,
+  );
 
   const queueStatus = queue.getStatus();
   const settings = getSystemSettings();
 
   // Check if the current group's folder is active or queued
-  const groupState = queueStatus.groups.find(g => {
+  const groupState = queueStatus.groups.find((g) => {
     const rg = lookupGroup(g.jid);
     return rg?.folder === location.folder;
   });
   const isActive = !!groupState?.active;
-  const queuePosition = !isActive && queueStatus.waitingGroupJids.includes(chatJid)
-    ? queueStatus.waitingGroupJids.indexOf(chatJid) + 1
-    : null;
+  const queuePosition =
+    !isActive && queueStatus.waitingGroupJids.includes(chatJid)
+      ? queueStatus.waitingGroupJids.indexOf(chatJid) + 1
+      : null;
 
   return formatSystemStatus(
     location,
@@ -690,8 +800,14 @@ function handleWhereCommand(chatJid: string): string {
   const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
   if (!group) return '当前 IM 未绑定工作区';
 
-  const lookupGroup = (jid: string) => registeredGroups[jid] ?? getRegisteredGroup(jid);
-  const location = resolveLocationInfo(group, lookupGroup, getAgent, findGroupNameByFolder);
+  const lookupGroup = (jid: string) =>
+    registeredGroups[jid] ?? getRegisteredGroup(jid);
+  const location = resolveLocationInfo(
+    group,
+    lookupGroup,
+    getAgent,
+    findGroupNameByFolder,
+  );
 
   const lines = [`📍 当前绑定: ${location.locationLine}`];
   if (location.replyPolicy) {
@@ -1457,7 +1573,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // Create a streaming session for Feishu channels (typing-machine effect).
   // Non-Feishu channels get undefined → all streaming logic is no-op.
   const streamingSessionJid = replySourceImJid ?? chatJid;
-  const streamingSession = imManager.createStreamingSession(streamingSessionJid);
+  const streamingSession =
+    imManager.createStreamingSession(streamingSessionJid);
   let streamingAccumulatedText = '';
   if (streamingSession) {
     registerStreamingSession(streamingSessionJid, streamingSession);
@@ -1493,6 +1610,32 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     saveState();
     cursorCommitted = true;
   };
+
+  if (effectiveGroup.created_by) {
+    const owner = getUserById(effectiveGroup.created_by);
+    if (owner && owner.role !== 'admin') {
+      const accessResult = checkBillingAccessFresh(
+        effectiveGroup.created_by,
+        owner.role,
+      );
+      if (!accessResult.allowed) {
+        const sysMsg = formatBillingAccessDeniedMessage(accessResult);
+        sendBillingDeniedMessage(chatJid, sysMsg);
+        commitCursor();
+        await setTyping(chatJid, false);
+        logger.info(
+          {
+            chatJid,
+            userId: effectiveGroup.created_by,
+            reason: accessResult.reason,
+            blockType: accessResult.blockType,
+          },
+          'Billing access denied inside processGroupMessages',
+        );
+        return true;
+      }
+    }
+  }
 
   const output = await runAgent(
     effectiveGroup,
@@ -1659,14 +1802,24 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             }
           }
 
-          // Persist token usage to the latest agent message
+          // Persist token usage to the latest agent message + usage_records
           if (se.eventType === 'usage' && se.usage) {
             try {
               updateLatestMessageTokenUsage(
                 chatJid,
                 JSON.stringify(se.usage),
                 lastReplyMsgId,
+                se.usage.costUSD,
               );
+
+              // Write to usage_records + usage_daily_summary
+              writeUsageRecords({
+                userId: effectiveGroup.created_by || 'system',
+                groupFolder: effectiveGroup.folder,
+                messageId: lastReplyMsgId,
+                usage: se.usage,
+              });
+
               logger.debug(
                 {
                   chatJid,
@@ -1676,6 +1829,43 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                 },
                 'Token usage persisted',
               );
+
+              // Update billing monthly usage
+              const ownerGroup = registeredGroups[chatJid];
+              if (ownerGroup?.created_by && se.usage.costUSD) {
+                try {
+                  const effective = updateUsage(
+                    ownerGroup.created_by,
+                    se.usage.costUSD,
+                    se.usage.inputTokens || 0,
+                    se.usage.outputTokens || 0,
+                  );
+                  deductUsageCost(
+                    ownerGroup.created_by,
+                    se.usage.costUSD,
+                    lastReplyMsgId || chatJid,
+                    effective,
+                  );
+                  // Broadcast real-time billing update to the user
+                  const owner = getUserById(ownerGroup.created_by);
+                  if (owner && owner.role !== 'admin') {
+                    const freshAccess = checkBillingAccessFresh(
+                      ownerGroup.created_by,
+                      owner.role,
+                    );
+                    if (freshAccess.usage) {
+                      broadcastBillingUpdate(ownerGroup.created_by, {
+                        ...freshAccess,
+                      });
+                    }
+                  }
+                } catch (billingErr) {
+                  logger.warn(
+                    { err: billingErr, chatJid },
+                    'Failed to update billing usage',
+                  );
+                }
+              }
             } catch (err) {
               logger.warn({ err, chatJid }, 'Failed to persist token usage');
             }
@@ -1690,11 +1880,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             typeof result.result === 'string'
               ? result.result
               : JSON.stringify(result.result);
-          // Strip <internal>...</internal> and <process>...</process> blocks — agent uses these for internal reasoning/process text
-          const text = raw
-            .replace(/<internal>[\s\S]*?<\/internal>/g, '')
-            .replace(/<process>[\s\S]*?<\/process>/g, '')
-            .trim();
+          const text = stripAgentInternalTags(raw);
           logger.info(
             { group: group.name },
             `Agent output: ${raw.slice(0, 200)}`,
@@ -2005,10 +2191,7 @@ async function runTerminalWarmup(chatJid: string): Promise<void> {
           typeof result.result === 'string'
             ? result.result
             : JSON.stringify(result.result);
-        const text = raw
-          .replace(/<internal>[\s\S]*?<\/internal>/g, '')
-          .replace(/<process>[\s\S]*?<\/process>/g, '')
-          .trim();
+        const text = stripAgentInternalTags(raw);
         if (!text || text === warmupReadyToken) return;
         await sendMessage(chatJid, text);
         resetIdleTimer();
@@ -3069,11 +3252,27 @@ async function processAgentConversation(
   // the batch originated from the web (e.g. after a /clear).
   let replySourceImJid: string | null = null;
   {
-    const lastSourceJid =
-      missedMessages[missedMessages.length - 1]?.source_jid;
+    const lastSourceJid = missedMessages[missedMessages.length - 1]?.source_jid;
     if (lastSourceJid && getChannelType(lastSourceJid) !== null) {
       replySourceImJid = lastSourceJid;
     }
+  }
+
+  // ── Feishu Streaming Card (conversation agent) ──
+  // Unlike processGroupMessages which falls back to chatJid, conversation agents
+  // only stream when the message originates from an IM channel (replySourceImJid).
+  // Web-only interactions don't need a Feishu streaming card.
+  const streamingSessionJid = replySourceImJid;
+  const agentStreamingSession = streamingSessionJid
+    ? imManager.createStreamingSession(streamingSessionJid)
+    : undefined;
+  let agentStreamingAccText = '';
+  if (agentStreamingSession && streamingSessionJid) {
+    registerStreamingSession(streamingSessionJid, agentStreamingSession);
+    logger.debug(
+      { chatJid, agentId },
+      'Streaming card session created for conversation agent',
+    );
   }
 
   // Track idle timer
@@ -3117,6 +3316,16 @@ async function processAgentConversation(
     if (output.status === 'stream' && output.streamEvent) {
       broadcastStreamEvent(chatJid, output.streamEvent, agentId);
 
+      // ── Feed text_delta into Feishu streaming card ──
+      if (
+        agentStreamingSession &&
+        output.streamEvent.eventType === 'text_delta' &&
+        output.streamEvent.text
+      ) {
+        agentStreamingAccText += output.streamEvent.text;
+        agentStreamingSession.append(agentStreamingAccText);
+      }
+
       // Persist token usage for agent conversations
       if (
         output.streamEvent.eventType === 'usage' &&
@@ -3128,6 +3337,18 @@ async function processAgentConversation(
             JSON.stringify(output.streamEvent.usage),
             lastAgentReplyMsgId,
           );
+
+          // Write to usage_records + usage_daily_summary
+          // Sub-Agent 的 effectiveGroup 可能没有 created_by，从父群组继承
+          writeUsageRecords({
+            userId: effectiveGroup.created_by
+              || registeredGroups[chatJid]?.created_by
+              || 'system',
+            groupFolder: effectiveGroup.folder,
+            agentId,
+            messageId: lastAgentReplyMsgId,
+            usage: output.streamEvent.usage,
+          });
         } catch (err) {
           logger.warn(
             { err, chatJid, agentId },
@@ -3144,10 +3365,7 @@ async function processAgentConversation(
         typeof output.result === 'string'
           ? output.result
           : JSON.stringify(output.result);
-      const text = raw
-        .replace(/<internal>[\s\S]*?<\/internal>/g, '')
-        .replace(/<process>[\s\S]*?<\/process>/g, '')
-        .trim();
+      const text = stripAgentInternalTags(raw);
       if (text) {
         const msgId = crypto.randomUUID();
         lastAgentReplyMsgId = msgId;
@@ -3180,7 +3398,22 @@ async function processAgentConversation(
           text,
           effectiveGroup.folder,
         );
-        if (replySourceImJid) {
+
+        // ── Complete Feishu streaming card or fall back to static message ──
+        let streamingCardHandledIM = false;
+        if (agentStreamingSession?.isActive()) {
+          try {
+            await agentStreamingSession.complete(text);
+            streamingCardHandledIM = true;
+          } catch (err) {
+            logger.warn(
+              { err, chatJid, agentId },
+              'Agent streaming card complete failed, falling back to static message',
+            );
+          }
+        }
+
+        if (replySourceImJid && !streamingCardHandledIM) {
           sendImWithFailTracking(replySourceImJid, text, localImagePaths);
         }
 
@@ -3314,9 +3547,24 @@ async function processAgentConversation(
 
     commitCursor();
   } catch (err) {
+    hadError = true;
     logger.error({ agentId, chatJid, err }, 'Agent conversation error');
   } finally {
     if (idleTimer) clearTimeout(idleTimer);
+
+    // ── Streaming card cleanup ──
+    if (agentStreamingSession) {
+      if (agentStreamingSession.isActive()) {
+        if (hadError) {
+          await agentStreamingSession.abort('处理出错').catch(() => {});
+        } else {
+          agentStreamingSession.dispose();
+        }
+      }
+      if (streamingSessionJid) {
+        unregisterStreamingSession(streamingSessionJid);
+      }
+    }
   }
 
   // Process ended → set status back to idle (conversation agents persist)
@@ -3398,6 +3646,55 @@ async function startMessageLoop(): Promise<void> {
             }
           }
 
+          // Billing quota check before processing
+          if (group.created_by) {
+            const owner = getUserById(group.created_by);
+            if (owner && owner.role !== 'admin') {
+              const accessResult = checkBillingAccessFresh(
+                group.created_by,
+                owner.role,
+              );
+              if (!accessResult.allowed) {
+                logger.info(
+                  {
+                    chatJid,
+                    userId: group.created_by,
+                    reason: accessResult.reason,
+                    blockType: accessResult.blockType,
+                    exceededWindow: accessResult.exceededWindow,
+                  },
+                  'Billing access denied, blocking message processing',
+                );
+                const sysMsg = formatBillingAccessDeniedMessage(accessResult);
+                sendBillingDeniedMessage(chatJid, sysMsg);
+
+                // Notify IM channel if the message came from an IM source
+                const lastSourceJid =
+                  groupMessages[groupMessages.length - 1]?.source_jid;
+                const imSourceJid = lastSourceJid || chatJid;
+                if (getChannelType(imSourceJid)) {
+                  imManager
+                    .sendMessage(imSourceJid, sysMsg)
+                    .catch((err) =>
+                      logger.warn(
+                        { err, jid: imSourceJid },
+                        'Failed to send quota exceeded notice to IM',
+                      ),
+                    );
+                }
+
+                // Advance cursor past these messages so they aren't re-processed
+                const lastMsg = groupMessages[groupMessages.length - 1];
+                lastAgentTimestamp[chatJid] = {
+                  timestamp: lastMsg.timestamp,
+                  id: lastMsg.id,
+                };
+                saveState();
+                continue;
+              }
+            }
+          }
+
           // Pull all messages since lastAgentTimestamp to preserve full context.
           const allPending = getMessagesSince(
             chatJid,
@@ -3410,11 +3707,25 @@ async function startMessageLoop(): Promise<void> {
           // This prevents IM messages from being piped into an active web:main
           // container (whose onOutput callback wouldn't route replies to IM).
           if (homeFolders.has(group.folder)) {
-            queue.closeStdin(chatJid);
-            logger.debug(
-              { chatJid },
-              'Home-folder message received, forcing stdin close before enqueue',
-            );
+            // Only close the active runner's stdin if it is handling user
+            // messages (not a scheduled task).  Sending the _close sentinel to
+            // a running task container prematurely terminates the task, which
+            // causes its reply to be swallowed or delivered to the wrong IM
+            // context.  When the runner is a task, simply enqueue the message
+            // check; GroupQueue will start it once the task finishes.
+            // See GitHub issue riba2534/happyclaw#151.
+            if (!queue.isActiveRunnerTask(chatJid)) {
+              queue.closeStdin(chatJid);
+              logger.debug(
+                { chatJid },
+                'Home-folder message received, forcing stdin close before enqueue',
+              );
+            } else {
+              logger.debug(
+                { chatJid },
+                'Home-folder message received while scheduled task is running; deferring until task completes',
+              );
+            }
             queue.enqueueMessageCheck(chatJid);
             continue;
           }
@@ -3762,8 +4073,7 @@ function buildOnAgentMessage(): (baseChatJid: string, agentId: string) => void {
     // IM messages must force-restart the agent process so reply routing
     // (replySourceImJid) is recalculated from the latest batch.  This mirrors
     // the home-folder force-restart for the main conversation.
-    const lastSourceJid =
-      missedMessages[missedMessages.length - 1]?.source_jid;
+    const lastSourceJid = missedMessages[missedMessages.length - 1]?.source_jid;
     const isImSource =
       !!lastSourceJid && getChannelType(lastSourceJid) !== null;
 
@@ -3779,9 +4089,7 @@ function buildOnAgentMessage(): (baseChatJid: string, agentId: string) => void {
     } else {
       // Web-origin: try to pipe into running agent process
       const formatted =
-        missedMessages.length > 0
-          ? formatMessages(missedMessages, false)
-          : '';
+        missedMessages.length > 0 ? formatMessages(missedMessages, false) : '';
       const images = collectMessageImages(virtualChatJid, missedMessages);
       const imagesForAgent = images.length > 0 ? images : undefined;
 
@@ -4475,6 +4783,59 @@ async function main(): Promise<void> {
     60 * 60 * 1000,
   );
 
+  // Billing: check expired subscriptions every hour
+  setInterval(
+    () => {
+      checkAndExpireSubscriptions();
+    },
+    60 * 60 * 1000,
+  );
+
+  // Billing: reconcile monthly usage every 6 hours
+  setInterval(
+    () => {
+      if (!isBillingEnabled()) return;
+      try {
+        const month = new Date().toISOString().slice(0, 7);
+        // Reconcile all non-admin users with pagination
+        let page = 1;
+        const pageSize = 200;
+        // eslint-disable-next-line no-constant-condition
+        while (true) {
+          const batch = listUsers({ status: 'active', pageSize, page });
+          for (const u of batch.users) {
+            if (u.role === 'admin') continue;
+            reconcileMonthlyUsage(u.id, month);
+          }
+          if (batch.users.length < pageSize) break;
+          page++;
+        }
+      } catch (err) {
+        logger.error({ err }, 'Failed to run monthly usage reconciliation');
+      }
+    },
+    6 * 60 * 60 * 1000,
+  );
+
+  // Billing: cleanup old daily_usage and billing_audit_log every 24 hours
+  setInterval(
+    () => {
+      try {
+        const deletedDaily = cleanupOldDailyUsage();
+        const deletedAudit = cleanupOldBillingAuditLog();
+        if (deletedDaily > 0 || deletedAudit > 0) {
+          logger.info(
+            { deletedDaily, deletedAudit },
+            'Cleaned up old billing data',
+          );
+        }
+      } catch (err) {
+        logger.error({ err }, 'Failed to cleanup old billing data');
+      }
+    },
+    24 * 60 * 60 * 1000,
+  );
+
   await ensureDockerRunning();
 
   queue.setProcessMessagesFn(processGroupMessages);
@@ -4514,6 +4875,24 @@ async function main(): Promise<void> {
       `${name} 处理失败，已达最大重试次数`,
     );
     setTyping(groupJid, false);
+  });
+  // Billing: user-level concurrent container limit
+  queue.setUserConcurrentLimitChecker((groupJid: string) => {
+    if (!isBillingEnabled()) return { allowed: true };
+    const group = registeredGroups[groupJid];
+    if (!group?.created_by) return { allowed: true };
+    const owner = getUserById(group.created_by);
+    if (!owner || owner.role === 'admin') return { allowed: true };
+    const limit = getUserConcurrentContainerLimit(owner.id, owner.role);
+    if (limit == null) return { allowed: true };
+    // Count active containers for this user
+    let userActive = 0;
+    for (const [jid, g] of Object.entries(registeredGroups)) {
+      if (g.created_by === owner.id && queue.hasDirectActiveRunner(jid)) {
+        userActive++;
+      }
+    }
+    return { allowed: userActive < limit };
   });
   startSchedulerLoop({
     registeredGroups: () => registeredGroups,

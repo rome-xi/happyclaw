@@ -22,6 +22,7 @@ import {
   cleanupOldTaskRunLogs,
   getDueTasks,
   getTaskById,
+  getUserById,
   logTaskRun,
   updateTaskAfterRun,
 } from './db.js';
@@ -29,6 +30,7 @@ import { GroupQueue } from './group-queue.js';
 import { logger } from './logger.js';
 import { hasScriptCapacity, runScript } from './script-runner.js';
 import { RegisteredGroup, ScheduledTask } from './types.js';
+import { checkBillingAccessFresh, isBillingEnabled } from './billing.js';
 
 export interface SchedulerDependencies {
   registeredGroups: () => Record<string, RegisteredGroup>;
@@ -105,6 +107,39 @@ async function runTask(
     });
     runningTaskIds.delete(task.id);
     return;
+  }
+
+  // Billing quota check before running task
+  if (isBillingEnabled() && group.created_by) {
+    const owner = getUserById(group.created_by);
+    if (owner && owner.role !== 'admin') {
+      const accessResult = checkBillingAccessFresh(group.created_by, owner.role);
+      if (!accessResult.allowed) {
+        const reason = accessResult.reason || '当前账户不可用';
+        logger.info(
+          {
+            taskId: task.id,
+            userId: group.created_by,
+            reason,
+            blockType: accessResult.blockType,
+          },
+          'Billing access denied, blocking scheduled task',
+        );
+        logTaskRun({
+          task_id: task.id,
+          run_at: new Date().toISOString(),
+          duration_ms: Date.now() - startTime,
+          status: 'error',
+          result: null,
+          error: `计费限制: ${reason}`,
+        });
+        runningTaskIds.delete(task.id);
+        // Still compute next run so the task isn't stuck
+        const nextRun = computeNextRun(task);
+        updateTaskAfterRun(task.id, nextRun, `Error: 计费限制: ${reason}`);
+        return;
+      }
+    }
   }
 
   // Update tasks snapshot for container to read (filtered by group)
@@ -255,6 +290,42 @@ async function runScriptTask(
     { taskId: task.id, group: task.group_folder, executionType: 'script' },
     'Running script task',
   );
+
+  // Billing quota check before running script task
+  if (isBillingEnabled() && task.group_folder) {
+    const groups = deps.registeredGroups();
+    const group = groups[groupJid];
+    if (group?.created_by) {
+      const owner = getUserById(group.created_by);
+      if (owner && owner.role !== 'admin') {
+        const accessResult = checkBillingAccessFresh(group.created_by, owner.role);
+        if (!accessResult.allowed) {
+          const reason = accessResult.reason || '当前账户不可用';
+          logger.info(
+            {
+              taskId: task.id,
+              userId: group.created_by,
+              reason,
+              blockType: accessResult.blockType,
+            },
+            'Billing access denied, blocking script task',
+          );
+          logTaskRun({
+            task_id: task.id,
+            run_at: new Date().toISOString(),
+            duration_ms: Date.now() - startTime,
+            status: 'error',
+            result: null,
+            error: `计费限制: ${reason}`,
+          });
+          runningTaskIds.delete(task.id);
+          const nextRun = computeNextRun(task);
+          updateTaskAfterRun(task.id, nextRun, `Error: 计费限制: ${reason}`);
+          return;
+        }
+      }
+    }
+  }
 
   const groupDir = path.join(GROUPS_DIR, task.group_folder);
   fs.mkdirSync(groupDir, { recursive: true });

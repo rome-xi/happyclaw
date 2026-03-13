@@ -1,5 +1,7 @@
 import { useState, useRef, memo } from 'react';
 import { Copy, Check, ChevronDown, ChevronUp, Ellipsis } from 'lucide-react';
+import { Link } from 'react-router-dom';
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { Message } from '../../stores/chat';
 import { useAuthStore } from '../../stores/auth';
 import { EmojiAvatar } from '../common/EmojiAvatar';
@@ -49,6 +51,82 @@ function ReasoningBlock({ content }: { content: string }) {
           {content}
         </div>
       )}
+    </div>
+  );
+}
+
+/** Parse and display token usage for AI messages */
+function TokenUsageDisplay({ tokenUsageJson }: { tokenUsageJson: string }) {
+  const usage = (() => {
+    try {
+      return JSON.parse(tokenUsageJson) as {
+        inputTokens?: number;
+        outputTokens?: number;
+        cacheReadInputTokens?: number;
+        cacheCreationInputTokens?: number;
+        costUSD?: number;
+        durationMs?: number;
+        numTurns?: number;
+        modelUsage?: Record<string, { inputTokens: number; outputTokens: number; costUSD: number }>;
+      };
+    } catch {
+      return null;
+    }
+  })();
+
+  if (!usage) return null;
+
+  const models = usage.modelUsage ? Object.entries(usage.modelUsage) : [];
+  // 主模型 = 费用最高的（即用户指定的模型），内部模型不向用户展示
+  models.sort((a, b) => (b[1].costUSD || 0) - (a[1].costUSD || 0));
+  const primary = models.length > 0 ? models[0] : null;
+  const primaryInput = primary ? primary[1].inputTokens : (usage.inputTokens || 0);
+  const primaryOutput = primary ? primary[1].outputTokens : (usage.outputTokens || 0);
+  const totalTokens = primaryInput + primaryOutput;
+
+  const formatNum = (n: number): string => {
+    if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+    if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+    return String(n);
+  };
+
+  const summaryContent = (
+    <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors cursor-default">
+      <span>{formatNum(totalTokens)} tokens</span>
+      {usage.durationMs ? (
+        <>
+          <span className="opacity-40">·</span>
+          <span>{(usage.durationMs / 1000).toFixed(1)}s</span>
+        </>
+      ) : null}
+    </span>
+  );
+
+  const hasDetails = primary || (usage.cacheReadInputTokens || 0) > 0;
+
+  if (!hasDetails) {
+    return <div className="mt-1.5">{summaryContent}</div>;
+  }
+
+  return (
+    <div className="mt-1.5">
+      <TooltipProvider delayDuration={200}>
+        <Tooltip>
+          <TooltipTrigger asChild>{summaryContent}</TooltipTrigger>
+          <TooltipContent side="bottom" align="start">
+            <div className="text-xs space-y-0.5">
+              {primary && <div className="opacity-70 font-medium mb-1">{primary[0]}</div>}
+              {primary && <div>In {formatNum(primaryInput)} / Out {formatNum(primaryOutput)}</div>}
+              {(usage.cacheReadInputTokens || 0) > 0 && (
+                <div className="opacity-70">
+                  Read {formatNum(usage.cacheReadInputTokens || 0)}
+                  {(usage.cacheCreationInputTokens || 0) > 0 && ` / Write ${formatNum(usage.cacheCreationInputTokens || 0)}`}
+                </div>
+              )}
+            </div>
+          </TooltipContent>
+        </Tooltip>
+      </TooltipProvider>
     </div>
   );
 }
@@ -171,6 +249,67 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
     );
   }
 
+  // Billing system message (quota exceeded / insufficient balance)
+  if (message.sender === '__billing__') {
+    const displayMsg = message.content.replace(/^⚠️\s*/, '');
+    const isBalanceBlocked = displayMsg.includes('充值余额后继续使用');
+    // Detect which quota window was exceeded
+    const windowLabels: Record<string, string> = { daily: '日度', weekly: '周度', monthly: '月度' };
+    let exceededWindow = '';
+    if (displayMsg.includes('日度')) exceededWindow = 'daily';
+    else if (displayMsg.includes('周度')) exceededWindow = 'weekly';
+    else if (displayMsg.includes('月度')) exceededWindow = 'monthly';
+    const windowTag = isBalanceBlocked ? '余额' : windowLabels[exceededWindow] || '配额';
+    // Extract reset hint if present (e.g. "约 3 小时后重置" or "约 1 天后重置")
+    const resetMatch = displayMsg.match(/约\s*(\d+)\s*(小时|天)后重置/);
+    return (
+      <div className="mb-6">
+        {showTime && (
+          <div className="flex items-center gap-2 mb-2">
+            <span className="text-xs text-slate-500">{time}</span>
+            <span className="text-xs font-medium text-amber-600">
+              {isBalanceBlocked ? '余额提醒' : '配额提醒'}
+            </span>
+          </div>
+        )}
+        <div className="relative bg-amber-50 dark:bg-amber-950/30 rounded-xl border border-amber-200 dark:border-amber-800 border-l-[3px] border-l-amber-500 px-5 py-4">
+          <div className="flex items-start gap-3">
+            <div className="flex-shrink-0 w-6 h-6 bg-amber-500 rounded-full flex items-center justify-center text-white font-bold text-sm">
+              !
+            </div>
+            <div className="flex-1">
+              <div className="flex items-center gap-2 mb-1">
+                <h3 className="text-sm font-semibold text-amber-900 dark:text-amber-200">
+                  {isBalanceBlocked ? '余额不足' : `${windowTag}配额已用完`}
+                </h3>
+                {!isBalanceBlocked && exceededWindow && (
+                  <span className={`px-1.5 py-0.5 text-[10px] rounded-full font-medium ${
+                    exceededWindow === 'daily'
+                      ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300'
+                      : exceededWindow === 'weekly'
+                        ? 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/40 dark:text-yellow-300'
+                        : 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300'
+                  }`}>
+                    {windowTag}限额
+                  </span>
+                )}
+              </div>
+              <p className="text-sm text-amber-800 dark:text-amber-300 leading-relaxed">{displayMsg}</p>
+              {resetMatch && (
+                <p className="text-xs text-amber-600 dark:text-amber-400 mt-1">
+                  预计 {resetMatch[1]} {resetMatch[2]}后自动重置
+                </p>
+              )}
+              <Link to="/billing" className="inline-block mt-2 text-sm text-primary hover:underline font-medium">
+                查看账单 &rarr;
+              </Link>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   // ── Compact mode: all messages left-aligned, no bubbles, full-width ──
   if (displayMode === 'compact') {
     const isAI = message.is_from_me;
@@ -220,6 +359,11 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
               <p className="text-[15px] leading-relaxed whitespace-pre-wrap break-words text-foreground">{message.content}</p>
             )}
           </div>
+        )}
+
+        {/* Token usage (compact mode) */}
+        {isAI && message.token_usage && (
+          <TokenUsageDisplay tokenUsageJson={message.token_usage} />
         )}
 
         {lightboxState && (
@@ -451,6 +595,11 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
                 <MarkdownRenderer content={message.content} groupJid={message.chat_jid} variant="chat" />
               </div>
             )}
+
+            {/* Token usage */}
+            {message.is_from_me && message.token_usage && (
+              <TokenUsageDisplay tokenUsageJson={message.token_usage} />
+            )}
           </div>
         </div>
       </div>
@@ -476,6 +625,7 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
 }, (prev, next) =>
   prev.message.id === next.message.id &&
   prev.message.content === next.message.content &&
+  prev.message.token_usage === next.message.token_usage &&
   prev.showTime === next.showTime &&
   prev.thinkingContent === next.thinkingContent &&
   prev.isShared === next.isShared

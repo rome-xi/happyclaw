@@ -17,7 +17,10 @@ import {
   createDirectory,
   isSystemPath,
   MAX_FILE_SIZE,
+  getGroupStorageUsage,
+  invalidateGroupStorageUsage,
 } from '../file-manager.js';
+import { checkStorageLimit, isBillingEnabled } from '../billing.js';
 import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -278,6 +281,24 @@ fileRoutes.post('/:jid/files', authMiddleware, async (c) => {
     const fileList = Array.isArray(files) ? files : [files];
     const uploadedFiles: string[] = [];
 
+    // Billing: check storage limit before uploading
+    if (isBillingEnabled() && group.created_by) {
+      const totalUploadSize = fileList.reduce(
+        (sum, f) => sum + (f instanceof File ? f.size : 0),
+        0,
+      );
+      const currentUsage = getGroupStorageUsage(group.folder, rootOverride);
+      const storageCheck = checkStorageLimit(
+        group.created_by,
+        authUser.role,
+        currentUsage,
+        totalUploadSize,
+      );
+      if (!storageCheck.allowed) {
+        return c.json({ error: storageCheck.reason }, 403);
+      }
+    }
+
     for (const file of fileList) {
       if (!(file instanceof File)) continue;
 
@@ -321,6 +342,7 @@ fileRoutes.post('/:jid/files', authMiddleware, async (c) => {
       uploadedFiles.push(file.name);
     }
 
+    invalidateGroupStorageUsage(group.folder, rootOverride);
     return c.json({ success: true, files: uploadedFiles });
   } catch (error) {
     logger.error({ err: error }, `Failed to upload files for ${jid}`);
@@ -584,13 +606,14 @@ fileRoutes.get('/:jid/files/content/:path', authMiddleware, (c) => {
   }
 
   try {
+    const rootOverride = getFileRootOverride(group);
     const relativePath = Buffer.from(encodedPath, 'base64url').toString(
       'utf-8',
     );
     const absolutePath = validateAndResolvePath(
       group.folder,
       relativePath,
-      getFileRootOverride(group),
+      rootOverride,
     );
 
     if (!fs.existsSync(absolutePath)) {
@@ -646,6 +669,7 @@ fileRoutes.put('/:jid/files/content/:path', authMiddleware, async (c) => {
   }
 
   try {
+    const rootOverride = getFileRootOverride(group);
     const relativePath = Buffer.from(encodedPath, 'base64url').toString(
       'utf-8',
     );
@@ -658,11 +682,16 @@ fileRoutes.put('/:jid/files/content/:path', authMiddleware, async (c) => {
     const absolutePath = validateAndResolvePath(
       group.folder,
       relativePath,
-      getFileRootOverride(group),
+      rootOverride,
     );
 
     if (!fs.existsSync(absolutePath)) {
       return c.json({ error: 'File not found' }, 404);
+    }
+
+    const stats = fs.statSync(absolutePath);
+    if (stats.isDirectory()) {
+      return c.json({ error: 'Cannot edit directory content' }, 400);
     }
 
     // 仅允许文本文件
@@ -681,11 +710,29 @@ fileRoutes.put('/:jid/files/content/:path', authMiddleware, async (c) => {
       return c.json({ error: 'Content too large (max 10MB)' }, 400);
     }
 
+    if (isBillingEnabled() && group.created_by) {
+      const nextSize = Buffer.byteLength(body.content, 'utf-8');
+      const additionalBytes = Math.max(0, nextSize - stats.size);
+      if (additionalBytes > 0) {
+        const currentUsage = getGroupStorageUsage(group.folder, rootOverride);
+        const storageCheck = checkStorageLimit(
+          group.created_by,
+          authUser.role,
+          currentUsage,
+          additionalBytes,
+        );
+        if (!storageCheck.allowed) {
+          return c.json({ error: storageCheck.reason }, 403);
+        }
+      }
+    }
+
     // 原子写入
     const tmp = `${absolutePath}.tmp`;
     fs.writeFileSync(tmp, body.content, 'utf-8');
     fs.renameSync(tmp, absolutePath);
 
+    invalidateGroupStorageUsage(group.folder, rootOverride);
     return c.json({ success: true });
   } catch (error) {
     logger.error({ err: error }, `Failed to save file content for ${jid}`);
@@ -715,11 +762,13 @@ fileRoutes.delete('/:jid/files/:path', authMiddleware, (c) => {
   }
 
   try {
+    const rootOverride = getFileRootOverride(group);
     // 解码 base64url 路径
     const relativePath = Buffer.from(encodedPath, 'base64url').toString(
       'utf-8',
     );
-    deleteFile(group.folder, relativePath, getFileRootOverride(group));
+    deleteFile(group.folder, relativePath, rootOverride);
+    invalidateGroupStorageUsage(group.folder, rootOverride);
 
     return c.json({ success: true });
   } catch (error) {

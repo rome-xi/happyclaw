@@ -75,6 +75,11 @@ export interface SystemSettings {
   loginLockoutMinutes: number;
   maxConcurrentScripts: number;
   scriptTimeout: number;
+  billingEnabled: boolean;
+  billingMode: 'wallet_first';
+  billingMinStartBalanceUsd: number;
+  billingCurrency: string;
+  billingCurrencyRate: number;
 }
 
 export type SettingsTab = 'claude' | 'registration' | 'appearance' | 'system' | 'profile' | 'my-channels' | 'security' | 'groups' | 'memory' | 'skills' | 'mcp-servers' | 'users' | 'about' | 'bindings';
@@ -87,4 +92,3 @@ export function getErrorMessage(err: unknown, fallback: string): string {
   if (err instanceof Error && err.message) return err.message;
   return fallback;
 }
-

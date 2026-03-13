@@ -18,6 +18,7 @@ export interface Message {
   timestamp: string;
   is_from_me: boolean;
   attachments?: string;
+  token_usage?: string;
 }
 
 // Streaming event types (canonical source: shared/stream-event.ts)
@@ -61,7 +62,7 @@ function mergeMessagesChronologically(
   // Incoming messages are authoritative, but preserve reference if content unchanged
   for (const m of incoming) {
     const old = byId.get(m.id);
-    if (!old || old.content !== m.content || old.timestamp !== m.timestamp) {
+    if (!old || old.content !== m.content || old.timestamp !== m.timestamp || old.token_usage !== m.token_usage) {
       byId.set(m.id, m);
     }
   }
@@ -229,6 +230,16 @@ function pickSdkTaskAliasTarget(
   const createdAtMap = new Map((state.agents[chatJid] || []).map((a) => [a.id, a.created_at]));
   pool.sort((a, b) => (createdAtMap.get(a) || '').localeCompare(createdAtMap.get(b) || ''));
   return pool[0] || null;
+}
+
+function isTerminalSystemMessage(message: Pick<Message, 'sender' | 'content'>): boolean {
+  if (message.sender === '__billing__') return true;
+  return message.sender === '__system__' && (
+    message.content.startsWith('agent_error:') ||
+    message.content.startsWith('agent_max_retries:') ||
+    message.content.startsWith('context_overflow:') ||
+    message.content === 'query_interrupted'
+  );
 }
 
 function clearSdkTaskCleanupTimer(taskId: string): void {
@@ -628,15 +639,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           const agentReplied = data.messages.some(
             (m) => m.is_from_me && m.sender !== '__system__',
           );
-          const hasSystemError = data.messages.some(
-            (m) => m.sender === '__system__' &&
-              (
-                m.content.startsWith('agent_error:') ||
-                m.content.startsWith('agent_max_retries:') ||
-                m.content.startsWith('context_overflow:') ||
-                m.content === 'query_interrupted'
-              )
-          );
+          const hasSystemError = data.messages.some((m) => isTerminalSystemMessage(m));
 
           // Transfer pending thinking to thinkingCache
           let nextThinkingCache = s.thinkingCache;
@@ -701,16 +704,25 @@ export const useChatStore = create<ChatState>((set, get) => ({
           is_from_me: false,
           attachments: body.attachments ? JSON.stringify(body.attachments) : undefined,
         };
-        set((s) => ({
-          messages: {
-            ...s.messages,
-            [jid]: (s.messages[jid] || []).some((m) => m.id === msg.id)
-              ? (s.messages[jid] || [])
-              : [...(s.messages[jid] || []), msg],
-          },
-          waiting: { ...s.waiting, [jid]: true },
-          error: null,
-        }));
+        set((s) => {
+          const merged = mergeMessagesChronologically(
+            s.messages[jid] || [],
+            [msg],
+          );
+          const latest = merged.length > 0 ? merged[merged.length - 1] : null;
+          const shouldWait =
+            !!latest &&
+            latest.is_from_me === false &&
+            !isTerminalSystemMessage(latest);
+          return {
+            messages: {
+              ...s.messages,
+              [jid]: merged,
+            },
+            waiting: { ...s.waiting, [jid]: shouldWait },
+            error: null,
+          };
+        });
       }
     } catch (err) {
       set({ error: err instanceof Error ? err.message : String(err) });
@@ -1282,6 +1294,36 @@ export const useChatStore = create<ChatState>((set, get) => ({
       return;
     }
 
+    // ⑤.5 usage 事件 → 实时更新最近一条 AI 消息的 token_usage
+    if (event.eventType === 'usage' && event.usage) {
+      const usage = event.usage;
+      // 构造与 DB 中 token_usage JSON 一致的格式
+      const tokenUsageJson = JSON.stringify({
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        cacheReadInputTokens: usage.cacheReadInputTokens,
+        cacheCreationInputTokens: usage.cacheCreationInputTokens,
+        costUSD: usage.costUSD,
+        durationMs: usage.durationMs,
+        numTurns: usage.numTurns,
+        modelUsage: usage.modelUsage,
+      });
+      set((s) => {
+        const msgs = s.messages[chatJid];
+        if (!msgs || msgs.length === 0) return s;
+        // 从后往前找最近一条 AI 回复
+        let targetIdx = -1;
+        for (let i = msgs.length - 1; i >= 0; i--) {
+          if (msgs[i].is_from_me) { targetIdx = i; break; }
+        }
+        if (targetIdx < 0) return s;
+        const updated = [...msgs];
+        updated[targetIdx] = { ...updated[targetIdx], token_usage: tokenUsageJson };
+        return { messages: { ...s.messages, [chatJid]: updated } };
+      });
+      // 不 return — usage 事件同时落入主对话 streaming（如需 recentEvents 展示）
+    }
+
     // ⑥ 主对话 streaming — 使用 applyStreamEvent 共享函数
     set((s) => {
       // If streaming state was already cleared (final message received),
@@ -1348,12 +1390,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const updated = alreadyExists ? existing : [...existing, msg];
 
       const isAgentReply = msg.is_from_me && msg.sender !== '__system__';
-      const isSystemError =
-        msg.sender === '__system__' &&
-        (msg.content.startsWith('agent_error:') ||
-          msg.content.startsWith('agent_max_retries:') ||
-          msg.content.startsWith('context_overflow:') ||
-          msg.content === 'query_interrupted');
+      const isSystemError = isTerminalSystemMessage(msg);
 
       if (isAgentReply || isSystemError) {
         // Agent 回复或系统错误：立即清除流式状态和等待标志，转移 thinking 缓存
