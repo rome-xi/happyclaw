@@ -3258,6 +3258,23 @@ async function processAgentConversation(
     }
   }
 
+  // ── Feishu Streaming Card (conversation agent) ──
+  // Unlike processGroupMessages which falls back to chatJid, conversation agents
+  // only stream when the message originates from an IM channel (replySourceImJid).
+  // Web-only interactions don't need a Feishu streaming card.
+  const streamingSessionJid = replySourceImJid;
+  const agentStreamingSession = streamingSessionJid
+    ? imManager.createStreamingSession(streamingSessionJid)
+    : undefined;
+  let agentStreamingAccText = '';
+  if (agentStreamingSession && streamingSessionJid) {
+    registerStreamingSession(streamingSessionJid, agentStreamingSession);
+    logger.debug(
+      { chatJid, agentId },
+      'Streaming card session created for conversation agent',
+    );
+  }
+
   // Track idle timer
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
   const resetIdleTimer = () => {
@@ -3298,6 +3315,16 @@ async function processAgentConversation(
     // Stream events
     if (output.status === 'stream' && output.streamEvent) {
       broadcastStreamEvent(chatJid, output.streamEvent, agentId);
+
+      // ── Feed text_delta into Feishu streaming card ──
+      if (
+        agentStreamingSession &&
+        output.streamEvent.eventType === 'text_delta' &&
+        output.streamEvent.text
+      ) {
+        agentStreamingAccText += output.streamEvent.text;
+        agentStreamingSession.append(agentStreamingAccText);
+      }
 
       // Persist token usage for agent conversations
       if (
@@ -3371,7 +3398,22 @@ async function processAgentConversation(
           text,
           effectiveGroup.folder,
         );
-        if (replySourceImJid) {
+
+        // ── Complete Feishu streaming card or fall back to static message ──
+        let streamingCardHandledIM = false;
+        if (agentStreamingSession?.isActive()) {
+          try {
+            await agentStreamingSession.complete(text);
+            streamingCardHandledIM = true;
+          } catch (err) {
+            logger.warn(
+              { err, chatJid, agentId },
+              'Agent streaming card complete failed, falling back to static message',
+            );
+          }
+        }
+
+        if (replySourceImJid && !streamingCardHandledIM) {
           sendImWithFailTracking(replySourceImJid, text, localImagePaths);
         }
 
@@ -3505,9 +3547,24 @@ async function processAgentConversation(
 
     commitCursor();
   } catch (err) {
+    hadError = true;
     logger.error({ agentId, chatJid, err }, 'Agent conversation error');
   } finally {
     if (idleTimer) clearTimeout(idleTimer);
+
+    // ── Streaming card cleanup ──
+    if (agentStreamingSession) {
+      if (agentStreamingSession.isActive()) {
+        if (hadError) {
+          await agentStreamingSession.abort('处理出错').catch(() => {});
+        } else {
+          agentStreamingSession.dispose();
+        }
+      }
+      if (streamingSessionJid) {
+        unregisterStreamingSession(streamingSessionJid);
+      }
+    }
   }
 
   // Process ended → set status back to idle (conversation agents persist)
