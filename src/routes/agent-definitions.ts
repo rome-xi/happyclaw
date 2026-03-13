@@ -6,7 +6,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import type { Variables } from '../web-context.js';
-import { authMiddleware } from '../middleware/auth.js';
+import { authMiddleware, systemConfigMiddleware } from '../middleware/auth.js';
 
 const agentDefinitionsRoutes = new Hono<{ Variables: Variables }>();
 
@@ -195,7 +195,7 @@ agentDefinitionsRoutes.get('/:id', authMiddleware, (c) => {
 });
 
 // Update agent content
-agentDefinitionsRoutes.put('/:id', authMiddleware, async (c) => {
+agentDefinitionsRoutes.put('/:id', authMiddleware, systemConfigMiddleware, async (c) => {
   const id = c.req.param('id');
   if (!validateAgentId(id)) {
     return c.json({ error: 'Invalid agent ID' }, 400);
@@ -206,7 +206,8 @@ agentDefinitionsRoutes.put('/:id', authMiddleware, async (c) => {
     return c.json({ error: 'Agent definition not found' }, 404);
   }
 
-  const { content } = await c.req.json<{ content: string }>();
+  const body = await c.req.json().catch(() => ({}));
+  const { content } = body as { content: string };
   if (typeof content !== 'string') {
     return c.json({ error: 'content must be a string' }, 400);
   }
@@ -216,8 +217,9 @@ agentDefinitionsRoutes.put('/:id', authMiddleware, async (c) => {
 });
 
 // Create new agent
-agentDefinitionsRoutes.post('/', authMiddleware, async (c) => {
-  const { name, content } = await c.req.json<{ name: string; content: string }>();
+agentDefinitionsRoutes.post('/', authMiddleware, systemConfigMiddleware, async (c) => {
+  const body = await c.req.json().catch(() => ({}));
+  const { name, content } = body as { name: string; content: string };
 
   if (!name || typeof name !== 'string') {
     return c.json({ error: 'name is required' }, 400);
@@ -245,7 +247,7 @@ agentDefinitionsRoutes.post('/', authMiddleware, async (c) => {
 });
 
 // Delete agent
-agentDefinitionsRoutes.delete('/:id', authMiddleware, (c) => {
+agentDefinitionsRoutes.delete('/:id', authMiddleware, systemConfigMiddleware, (c) => {
   const id = c.req.param('id');
   if (!validateAgentId(id)) {
     return c.json({ error: 'Invalid agent ID' }, 400);

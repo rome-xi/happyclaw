@@ -125,7 +125,7 @@ export function AgentDefinitionsPage() {
     if (!createName.trim()) return;
     setCreating(true);
     try {
-      const slug = createName.trim().toLowerCase().replace(/[^a-z0-9\-]/g, '-');
+      const slug = createName.trim().toLowerCase().replace(/[^a-z0-9\-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
       const defaultContent = `---
 name: ${slug}
 description:
