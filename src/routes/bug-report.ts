@@ -261,12 +261,6 @@ bugReportRoutes.get('/capabilities', authMiddleware, async (c) => {
 bugReportRoutes.post('/generate', authMiddleware, async (c) => {
   const user = c.get('user') as AuthUser;
 
-  // Rate limiting
-  const cooldownMsg = checkCooldown(user.id);
-  if (cooldownMsg) {
-    return c.json({ error: cooldownMsg }, 429);
-  }
-
   const parseResult = BugReportGenerateSchema.safeParse(await c.req.json());
   if (!parseResult.success) {
     return c.json(
@@ -296,9 +290,6 @@ bugReportRoutes.post('/generate', authMiddleware, async (c) => {
   // Read recent logs
   const rawLogs = readRecentLogs(folder);
   const logs = sanitizeLogs(rawLogs);
-
-  // Record cooldown
-  cooldowns.set(user.id, Date.now());
 
   // Try Claude analysis
   const caps = await checkCapabilities();
@@ -388,6 +379,12 @@ bugReportRoutes.post('/generate', authMiddleware, async (c) => {
 bugReportRoutes.post('/submit', authMiddleware, async (c) => {
   const user = c.get('user') as AuthUser;
 
+  // Rate limiting — only on actual issue submission
+  const cooldownMsg = checkCooldown(user.id);
+  if (cooldownMsg) {
+    return c.json({ error: cooldownMsg }, 429);
+  }
+
   const parseResult = BugReportSubmitSchema.safeParse(await c.req.json());
   if (!parseResult.success) {
     return c.json(
@@ -445,6 +442,7 @@ bugReportRoutes.post('/submit', authMiddleware, async (c) => {
       const url = urlMatch ? urlMatch[0] : result;
 
       logger.info({ url, userId: user.id }, 'bug-report: issue created via gh');
+      cooldowns.set(user.id, Date.now());
       return c.json({ method: 'created', url });
     } catch {
       // Fall through to manual URL
@@ -462,6 +460,7 @@ bugReportRoutes.post('/submit', authMiddleware, async (c) => {
   const url = `https://github.com/riba2534/happyclaw/issues/new?title=${encodeURIComponent(title)}&body=${encodeURIComponent(truncatedBody)}`;
 
   logger.info({ userId: user.id }, 'bug-report: returning pre-filled URL');
+  cooldowns.set(user.id, Date.now());
   return c.json({ method: 'manual', url });
 });
 
