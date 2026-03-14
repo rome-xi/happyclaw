@@ -465,6 +465,9 @@ export function BugReportDialog({ open, onClose }: BugReportDialogProps) {
               <Button variant="outline" onClick={() => setShowConfirm(false)}>
                 取消
               </Button>
+              <Button variant="outline" onClick={() => { setShowConfirm(false); handleGenerateForPreview(); }}>
+                手动编辑
+              </Button>
               <Button onClick={handleConfirmSubmit}>
                 确认提交
               </Button>
