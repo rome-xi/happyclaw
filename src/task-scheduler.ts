@@ -80,6 +80,16 @@ async function runTask(
   deps: SchedulerDependencies,
   groupJid: string,
 ): Promise<void> {
+  // Re-check DB before running — task may have been cancelled while queued
+  const currentTask = getTaskById(task.id);
+  if (!currentTask || currentTask.status !== 'active') {
+    logger.info(
+      { taskId: task.id },
+      'Skipping task: deleted or no longer active since enqueue',
+    );
+    return;
+  }
+
   runningTaskIds.add(task.id);
   const startTime = Date.now();
   const groupDir = path.join(GROUPS_DIR, task.group_folder);
@@ -284,6 +294,16 @@ async function runScriptTask(
   deps: SchedulerDependencies,
   groupJid: string,
 ): Promise<void> {
+  // Re-check DB before running — task may have been cancelled while queued
+  const currentTask = getTaskById(task.id);
+  if (!currentTask || currentTask.status !== 'active') {
+    logger.info(
+      { taskId: task.id },
+      'Skipping script task: deleted or no longer active since enqueue',
+    );
+    return;
+  }
+
   runningTaskIds.add(task.id);
   const startTime = Date.now();
 
