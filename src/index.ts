@@ -85,6 +85,7 @@ import {
   hasActiveStreamingSession,
   abortAllStreamingSessions,
   registerMessageIdMapping,
+  getStreamingSession,
 } from './feishu-streaming-card.js';
 import {
   formatContextMessages,
@@ -4188,6 +4189,15 @@ function handleIMInterruptRequest(
       { chatJid, intent },
       'Interrupt fast-path: query interrupted immediately',
     );
+  }
+
+  // Immediately abort the streaming card so the user sees "已中断" right away,
+  // without waiting for the agent-runner to process the interrupt sentinel.
+  const session = getStreamingSession(chatJid);
+  if (session?.isActive()) {
+    session.abort('用户中断').catch((err) => {
+      logger.debug({ err, chatJid }, 'Failed to abort streaming card on interrupt');
+    });
   }
 }
 
