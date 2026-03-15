@@ -1872,34 +1872,35 @@ export const useChatStore = create<ChatState>((set, get) => ({
       }
 
       // 收集该 chatJid 下仍在运行的 SDK Task
-      const runningTaskIds: string[] = [];
+      const runningSet = new Set<string>();
       for (const [taskId, task] of Object.entries(s.sdkTasks)) {
         if (task.chatJid === chatJid && task.status === 'running') {
-          runningTaskIds.push(taskId);
+          runningSet.add(taskId);
         }
       }
 
-      // 有运行中的 task 时，保留其 agentStreaming，清理已结束 task 的
-      if (runningTaskIds.length > 0) {
-        const runningSet = new Set(runningTaskIds);
-        const nextAgentStreaming = { ...s.agentStreaming };
-        for (const [taskId, task] of Object.entries(s.sdkTasks)) {
-          if (task.chatJid === chatJid && !runningSet.has(taskId)) {
-            delete nextAgentStreaming[taskId];
-          }
+      // 清理已结束 task 的 agentStreaming（无论是否有运行中的 task）
+      const nextAgentStreaming = { ...s.agentStreaming };
+      let agentStreamingChanged = false;
+      for (const [taskId, task] of Object.entries(s.sdkTasks)) {
+        if (task.chatJid === chatJid && !runningSet.has(taskId) && nextAgentStreaming[taskId]) {
+          delete nextAgentStreaming[taskId];
+          agentStreamingChanged = true;
         }
-        return {
-          waiting: { ...s.waiting, [chatJid]: false },
-          streaming: next,
-          pendingThinking: nextPendingThinking,
-          agentStreaming: nextAgentStreaming,
-        };
+      }
+      // 同时清理 agents[] 中已完成的 conversation agent 的 agentStreaming
+      for (const agent of (s.agents[chatJid] || [])) {
+        if (agent.status !== 'running' && nextAgentStreaming[agent.id]) {
+          delete nextAgentStreaming[agent.id];
+          agentStreamingChanged = true;
+        }
       }
 
       return {
         waiting: { ...s.waiting, [chatJid]: false },
         streaming: next,
         pendingThinking: nextPendingThinking,
+        ...(agentStreamingChanged ? { agentStreaming: nextAgentStreaming } : {}),
       };
     });
   },
