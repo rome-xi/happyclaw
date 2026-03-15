@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { ChevronDown, ChevronUp } from 'lucide-react';
+import { ChevronDown, ChevronUp, OctagonX } from 'lucide-react';
 import { useChatStore } from '../../stores/chat';
 import { useAuthStore } from '../../stores/auth';
 import { EmojiAvatar } from '../common/EmojiAvatar';
@@ -209,6 +209,16 @@ function StreamingContent({
           />
         </div>
       )}
+
+      {/* Interrupted indicator */}
+      {streaming.interrupted && (
+        <div className="mt-3 pt-3 border-t border-border">
+          <div className="flex items-center gap-1.5 text-xs text-amber-600">
+            <OctagonX className="w-3.5 h-3.5" />
+            <span>已中断</span>
+          </div>
+        </div>
+      )}
     </>
   );
 }
@@ -330,9 +340,7 @@ export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNamePr
     userScrolledRef.current = !isAtBottom;
   };
 
-  // Streaming panel should only be visible while waiting for the current turn.
-  if (!isWaiting) return null;
-
+  // 计算是否有流式数据（含中断后冻结的 partialText）
   const hasStreamData = streaming && (
     streaming.partialText ||
     streaming.thinkingText ||
@@ -343,8 +351,11 @@ export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNamePr
     (streaming.todos && streaming.todos.length > 0)
   );
 
+  // 仅在既不等待也无冻结数据时才隐藏
+  if (!isWaiting && !hasStreamData) return null;
+
   // Waiting but no stream data: show empty AI card with bouncing dots
-  if (!hasStreamData) {
+  if (isWaiting && !hasStreamData) {
     if (isCompact) {
       return (
         <div className="mb-2 border-b border-border pb-2">

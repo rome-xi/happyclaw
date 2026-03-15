@@ -51,6 +51,7 @@ export interface StreamingState {
   systemStatus: string | null;
   recentEvents: StreamingTimelineEvent[];
   todos?: Array<{ id: string; content: string; status: string }>;
+  interrupted?: boolean;
 }
 
 function mergeMessagesChronologically(
@@ -236,11 +237,12 @@ function pickSdkTaskAliasTarget(
 
 function isTerminalSystemMessage(message: Pick<Message, 'sender' | 'content'>): boolean {
   if (message.sender === '__billing__') return true;
+  // query_interrupted 不再作为终端消息：中断后由 status:interrupted 流式事件冻结 UI，
+  // 再由后续 new_message（含中断文本）完成最终转换，避免提前清除 streaming 导致内容消失。
   return message.sender === '__system__' && (
     message.content.startsWith('agent_error:') ||
     message.content.startsWith('agent_max_retries:') ||
-    message.content.startsWith('context_overflow:') ||
-    message.content === 'query_interrupted'
+    message.content.startsWith('context_overflow:')
   );
 }
 
@@ -759,25 +761,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
         return false;
       }
 
-      // Agent conversation JIDs contain #agent:{agentId}
-      const agentSep = jid.indexOf('#agent:');
-      if (agentSep >= 0) {
-        const agentId = jid.slice(agentSep + 7);
-        set((s) => {
-          const nextStreaming = { ...s.agentStreaming };
-          delete nextStreaming[agentId];
-          const nextWaiting = { ...s.agentWaiting };
-          delete nextWaiting[agentId];
-          return { agentStreaming: nextStreaming, agentWaiting: nextWaiting };
-        });
-      } else {
-        get().clearStreaming(jid, { preserveThinking: false });
-        set((s) => {
-          const next = { ...s.waiting };
-          delete next[jid];
-          return { waiting: next };
-        });
-      }
+      // 不主动清理流式状态和 waiting 标志。
+      // 后端的 status:interrupted 事件会冻结 UI（保留已输出文本），
+      // 随后的 new_message 事件完成最终清理（流式 → 正式消息）。
       return true;
     } catch (err) {
       set({ error: err instanceof Error ? err.message : String(err) });
@@ -1278,21 +1264,60 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // fall-through 到主对话处理，移除 activeTools 中的 Task 条目
     }
 
-    // 中断事件需要在所有客户端显式收尾，避免 waiting 残留。
+    // 中断事件：冻结流式 UI（保留已输出文本），等待 new_message 完成最终转换。
     if (event.eventType === 'status' && event.statusText === 'interrupted') {
       set((s) => {
+        const streamState = s.streaming[chatJid];
         const nextStreaming = { ...s.streaming };
-        delete nextStreaming[chatJid];
+
+        const hasData = streamState && (
+          streamState.partialText ||
+          streamState.thinkingText ||
+          streamState.activeTools.length > 0 ||
+          streamState.activeHook ||
+          streamState.systemStatus ||
+          streamState.recentEvents.length > 0 ||
+          (streamState.todos && streamState.todos.length > 0)
+        );
+
+        if (hasData) {
+          // 冻结：保留所有已输出内容（文本、Reasoning、事件轨迹），
+          // 清除活跃动画指示器，标记已中断
+          nextStreaming[chatJid] = {
+            ...streamState,
+            isThinking: false,
+            activeTools: [],
+            activeHook: null,
+            systemStatus: null,
+            interrupted: true,
+          };
+        } else {
+          // 完全无输出，直接清除
+          delete nextStreaming[chatJid];
+        }
+
         const nextPendingThinking = { ...s.pendingThinking };
         delete nextPendingThinking[chatJid];
-        const nextWaiting = { ...s.waiting };
-        delete nextWaiting[chatJid];
+
         return {
-          waiting: nextWaiting,
+          waiting: { ...s.waiting, [chatJid]: false },
           streaming: nextStreaming,
           pendingThinking: nextPendingThinking,
         };
       });
+
+      // Fallback：10s 后如果 new_message 未到达，强制清除冻结状态
+      setTimeout(() => {
+        const state = get();
+        if (state.streaming[chatJid] && !state.waiting[chatJid]) {
+          set((s) => {
+            const next = { ...s.streaming };
+            delete next[chatJid];
+            return { streaming: next };
+          });
+        }
+      }, 10_000);
+
       return;
     }
 
@@ -1331,6 +1356,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // If streaming state was already cleared (final message received),
       // ignore late-arriving stream events to prevent "thinking" from reappearing.
       if (!s.streaming[chatJid] && s.waiting[chatJid] === false) {
+        return s;
+      }
+      // 冻结的中断状态不接收新事件（如 usage），防止 waiting 被改回 true
+      if (s.streaming[chatJid]?.interrupted) {
         return s;
       }
       const MAX_STREAMING_TEXT = 8000;
@@ -1846,14 +1875,24 @@ export const useChatStore = create<ChatState>((set, get) => ({
   // Runner 状态同步：idle 时清理残留状态，running 时重新启用 stream event 接收
   handleRunnerState: (chatJid, state) => {
     if (state === 'idle') {
+      // 冻结的中断状态不清除：等 new_message 或 fallback 定时器处理
+      if (get().streaming[chatJid]?.interrupted) return;
       get().clearStreaming(chatJid);
     } else if (state === 'running') {
       // 新进程启动时重新设置 waiting=true，确保 handleStreamEvent 的防重入
       // guard（!streaming && waiting===false）不会丢弃新进程的 stream events。
       // 典型场景：上一进程的 idle 清除了 waiting，drainGroup 立即启动新进程。
-      set((s) => ({
-        waiting: { ...s.waiting, [chatJid]: true },
-      }));
+      // 同时清除残留的冻结中断状态，防止新流式输出继承 interrupted 标志。
+      set((s) => {
+        const nextStreaming = { ...s.streaming };
+        if (nextStreaming[chatJid]?.interrupted) {
+          delete nextStreaming[chatJid];
+        }
+        return {
+          waiting: { ...s.waiting, [chatJid]: true },
+          streaming: nextStreaming,
+        };
+      });
     }
   },
 
