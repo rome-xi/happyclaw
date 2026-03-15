@@ -1698,14 +1698,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         if (result.status === 'stream' && result.streamEvent) {
           broadcastStreamEvent(chatJid, result.streamEvent);
 
-          // ── Feed text_delta into Feishu streaming card ──
-          if (
-            streamingSession &&
-            result.streamEvent.eventType === 'text_delta' &&
-            result.streamEvent.text
-          ) {
+          // ── 累积 text_delta 文本（中断时用于保存已输出内容）──
+          if (result.streamEvent.eventType === 'text_delta' && result.streamEvent.text) {
             streamingAccumulatedText += result.streamEvent.text;
-            streamingSession.append(streamingAccumulatedText);
+            // 同步到飞书流式卡片（Web 端无 streamingSession）
+            if (streamingSession) {
+              streamingSession.append(streamingAccumulatedText);
+            }
           }
 
           // ── 中断时立即保存已输出内容 ──
