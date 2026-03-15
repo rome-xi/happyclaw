@@ -754,9 +754,11 @@ async function runQuery(
     }
     // ── 结果后超时：result 已收到，给 host 短暂时间写 _drain ──
     // 避免等待完整的 STREAM_IDLE_TIMEOUT_MS（5 分钟）。
+    // 注意：不设置 closedDuringQuery — 这只是 stream 清理，不是退出信号。
+    // 主循环会继续进入 waitForIpcMessage()，等待 _close/_drain 才退出。
+    // 这保证了终端预热等场景下容器不会在查询完成后立即退出。
     if (resultReceivedAt && Date.now() - resultReceivedAt > POST_RESULT_TIMEOUT_MS) {
       log(`Post-result timeout (${POST_RESULT_TIMEOUT_MS / 1000}s), closing stream`);
-      closedDuringQuery = true;
       stream.end();
       ipcPolling = false;
       return;

@@ -649,6 +649,11 @@ groupRoutes.post('/', authMiddleware, async (c) => {
     return c.json({ error: `Workspace initialization failed: ${errMsg}` }, 500);
   }
 
+  // 容器模式工作区创建后立即启动容器预热，避免用户打开终端时还需等待
+  if (executionMode === 'container') {
+    deps.ensureTerminalContainerStarted(jid);
+  }
+
   return c.json({
     success: true,
     jid,
