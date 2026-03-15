@@ -47,11 +47,6 @@ const IPC_INPUT_DIR = path.join(WORKSPACE_IPC, 'input');
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_POLL_MS = 500;
 
-/**
- * 流式消息空闲超时：如果 query 期间超过此时间没有收到任何 SDK 消息，
- * 认为 SDK 已挂起（例如子 Agent 进程崩溃但迭代器未结束），主动中断。
- */
-const STREAM_IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 分钟
 
 let needsMemoryFlush = false;
 let currentPermissionMode: PermissionMode = 'bypassPermissions';
@@ -732,11 +727,8 @@ async function runQuery(
   let interruptedDuringQuery = false;
   let suppressOutputAfterInterrupt = false;
   let visibleOutputStarted = false;
-  // Track last SDK message time for idle timeout detection
-  let lastSdkMessageAt = Date.now();
   // After a result is received, allow a short window for the host to write _drain
-  // before force-closing the stream. This preserves the drain model while avoiding
-  // the full STREAM_IDLE_TIMEOUT_MS (5 min) wait.
+  // before force-closing the stream.
   let resultReceivedAt: number | null = null;
   const POST_RESULT_TIMEOUT_MS = 5_000;
   // queryRef is set just before the for-await loop so pollIpcDuringQuery can call interrupt()
@@ -774,24 +766,11 @@ async function runQuery(
       return;
     }
     // ── 结果后超时：result 已收到，给 host 短暂时间写 _drain ──
-    // 避免等待完整的 STREAM_IDLE_TIMEOUT_MS（5 分钟）。
     // 注意：不设置 closedDuringQuery — 这只是 stream 清理，不是退出信号。
     // 主循环会继续进入 waitForIpcMessage()，等待 _close/_drain 才退出。
     // 这保证了终端预热等场景下容器不会在查询完成后立即退出。
     if (resultReceivedAt && Date.now() - resultReceivedAt > POST_RESULT_TIMEOUT_MS) {
       log(`Post-result timeout (${POST_RESULT_TIMEOUT_MS / 1000}s), closing stream`);
-      stream.end();
-      ipcPolling = false;
-      return;
-    }
-    // 空闲超时检测：如果 SDK 长时间没有发送任何消息（子 Agent 崩溃等），
-    // 主动中断 query 防止进程死等。
-    const idleMs = Date.now() - lastSdkMessageAt;
-    if (idleMs > STREAM_IDLE_TIMEOUT_MS) {
-      log(`Stream idle timeout: no SDK messages for ${Math.round(idleMs / 1000)}s, interrupting query`);
-      emit({ status: 'error', result: null, error: `Stream idle timeout: SDK 超过 ${Math.round(idleMs / 1000)} 秒无响应，已自动中断` });
-      interruptedDuringQuery = true;
-      queryRef?.interrupt().catch((err: unknown) => log(`Idle timeout interrupt failed: ${err}`));
       stream.end();
       ipcPolling = false;
       return;
@@ -998,9 +977,6 @@ async function runQuery(
       ipcPolling = false;
     }
     for await (const message of q) {
-    // 每收到一条 SDK 消息就重置空闲计时器
-    lastSdkMessageAt = Date.now();
-
     // 流式事件处理
     if (message.type === 'stream_event') {
       if (!suppressOutputAfterInterrupt) {
