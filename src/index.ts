@@ -1705,9 +1705,32 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           // ── 累积 text_delta 文本（中断时用于保存已输出内容）──
           if (result.streamEvent.eventType === 'text_delta' && result.streamEvent.text) {
             streamingAccumulatedText += result.streamEvent.text;
-            // 同步到飞书流式卡片（Web 端无 streamingSession）
-            if (streamingSession) {
-              streamingSession.append(streamingAccumulatedText);
+          }
+
+          // ── Feed stream events into Feishu streaming card ──
+          if (streamingSession) {
+            const se = result.streamEvent;
+            switch (se.eventType) {
+              case 'text_delta':
+                if (se.text) {
+                  streamingSession.append(streamingAccumulatedText);
+                }
+                break;
+              case 'thinking_delta':
+                if (!streamingAccumulatedText) {
+                  streamingSession.setThinking();
+                }
+                break;
+              case 'tool_use_start':
+                if (se.toolUseId && se.toolName) {
+                  streamingSession.startTool(se.toolUseId, se.toolName);
+                }
+                break;
+              case 'tool_use_end':
+                if (se.toolUseId) {
+                  streamingSession.endTool(se.toolUseId, false);
+                }
+                break;
             }
           }
 
@@ -3438,14 +3461,36 @@ async function processAgentConversation(
     if (output.status === 'stream' && output.streamEvent) {
       broadcastStreamEvent(chatJid, output.streamEvent, agentId);
 
-      // ── Feed text_delta into Feishu streaming card ──
-      if (
-        agentStreamingSession &&
-        output.streamEvent.eventType === 'text_delta' &&
-        output.streamEvent.text
-      ) {
+      // ── 累积 text_delta 文本（中断时用于保存已输出内容）──
+      if (output.streamEvent.eventType === 'text_delta' && output.streamEvent.text) {
         agentStreamingAccText += output.streamEvent.text;
-        agentStreamingSession.append(agentStreamingAccText);
+      }
+
+      // ── Feed stream events into Feishu streaming card ──
+      if (agentStreamingSession) {
+        const se = output.streamEvent;
+        switch (se.eventType) {
+          case 'text_delta':
+            if (se.text) {
+              agentStreamingSession.append(agentStreamingAccText);
+            }
+            break;
+          case 'thinking_delta':
+            if (!agentStreamingAccText) {
+              agentStreamingSession.setThinking();
+            }
+            break;
+          case 'tool_use_start':
+            if (se.toolUseId && se.toolName) {
+              agentStreamingSession.startTool(se.toolUseId, se.toolName);
+            }
+            break;
+          case 'tool_use_end':
+            if (se.toolUseId) {
+              agentStreamingSession.endTool(se.toolUseId, false);
+            }
+            break;
+        }
       }
 
       // ── 中断时立即保存已输出内容 ──
