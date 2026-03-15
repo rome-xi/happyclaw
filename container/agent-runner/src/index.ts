@@ -892,6 +892,23 @@ async function runQuery(
     '- 如果用户的消息很简短（如打招呼），简洁回应即可，不要用工具列表填充回复。',
   ].join('\n');
 
+  // Conversation agents (sub-conversations with agentId) get special behavioral guidelines
+  // to prevent excessive send_message usage and duplicate responses.
+  const conversationAgentGuidelines = containerInput.agentId ? [
+    '',
+    '## 子会话行为规则（最高优先级，覆盖其他冲突指令）',
+    '',
+    '你正在一个**子会话**中运行，不是主会话。以下规则覆盖全局记忆中的"响应行为准则"：',
+    '',
+    '1. **不要用 `send_message` 发送"收到"之类的确认消息** — 你的正常文本输出就是回复，不需要额外发消息',
+    '2. **每次回复只产生一条消息** — 把分析、结论、建议整合到一条回复中，不要拆成多条',
+    '3. **只在以下情况使用 `send_message`**：',
+    '   - 执行超过 2 分钟的长任务时，发送一次进度更新（不是确认收到）',
+    '   - 用户明确要求你"先回复一下"时',
+    '4. **你的正常文本输出会自动发送给用户**，不需要通过 `send_message` 转发',
+    '5. **回复语言使用简体中文**，除非用户用其他语言提问',
+  ].join('\n') : '';
+
   const systemPromptAppend = [
     globalClaudeMd,
     heartbeatContent,
@@ -900,6 +917,7 @@ async function runQuery(
     outputGuidelines,
     webFetchGuidelines,
     backgroundTaskGuidelines,
+    conversationAgentGuidelines,
   ].filter(Boolean).join('\n');
 
   // Home containers (admin & member) can access global and memory directories.
