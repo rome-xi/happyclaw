@@ -26,10 +26,13 @@ const bugReportRoutes = new Hono<{ Variables: Variables }>();
 const cooldowns = new Map<string, number>();
 const COOLDOWN_MS = 60_000;
 
-function checkCooldown(userId: string): string | null {
-  const last = cooldowns.get(userId);
+const generateCooldowns = new Map<string, number>();
+const GENERATE_COOLDOWN_MS = 30_000;
+
+function checkCooldown(userId: string, map: Map<string, number> = cooldowns, cooldownMs: number = COOLDOWN_MS): string | null {
+  const last = map.get(userId);
   if (last) {
-    const remaining = COOLDOWN_MS - (Date.now() - last);
+    const remaining = cooldownMs - (Date.now() - last);
     if (remaining > 0) {
       return `请等待 ${Math.ceil(remaining / 1000)} 秒后再试`;
     }
@@ -119,38 +122,31 @@ function readRecentLogs(folder: string, maxLines = 50): string {
 
 /** Mask environment variable values in log text */
 function sanitizeLogs(text: string): string {
-  const sensitiveKeys = [
-    'ANTHROPIC_API_KEY',
-    'ANTHROPIC_AUTH_TOKEN',
-    'FEISHU_APP_SECRET',
-    'TELEGRAM_BOT_TOKEN',
-    'WEB_SESSION_SECRET',
-    'GITHUB_TOKEN',
-  ];
-  let result = text;
-  for (const key of sensitiveKeys) {
-    // Match patterns like KEY=value or KEY: value
-    result = result.replace(
-      new RegExp(`(${key})[=:]\\s*\\S+`, 'gi'),
-      `$1=***`,
-    );
-  }
-  return result;
+  // Generic pattern matching any env var name containing sensitive keywords
+  const sensitivePattern =
+    /(\b\w*(?:token|password|passwd|secret|api[_-]?key|auth[_-]?token|authorization|cookie|credential|private[_-]?key|access[_-]?key|app[_-]?secret)\w*)[=:]\s*\S+/gi;
+  return text.replace(sensitivePattern, '$1=***');
 }
 
 function buildGeneratePrompt(
   description: string,
   systemInfo: Record<string, string>,
   logs: string,
+  screenshotCount: number,
 ): string {
   const sysInfoText = Object.entries(systemInfo)
     .map(([k, v]) => `- ${k}: ${v}`)
     .join('\n');
 
+  const screenshotNote =
+    screenshotCount > 0
+      ? `\n\n## 附加截图\n用户附加了 ${screenshotCount} 张截图（截图内容无法在此展示）。请在 Issue 正文末尾添加提示：「报告者附加了 ${screenshotCount} 张截图，如需查看请联系报告者。」`
+      : '';
+
   return `你是一个 Bug 报告助手，帮用户将 bug 描述整理为结构化的 GitHub Issue。
 
 ## 用户描述
-${description}
+${description}${screenshotNote}
 
 ## 系统信息
 ${sysInfoText}
@@ -261,6 +257,12 @@ bugReportRoutes.get('/capabilities', authMiddleware, async (c) => {
 bugReportRoutes.post('/generate', authMiddleware, async (c) => {
   const user = c.get('user') as AuthUser;
 
+  // Rate limiting — 30s cooldown per user for generate
+  const generateCooldownMsg = checkCooldown(user.id, generateCooldowns, GENERATE_COOLDOWN_MS);
+  if (generateCooldownMsg) {
+    return c.json({ error: generateCooldownMsg }, 429);
+  }
+
   const parseResult = BugReportGenerateSchema.safeParse(await c.req.json());
   if (!parseResult.success) {
     return c.json(
@@ -269,6 +271,9 @@ bugReportRoutes.post('/generate', authMiddleware, async (c) => {
     );
   }
   const { description, screenshots } = parseResult.data;
+
+  // Set cooldown immediately to prevent concurrent requests
+  generateCooldowns.set(user.id, Date.now());
 
   // Collect system info
   const homeGroup = getUserHomeGroup(user.id);
@@ -299,7 +304,7 @@ bugReportRoutes.post('/generate', authMiddleware, async (c) => {
     return c.json({ ...fallback, systemInfo });
   }
 
-  const prompt = buildGeneratePrompt(description, systemInfo, logs);
+  const prompt = buildGeneratePrompt(description, systemInfo, logs, screenshots?.length || 0);
 
   try {
     const result = await new Promise<string | null>((resolve) => {

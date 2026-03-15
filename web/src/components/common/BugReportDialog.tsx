@@ -188,6 +188,30 @@ export function BugReportDialog({ open, onClose }: BugReportDialogProps) {
 
   // --- Submit flow ---
 
+  // No gh: generate report then show preview
+  const handleGenerateForPreview = useCallback(async () => {
+    if (!description.trim()) {
+      setError('请输入问题描述');
+      return;
+    }
+    setLoading(true);
+    setError(null);
+
+    try {
+      const result = await generateReport();
+      if (!result) throw new Error('生成报告失败');
+      setTitle(result.title);
+      setBody(result.body);
+      setSystemInfo(result.systemInfo);
+      setStep(2);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : '生成报告失败，请重试';
+      setError(msg);
+    } finally {
+      setLoading(false);
+    }
+  }, [description, generateReport]);
+
   const handleSubmitClick = useCallback(() => {
     if (!description.trim()) {
       setError('请输入问题描述');
@@ -202,7 +226,7 @@ export function BugReportDialog({ open, onClose }: BugReportDialogProps) {
       // No gh — generate and go to preview/edit
       handleGenerateForPreview();
     }
-  }, [description, caps]);
+  }, [description, caps, handleGenerateForPreview]);
 
   // gh available: user confirmed → close dialog, async generate+submit, toast result
   const handleConfirmSubmit = useCallback(async () => {
@@ -235,30 +259,6 @@ export function BugReportDialog({ open, onClose }: BugReportDialogProps) {
       showToast('提交失败', msg, 6000);
     }
   }, [generateReport, handleClose]);
-
-  // No gh: generate report then show preview
-  const handleGenerateForPreview = useCallback(async () => {
-    if (!description.trim()) {
-      setError('请输入问题描述');
-      return;
-    }
-    setLoading(true);
-    setError(null);
-
-    try {
-      const result = await generateReport();
-      if (!result) throw new Error('生成报告失败');
-      setTitle(result.title);
-      setBody(result.body);
-      setSystemInfo(result.systemInfo);
-      setStep(2);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : '生成报告失败，请重试';
-      setError(msg);
-    } finally {
-      setLoading(false);
-    }
-  }, [description, generateReport]);
 
   // Preview step: manual submit (opens pre-filled URL)
   const handleManualSubmit = useCallback(async () => {
