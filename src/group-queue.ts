@@ -4,6 +4,7 @@ import path from 'path';
 
 import { DATA_DIR } from './config.js';
 import { killProcessTree } from './container-runner.js';
+import { getTaskById } from './db.js';
 import { getSystemSettings } from './runtime-config.js';
 import { logger } from './logger.js';
 import { type MessageIntent } from './intent-analyzer.js';
@@ -925,8 +926,17 @@ export class GroupQueue {
     }
 
     // Tasks first (they won't be re-discovered from SQLite like messages)
-    if (state.pendingTasks.length > 0) {
+    while (state.pendingTasks.length > 0) {
       const task = state.pendingTasks.shift()!;
+      // Check if scheduled task is still active before occupying a slot
+      const dbTask = getTaskById(task.id);
+      if (!dbTask || dbTask.status !== 'active') {
+        logger.info(
+          { groupJid, taskId: task.id },
+          'Skipping cancelled/deleted task during drain',
+        );
+        continue;
+      }
       this.runTask(groupJid, task);
       return;
     }
@@ -959,8 +969,26 @@ export class GroupQueue {
 
       // Prioritize tasks over messages
       if (state.pendingTasks.length > 0) {
-        const task = state.pendingTasks.shift()!;
-        this.runTask(jid, task);
+        // Skip cancelled/deleted tasks
+        let validTask: QueuedTask | undefined;
+        while (state.pendingTasks.length > 0) {
+          const candidate = state.pendingTasks.shift()!;
+          const dbTask = getTaskById(candidate.id);
+          if (dbTask && dbTask.status === 'active') {
+            validTask = candidate;
+            break;
+          }
+          logger.info(
+            { groupJid: jid, taskId: candidate.id },
+            'Skipping cancelled/deleted task during drainWaiting',
+          );
+        }
+        if (validTask) {
+          this.runTask(jid, validTask);
+        } else if (state.pendingMessages) {
+          // All tasks were stale, fall through to messages
+          this.runForGroup(jid, 'drain');
+        }
       } else if (state.pendingMessages) {
         this.runForGroup(jid, 'drain');
       }
