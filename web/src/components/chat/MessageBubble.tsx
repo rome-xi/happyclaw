@@ -1,5 +1,5 @@
 import { useState, useRef, memo } from 'react';
-import { Copy, Check, ChevronDown, ChevronUp, Ellipsis } from 'lucide-react';
+import { Copy, Check, ChevronDown, ChevronUp, Ellipsis, ImageDown } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { Message } from '../../stores/chat';
@@ -8,6 +8,7 @@ import { EmojiAvatar } from '../common/EmojiAvatar';
 import { MarkdownRenderer } from './MarkdownRenderer';
 import { MessageContextMenu } from './MessageContextMenu';
 import { ImageLightbox } from './ImageLightbox';
+import { ShareImageDialog } from './ShareImageDialog';
 import { mediumTap } from '../../hooks/useHaptic';
 import { useDisplayMode } from '../../hooks/useDisplayMode';
 
@@ -135,6 +136,7 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
   const [copied, setCopied] = useState(false);
   const [lightboxState, setLightboxState] = useState<{ images: string[]; index: number } | null>(null);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
+  const [showShareDialog, setShowShareDialog] = useState(false);
   const touchTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
   const touchStartPos = useRef({ x: 0, y: 0 });
   const currentUser = useAuthStore((s) => s.user);
@@ -554,6 +556,14 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
             {/* Action buttons */}
             <div className="absolute top-2 right-2 flex items-center gap-0.5 lg:opacity-0 lg:group-hover:opacity-100 transition-opacity">
               <button
+                onClick={() => setShowShareDialog(true)}
+                className="w-7 h-7 rounded-md flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-foreground/10 max-lg:hidden cursor-pointer"
+                title="分享图片"
+                aria-label="生成分享图片"
+              >
+                <ImageDown className="w-4 h-4" />
+              </button>
+              <button
                 onClick={handleCopy}
                 className="w-7 h-7 rounded-md flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-foreground/10 max-lg:hidden cursor-pointer"
                 title="复制"
@@ -618,6 +628,14 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
           onClose={() => setContextMenu(null)}
           chatJid={message.chat_jid}
           messageId={message.id}
+          onShareImage={() => setShowShareDialog(true)}
+        />
+      )}
+      {showShareDialog && (
+        <ShareImageDialog
+          open={showShareDialog}
+          onClose={() => setShowShareDialog(false)}
+          message={message}
         />
       )}
     </div>

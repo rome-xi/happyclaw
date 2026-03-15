@@ -1,0 +1,172 @@
+import { forwardRef } from 'react';
+import { EmojiAvatar } from '../common/EmojiAvatar';
+import { MarkdownRenderer } from './MarkdownRenderer';
+
+interface ShareCardRendererProps {
+  content: string;
+  senderName: string;
+  timestamp: string;
+  groupJid?: string;
+  aiEmoji?: string | null;
+  aiColor?: string | null;
+  aiImageUrl?: string | null;
+  assistantName?: string;
+}
+
+/**
+ * Inline light-theme CSS variables for consistent rendering regardless of current theme.
+ * Extracted from globals.css :root values.
+ */
+const LIGHT_THEME_VARS: React.CSSProperties = {
+  // shadcn/ui semantic tokens
+  '--background': '#ffffff',
+  '--foreground': '#0f172a',
+  '--card': '#ffffff',
+  '--card-foreground': '#0f172a',
+  '--popover': '#ffffff',
+  '--popover-foreground': '#0f172a',
+  '--primary': '#0d9488',
+  '--primary-foreground': '#ffffff',
+  '--secondary': '#f1f5f9',
+  '--secondary-foreground': '#0f172a',
+  '--muted': '#f1f5f9',
+  '--muted-foreground': '#64748b',
+  '--accent': '#f0fdfa',
+  '--accent-foreground': '#134e4a',
+  '--destructive': '#dc2626',
+  '--destructive-foreground': '#ffffff',
+  '--border': '#e2e8f0',
+  '--input': '#e2e8f0',
+  '--ring': '#0d9488',
+  // Brand
+  '--brand-50': '#f0fdfa',
+  '--brand-100': '#ccfbf1',
+  '--brand-200': '#99f6e4',
+  '--brand-300': '#5eead4',
+  '--brand-400': '#2dd4bf',
+  '--brand-500': '#0d9488',
+  '--brand-600': '#0f766e',
+  '--brand-700': '#115e59',
+} as React.CSSProperties;
+
+const MAX_HEIGHT = 20000;
+
+/**
+ * Override styles for the share card content area.
+ * Forces all content to wrap within the fixed card width (720px)
+ * instead of overflowing or creating horizontal scroll.
+ */
+const CONTENT_OVERRIDE_STYLE = `
+  .share-card-content {
+    overflow-wrap: break-word !important;
+    word-break: break-word !important;
+  }
+  .share-card-content th,
+  .share-card-content td {
+    white-space: normal !important;
+    word-break: break-word !important;
+  }
+  .share-card-content pre {
+    white-space: pre-wrap !important;
+    word-break: break-all !important;
+  }
+  .share-card-content code {
+    word-break: break-all !important;
+  }
+  .share-card-content .overflow-x-auto {
+    overflow: visible !important;
+  }
+`;
+
+export const ShareCardRenderer = forwardRef<HTMLDivElement, ShareCardRendererProps>(
+  function ShareCardRenderer(
+    { content, senderName, timestamp, groupJid, aiEmoji, aiColor, aiImageUrl, assistantName },
+    ref,
+  ) {
+    return (
+      <div
+        ref={ref}
+        style={{
+          ...LIGHT_THEME_VARS,
+          width: 720,
+          fontFamily: "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
+          background: '#ffffff',
+          color: '#0f172a',
+          borderRadius: 16,
+          WebkitFontSmoothing: 'antialiased',
+        }}
+      >
+        <style>{CONTENT_OVERRIDE_STYLE}</style>
+
+        {/* Header */}
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            padding: '16px 24px',
+            borderBottom: '1px solid #e2e8f0',
+            background: '#f8fafc',
+            borderRadius: '16px 16px 0 0',
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <EmojiAvatar
+              imageUrl={aiImageUrl}
+              emoji={aiEmoji}
+              color={aiColor}
+              fallbackChar={senderName[0]}
+              size="md"
+            />
+            <span style={{ fontSize: 15, fontWeight: 600, color: '#0f172a' }}>{senderName}</span>
+          </div>
+          <span style={{ fontSize: 13, color: '#64748b', whiteSpace: 'nowrap', marginLeft: 16 }}>{timestamp}</span>
+        </div>
+
+        {/* Content */}
+        <div
+          style={{
+            padding: '20px 24px',
+            maxHeight: MAX_HEIGHT,
+            position: 'relative',
+          }}
+        >
+          <div className="share-card-content max-w-none">
+            <MarkdownRenderer content={content} groupJid={groupJid} variant="chat" />
+          </div>
+          {/* Gradient fade for extremely long content */}
+          {content.length > 30000 && (
+            <div
+              style={{
+                position: 'absolute',
+                bottom: 0,
+                left: 0,
+                right: 0,
+                height: 80,
+                background: 'linear-gradient(transparent, #ffffff)',
+                pointerEvents: 'none',
+              }}
+            />
+          )}
+        </div>
+
+        {/* Footer */}
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: '12px 24px',
+            borderTop: '1px solid #e2e8f0',
+            background: '#f8fafc',
+            borderRadius: '0 0 16px 16px',
+          }}
+        >
+          <span style={{ fontSize: 12, color: '#94a3b8' }}>
+            {assistantName || 'HappyClaw'} · Powered by Claude
+          </span>
+        </div>
+      </div>
+    );
+  },
+);
