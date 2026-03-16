@@ -5004,6 +5004,22 @@ async function main(): Promise<void> {
     60 * 60 * 1000,
   );
 
+  // Periodically clean completed task agents (every 10 minutes)
+  setInterval(
+    () => {
+      try {
+        const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+        const cleaned = deleteCompletedTaskAgents(tenMinutesAgo);
+        if (cleaned > 0) {
+          logger.info({ cleaned }, 'Periodic cleanup: removed completed task agents');
+        }
+      } catch (err) {
+        logger.warn({ err }, 'Failed periodic task agent cleanup');
+      }
+    },
+    10 * 60 * 1000,
+  );
+
   // Billing: check expired subscriptions every hour
   setInterval(
     () => {
