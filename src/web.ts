@@ -567,12 +567,6 @@ function setupWebSocket(server: any): WebSocketServer {
       socket.destroy();
       return;
     }
-    if (session.must_change_password) {
-      socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
-      socket.destroy();
-      return;
-    }
-
     request.__happyclawSessionId = token;
 
     wss.handleUpgrade(request, socket, head, (ws) => {
@@ -610,8 +604,7 @@ function setupWebSocket(server: any): WebSocketServer {
         if (
           !session ||
           isSessionExpired(session.expires_at) ||
-          session.status !== 'active' ||
-          session.must_change_password
+          session.status !== 'active'
         ) {
           if (session && isSessionExpired(session.expires_at)) {
             deleteUserSession(sessionId);
@@ -634,6 +627,11 @@ function setupWebSocket(server: any): WebSocketServer {
 
         const msg: WsMessageIn = JSON.parse(data.toString());
 
+        const sendWsError = (error: string, chatJid?: string) => {
+          const msg: WsMessageOut = { type: 'ws_error', error, chatJid };
+          ws.send(JSON.stringify(msg));
+        };
+
         if (msg.type === 'send_message') {
           const wsValidation = MessageCreateSchema.safeParse({
             chatJid: msg.chatJid,
@@ -641,6 +639,11 @@ function setupWebSocket(server: any): WebSocketServer {
             attachments: msg.attachments,
           });
           if (!wsValidation.success) {
+            sendWsError('消息格式无效', msg.chatJid);
+            logger.warn(
+              { chatJid: msg.chatJid, issues: wsValidation.error.issues.map(i => i.message) },
+              'WebSocket send_message validation failed',
+            );
             return;
           }
           const { chatJid, content, attachments } = wsValidation.data;
@@ -655,6 +658,7 @@ function setupWebSocket(server: any): WebSocketServer {
                 targetGroup,
               )
             ) {
+              sendWsError('无权访问该群组', chatJid);
               logger.warn(
                 { chatJid, userId: session.user_id },
                 'WebSocket send_message blocked: access denied',
@@ -663,6 +667,7 @@ function setupWebSocket(server: any): WebSocketServer {
             }
             if (isHostExecutionGroup(targetGroup)) {
               if (session.role !== 'admin') {
+                sendWsError('宿主机模式需要管理员权限', chatJid);
                 logger.warn(
                   { chatJid, userId: session.user_id },
                   'WebSocket send_message blocked: host mode requires admin',
@@ -1052,8 +1057,7 @@ function safeBroadcast(
     const invalid =
       !session ||
       expired ||
-      session.status !== 'active' ||
-      session.must_change_password;
+      session.status !== 'active';
     if (invalid) {
       if (expired) {
         deleteUserSession(clientInfo.sessionId);

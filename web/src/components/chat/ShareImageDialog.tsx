@@ -4,6 +4,8 @@ import { X, Download, RefreshCw } from 'lucide-react';
 import { toPng } from 'html-to-image';
 import { Message } from '../../stores/chat';
 import { useAuthStore } from '../../stores/auth';
+import { downloadFromDataUrl } from '../../utils/download';
+import { showToast } from '../../utils/toast';
 import {
   ShareCardRenderer,
   SHARE_CARD_DEFAULT_WIDTH,
@@ -12,7 +14,6 @@ import {
 } from './ShareCardRenderer';
 
 interface ShareImageDialogProps {
-  open: boolean;
   onClose: () => void;
   message: Message;
 }
@@ -24,27 +25,31 @@ type GenerateState = 'generating' | 'preview' | 'error';
  */
 function waitForRenderComplete(container: HTMLElement): Promise<void> {
   return new Promise((resolve) => {
-    const timeout = setTimeout(resolve, 5000);
+    const observer = new MutationObserver(check);
+    const timeout = setTimeout(() => {
+      observer.disconnect();
+      resolve();
+    }, 5000);
 
-    const check = () => {
+    function check() {
       // Mermaid loading placeholders use animate-pulse
       const loading = container.querySelectorAll('.animate-pulse');
       const images = container.querySelectorAll('img');
       const allImagesLoaded = Array.from(images).every((img) => img.complete);
       if (loading.length === 0 && allImagesLoaded) {
         clearTimeout(timeout);
+        observer.disconnect();
         // Small extra delay to let SVG painting settle
         setTimeout(resolve, 300);
       }
-    };
+    }
 
-    const observer = new MutationObserver(check);
     observer.observe(container, { childList: true, subtree: true });
     check();
   });
 }
 
-export function ShareImageDialog({ open, onClose, message }: ShareImageDialogProps) {
+export function ShareImageDialog({ onClose, message }: ShareImageDialogProps) {
   const [state, setState] = useState<GenerateState>('generating');
   const [dataUrl, setDataUrl] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState('');
@@ -120,25 +125,16 @@ export function ShareImageDialog({ open, onClose, message }: ShareImageDialogPro
   }, []);
 
   useEffect(() => {
-    if (open) generate();
-  }, [open, generate]);
-
-  // Cleanup data URL on unmount
-  useEffect(() => {
-    return () => {
-      setDataUrl(null);
-    };
-  }, []);
+    generate();
+  }, [generate]);
 
   const handleDownload = () => {
     if (!dataUrl) return;
-    const a = document.createElement('a');
-    a.href = dataUrl;
-    a.download = `share-${Date.now()}.png`;
-    a.click();
+    downloadFromDataUrl(dataUrl, `share-${Date.now()}.png`).catch((err) => {
+      console.error('Share image download failed:', err);
+      showToast('保存失败', err instanceof Error ? err.message : '图片保存出错，请重试');
+    });
   };
-
-  if (!open) return null;
 
   return createPortal(
     <div
