@@ -162,7 +162,7 @@ interface ChatState {
   // Conversation agent actions
   createConversation: (jid: string, name: string, description?: string) => Promise<AgentInfo | null>;
   loadAgentMessages: (jid: string, agentId: string, loadMore?: boolean) => Promise<void>;
-  sendAgentMessage: (jid: string, agentId: string, content: string) => void;
+  sendAgentMessage: (jid: string, agentId: string, content: string, attachments?: Array<{ data: string; mimeType: string }>) => void;
   refreshAgentMessages: (jid: string, agentId: string) => Promise<void>;
   // Runner state sync
   handleRunnerState: (chatJid: string, state: string) => void;
@@ -1715,7 +1715,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   },
 
-  sendAgentMessage: (jid, agentId, content) => {
+  sendAgentMessage: (jid, agentId, content, attachments?) => {
     // Clear agent streaming state before sending
     set((s) => {
       const next = { ...s.agentStreaming };
@@ -1723,7 +1723,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
       return { agentStreaming: next };
     });
     // Send via WebSocket with agentId
-    wsManager.send({ type: 'send_message', chatJid: jid, content, agentId });
+    const normalizedAttachments = attachments && attachments.length > 0
+      ? attachments.map(att => ({ type: 'image' as const, ...att }))
+      : undefined;
+    wsManager.send({ type: 'send_message', chatJid: jid, content, agentId, attachments: normalizedAttachments });
     set((s) => ({
       agentWaiting: { ...s.agentWaiting, [agentId]: true },
     }));
