@@ -189,6 +189,41 @@ const sdkTaskStaleTimers = new Map<string, ReturnType<typeof setTimeout>>();
 /** 已完成/出错的 SDK Task ID，防止迟到事件 re-create */
 const completedSdkTaskIds = new Set<string>();
 
+/** DB task agent 自动清理定时器（完成后延迟移除） */
+const DB_TASK_AGENT_AUTO_CLEAN_MS = 5000;
+const dbTaskAgentCleanupTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function scheduleDbTaskAgentCleanup(
+  set: (fn: (s: ChatState) => Partial<ChatState>) => void,
+  agentId: string,
+  chatJid: string,
+): void {
+  clearDbTaskAgentCleanupTimer(agentId);
+  const timer = setTimeout(() => {
+    dbTaskAgentCleanupTimers.delete(agentId);
+    set((s) => {
+      const existing = s.agents[chatJid] || [];
+      const filtered = existing.filter((a) => a.id !== agentId);
+      if (filtered.length === existing.length) return {};
+      const nextActiveTab = { ...s.activeAgentTab };
+      if (nextActiveTab[chatJid] === agentId) nextActiveTab[chatJid] = null;
+      return {
+        agents: { ...s.agents, [chatJid]: filtered },
+        activeAgentTab: nextActiveTab,
+      };
+    });
+  }, DB_TASK_AGENT_AUTO_CLEAN_MS);
+  dbTaskAgentCleanupTimers.set(agentId, timer);
+}
+
+function clearDbTaskAgentCleanupTimer(agentId: string): void {
+  const timer = dbTaskAgentCleanupTimers.get(agentId);
+  if (timer) {
+    clearTimeout(timer);
+    dbTaskAgentCleanupTimers.delete(agentId);
+  }
+}
+
 // 兜底路由支持的事件类型（模块级常量，避免热路径上重复创建 Set）
 const FALLBACK_EVENT_TYPES: Set<StreamEventType> = new Set([
   'text_delta', 'thinking_delta',
@@ -1467,6 +1502,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       if (resultSummary === '__removed__') {
         clearSdkTaskCleanupTimer(agentId);
         clearSdkTaskStaleTimer(agentId);
+        clearDbTaskAgentCleanupTimer(agentId);
         const filtered = existing.filter((a) => a.id !== agentId);
         const nextAgentStreaming = { ...s.agentStreaming };
         delete nextAgentStreaming[agentId];
@@ -1524,13 +1560,19 @@ export const useChatStore = create<ChatState>((set, get) => ({
           clearSdkTaskStaleTimer(agentId);
           delete nextSdkTasks[agentId];
           nextSdkTaskAliases = removeSdkTaskAliases(nextSdkTaskAliases, agentId);
-        } else if (nextSdkTasks[agentId]) {
-          nextSdkTasks[agentId] = {
-            ...nextSdkTasks[agentId],
-            chatJid,
-            description: prompt,
-            status: 'running',
-          };
+          // 自动清理已完成的 DB task agent（延迟移除，让用户看到完成状态）
+          scheduleDbTaskAgentCleanup(set, agentId, chatJid);
+        } else {
+          // Task 回到 running 状态，取消 pending 的清理定时器
+          clearDbTaskAgentCleanupTimer(agentId);
+          if (nextSdkTasks[agentId]) {
+            nextSdkTasks[agentId] = {
+              ...nextSdkTasks[agentId],
+              chatJid,
+              description: prompt,
+              status: 'running',
+            };
+          }
         }
       }
 
