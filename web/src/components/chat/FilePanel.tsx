@@ -24,6 +24,7 @@ import { useAuthStore } from '../../stores/auth';
 import { api } from '../../api/client';
 import { withBasePath } from '../../utils/url';
 import { downloadFromUrl } from '../../utils/download';
+import { showToast } from '../../utils/toast';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { ConfirmDialog } from '@/components/common/ConfirmDialog';
 import { Button } from '@/components/ui/button';
@@ -370,6 +371,7 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
     const url = `/api/groups/${encodeURIComponent(groupJid)}/files/download/${encoded}`;
     downloadFromUrl(url, item.name).catch((err) => {
       console.error('Download failed:', err);
+      showToast('下载失败', err instanceof Error ? err.message : '文件下载出错，请重试');
     });
   };
 

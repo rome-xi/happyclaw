@@ -5,6 +5,7 @@ import { toPng } from 'html-to-image';
 import { Message } from '../../stores/chat';
 import { useAuthStore } from '../../stores/auth';
 import { downloadFromDataUrl } from '../../utils/download';
+import { showToast } from '../../utils/toast';
 import {
   ShareCardRenderer,
   SHARE_CARD_DEFAULT_WIDTH,
@@ -135,6 +136,7 @@ export function ShareImageDialog({ open, onClose, message }: ShareImageDialogPro
     if (!dataUrl) return;
     downloadFromDataUrl(dataUrl, `share-${Date.now()}.png`).catch((err) => {
       console.error('Share image download failed:', err);
+      showToast('保存失败', err instanceof Error ? err.message : '图片保存出错，请重试');
     });
   };
 
