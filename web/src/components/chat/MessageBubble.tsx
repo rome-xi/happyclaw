@@ -1,4 +1,4 @@
-import { useState, useRef, memo } from 'react';
+import { useState, useRef, memo, lazy, Suspense } from 'react';
 import { Copy, Check, ChevronDown, ChevronUp, Ellipsis, ImageDown } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
@@ -8,9 +8,10 @@ import { EmojiAvatar } from '../common/EmojiAvatar';
 import { MarkdownRenderer } from './MarkdownRenderer';
 import { MessageContextMenu } from './MessageContextMenu';
 import { ImageLightbox } from './ImageLightbox';
-import { ShareImageDialog } from './ShareImageDialog';
 import { mediumTap } from '../../hooks/useHaptic';
 import { useDisplayMode } from '../../hooks/useDisplayMode';
+
+const ShareImageDialog = lazy(() => import('./ShareImageDialog').then(m => ({ default: m.ShareImageDialog })));
 
 interface MessageBubbleProps {
   message: Message;
@@ -632,11 +633,12 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
         />
       )}
       {showShareDialog && (
-        <ShareImageDialog
-          open={showShareDialog}
-          onClose={() => setShowShareDialog(false)}
-          message={message}
-        />
+        <Suspense>
+          <ShareImageDialog
+            onClose={() => setShowShareDialog(false)}
+            message={message}
+          />
+        </Suspense>
       )}
     </div>
   );

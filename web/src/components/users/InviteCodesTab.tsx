@@ -92,8 +92,8 @@ export function InviteCodesTab({ currentUser, setNotice, setError }: InviteCodes
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="member">普通成员</SelectItem>
-                  {isAdmin && <SelectItem value="admin">管理员</SelectItem>}
+                  <SelectItem value="member">{ROLE_LABELS.member}</SelectItem>
+                  {isAdmin && <SelectItem value="admin">{ROLE_LABELS.admin}</SelectItem>}
                 </SelectContent>
               </Select>
             </div>
