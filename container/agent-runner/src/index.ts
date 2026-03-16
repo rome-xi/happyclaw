@@ -47,11 +47,6 @@ const IPC_INPUT_DIR = path.join(WORKSPACE_IPC, 'input');
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_POLL_MS = 500;
 
-/**
- * 流式消息空闲超时：如果 query 期间超过此时间没有收到任何 SDK 消息，
- * 认为 SDK 已挂起（例如子 Agent 进程崩溃但迭代器未结束），主动中断。
- */
-const STREAM_IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 分钟
 
 let needsMemoryFlush = false;
 let currentPermissionMode: PermissionMode = 'bypassPermissions';
@@ -508,6 +503,21 @@ function shouldInterrupt(): boolean {
   return false;
 }
 
+function cleanupStartupInterruptSentinel(): void {
+  try {
+    const stat = fs.statSync(IPC_INPUT_INTERRUPT_SENTINEL);
+    const ageMs = Date.now() - stat.mtimeMs;
+    if (ageMs <= INTERRUPT_GRACE_WINDOW_MS) {
+      log(`Preserving recent interrupt sentinel at startup (${Math.round(ageMs)}ms old)`);
+      return;
+    }
+    fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL);
+    log(`Removed stale interrupt sentinel at startup (${Math.round(ageMs)}ms old)`);
+  } catch {
+    /* ignore */
+  }
+}
+
 /**
  * Check for _drain sentinel (finish current query then exit).
  * Unlike _close which exits from idle wait, _drain is checked after
@@ -715,8 +725,12 @@ async function runQuery(
   let ipcPolling = true;
   let closedDuringQuery = false;
   let interruptedDuringQuery = false;
-  // Track last SDK message time for idle timeout detection
-  let lastSdkMessageAt = Date.now();
+  let suppressOutputAfterInterrupt = false;
+  let visibleOutputStarted = false;
+  // After a result is received, allow a short window for the host to write _drain
+  // before force-closing the stream.
+  let resultReceivedAt: number | null = null;
+  const POST_RESULT_TIMEOUT_MS = 5_000;
   // queryRef is set just before the for-await loop so pollIpcDuringQuery can call interrupt()
   let queryRef: { interrupt(): Promise<void>; setPermissionMode(mode: PermissionMode): Promise<void> } | null = null;
   const pollIpcDuringQuery = () => {
@@ -731,6 +745,10 @@ async function runQuery(
     if (shouldInterrupt()) {
       log('Interrupt sentinel detected, interrupting current query');
       interruptedDuringQuery = true;
+      if (!visibleOutputStarted && resultCount === 0) {
+        suppressOutputAfterInterrupt = true;
+        log('Interrupt arrived before visible output, suppressing query output');
+      }
       lastInterruptRequestedAt = Date.now();
       queryRef?.interrupt().catch((err: unknown) => log(`Interrupt call failed: ${err}`));
       stream.end();
@@ -747,14 +765,12 @@ async function runQuery(
       ipcPolling = false;
       return;
     }
-    // 空闲超时检测：如果 SDK 长时间没有发送任何消息（子 Agent 崩溃等），
-    // 主动中断 query 防止进程死等。
-    const idleMs = Date.now() - lastSdkMessageAt;
-    if (idleMs > STREAM_IDLE_TIMEOUT_MS) {
-      log(`Stream idle timeout: no SDK messages for ${Math.round(idleMs / 1000)}s, interrupting query`);
-      emit({ status: 'error', result: null, error: `Stream idle timeout: SDK 超过 ${Math.round(idleMs / 1000)} 秒无响应，已自动中断` });
-      interruptedDuringQuery = true;
-      queryRef?.interrupt().catch((err: unknown) => log(`Idle timeout interrupt failed: ${err}`));
+    // ── 结果后超时：result 已收到，给 host 短暂时间写 _drain ──
+    // 注意：不设置 closedDuringQuery — 这只是 stream 清理，不是退出信号。
+    // 主循环会继续进入 waitForIpcMessage()，等待 _close/_drain 才退出。
+    // 这保证了终端预热等场景下容器不会在查询完成后立即退出。
+    if (resultReceivedAt && Date.now() - resultReceivedAt > POST_RESULT_TIMEOUT_MS) {
+      log(`Post-result timeout (${POST_RESULT_TIMEOUT_MS / 1000}s), closing stream`);
       stream.end();
       ipcPolling = false;
       return;
@@ -878,6 +894,23 @@ async function runQuery(
     '- 如果用户的消息很简短（如打招呼），简洁回应即可，不要用工具列表填充回复。',
   ].join('\n');
 
+  // Conversation agents (sub-conversations with agentId) get special behavioral guidelines
+  // to prevent excessive send_message usage and duplicate responses.
+  const conversationAgentGuidelines = containerInput.agentId ? [
+    '',
+    '## 子会话行为规则（最高优先级，覆盖其他冲突指令）',
+    '',
+    '你正在一个**子会话**中运行，不是主会话。以下规则覆盖全局记忆中的"响应行为准则"：',
+    '',
+    '1. **不要用 `send_message` 发送"收到"之类的确认消息** — 你的正常文本输出就是回复，不需要额外发消息',
+    '2. **每次回复只产生一条消息** — 把分析、结论、建议整合到一条回复中，不要拆成多条',
+    '3. **只在以下情况使用 `send_message`**：',
+    '   - 执行超过 2 分钟的长任务时，发送一次进度更新（不是确认收到）',
+    '   - 用户明确要求你"先回复一下"时',
+    '4. **你的正常文本输出会自动发送给用户**，不需要通过 `send_message` 转发',
+    '5. **回复语言使用简体中文**，除非用户用其他语言提问',
+  ].join('\n') : '';
+
   const systemPromptAppend = [
     globalClaudeMd,
     heartbeatContent,
@@ -886,6 +919,7 @@ async function runQuery(
     outputGuidelines,
     webFetchGuidelines,
     backgroundTaskGuidelines,
+    conversationAgentGuidelines,
   ].filter(Boolean).join('\n');
 
   // Home containers (admin & member) can access global and memory directories.
@@ -894,6 +928,15 @@ async function runQuery(
   const extraDirs = isHome
     ? [WORKSPACE_GLOBAL, WORKSPACE_MEMORY]
     : [WORKSPACE_MEMORY];
+
+  if (shouldInterrupt()) {
+    log('Interrupt sentinel detected before query start, skipping query');
+    interruptedDuringQuery = true;
+    suppressOutputAfterInterrupt = true;
+    ipcPolling = false;
+    stream.end();
+    return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery };
+  }
 
   try {
     const q = query({
@@ -923,22 +966,47 @@ async function runQuery(
     }
   });
     queryRef = q;
+    if (shouldInterrupt()) {
+      log('Interrupt sentinel already present when query started, interrupting immediately');
+      interruptedDuringQuery = true;
+      if (!visibleOutputStarted && resultCount === 0) {
+        suppressOutputAfterInterrupt = true;
+      }
+      queryRef.interrupt().catch((err: unknown) => log(`Immediate interrupt call failed: ${err}`));
+      stream.end();
+      ipcPolling = false;
+    }
     for await (const message of q) {
-    // 每收到一条 SDK 消息就重置空闲计时器
-    lastSdkMessageAt = Date.now();
-
     // 流式事件处理
     if (message.type === 'stream_event') {
+      if (!suppressOutputAfterInterrupt) {
+        visibleOutputStarted = true;
+      }
+      if (suppressOutputAfterInterrupt) {
+        continue;
+      }
       processor.processStreamEvent(message as any);
       continue;
     }
 
     if (message.type === 'tool_progress') {
+      if (!suppressOutputAfterInterrupt) {
+        visibleOutputStarted = true;
+      }
+      if (suppressOutputAfterInterrupt) {
+        continue;
+      }
       processor.processToolProgress(message as any);
       continue;
     }
 
     if (message.type === 'tool_use_summary') {
+      if (!suppressOutputAfterInterrupt) {
+        visibleOutputStarted = true;
+      }
+      if (suppressOutputAfterInterrupt) {
+        continue;
+      }
       processor.processToolUseSummary(message as any);
       continue;
     }
@@ -963,6 +1031,18 @@ async function runQuery(
       log(`[msg #${messageCount}] type=${msgType} parent_tool_use_id=${rawParent === undefined ? 'UNDEFINED' : rawParent === null ? 'NULL' : rawParent} content_types=[${contentTypes}] keys=[${Object.keys(message).join(',')}]`);
     } else {
       log(`[msg #${messageCount}] type=${msgType}${msgParentToolUseId ? ` parent=${msgParentToolUseId.slice(0, 12)}` : ''}`);
+    }
+
+    if (message.type !== 'system') {
+      visibleOutputStarted = true;
+    }
+    if (suppressOutputAfterInterrupt && message.type !== 'system') {
+      if (message.type === 'result') {
+        resultCount++;
+        resultReceivedAt = Date.now();
+      }
+      log(`[msg #${messageCount}] suppressed after early interrupt`);
+      continue;
     }
 
     // ── 子 Agent 消息转 StreamEvent ──
@@ -1066,6 +1146,11 @@ async function runQuery(
         });
         log(`Usage: input=${sdkUsage.input_tokens} output=${sdkUsage.output_tokens} cost=$${resultMsg.total_cost_usd} turns=${resultMsg.num_turns}`);
       }
+
+      // ── 标记结果已收到 ──
+      // pollIpcDuringQuery 会在 POST_RESULT_TIMEOUT_MS 后关闭 stream，
+      // 期间仍可检测 _drain/_close/_interrupt sentinel。
+      resultReceivedAt = Date.now();
     }
   }
 
@@ -1148,7 +1233,7 @@ async function main(): Promise<void> {
 
   // Clean up stale sentinels from previous container runs
   try { fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL); } catch { /* ignore */ }
-  try { fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL); } catch { /* ignore */ }
+  cleanupStartupInterruptSentinel();
   try { fs.unlinkSync(IPC_INPUT_DRAIN_SENTINEL); } catch { /* ignore */ }
 
   // Build initial prompt (drain any pending IPC messages too)

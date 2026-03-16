@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { ChevronDown, ChevronUp } from 'lucide-react';
+import { ChevronDown, ChevronUp, OctagonX } from 'lucide-react';
 import { useChatStore } from '../../stores/chat';
 import { useAuthStore } from '../../stores/auth';
 import { EmojiAvatar } from '../common/EmojiAvatar';
@@ -207,6 +207,16 @@ function StreamingContent({
           />
         </div>
       )}
+
+      {/* Interrupted indicator */}
+      {streaming.interrupted && (
+        <div className="mt-3 pt-3 border-t border-border">
+          <div className="flex items-center gap-1.5 text-xs text-amber-600">
+            <OctagonX className="w-3.5 h-3.5" />
+            <span>已中断</span>
+          </div>
+        </div>
+      )}
     </>
   );
 }
@@ -235,6 +245,52 @@ export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNamePr
   const thinkingRef = useRef<HTMLDivElement>(null);
   const userScrolledRef = useRef(false);
   const [localElapsed, setLocalElapsed] = useState<Record<string, number>>({});
+
+  // Auto-clear stale waiting state to prevent UI getting stuck when agent
+  // process dies without sending a final message.
+  const lastStreamActivityRef = useRef(Date.now());
+  useEffect(() => {
+    // Reset activity timer whenever streaming state changes (i.e., new stream events)
+    if (streaming) {
+      lastStreamActivityRef.current = Date.now();
+    }
+  }, [streaming]);
+
+  useEffect(() => {
+    if (!isWaiting) return;
+    // Record the moment waiting starts
+    lastStreamActivityRef.current = Date.now();
+
+    const STALE_NO_DATA_MS = 60_000;   // 60s with no stream data at all
+    const STALE_WITH_DATA_MS = 180_000; // 3min since last stream event
+
+    const interval = setInterval(() => {
+      const elapsed = Date.now() - lastStreamActivityRef.current;
+      const state = useChatStore.getState();
+      const hasData = agentId
+        ? !!state.agentStreaming[agentId]
+        : !!state.streaming[groupJid];
+      const threshold = hasData ? STALE_WITH_DATA_MS : STALE_NO_DATA_MS;
+
+      if (elapsed > threshold) {
+        // Clear the stuck waiting state via clearStreaming (handles pendingThinking + SDK Task preservation)
+        useChatStore.getState().clearStreaming(groupJid);
+        if (agentId) {
+          // clearStreaming doesn't handle agent-specific state, clean it separately
+          useChatStore.setState(s => {
+            const nextStreaming = { ...s.agentStreaming };
+            delete nextStreaming[agentId];
+            return {
+              agentWaiting: { ...s.agentWaiting, [agentId]: false },
+              agentStreaming: nextStreaming,
+            };
+          });
+        }
+      }
+    }, 10_000); // check every 10s
+
+    return () => clearInterval(interval);
+  }, [isWaiting, groupJid, agentId]);
 
   // Auto-scroll thinking content (unless user scrolled up)
   useEffect(() => {
@@ -282,9 +338,7 @@ export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNamePr
     userScrolledRef.current = !isAtBottom;
   };
 
-  // Streaming panel should only be visible while waiting for the current turn.
-  if (!isWaiting) return null;
-
+  // 计算是否有流式数据（含中断后冻结的 partialText）
   const hasStreamData = streaming && (
     streaming.partialText ||
     streaming.thinkingText ||
@@ -295,8 +349,11 @@ export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNamePr
     (streaming.todos && streaming.todos.length > 0)
   );
 
+  // 仅在既不等待也无冻结数据时才隐藏
+  if (!isWaiting && !hasStreamData) return null;
+
   // Waiting but no stream data: show empty AI card with bouncing dots
-  if (!hasStreamData) {
+  if (isWaiting && !hasStreamData) {
     if (isCompact) {
       return (
         <div className="mb-2 border-b border-border pb-2">
