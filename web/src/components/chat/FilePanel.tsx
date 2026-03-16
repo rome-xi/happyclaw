@@ -23,6 +23,7 @@ import { useChatStore } from '../../stores/chat';
 import { useAuthStore } from '../../stores/auth';
 import { api } from '../../api/client';
 import { withBasePath } from '../../utils/url';
+import { downloadFromUrl } from '../../utils/download';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { ConfirmDialog } from '@/components/common/ConfirmDialog';
 import { Button } from '@/components/ui/button';
@@ -366,14 +367,10 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
 
   const handleDownload = (item: FileEntry) => {
     const encoded = toBase64Url(item.path);
-    const url = withBasePath(`/api/groups/${encodeURIComponent(groupJid)}/files/download/${encoded}`);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = item.name;
-    a.rel = 'noopener noreferrer';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
+    const url = `/api/groups/${encodeURIComponent(groupJid)}/files/download/${encoded}`;
+    downloadFromUrl(url, item.name).catch((err) => {
+      console.error('Download failed:', err);
+    });
   };
 
   const handleDeleteClick = (item: FileEntry) => {
