@@ -569,8 +569,8 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
                 agentId={activeAgentTab}
               />
               <MessageInput
-                onSend={async (content) => {
-                  sendAgentMessage(groupJid, activeAgentTab, content);
+                onSend={async (content, attachments) => {
+                  sendAgentMessage(groupJid, activeAgentTab, content, attachments);
                   setScrollTrigger(n => n + 1);
                 }}
                 groupJid={groupJid}
