@@ -1502,6 +1502,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       if (resultSummary === '__removed__') {
         clearSdkTaskCleanupTimer(agentId);
         clearSdkTaskStaleTimer(agentId);
+        clearDbTaskAgentCleanupTimer(agentId);
         const filtered = existing.filter((a) => a.id !== agentId);
         const nextAgentStreaming = { ...s.agentStreaming };
         delete nextAgentStreaming[agentId];
@@ -1561,13 +1562,17 @@ export const useChatStore = create<ChatState>((set, get) => ({
           nextSdkTaskAliases = removeSdkTaskAliases(nextSdkTaskAliases, agentId);
           // 自动清理已完成的 DB task agent（延迟移除，让用户看到完成状态）
           scheduleDbTaskAgentCleanup(set, agentId, chatJid);
-        } else if (nextSdkTasks[agentId]) {
-          nextSdkTasks[agentId] = {
-            ...nextSdkTasks[agentId],
-            chatJid,
-            description: prompt,
-            status: 'running',
-          };
+        } else {
+          // Task 回到 running 状态，取消 pending 的清理定时器
+          clearDbTaskAgentCleanupTimer(agentId);
+          if (nextSdkTasks[agentId]) {
+            nextSdkTasks[agentId] = {
+              ...nextSdkTasks[agentId],
+              chatJid,
+              description: prompt,
+              status: 'running',
+            };
+          }
         }
       }
 
