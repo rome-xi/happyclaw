@@ -4859,6 +4859,13 @@ async function main(): Promise<void> {
     shuttingDown = true;
     logger.info({ signal }, 'Shutdown signal received, cleaning up...');
 
+    // Force exit after 5s if graceful shutdown hangs
+    const forceExitTimer = setTimeout(() => {
+      logger.warn('Graceful shutdown timed out after 5s, force exiting');
+      process.exit(1);
+    }, 5000);
+    forceExitTimer.unref();
+
     if (feishuSyncInterval) {
       clearInterval(feishuSyncInterval);
       feishuSyncInterval = null;

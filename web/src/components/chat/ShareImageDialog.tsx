@@ -61,7 +61,6 @@ export function ShareImageDialog({ onClose, message }: ShareImageDialogProps) {
   const aiEmoji = currentUser?.ai_avatar_emoji || appearance?.aiAvatarEmoji;
   const aiColor = currentUser?.ai_avatar_color || appearance?.aiAvatarColor;
   const aiImageUrl = currentUser?.ai_avatar_url;
-  const assistantName = currentUser?.ai_name || appearance?.aiName || 'HappyClaw';
 
   const timestamp = new Date(message.timestamp)
     .toLocaleString('zh-CN', {
@@ -237,7 +236,6 @@ export function ShareImageDialog({ onClose, message }: ShareImageDialogProps) {
           aiEmoji={aiEmoji}
           aiColor={aiColor}
           aiImageUrl={aiImageUrl}
-          assistantName={assistantName}
         />
       </div>
     </div>,
