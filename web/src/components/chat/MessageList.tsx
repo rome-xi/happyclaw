@@ -182,22 +182,35 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
         parentRef.current.scrollTop = parentRef.current.scrollHeight;
       }
       setAutoScroll(true);
+      // Delayed correction: after virtualizer measures actual heights, scroll again
+      const raf = requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          if (parentRef.current) {
+            parentRef.current.scrollTop = parentRef.current.scrollHeight;
+          }
+        });
+      });
+      return () => cancelAnimationFrame(raf);
     }
   }, [flatMessages.length, virtualizer, messages.length]);
 
   // Safety net: initialOffset relies on estimated sizes which may be inaccurate.
   // After mount, verify we're actually at the bottom and correct if not.
+  // Multiple delayed corrections cover the virtualizer's progressive measurement.
   useEffect(() => {
     if (flatMessages.length === 0) return;
-    const raf1 = requestAnimationFrame(() => {
-      const el = parentRef.current;
-      if (!el) return;
-      const gap = el.scrollHeight - el.scrollTop - el.clientHeight;
-      if (gap > 100) {
-        el.scrollTop = el.scrollHeight;
-      }
-    });
-    return () => cancelAnimationFrame(raf1);
+    const timers: number[] = [];
+    for (const delay of [50, 150, 300]) {
+      timers.push(window.setTimeout(() => {
+        const el = parentRef.current;
+        if (!el) return;
+        const gap = el.scrollHeight - el.scrollTop - el.clientHeight;
+        if (gap > 100) {
+          el.scrollTop = el.scrollHeight;
+        }
+      }, delay));
+    }
+    return () => timers.forEach(clearTimeout);
     // Only on mount
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);

@@ -30,6 +30,7 @@ import {
   closeDatabase,
   createTask,
   deleteExpiredSessions,
+  getExpiredSessionIds,
   deleteTask,
   ensureChatExists,
   ensureUserHomeGroup,
@@ -95,6 +96,7 @@ import {
   type WorkspaceInfo,
 } from './im-command-utils.js';
 import { analyzeIntent } from './intent-analyzer.js';
+import { invalidateSessionCache } from './web-context.js';
 import {
   getFeishuProviderConfigWithSource,
   getTelegramProviderConfig,
@@ -2668,15 +2670,17 @@ function startIpcWatcher(): void {
   const ipcBaseDir = path.join(DATA_DIR, 'ipc');
   fs.mkdirSync(ipcBaseDir, { recursive: true });
 
+  const fsp = fs.promises;
+
   const processIpcFiles = async () => {
     if (shuttingDown) return;
     // Scan all group IPC directories (identity determined by directory)
     let groupFolders: string[];
     try {
-      groupFolders = fs.readdirSync(ipcBaseDir).filter((f) => {
-        const stat = fs.statSync(path.join(ipcBaseDir, f));
-        return stat.isDirectory() && f !== 'errors';
-      });
+      const entries = await fsp.readdir(ipcBaseDir, { withFileTypes: true });
+      groupFolders = entries
+        .filter((e) => e.isDirectory() && e.name !== 'errors')
+        .map((e) => e.name);
     } catch (err) {
       logger.error({ err }, 'Error reading IPC base directory');
       if (!shuttingDown) setTimeout(processIpcFiles, IPC_POLL_INTERVAL);
@@ -2698,17 +2702,16 @@ function startIpcWatcher(): void {
       const ipcRoots = [groupIpcRoot];
       try {
         const agentsDir = path.join(groupIpcRoot, 'agents');
-        if (fs.existsSync(agentsDir)) {
-          for (const entry of fs.readdirSync(agentsDir, {
-            withFileTypes: true,
-          })) {
-            if (entry.isDirectory()) {
-              ipcRoots.push(path.join(agentsDir, entry.name));
-            }
+        const agentEntries = await fsp.readdir(agentsDir, {
+          withFileTypes: true,
+        });
+        for (const entry of agentEntries) {
+          if (entry.isDirectory()) {
+            ipcRoots.push(path.join(agentsDir, entry.name));
           }
         }
       } catch {
-        /* ignore */
+        /* agents dir may not exist */
       }
 
       for (const ipcRoot of ipcRoots) {
@@ -2717,271 +2720,274 @@ function startIpcWatcher(): void {
 
         // Process messages from this group's IPC directory
         try {
-          if (fs.existsSync(messagesDir)) {
-            const messageFiles = fs
-              .readdirSync(messagesDir)
-              .filter((f) => f.endsWith('.json'));
-            for (const file of messageFiles) {
-              const filePath = path.join(messagesDir, file);
-              try {
-                const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-                if (data.type === 'message' && data.chatJid && data.text) {
-                  const targetGroup = registeredGroups[data.chatJid];
-                  if (
-                    canSendCrossGroupMessage(
-                      isAdminHome,
-                      isHome,
-                      sourceGroup,
-                      sourceGroupEntry,
-                      targetGroup,
-                    )
-                  ) {
-                    await sendMessage(data.chatJid, data.text, {
-                      messageMeta: {
-                        sourceKind: 'sdk_send_message',
-                      },
-                    });
-                    // Forward to IM channel when chatJid is a routed web JID
-                    // (e.g. 'web:main') but the message originated from an IM source.
-                    // Without this, IPC send_message only reaches Web + DB, not Feishu/TG.
-                    const ipcImRoute = activeImReplyRoutes.get(sourceGroup);
-                    if (
-                      ipcImRoute &&
-                      getChannelType(data.chatJid) === null &&
-                      ipcImRoute !== data.chatJid
-                    ) {
-                      const localImages = extractLocalImImagePaths(
-                        data.text,
-                        sourceGroup,
-                      );
-                      sendImWithFailTracking(ipcImRoute, data.text, localImages);
-                    }
-                    ipcMessageSentFolders.add(sourceGroup);
-                    logger.info(
-                      { chatJid: data.chatJid, sourceGroup, imRoute: ipcImRoute },
-                      'IPC message sent (flagged for dual-reply)',
-                    );
-                  } else {
-                    logger.warn(
-                      { chatJid: data.chatJid, sourceGroup },
-                      'Unauthorized IPC message attempt blocked',
-                    );
-                  }
-                } else if (
-                  data.type === 'image' &&
-                  data.chatJid &&
-                  data.imageBase64
+          const messageEntries = await fsp.readdir(messagesDir);
+          const messageFiles = messageEntries.filter((f) =>
+            f.endsWith('.json'),
+          );
+          for (const file of messageFiles) {
+            const filePath = path.join(messagesDir, file);
+            try {
+              const raw = await fsp.readFile(filePath, 'utf-8');
+              const data = JSON.parse(raw);
+              if (data.type === 'message' && data.chatJid && data.text) {
+                const targetGroup = registeredGroups[data.chatJid];
+                if (
+                  canSendCrossGroupMessage(
+                    isAdminHome,
+                    isHome,
+                    sourceGroup,
+                    sourceGroupEntry,
+                    targetGroup,
+                  )
                 ) {
-                  // Handle image IPC messages from send_image MCP tool
-                  const targetGroup = registeredGroups[data.chatJid];
+                  await sendMessage(data.chatJid, data.text, {
+                    messageMeta: {
+                      sourceKind: 'sdk_send_message',
+                    },
+                  });
+                  // Forward to IM channel when chatJid is a routed web JID
+                  // (e.g. 'web:main') but the message originated from an IM source.
+                  // Without this, IPC send_message only reaches Web + DB, not Feishu/TG.
+                  const ipcImRoute = activeImReplyRoutes.get(sourceGroup);
                   if (
-                    canSendCrossGroupMessage(
-                      isAdminHome,
-                      isHome,
-                      sourceGroup,
-                      sourceGroupEntry,
-                      targetGroup,
-                    )
+                    ipcImRoute &&
+                    getChannelType(data.chatJid) === null &&
+                    ipcImRoute !== data.chatJid
                   ) {
-                    try {
-                      const imageBuffer = Buffer.from(
-                        data.imageBase64,
-                        'base64',
-                      );
-                      const mimeType = data.mimeType || 'image/png';
-                      const caption = data.caption || undefined;
-                      const fileName = data.fileName || undefined;
+                    const localImages = extractLocalImImagePaths(
+                      data.text,
+                      sourceGroup,
+                    );
+                    sendImWithFailTracking(ipcImRoute, data.text, localImages);
+                  }
+                  ipcMessageSentFolders.add(sourceGroup);
+                  logger.info(
+                    { chatJid: data.chatJid, sourceGroup, imRoute: ipcImRoute },
+                    'IPC message sent (flagged for dual-reply)',
+                  );
+                } else {
+                  logger.warn(
+                    { chatJid: data.chatJid, sourceGroup },
+                    'Unauthorized IPC message attempt blocked',
+                  );
+                }
+              } else if (
+                data.type === 'image' &&
+                data.chatJid &&
+                data.imageBase64
+              ) {
+                // Handle image IPC messages from send_image MCP tool
+                const targetGroup = registeredGroups[data.chatJid];
+                if (
+                  canSendCrossGroupMessage(
+                    isAdminHome,
+                    isHome,
+                    sourceGroup,
+                    sourceGroupEntry,
+                    targetGroup,
+                  )
+                ) {
+                  try {
+                    const imageBuffer = Buffer.from(
+                      data.imageBase64,
+                      'base64',
+                    );
+                    const mimeType = data.mimeType || 'image/png';
+                    const caption = data.caption || undefined;
+                    const fileName = data.fileName || undefined;
 
-                      // Send to IM channel (caption is included in the image message itself)
-                      // Determine which JID to actually send the image to:
-                      // if chatJid is a web JID, route via activeImReplyRoutes.
-                      const imgImRoute =
-                        getChannelType(data.chatJid) !== null
-                          ? data.chatJid
-                          : activeImReplyRoutes.get(sourceGroup) ?? null;
-                      if (imgImRoute) {
-                        await imManager.sendImage(
-                          imgImRoute,
-                          imageBuffer,
-                          mimeType,
-                          caption,
-                          fileName,
-                        );
-                      }
-
-                      // Persist image message to DB and broadcast to WebSocket (same as sendMessage flow)
-                      const displayText = caption
-                        ? `[图片: ${fileName || 'image'}]\n${caption}`
-                        : `[图片: ${fileName || 'image'}]`;
-                      const imgMsgId = crypto.randomUUID();
-                      const imgTimestamp = new Date().toISOString();
-                      ensureChatExists(data.chatJid);
-                      const persistedImgMsgId = storeMessageDirect(
-                        imgMsgId,
-                        data.chatJid,
-                        'happyclaw-agent',
-                        ASSISTANT_NAME,
-                        displayText,
-                        imgTimestamp,
-                        true,
-                        { meta: { sourceKind: 'sdk_send_message' } },
-                      );
-                      broadcastNewMessage(data.chatJid, {
-                        id: persistedImgMsgId,
-                        chat_jid: data.chatJid,
-                        sender: 'happyclaw-agent',
-                        sender_name: ASSISTANT_NAME,
-                        content: displayText,
-                        timestamp: imgTimestamp,
-                        is_from_me: true,
-                        turn_id: null,
-                        session_id: null,
-                        sdk_message_uuid: null,
-                        source_kind: 'sdk_send_message',
-                        finalization_reason: null,
-                      });
-                      broadcastToWebClients(data.chatJid, displayText);
-
-                      logger.info(
-                        {
-                          chatJid: data.chatJid,
-                          sourceGroup,
-                          mimeType,
-                          size: imageBuffer.length,
-                        },
-                        'IPC image sent',
-                      );
-                    } catch (err) {
-                      logger.error(
-                        { chatJid: data.chatJid, sourceGroup, err },
-                        'Failed to process IPC image',
+                    // Send to IM channel (caption is included in the image message itself)
+                    // Determine which JID to actually send the image to:
+                    // if chatJid is a web JID, route via activeImReplyRoutes.
+                    const imgImRoute =
+                      getChannelType(data.chatJid) !== null
+                        ? data.chatJid
+                        : activeImReplyRoutes.get(sourceGroup) ?? null;
+                    if (imgImRoute) {
+                      await imManager.sendImage(
+                        imgImRoute,
+                        imageBuffer,
+                        mimeType,
+                        caption,
+                        fileName,
                       );
                     }
-                  } else {
-                    logger.warn(
-                      { chatJid: data.chatJid, sourceGroup },
-                      'Unauthorized IPC image attempt blocked',
+
+                    // Persist image message to DB and broadcast to WebSocket (same as sendMessage flow)
+                    const displayText = caption
+                      ? `[图片: ${fileName || 'image'}]\n${caption}`
+                      : `[图片: ${fileName || 'image'}]`;
+                    const imgMsgId = crypto.randomUUID();
+                    const imgTimestamp = new Date().toISOString();
+                    ensureChatExists(data.chatJid);
+                    const persistedImgMsgId = storeMessageDirect(
+                      imgMsgId,
+                      data.chatJid,
+                      'happyclaw-agent',
+                      ASSISTANT_NAME,
+                      displayText,
+                      imgTimestamp,
+                      true,
+                      { meta: { sourceKind: 'sdk_send_message' } },
+                    );
+                    broadcastNewMessage(data.chatJid, {
+                      id: persistedImgMsgId,
+                      chat_jid: data.chatJid,
+                      sender: 'happyclaw-agent',
+                      sender_name: ASSISTANT_NAME,
+                      content: displayText,
+                      timestamp: imgTimestamp,
+                      is_from_me: true,
+                      turn_id: null,
+                      session_id: null,
+                      sdk_message_uuid: null,
+                      source_kind: 'sdk_send_message',
+                      finalization_reason: null,
+                    });
+                    broadcastToWebClients(data.chatJid, displayText);
+
+                    logger.info(
+                      {
+                        chatJid: data.chatJid,
+                        sourceGroup,
+                        mimeType,
+                        size: imageBuffer.length,
+                      },
+                      'IPC image sent',
+                    );
+                  } catch (err) {
+                    logger.error(
+                      { chatJid: data.chatJid, sourceGroup, err },
+                      'Failed to process IPC image',
                     );
                   }
-                }
-                fs.unlinkSync(filePath);
-              } catch (err) {
-                logger.error(
-                  { file, sourceGroup, err },
-                  'Error processing IPC message',
-                );
-                const errorDir = path.join(ipcBaseDir, 'errors');
-                fs.mkdirSync(errorDir, { recursive: true });
-                try {
-                  fs.renameSync(
-                    filePath,
-                    path.join(errorDir, `${sourceGroup}-${file}`),
+                } else {
+                  logger.warn(
+                    { chatJid: data.chatJid, sourceGroup },
+                    'Unauthorized IPC image attempt blocked',
                   );
-                } catch (renameErr) {
-                  logger.error(
-                    { file, sourceGroup, renameErr },
-                    'Failed to move IPC message to error directory, deleting',
-                  );
-                  try {
-                    fs.unlinkSync(filePath);
-                  } catch {
-                    /* ignore */
-                  }
                 }
               }
-            }
-          }
-        } catch (err) {
-          logger.error(
-            { err, sourceGroup },
-            'Error reading IPC messages directory',
-          );
-        }
-
-        // Process tasks from this group's IPC directory
-        try {
-          if (fs.existsSync(tasksDir)) {
-            const allEntries = fs.readdirSync(tasksDir, {
-              withFileTypes: true,
-            });
-
-            // 清理孤儿结果文件（容器崩溃或超时后残留，超过 10 分钟自动删除）
-            for (const entry of allEntries) {
-              if (
-                entry.isFile() &&
-                entry.name.endsWith('.json') &&
-                (entry.name.startsWith('install_skill_result_') ||
-                  entry.name.startsWith('uninstall_skill_result_'))
-              ) {
+              await fsp.unlink(filePath);
+            } catch (err) {
+              logger.error(
+                { file, sourceGroup, err },
+                'Error processing IPC message',
+              );
+              const errorDir = path.join(ipcBaseDir, 'errors');
+              await fsp.mkdir(errorDir, { recursive: true });
+              try {
+                await fsp.rename(
+                  filePath,
+                  path.join(errorDir, `${sourceGroup}-${file}`),
+                );
+              } catch (renameErr) {
+                logger.error(
+                  { file, sourceGroup, renameErr },
+                  'Failed to move IPC message to error directory, deleting',
+                );
                 try {
-                  const filePath = path.join(tasksDir, entry.name);
-                  const stat = fs.statSync(filePath);
-                  if (Date.now() - stat.mtimeMs > 10 * 60 * 1000) {
-                    fs.unlinkSync(filePath);
-                    logger.debug(
-                      { sourceGroup, file: entry.name },
-                      'Cleaned up stale skill result file',
-                    );
-                  }
+                  await fsp.unlink(filePath);
                 } catch {
                   /* ignore */
                 }
               }
             }
+          }
+        } catch (err: any) {
+          if (err?.code !== 'ENOENT') {
+            logger.error(
+              { err, sourceGroup },
+              'Error reading IPC messages directory',
+            );
+          }
+        }
 
-            const taskFiles = allEntries
-              .filter(
-                (entry) =>
-                  entry.isFile() &&
-                  entry.name.endsWith('.json') &&
-                  !entry.name.startsWith('install_skill_result_') &&
-                  !entry.name.startsWith('uninstall_skill_result_'),
-              )
-              .map((entry) => entry.name);
-            for (const file of taskFiles) {
-              const filePath = path.join(tasksDir, file);
+        // Process tasks from this group's IPC directory
+        try {
+          const allEntries = await fsp.readdir(tasksDir, {
+            withFileTypes: true,
+          });
+
+          // 清理孤儿结果文件（容器崩溃或超时后残留，超过 10 分钟自动删除）
+          for (const entry of allEntries) {
+            if (
+              entry.isFile() &&
+              entry.name.endsWith('.json') &&
+              (entry.name.startsWith('install_skill_result_') ||
+                entry.name.startsWith('uninstall_skill_result_'))
+            ) {
               try {
-                const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-                // Pass source group identity to processTaskIpc for authorization
-                await processTaskIpc(
-                  data,
-                  sourceGroup,
-                  isAdminHome,
-                  isHome,
-                  sourceGroupEntry,
+                const filePath = path.join(tasksDir, entry.name);
+                const stat = await fsp.stat(filePath);
+                if (Date.now() - stat.mtimeMs > 10 * 60 * 1000) {
+                  await fsp.unlink(filePath);
+                  logger.debug(
+                    { sourceGroup, file: entry.name },
+                    'Cleaned up stale skill result file',
+                  );
+                }
+              } catch {
+                /* ignore */
+              }
+            }
+          }
+
+          const taskFiles = allEntries
+            .filter(
+              (entry) =>
+                entry.isFile() &&
+                entry.name.endsWith('.json') &&
+                !entry.name.startsWith('install_skill_result_') &&
+                !entry.name.startsWith('uninstall_skill_result_'),
+            )
+            .map((entry) => entry.name);
+          for (const file of taskFiles) {
+            const filePath = path.join(tasksDir, file);
+            try {
+              const raw = await fsp.readFile(filePath, 'utf-8');
+              const data = JSON.parse(raw);
+              // Pass source group identity to processTaskIpc for authorization
+              await processTaskIpc(
+                data,
+                sourceGroup,
+                isAdminHome,
+                isHome,
+                sourceGroupEntry,
+              );
+              await fsp.unlink(filePath);
+            } catch (err) {
+              logger.error(
+                { file, sourceGroup, err },
+                'Error processing IPC task',
+              );
+              const errorDir = path.join(ipcBaseDir, 'errors');
+              await fsp.mkdir(errorDir, { recursive: true });
+              try {
+                await fsp.rename(
+                  filePath,
+                  path.join(errorDir, `${sourceGroup}-${file}`),
                 );
-                fs.unlinkSync(filePath);
-              } catch (err) {
+              } catch (renameErr) {
                 logger.error(
-                  { file, sourceGroup, err },
-                  'Error processing IPC task',
+                  { file, sourceGroup, renameErr },
+                  'Failed to move IPC task to error directory, deleting',
                 );
-                const errorDir = path.join(ipcBaseDir, 'errors');
-                fs.mkdirSync(errorDir, { recursive: true });
                 try {
-                  fs.renameSync(
-                    filePath,
-                    path.join(errorDir, `${sourceGroup}-${file}`),
-                  );
-                } catch (renameErr) {
-                  logger.error(
-                    { file, sourceGroup, renameErr },
-                    'Failed to move IPC task to error directory, deleting',
-                  );
-                  try {
-                    fs.unlinkSync(filePath);
-                  } catch {
-                    /* ignore */
-                  }
+                  await fsp.unlink(filePath);
+                } catch {
+                  /* ignore */
                 }
               }
             }
           }
-        } catch (err) {
-          logger.error(
-            { err, sourceGroup },
-            'Error reading IPC tasks directory',
-          );
+        } catch (err: any) {
+          if (err?.code !== 'ENOENT') {
+            logger.error(
+              { err, sourceGroup },
+              'Error reading IPC tasks directory',
+            );
+          }
         }
       } // end for (const ipcRoot of ipcRoots)
     }
@@ -5162,6 +5168,8 @@ async function main(): Promise<void> {
   setInterval(
     () => {
       try {
+        const expiredIds = getExpiredSessionIds();
+        for (const id of expiredIds) invalidateSessionCache(id);
         const deleted = deleteExpiredSessions();
         if (deleted > 0) {
           logger.info({ deleted }, 'Cleaned expired user sessions');
