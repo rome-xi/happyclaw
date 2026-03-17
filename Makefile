@@ -21,7 +21,7 @@ dev-web: ## 仅启动前端
 
 build: sync-types ## 编译前后端及 agent-runner
 	npm run build:all
-	npm --prefix container/agent-runner run build
+	@touch .build-sentinel
 
 build-backend: ## 仅编译后端
 	npm run build
@@ -34,7 +34,7 @@ build-web: ## 仅编译前端
 start: ## 一键启动生产环境（首次自动安装依赖和构建容器镜像）
 	@if [ ! -d node_modules ] || [ package.json -nt node_modules ] || [ web/package.json -nt web/node_modules ] || [ container/agent-runner/package.json -nt container/agent-runner/node_modules ]; then echo "📦 依赖有更新，安装依赖..."; $(MAKE) install; fi
 	@if command -v docker >/dev/null 2>&1 && ! docker image inspect happyclaw-agent:latest >/dev/null 2>&1; then echo "🐳 构建 Agent 容器镜像..."; ./container/build.sh; fi
-	$(MAKE) build
+	@if [ ! -f .build-sentinel ] || [ -n "$$(find src/ web/src/ container/agent-runner/src/ shared/ -newer .build-sentinel \( -name '*.ts' -o -name '*.tsx' \) 2>/dev/null | head -1)" ]; then echo "🔨 检测到源码变更，重新编译..."; $(MAKE) build; else echo "✅ dist/ 已是最新，跳过编译"; fi
 	npm run start
 
 # ─── Quality ─────────────────────────────────────────────────
@@ -81,6 +81,7 @@ clean: ## 清理构建产物
 	rm -rf dist
 	rm -rf web/dist
 	rm -rf container/agent-runner/dist
+	rm -f .build-sentinel
 
 reset-init: ## 完全重置为首装状态（清空所有运行时数据）
 	rm -rf data store groups

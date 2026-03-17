@@ -28,6 +28,10 @@ dist/
 *.db-shm
 *.sqlite
 
+# Build cache
+.build-sentinel
+*.tsbuildinfo
+
 # Local tooling metadata
 .claude/
 .mcp.json
