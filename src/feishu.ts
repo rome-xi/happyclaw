@@ -1638,8 +1638,12 @@ export function createFeishuConnection(
                 image_type: 'message',
                 image: fs.createReadStream(localImagePath),
               },
-            })) as { data?: { image_key?: string } } | null;
-            const imageKey = uploadRes?.data?.image_key;
+            })) as
+              | { image_key?: string; data?: { image_key?: string } }
+              | null
+              | undefined;
+            const imageKey =
+              uploadRes?.image_key ?? uploadRes?.data?.image_key;
             if (!imageKey) {
               logger.warn(
                 { chatId, localImagePath },
@@ -1690,9 +1694,13 @@ export function createFeishuConnection(
             image_type: 'message',
             image: imageBuffer,
           },
-        })) as { data?: { image_key?: string } } | null;
+        })) as
+          | { image_key?: string; data?: { image_key?: string } }
+          | null
+          | undefined;
 
-        const imageKey = uploadResult?.data?.image_key;
+        const imageKey =
+          uploadResult?.image_key ?? uploadResult?.data?.image_key;
         if (!imageKey) {
           logger.error(
             { chatId },
@@ -1783,9 +1791,13 @@ export function createFeishuConnection(
             file_name: fileName,
             file: buffer,
           },
-        })) as { data?: { file_key?: string } } | null;
+        })) as
+          | { file_key?: string; data?: { file_key?: string } }
+          | null
+          | undefined;
 
-        const fileKey = uploadResult?.data?.file_key;
+        const fileKey =
+          uploadResult?.file_key ?? uploadResult?.data?.file_key;
         if (!fileKey) {
           throw new Error('文件上传失败：未返回 file_key');
         }
