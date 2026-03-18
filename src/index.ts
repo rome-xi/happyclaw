@@ -167,9 +167,6 @@ let shuttingDown = false;
 const queue = new GroupQueue();
 const EMPTY_CURSOR: MessageCursor = { timestamp: '', id: '' };
 const terminalWarmupInFlight = new Set<string>();
-/** Tracks group folders whose agent has sent at least one IPC message via send_message.
- *  When set, onOutput must NOT skip the final result IM send — both messages should reach the user. */
-const ipcMessageSentFolders = new Set<string>();
 const STUCK_RUNNER_CHECK_INTERVAL_POLLS = 15;
 const STUCK_RUNNER_IDLE_MS = 6 * 60 * 1000;
 let stuckRunnerCheckCounter = 0;
@@ -2050,11 +2047,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               }
             }
 
-            // For direct IM chats, if streaming card handled the reply,
-            // skip IM send — UNLESS the agent already sent content via
-            // send_message MCP tool, in which case both messages must reach IM.
-            const ipcAlreadySent = ipcMessageSentFolders.has(effectiveGroup.folder);
-            const skipImSend = streamingCardHandledIM && directImReply && !ipcAlreadySent;
+            // Skip IM send to the original chatJid when:
+            // 1. Streaming card already handled the IM delivery, OR
+            // 2. Reply route switched to a different IM channel (the routed IM
+            //    path below will deliver to the correct channel instead).
+            // Any send_message content is delivered independently via IPC watcher.
+            const routeSwitchedAway = directImReply && replySourceImJid !== null && replySourceImJid !== chatJid;
+            const skipImSend = (streamingCardHandledIM && directImReply) || routeSwitchedAway;
             lastReplyMsgId = await sendMessage(chatJid, text, {
               sendToIM: directImReply && !skipImSend,
               localImagePaths,
@@ -2068,9 +2067,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             });
 
             // For routed IM (web JID with IM source), skip the source channel
-            // if streaming card handled it (and no IPC send_message was used).
+            // if streaming card handled it. send_message content is already
+            // forwarded to IM by the IPC watcher's activeImReplyRoutes logic.
             if (replySourceImJid && replySourceImJid !== chatJid) {
-              if (!streamingCardHandledIM || ipcAlreadySent) {
+              if (!streamingCardHandledIM) {
                 sendImWithFailTracking(replySourceImJid, text, localImagePaths);
               }
             }
@@ -2156,8 +2156,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       }
     }
 
-    // Clear IPC send_message flag so next run starts fresh
-    ipcMessageSentFolders.delete(effectiveGroup.folder);
   }
 
   // runAgent threw — output is undefined, cannot proceed with post-processing
@@ -2819,11 +2817,9 @@ function startIpcWatcher(): void {
                       }
                     }
                   }
-
-                  ipcMessageSentFolders.add(sourceGroup);
                   logger.info(
                     { chatJid: data.chatJid, sourceGroup, imRoute: ipcImRoute },
-                    'IPC message sent (flagged for dual-reply)',
+                    'IPC message sent',
                   );
                 } else {
                   logger.warn(

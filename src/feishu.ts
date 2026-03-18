@@ -463,7 +463,10 @@ function buildInteractiveCard(text: string): object {
 
   return {
     schema: '2.0',
-    config: { wide_screen_mode: true },
+    config: {
+      wide_screen_mode: true,
+      summary: { content: title },
+    },
     header: {
       title: { tag: 'plain_text', content: title },
       template: 'indigo',
