@@ -146,6 +146,7 @@ import {
   broadcastBillingUpdate,
   shutdownTerminals,
   shutdownWebServer,
+  getActiveStreamingTexts,
 } from './web.js';
 import { installSkillForUser, deleteSkillForUser } from './routes/skills.js';
 import { verifyPairingCode } from './telegram-pairing.js';
@@ -2665,6 +2666,40 @@ function buildOverflowPartialReply(partialText: string): string {
 }
 
 /**
+ * Save any in-progress streaming responses to DB before shutdown.
+ * Without this, partial bot responses are lost when the service restarts.
+ */
+function saveInterruptedStreamingMessages(): void {
+  try {
+    const activeTexts = getActiveStreamingTexts();
+    if (activeTexts.size === 0) return;
+
+    logger.info(
+      { count: activeTexts.size },
+      'Saving interrupted streaming messages to DB',
+    );
+
+    for (const [jid, partialText] of activeTexts) {
+      const interruptedText = buildInterruptedReply(partialText);
+      const msgId = crypto.randomUUID();
+      const timestamp = new Date().toISOString();
+      ensureChatExists(jid);
+      storeMessageDirect(
+        msgId,
+        jid,
+        'happyclaw-agent',
+        ASSISTANT_NAME,
+        interruptedText,
+        timestamp,
+        true,
+      );
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Error saving interrupted streaming messages');
+  }
+}
+
+/**
  * Check if a source group is authorized to send IPC messages to a target group.
  * - Admin home can send to any group.
  * - Non-home groups can only send to groups sharing the same folder.
@@ -5114,6 +5149,10 @@ async function main(): Promise<void> {
     } catch (err) {
       logger.warn({ err }, 'Error shutting down terminals');
     }
+
+    // Persist any in-progress streaming text to DB before cleanup.
+    // Must run before abortAllStreamingSessions / shutdownWebServer.
+    saveInterruptedStreamingMessages();
 
     // Run cleanup tasks concurrently with a tight timeout
     await Promise.allSettled([
