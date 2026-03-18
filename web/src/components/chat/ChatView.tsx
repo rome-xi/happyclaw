@@ -96,6 +96,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
   const resetSession = useChatStore(s => s.resetSession);
   const handleStreamEvent = useChatStore(s => s.handleStreamEvent);
   const handleWsNewMessage = useChatStore(s => s.handleWsNewMessage);
+  const handleStreamSnapshot = useChatStore(s => s.handleStreamSnapshot);
 
   const agents = useChatStore(s => s.agents[groupJid] ?? EMPTY_AGENTS);
   const activeAgentTab = useChatStore(s => s.activeAgentTab[groupJid] ?? null);
@@ -255,9 +256,15 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
         showToast('发送失败', data.error || '消息格式无效', 4000);
       }
     });
+    // 后端推送的流式快照（WS 重连时恢复）
+    const unsub4 = wsManager.on('stream_snapshot', (data: any) => {
+      if (data.chatJid === groupJid && data.snapshot) {
+        handleStreamSnapshot(groupJid, data.snapshot);
+      }
+    });
     // agent_status 已提升到 AppLayout 全局监听
-    return () => { unsub1(); unsub2(); unsub3(); };
-  }, [groupJid, handleStreamEvent, handleWsNewMessage]);
+    return () => { unsub1(); unsub2(); unsub3(); unsub4(); };
+  }, [groupJid, handleStreamEvent, handleWsNewMessage, handleStreamSnapshot]);
 
   const [scrollTrigger, setScrollTrigger] = useState(0);
 

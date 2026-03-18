@@ -165,6 +165,8 @@ let lastAgentTimestamp: Record<string, MessageCursor> = {};
 let messageLoopRunning = false;
 let ipcWatcherRunning = false;
 let shuttingDown = false;
+/** JIDs already persisted by the shutdown handler — prevents finally blocks from duplicating. */
+const shutdownSavedJids = new Set<string>();
 
 const queue = new GroupQueue();
 const EMPTY_CURSOR: MessageCursor = { timestamp: '', id: '' };
@@ -1768,7 +1770,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             result.streamEvent.statusText === 'interrupted'
           ) {
             streamInterrupted = true;
-            if (!sentReply) {
+            // Skip if shutdown handler already saved this text (prevents duplicates)
+            const inlineWebJid = chatJid.startsWith('web:') ? chatJid : `web:${effectiveGroup.folder}`;
+            const inlineAlreadySaved = shutdownSavedJids.has(chatJid) || shutdownSavedJids.has(inlineWebJid);
+            if (!sentReply && !inlineAlreadySaved) {
               const interruptedText = buildInterruptedReply(streamingAccumulatedText);
               try {
                 if (streamingSession?.isActive()) {
@@ -2141,7 +2146,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }
 
     // ── 保存中断内容到数据库 + 广播到 Web ──
-    if (wasInterrupted) {
+    // Skip if the shutdown handler already saved this streaming text (prevents duplicates).
+    const webJidForShutdownCheck = chatJid.startsWith('web:') ? chatJid : `web:${effectiveGroup.folder}`;
+    const alreadySavedByShutdown = shutdownSavedJids.has(chatJid) || shutdownSavedJids.has(webJidForShutdownCheck);
+
+    if (wasInterrupted && !alreadySavedByShutdown) {
       const interruptedText = buildInterruptedReply(streamingAccumulatedText);
       try {
         // sendToIM: false — 飞书卡片已通过 abort() 展示内容，不重复发送
@@ -2162,7 +2171,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }
 
     // ── 兜底：overflow 等异常导致累积文本未持久化 ──
-    if (!sentReply && streamingAccumulatedText.trim()) {
+    if (!sentReply && !alreadySavedByShutdown && streamingAccumulatedText.trim()) {
       try {
         const partialReply = buildOverflowPartialReply(streamingAccumulatedText);
         lastReplyMsgId = await sendMessage(chatJid, partialReply, {
@@ -2680,7 +2689,12 @@ function saveInterruptedStreamingMessages(): void {
     );
 
     for (const [jid, partialText] of activeTexts) {
-      const interruptedText = buildInterruptedReply(partialText);
+      const cleaned = stripAgentInternalTags(partialText);
+      if (!cleaned.trim()) {
+        shutdownSavedJids.add(jid);
+        continue;
+      }
+      const interruptedText = buildInterruptedReply(cleaned);
       const msgId = crypto.randomUUID();
       const timestamp = new Date().toISOString();
       ensureChatExists(jid);
@@ -2692,7 +2706,15 @@ function saveInterruptedStreamingMessages(): void {
         interruptedText,
         timestamp,
         true,
+        {
+          meta: {
+            sourceKind: 'interrupt_partial',
+            finalizationReason: 'shutdown',
+          },
+        },
       );
+      // Mark as saved so the per-group finally blocks don't duplicate
+      shutdownSavedJids.add(jid);
     }
   } catch (err) {
     logger.warn({ err }, 'Error saving interrupted streaming messages');
@@ -2769,7 +2791,8 @@ function recoverStreamingBuffer(): void {
     for (const filename of txtFiles) {
       try {
         const jid = decodeJidFromFilename(filename);
-        const text = fs.readFileSync(path.join(STREAMING_BUFFER_DIR, filename), 'utf-8');
+        const rawText = fs.readFileSync(path.join(STREAMING_BUFFER_DIR, filename), 'utf-8');
+        const text = stripAgentInternalTags(rawText);
         if (text.trim()) {
           const interruptedText = buildInterruptedReply(text);
           const msgId = crypto.randomUUID();
@@ -2783,6 +2806,12 @@ function recoverStreamingBuffer(): void {
             interruptedText,
             timestamp,
             true,
+            {
+              meta: {
+                sourceKind: 'interrupt_partial',
+                finalizationReason: 'crash_recovery',
+              },
+            },
           );
           logger.info({ jid, textLen: text.length }, 'Recovered interrupted streaming message');
         }

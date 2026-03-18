@@ -172,6 +172,7 @@ interface ChatState {
     options?: { preserveThinking?: boolean },
   ) => void;
   restoreActiveState: () => Promise<void>;
+  handleStreamSnapshot: (chatJid: string, snapshot: any) => void;
   // Sub-agent actions
   loadAgents: (jid: string) => Promise<void>;
   deleteAgentAction: (jid: string, agentId: string) => Promise<boolean>;
@@ -226,6 +227,73 @@ const completedSdkTaskIds = new Set<string>();
 /** DB task agent 自动清理定时器（完成后延迟移除） */
 const DB_TASK_AGENT_AUTO_CLEAN_MS = 5000;
 const dbTaskAgentCleanupTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+// ─── Streaming state sessionStorage persistence ───────────────────────
+// Survives page refresh so StreamingDisplay can restore accumulated content.
+const STREAMING_STORAGE_KEY = 'hc_streaming';
+const streamingSaveTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+/** Debounced save of streaming state to sessionStorage (max once per 500ms per jid). */
+function saveStreamingToSession(chatJid: string, state: StreamingState | undefined): void {
+  if (streamingSaveTimers.has(chatJid)) return; // already scheduled
+  streamingSaveTimers.set(chatJid, setTimeout(() => {
+    streamingSaveTimers.delete(chatJid);
+    try {
+      const stored = JSON.parse(sessionStorage.getItem(STREAMING_STORAGE_KEY) || '{}');
+      if (state && (state.partialText || state.activeTools.length > 0 || state.recentEvents.length > 0)) {
+        stored[chatJid] = {
+          partialText: state.partialText.slice(-4000), // cap size
+          thinkingText: '',  // don't persist thinking
+          isThinking: false,
+          activeTools: state.activeTools,
+          recentEvents: state.recentEvents.slice(-10),
+          todos: state.todos,
+          systemStatus: state.systemStatus,
+          turnId: state.turnId,
+          ts: Date.now(),
+        };
+      } else {
+        delete stored[chatJid];
+      }
+      sessionStorage.setItem(STREAMING_STORAGE_KEY, JSON.stringify(stored));
+    } catch { /* quota exceeded or SSR */ }
+  }, 500));
+}
+
+/** Remove streaming state from sessionStorage. */
+function clearStreamingFromSession(chatJid: string): void {
+  const timer = streamingSaveTimers.get(chatJid);
+  if (timer) { clearTimeout(timer); streamingSaveTimers.delete(chatJid); }
+  try {
+    const stored = JSON.parse(sessionStorage.getItem(STREAMING_STORAGE_KEY) || '{}');
+    delete stored[chatJid];
+    sessionStorage.setItem(STREAMING_STORAGE_KEY, JSON.stringify(stored));
+  } catch { /* SSR */ }
+}
+
+/** Restore streaming state from sessionStorage (stale entries > 5min are discarded). */
+function restoreStreamingFromSession(chatJid: string): StreamingState | null {
+  try {
+    const stored = JSON.parse(sessionStorage.getItem(STREAMING_STORAGE_KEY) || '{}');
+    const entry = stored[chatJid];
+    if (!entry) return null;
+    // Discard stale entries (> 5 minutes old)
+    if (Date.now() - (entry.ts || 0) > 5 * 60 * 1000) {
+      delete stored[chatJid];
+      sessionStorage.setItem(STREAMING_STORAGE_KEY, JSON.stringify(stored));
+      return null;
+    }
+    return {
+      ...DEFAULT_STREAMING_STATE,
+      partialText: entry.partialText || '',
+      activeTools: entry.activeTools || [],
+      recentEvents: entry.recentEvents || [],
+      todos: entry.todos,
+      systemStatus: entry.systemStatus || null,
+      turnId: entry.turnId,
+    };
+  } catch { return null; }
+}
 
 /**
  * rAF batching for text_delta / thinking_delta events.
@@ -286,6 +354,7 @@ function flushPendingDelta(
         next.thinkingText = combined.length > MAX_STREAMING_TEXT ? combined.slice(-MAX_STREAMING_TEXT) : combined;
         next.isThinking = true;
       }
+      saveStreamingToSession(chatJid, next);
       return {
         waiting: { ...s.waiting, [chatJid]: true },
         streaming: { ...s.streaming, [chatJid]: next },
@@ -627,7 +696,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
   clearing: {},
   agents: {},
   agentStreaming: {},
-  activeAgentTab: {},
+  activeAgentTab: (() => {
+    try { return JSON.parse(sessionStorage.getItem('activeAgentTabs') || '{}'); } catch { return {}; }
+  })(),
   sdkTasks: {},
   sdkTaskAliases: {},
   agentMessages: {},
@@ -1413,6 +1484,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const prev = resolveStreamingPrev(s.streaming[chatJid], event);
       const next = { ...prev };
       applyStreamEvent(event, prev, next, MAX_STREAMING_TEXT);
+      saveStreamingToSession(chatJid, next);
       return {
         waiting: { ...s.waiting, [chatJid]: true },
         streaming: { ...s.streaming, [chatJid]: next },
@@ -1732,11 +1804,20 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   },
 
-  // 切换子 Agent 标签页
+  // 切换子 Agent 标签页（持久化到 sessionStorage，刷新后恢复）
   setActiveAgentTab: (jid, agentId) => {
     set((s) => ({
       activeAgentTab: { ...s.activeAgentTab, [jid]: agentId },
     }));
+    try {
+      const stored = JSON.parse(sessionStorage.getItem('activeAgentTabs') || '{}');
+      if (agentId) {
+        stored[jid] = agentId;
+      } else {
+        delete stored[jid];
+      }
+      sessionStorage.setItem('activeAgentTabs', JSON.stringify(stored));
+    } catch { /* ignore */ }
   },
 
   // -- Conversation agent actions --
@@ -1926,6 +2007,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           if (!knownJids.has(jid)) {
             delete nextWaiting[jid];
             delete nextStreaming[jid];
+            clearStreamingFromSession(jid);
           }
         }
 
@@ -1938,6 +2020,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           if (!g.active) {
             delete nextWaiting[g.jid];
             delete nextStreaming[g.jid];
+            clearStreamingFromSession(g.jid);
             continue;
           }
           // active 可能仅表示 runner 空闲存活，这里回退到消息语义推断。
@@ -1949,8 +2032,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
             (latest.is_from_me === false || latest.source_kind === 'sdk_send_message');
           if (inferredWaiting) {
             nextWaiting[g.jid] = true;
+            // Restore streaming state from sessionStorage if available
+            if (!nextStreaming[g.jid]) {
+              const restored = restoreStreamingFromSession(g.jid);
+              if (restored) {
+                nextStreaming[g.jid] = restored;
+              }
+            }
           } else {
             delete nextWaiting[g.jid];
+            clearStreamingFromSession(g.jid);
           }
         }
         return { waiting: nextWaiting, streaming: nextStreaming };
@@ -1958,6 +2049,33 @@ export const useChatStore = create<ChatState>((set, get) => ({
     } catch {
       // 静默失败
     }
+  },
+
+  // WS 重连时接收后端推送的流式快照，恢复 StreamingDisplay
+  handleStreamSnapshot: (chatJid, snapshot) => {
+    set((s) => {
+      // 已有流式状态 → 不覆盖（可能已经在接收新事件）
+      if (s.streaming[chatJid]?.partialText) return s;
+      const restored: StreamingState = {
+        ...DEFAULT_STREAMING_STATE,
+        partialText: snapshot.partialText || '',
+        activeTools: (snapshot.activeTools || []).map((t: any) => ({
+          toolName: t.toolName,
+          toolUseId: t.toolUseId,
+          startTime: t.startTime,
+          toolInputSummary: t.toolInputSummary,
+          parentToolUseId: t.parentToolUseId,
+        })),
+        recentEvents: snapshot.recentEvents || [],
+        todos: snapshot.todos,
+        systemStatus: snapshot.systemStatus || null,
+        turnId: snapshot.turnId,
+      };
+      return {
+        waiting: { ...s.waiting, [chatJid]: true },
+        streaming: { ...s.streaming, [chatJid]: restored },
+      };
+    });
   },
 
   // Runner 状态同步：idle 时清理残留状态，running 时重新启用 stream event 接收
@@ -1993,6 +2111,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       cancelAnimationFrame(mainEntry.raf);
       pendingDeltas.delete(mainKey);
     }
+    clearStreamingFromSession(chatJid);
     set((s) => {
       const next = { ...s.streaming };
       const thinkingText = next[chatJid]?.thinkingText;
