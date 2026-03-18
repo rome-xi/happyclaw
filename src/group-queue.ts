@@ -512,8 +512,10 @@ export class GroupQueue {
    * subsequent runner for the same folder does not immediately see stale
    * sentinels and exit prematurely.
    */
-  private cleanupIpcSentinels(groupFolder: string): void {
-    const inputDir = path.join(DATA_DIR, 'ipc', groupFolder, 'input');
+  private cleanupIpcSentinels(groupFolder: string, agentId?: string | null): void {
+    const inputDir = agentId
+      ? path.join(DATA_DIR, 'ipc', groupFolder, 'agents', agentId, 'input')
+      : path.join(DATA_DIR, 'ipc', groupFolder, 'input');
     for (const name of ['_drain', '_close']) {
       try {
         fs.unlinkSync(path.join(inputDir, name));
@@ -867,9 +869,13 @@ export class GroupQueue {
       logger.error({ groupJid, err }, 'Error processing messages for group');
       this.scheduleRetry(groupJid, state);
     } finally {
-      // Clean up stale sentinel files before clearing groupFolder
+      // Clean up stale sentinel files before clearing groupFolder/agentId
       if (state.groupFolder) {
-        this.cleanupIpcSentinels(state.groupFolder);
+        try {
+          this.cleanupIpcSentinels(state.groupFolder, state.agentId);
+        } catch (err) {
+          logger.warn({ groupJid, err }, 'Failed to clean up IPC sentinels');
+        }
       }
       state.active = false;
       state.drainSentinelWritten = false;
@@ -940,9 +946,13 @@ export class GroupQueue {
     } catch (err) {
       logger.error({ groupJid, taskId: task.id, err }, 'Error running task');
     } finally {
-      // Clean up stale sentinel files before clearing groupFolder
+      // Clean up stale sentinel files before clearing groupFolder/agentId
       if (state.groupFolder) {
-        this.cleanupIpcSentinels(state.groupFolder);
+        try {
+          this.cleanupIpcSentinels(state.groupFolder, state.agentId);
+        } catch (err) {
+          logger.warn({ groupJid, err }, 'Failed to clean up IPC sentinels');
+        }
       }
       state.active = false;
       state.activeRunnerIsTask = false;
