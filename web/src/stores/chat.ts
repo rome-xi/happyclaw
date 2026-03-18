@@ -1457,11 +1457,18 @@ export const useChatStore = create<ChatState>((set, get) => ({
           ? (() => { const n = { ...s.agentStreaming }; delete n[agentId]; return n; })()
           : s.agentStreaming;
 
+        // For user messages (non-reply), set agentWaiting=true so subsequent
+        // streaming events are accepted.  This handles messages injected from
+        // Feishu/Telegram which don't go through sendAgentMessage().
+        const nextAgentWaiting = isAgentReply
+          ? { ...s.agentWaiting, [agentId]: false }
+          : !msg.is_from_me
+            ? { ...s.agentWaiting, [agentId]: true }
+            : s.agentWaiting;
+
         return {
           agentMessages: { ...s.agentMessages, [agentId]: updated },
-          agentWaiting: isAgentReply
-            ? { ...s.agentWaiting, [agentId]: false }
-            : s.agentWaiting,
+          agentWaiting: nextAgentWaiting,
           agentStreaming: nextAgentStreaming,
         };
       });
@@ -1600,9 +1607,19 @@ export const useChatStore = create<ChatState>((set, get) => ({
         }
       }
 
+      // Conversation agent started running: reset agentWaiting so stream events
+      // are accepted (mirrors handleRunnerState for the main conversation).
+      // Without this, Feishu-sourced messages (which skip sendAgentMessage) would
+      // leave agentWaiting=false and cause all streaming events to be dropped.
+      const nextAgentWaiting =
+        resolvedKind === 'conversation' && status === 'running'
+          ? { ...s.agentWaiting, [agentId]: true }
+          : s.agentWaiting;
+
       return {
         agents: { ...s.agents, [chatJid]: updated },
         agentStreaming: nextAgentStreaming,
+        agentWaiting: nextAgentWaiting,
         sdkTasks: nextSdkTasks,
         sdkTaskAliases: nextSdkTaskAliases,
       };
