@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from 'react';
+import { useState, useRef, useEffect, useLayoutEffect, useCallback } from 'react';
 import { useKeyboardHeight } from '@/hooks/useKeyboardHeight';
 import { successTap } from '../../hooks/useHaptic';
 import {
@@ -122,15 +122,21 @@ export function MessageInput({
   );
 
   // Auto-resize textarea (1-6 lines)
-  useEffect(() => {
+  // useLayoutEffect runs BEFORE paint → height update is invisible to the user (no jitter)
+  useLayoutEffect(() => {
     const textarea = textareaRef.current;
     if (!textarea) return;
 
-    textarea.style.height = 'auto';
+    // Temporarily hide overflow to prevent scrollbar flash during measurement
+    const prevOverflow = textarea.style.overflow;
+    textarea.style.overflow = 'hidden';
+    textarea.style.height = '0px';
     const scrollHeight = textarea.scrollHeight;
     const lineHeight = 24;
     const maxHeight = lineHeight * 6;
-    textarea.style.height = `${Math.min(scrollHeight, maxHeight)}px`;
+    const newHeight = Math.max(lineHeight, Math.min(scrollHeight, maxHeight));
+    textarea.style.height = `${newHeight}px`;
+    textarea.style.overflow = newHeight >= maxHeight ? 'auto' : prevOverflow || '';
   }, [content]);
 
   // IME composition state — prevent Enter from sending while composing (e.g. Chinese input)

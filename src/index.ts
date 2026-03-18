@@ -146,6 +146,8 @@ import {
   broadcastBillingUpdate,
   shutdownTerminals,
   shutdownWebServer,
+  getActiveStreamingTexts,
+  clearStreamingSnapshot,
 } from './web.js';
 import { installSkillForUser, deleteSkillForUser } from './routes/skills.js';
 import { verifyPairingCode } from './telegram-pairing.js';
@@ -164,6 +166,8 @@ let lastAgentTimestamp: Record<string, MessageCursor> = {};
 let messageLoopRunning = false;
 let ipcWatcherRunning = false;
 let shuttingDown = false;
+/** JIDs already persisted by the shutdown handler — prevents finally blocks from duplicating. */
+const shutdownSavedJids = new Set<string>();
 
 const queue = new GroupQueue();
 const EMPTY_CURSOR: MessageCursor = { timestamp: '', id: '' };
@@ -1767,7 +1771,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             result.streamEvent.statusText === 'interrupted'
           ) {
             streamInterrupted = true;
-            if (!sentReply) {
+            // Skip if shutdown handler already saved this text (prevents duplicates)
+            const inlineWebJid = chatJid.startsWith('web:') ? chatJid : `web:${effectiveGroup.folder}`;
+            const inlineAlreadySaved = shutdownSavedJids.has(chatJid) || shutdownSavedJids.has(inlineWebJid);
+            if (!sentReply && !inlineAlreadySaved) {
               const interruptedText = buildInterruptedReply(streamingAccumulatedText);
               try {
                 if (streamingSession?.isActive()) {
@@ -1783,6 +1790,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                   },
                 });
                 sentReply = true;
+                clearStreamingSnapshot(chatJid);
+                streamingAccumulatedText = '';
                 commitCursor();
               } catch (err) {
                 logger.warn({ err, chatJid }, 'Failed to save interrupted text on status event');
@@ -2096,6 +2105,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             }
 
             sentReply = true;
+            // Clear streaming snapshot so the next turn starts fresh.
+            // Without this, saveInterruptedStreamingMessages() would merge
+            // text from multiple turns into one message on shutdown.
+            clearStreamingSnapshot(chatJid);
+            streamingAccumulatedText = '';
             // Persist cursor as soon as a visible reply is emitted.
             // Long-lived runners may stay alive for idleTimeout, and waiting
             // until process exit would cause duplicate replay after restart.
@@ -2140,7 +2154,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }
 
     // ── 保存中断内容到数据库 + 广播到 Web ──
-    if (wasInterrupted) {
+    // Skip if the shutdown handler already saved this streaming text (prevents duplicates).
+    const webJidForShutdownCheck = chatJid.startsWith('web:') ? chatJid : `web:${effectiveGroup.folder}`;
+    const alreadySavedByShutdown = shutdownSavedJids.has(chatJid) || shutdownSavedJids.has(webJidForShutdownCheck);
+
+    if (wasInterrupted && !alreadySavedByShutdown) {
       const interruptedText = buildInterruptedReply(streamingAccumulatedText);
       try {
         // sendToIM: false — 飞书卡片已通过 abort() 展示内容，不重复发送
@@ -2161,7 +2179,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }
 
     // ── 兜底：overflow 等异常导致累积文本未持久化 ──
-    if (!sentReply && streamingAccumulatedText.trim()) {
+    if (!sentReply && !alreadySavedByShutdown && streamingAccumulatedText.trim()) {
       try {
         const partialReply = buildOverflowPartialReply(streamingAccumulatedText);
         lastReplyMsgId = await sendMessage(chatJid, partialReply, {
@@ -2662,6 +2680,178 @@ function buildOverflowPartialReply(partialText: string): string {
   return trimmed
     ? `${trimmed}\n\n---\n*⚠️ 上下文压缩中，以上为部分回复*`
     : '*⚠️ 上下文压缩中*';
+}
+
+/**
+ * Save any in-progress streaming responses to DB before shutdown.
+ * Without this, partial bot responses are lost when the service restarts.
+ */
+function saveInterruptedStreamingMessages(): void {
+  try {
+    const activeTexts = getActiveStreamingTexts();
+    if (activeTexts.size === 0) return;
+
+    logger.info(
+      { count: activeTexts.size },
+      'Saving interrupted streaming messages to DB',
+    );
+
+    for (const [jid, partialText] of activeTexts) {
+      if (!partialText.trim()) {
+        shutdownSavedJids.add(jid);
+        continue;
+      }
+      const interruptedText = buildInterruptedReply(partialText);
+      const msgId = crypto.randomUUID();
+      const timestamp = new Date().toISOString();
+      ensureChatExists(jid);
+      storeMessageDirect(
+        msgId,
+        jid,
+        'happyclaw-agent',
+        ASSISTANT_NAME,
+        interruptedText,
+        timestamp,
+        true,
+        {
+          meta: {
+            sourceKind: 'interrupt_partial',
+            finalizationReason: 'shutdown',
+          },
+        },
+      );
+      // Mark as saved so the per-group finally blocks don't duplicate
+      shutdownSavedJids.add(jid);
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Error saving interrupted streaming messages');
+  }
+
+  // Clean up buffer files since we saved to DB (avoids duplicates on next startup)
+  cleanStreamingBufferDir();
+}
+
+// ─── Periodic Streaming Buffer ──────────────────────────────────────
+// Writes in-progress streaming text to disk every 5s so that even SIGKILL
+// crashes preserve most of the partial response.
+
+const STREAMING_BUFFER_DIR = path.join(DATA_DIR, 'streaming-buffer');
+const STREAMING_BUFFER_INTERVAL_MS = 5000;
+let streamingBufferInterval: ReturnType<typeof setInterval> | null = null;
+
+function encodeJidForFilename(jid: string): string {
+  return Buffer.from(jid).toString('base64url');
+}
+
+function decodeJidFromFilename(filename: string): string {
+  return Buffer.from(filename.replace('.txt', ''), 'base64url').toString();
+}
+
+/** Write all active streaming texts to disk (atomic write per file). */
+function flushStreamingBuffer(): void {
+  try {
+    const activeTexts = getActiveStreamingTexts();
+    if (activeTexts.size === 0) {
+      // Nothing streaming — clean up any stale files
+      cleanStreamingBufferDir();
+      return;
+    }
+
+    fs.mkdirSync(STREAMING_BUFFER_DIR, { recursive: true });
+
+    const activeFiles = new Set<string>();
+    for (const [jid, text] of activeTexts) {
+      const filename = encodeJidForFilename(jid) + '.txt';
+      activeFiles.add(filename);
+      const filePath = path.join(STREAMING_BUFFER_DIR, filename);
+      const tmpPath = filePath + '.tmp';
+      fs.writeFileSync(tmpPath, text);
+      fs.renameSync(tmpPath, filePath);
+    }
+
+    // Remove files for JIDs that are no longer streaming
+    try {
+      for (const f of fs.readdirSync(STREAMING_BUFFER_DIR)) {
+        if (f.endsWith('.txt') && !activeFiles.has(f)) {
+          fs.unlinkSync(path.join(STREAMING_BUFFER_DIR, f));
+        }
+      }
+    } catch { /* ignore cleanup errors */ }
+  } catch (err) {
+    logger.debug({ err }, 'Error flushing streaming buffer');
+  }
+}
+
+/** On startup, recover interrupted responses from buffer files left by a crash. */
+function recoverStreamingBuffer(): void {
+  try {
+    if (!fs.existsSync(STREAMING_BUFFER_DIR)) return;
+
+    const txtFiles = fs.readdirSync(STREAMING_BUFFER_DIR).filter((f) => f.endsWith('.txt'));
+    if (txtFiles.length === 0) return;
+
+    logger.info(
+      { count: txtFiles.length },
+      'Recovering interrupted streaming messages from buffer files',
+    );
+
+    for (const filename of txtFiles) {
+      try {
+        const jid = decodeJidFromFilename(filename);
+        const text = fs.readFileSync(path.join(STREAMING_BUFFER_DIR, filename), 'utf-8');
+        if (text.trim()) {
+          const interruptedText = buildInterruptedReply(text);
+          const msgId = crypto.randomUUID();
+          const timestamp = new Date().toISOString();
+          ensureChatExists(jid);
+          storeMessageDirect(
+            msgId,
+            jid,
+            'happyclaw-agent',
+            ASSISTANT_NAME,
+            interruptedText,
+            timestamp,
+            true,
+            {
+              meta: {
+                sourceKind: 'interrupt_partial',
+                finalizationReason: 'crash_recovery',
+              },
+            },
+          );
+          logger.info({ jid, textLen: text.length }, 'Recovered interrupted streaming message');
+        }
+        fs.unlinkSync(path.join(STREAMING_BUFFER_DIR, filename));
+      } catch (err) {
+        logger.warn({ err, filename }, 'Error recovering streaming buffer file');
+      }
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Error recovering streaming buffer');
+  }
+}
+
+/** Remove all buffer files. */
+function cleanStreamingBufferDir(): void {
+  try {
+    if (!fs.existsSync(STREAMING_BUFFER_DIR)) return;
+    for (const f of fs.readdirSync(STREAMING_BUFFER_DIR)) {
+      try {
+        fs.unlinkSync(path.join(STREAMING_BUFFER_DIR, f));
+      } catch { /* ignore */ }
+    }
+  } catch { /* ignore */ }
+}
+
+function startStreamingBuffer(): void {
+  streamingBufferInterval = setInterval(flushStreamingBuffer, STREAMING_BUFFER_INTERVAL_MS);
+}
+
+function stopStreamingBuffer(): void {
+  if (streamingBufferInterval) {
+    clearInterval(streamingBufferInterval);
+    streamingBufferInterval = null;
+  }
 }
 
 /**
@@ -5115,6 +5305,10 @@ async function main(): Promise<void> {
       logger.warn({ err }, 'Error shutting down terminals');
     }
 
+    // Stop periodic buffer, then persist streaming text to DB + clean buffer files.
+    stopStreamingBuffer();
+    saveInterruptedStreamingMessages();
+
     // Run cleanup tasks concurrently with a tight timeout
     await Promise.allSettled([
       // Abort all active streaming cards before disconnecting IM,
@@ -5592,8 +5786,10 @@ async function main(): Promise<void> {
   }
 
   startIpcWatcher();
+  recoverStreamingBuffer();
   recoverPendingMessages();
   recoverConversationAgents();
+  startStreamingBuffer();
   startMessageLoop();
 
   // --- IM Connection Pool: connect per-user IM channels ---
