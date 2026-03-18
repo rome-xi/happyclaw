@@ -85,6 +85,7 @@ export type MessageSourceKind =
   | 'sdk_final'
   | 'sdk_send_message'
   | 'interrupt_partial'
+  | 'overflow_partial'
   | 'legacy';
 
 export type MessageFinalizationReason =

@@ -1125,6 +1125,18 @@ async function runQuery(
       // SDK 将某些 API 错误包装为 subtype=success 的 result（不抛异常）
       if (textResult && isContextOverflowError(textResult)) {
         log(`Context overflow detected in result: ${textResult.slice(0, 100)}`);
+        // ── 发射已累积的部分回复，避免用户已看到的流式内容丢失 ──
+        const partialText = processor.getFullText();
+        if (partialText.trim()) {
+          log(`Emitting overflow_partial with ${partialText.length} chars`);
+          emit({
+            status: 'success',
+            result: partialText,
+            newSessionId,
+            sourceKind: 'overflow_partial',
+            finalizationReason: 'error',
+          });
+        }
         processor.resetFullTextAccumulator();
         return { newSessionId, lastAssistantUuid, closedDuringQuery, contextOverflow: true, interruptedDuringQuery };
       }
@@ -1207,6 +1219,18 @@ async function runQuery(
     // 检测上下文溢出错误
     if (isContextOverflowError(errorMessage)) {
       log(`Context overflow detected: ${errorMessage}`);
+      // ── 发射已累积的部分回复，避免用户已看到的流式内容丢失 ──
+      const partialText = processor.getFullText();
+      if (partialText.trim()) {
+        log(`Emitting overflow_partial (catch) with ${partialText.length} chars`);
+        emit({
+          status: 'success',
+          result: partialText,
+          newSessionId,
+          sourceKind: 'overflow_partial',
+          finalizationReason: 'error',
+        });
+      }
       return { newSessionId, lastAssistantUuid, closedDuringQuery, contextOverflow: true, interruptedDuringQuery };
     }
 

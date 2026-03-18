@@ -1120,7 +1120,7 @@ interface SendMessageOptions {
     turnId?: string;
     sessionId?: string;
     sdkMessageUuid?: string;
-    sourceKind?: 'sdk_final' | 'sdk_send_message' | 'interrupt_partial' | 'legacy';
+    sourceKind?: 'sdk_final' | 'sdk_send_message' | 'interrupt_partial' | 'overflow_partial' | 'legacy';
     finalizationReason?: 'completed' | 'interrupted' | 'error';
   };
 }
@@ -2012,7 +2012,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             typeof result.result === 'string'
               ? result.result
               : JSON.stringify(result.result);
-          const text = stripAgentInternalTags(raw);
+          let text = stripAgentInternalTags(raw);
+          if (result.sourceKind === 'overflow_partial') {
+            text = buildOverflowPartialReply(text);
+          }
           logger.info(
             { group: group.name },
             `Agent output: ${raw.slice(0, 200)}`,
@@ -2153,6 +2156,26 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         commitCursor();
       } catch (err) {
         logger.warn({ err, chatJid }, 'Failed to save interrupted text');
+      }
+    }
+
+    // ── 兜底：overflow 等异常导致累积文本未持久化 ──
+    if (!sentReply && streamingAccumulatedText.trim()) {
+      try {
+        const partialReply = buildOverflowPartialReply(streamingAccumulatedText);
+        lastReplyMsgId = await sendMessage(chatJid, partialReply, {
+          sendToIM: false,
+          messageMeta: {
+            turnId: lastProcessed.id,
+            sessionId: activeSessionId,
+            sourceKind: 'overflow_partial',
+            finalizationReason: 'error',
+          },
+        });
+        sentReply = true;
+        commitCursor();
+      } catch (err) {
+        logger.warn({ err, chatJid }, 'Failed to save overflow partial text');
       }
     }
 
@@ -2631,6 +2654,13 @@ async function sendMessage(
 function buildInterruptedReply(partialText: string): string {
   const trimmed = partialText.trimEnd();
   return trimmed ? `${trimmed}\n\n---\n*⚠️ 已中断*` : '*⚠️ 已中断*';
+}
+
+function buildOverflowPartialReply(partialText: string): string {
+  const trimmed = partialText.trimEnd();
+  return trimmed
+    ? `${trimmed}\n\n---\n*⚠️ 上下文压缩中，以上为部分回复*`
+    : '*⚠️ 上下文压缩中*';
 }
 
 /**
@@ -3781,7 +3811,10 @@ async function processAgentConversation(
         typeof output.result === 'string'
           ? output.result
           : JSON.stringify(output.result);
-      const text = stripAgentInternalTags(raw);
+      let text = stripAgentInternalTags(raw);
+      if (output.sourceKind === 'overflow_partial') {
+        text = buildOverflowPartialReply(text);
+      }
       if (text) {
         const msgId = crypto.randomUUID();
         lastAgentReplyMsgId = msgId;
@@ -4038,6 +4071,46 @@ async function processAgentConversation(
         commitCursor();
       } catch (err) {
         logger.warn({ err, chatJid, agentId }, 'Failed to save interrupted agent text');
+      }
+    }
+
+    // ── 兜底：overflow 等异常导致累积文本未持久化 ──
+    if (!cursorCommitted && agentStreamingAccText.trim()) {
+      try {
+        const partialReply = buildOverflowPartialReply(agentStreamingAccText);
+        const msgId = crypto.randomUUID();
+        const timestamp = new Date().toISOString();
+        ensureChatExists(virtualChatJid);
+        const persistedMsgId = storeMessageDirect(
+          msgId,
+          virtualChatJid,
+          'happyclaw-agent',
+          ASSISTANT_NAME,
+          partialReply,
+          timestamp,
+          true,
+          {
+            meta: {
+              turnId: lastProcessed.id,
+              sessionId: currentAgentSessionId,
+              sourceKind: 'overflow_partial',
+              finalizationReason: 'error',
+            },
+          },
+        );
+        broadcastNewMessage(virtualChatJid, {
+          id: persistedMsgId, chat_jid: virtualChatJid,
+          sender: 'happyclaw-agent', sender_name: ASSISTANT_NAME,
+          content: partialReply, timestamp, is_from_me: true,
+          turn_id: lastProcessed.id,
+          session_id: currentAgentSessionId,
+          sdk_message_uuid: null,
+          source_kind: 'overflow_partial',
+          finalization_reason: 'error',
+        }, agentId);
+        commitCursor();
+      } catch (err) {
+        logger.warn({ err, chatJid, agentId }, 'Failed to save overflow partial agent text');
       }
     }
   }
