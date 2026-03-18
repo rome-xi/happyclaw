@@ -2697,6 +2697,126 @@ function saveInterruptedStreamingMessages(): void {
   } catch (err) {
     logger.warn({ err }, 'Error saving interrupted streaming messages');
   }
+
+  // Clean up buffer files since we saved to DB (avoids duplicates on next startup)
+  cleanStreamingBufferDir();
+}
+
+// ─── Periodic Streaming Buffer ──────────────────────────────────────
+// Writes in-progress streaming text to disk every 5s so that even SIGKILL
+// crashes preserve most of the partial response.
+
+const STREAMING_BUFFER_DIR = path.join(DATA_DIR, 'streaming-buffer');
+const STREAMING_BUFFER_INTERVAL_MS = 5000;
+let streamingBufferInterval: ReturnType<typeof setInterval> | null = null;
+
+function encodeJidForFilename(jid: string): string {
+  return Buffer.from(jid).toString('base64url');
+}
+
+function decodeJidFromFilename(filename: string): string {
+  return Buffer.from(filename.replace('.txt', ''), 'base64url').toString();
+}
+
+/** Write all active streaming texts to disk (atomic write per file). */
+function flushStreamingBuffer(): void {
+  try {
+    const activeTexts = getActiveStreamingTexts();
+    if (activeTexts.size === 0) {
+      // Nothing streaming — clean up any stale files
+      cleanStreamingBufferDir();
+      return;
+    }
+
+    fs.mkdirSync(STREAMING_BUFFER_DIR, { recursive: true });
+
+    const activeFiles = new Set<string>();
+    for (const [jid, text] of activeTexts) {
+      const filename = encodeJidForFilename(jid) + '.txt';
+      activeFiles.add(filename);
+      const filePath = path.join(STREAMING_BUFFER_DIR, filename);
+      const tmpPath = filePath + '.tmp';
+      fs.writeFileSync(tmpPath, text);
+      fs.renameSync(tmpPath, filePath);
+    }
+
+    // Remove files for JIDs that are no longer streaming
+    try {
+      for (const f of fs.readdirSync(STREAMING_BUFFER_DIR)) {
+        if (f.endsWith('.txt') && !activeFiles.has(f)) {
+          fs.unlinkSync(path.join(STREAMING_BUFFER_DIR, f));
+        }
+      }
+    } catch { /* ignore cleanup errors */ }
+  } catch (err) {
+    logger.debug({ err }, 'Error flushing streaming buffer');
+  }
+}
+
+/** On startup, recover interrupted responses from buffer files left by a crash. */
+function recoverStreamingBuffer(): void {
+  try {
+    if (!fs.existsSync(STREAMING_BUFFER_DIR)) return;
+
+    const txtFiles = fs.readdirSync(STREAMING_BUFFER_DIR).filter((f) => f.endsWith('.txt'));
+    if (txtFiles.length === 0) return;
+
+    logger.info(
+      { count: txtFiles.length },
+      'Recovering interrupted streaming messages from buffer files',
+    );
+
+    for (const filename of txtFiles) {
+      try {
+        const jid = decodeJidFromFilename(filename);
+        const text = fs.readFileSync(path.join(STREAMING_BUFFER_DIR, filename), 'utf-8');
+        if (text.trim()) {
+          const interruptedText = buildInterruptedReply(text);
+          const msgId = crypto.randomUUID();
+          const timestamp = new Date().toISOString();
+          ensureChatExists(jid);
+          storeMessageDirect(
+            msgId,
+            jid,
+            'happyclaw-agent',
+            ASSISTANT_NAME,
+            interruptedText,
+            timestamp,
+            true,
+          );
+          logger.info({ jid, textLen: text.length }, 'Recovered interrupted streaming message');
+        }
+        fs.unlinkSync(path.join(STREAMING_BUFFER_DIR, filename));
+      } catch (err) {
+        logger.warn({ err, filename }, 'Error recovering streaming buffer file');
+      }
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Error recovering streaming buffer');
+  }
+}
+
+/** Remove all buffer files. */
+function cleanStreamingBufferDir(): void {
+  try {
+    if (!fs.existsSync(STREAMING_BUFFER_DIR)) return;
+    for (const f of fs.readdirSync(STREAMING_BUFFER_DIR)) {
+      try {
+        fs.unlinkSync(path.join(STREAMING_BUFFER_DIR, f));
+      } catch { /* ignore */ }
+    }
+  } catch { /* ignore */ }
+}
+
+function startStreamingBuffer(): void {
+  streamingBufferInterval = setInterval(flushStreamingBuffer, STREAMING_BUFFER_INTERVAL_MS);
+}
+
+function stopStreamingBuffer(): void {
+  if (streamingBufferInterval) {
+    clearInterval(streamingBufferInterval);
+    streamingBufferInterval = null;
+  }
 }
 
 /**
@@ -5150,8 +5270,8 @@ async function main(): Promise<void> {
       logger.warn({ err }, 'Error shutting down terminals');
     }
 
-    // Persist any in-progress streaming text to DB before cleanup.
-    // Must run before abortAllStreamingSessions / shutdownWebServer.
+    // Stop periodic buffer, then persist streaming text to DB + clean buffer files.
+    stopStreamingBuffer();
     saveInterruptedStreamingMessages();
 
     // Run cleanup tasks concurrently with a tight timeout
@@ -5631,8 +5751,10 @@ async function main(): Promise<void> {
   }
 
   startIpcWatcher();
+  recoverStreamingBuffer();
   recoverPendingMessages();
   recoverConversationAgents();
+  startStreamingBuffer();
   startMessageLoop();
 
   // --- IM Connection Pool: connect per-user IM channels ---
