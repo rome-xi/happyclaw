@@ -4314,62 +4314,69 @@ function recoverConversationAgents(): void {
   );
 
   for (const agent of agents) {
-    const chatJid = agent.chat_jid;
-    const agentId = agent.id;
+    try {
+      const chatJid = agent.chat_jid;
+      const agentId = agent.id;
 
-    // Reset running → idle (process is dead)
-    if (agent.status === 'running') {
-      updateAgentStatus(agentId, 'idle');
-      broadcastAgentStatus(
-        chatJid,
-        agentId,
-        'idle',
-        agent.name,
-        agent.prompt,
-        agent.result_summary ?? undefined,
-        agent.kind,
+      // Reset running → idle (process is dead)
+      if (agent.status === 'running') {
+        updateAgentStatus(agentId, 'idle');
+        broadcastAgentStatus(
+          chatJid,
+          agentId,
+          'idle',
+          agent.name,
+          agent.prompt,
+          agent.result_summary ?? undefined,
+          agent.kind,
+        );
+      }
+
+      // Check for pending messages on the virtual JID
+      const virtualChatJid = `${chatJid}#agent:${agentId}`;
+      const sinceCursor = lastAgentTimestamp[virtualChatJid] || EMPTY_CURSOR;
+      const pending = getMessagesSince(virtualChatJid, sinceCursor);
+
+      if (pending.length > 0) {
+        logger.info(
+          { agentId, agentName: agent.name, pendingCount: pending.length },
+          'Recovery: re-triggering conversation agent with pending messages',
+        );
+
+        // Store a system notice so the user sees something in the chat
+        const now = new Date().toISOString();
+        const noticeId = `system-recover-${agentId}-${Date.now()}`;
+        storeMessageDirect(
+          noticeId,
+          virtualChatJid,
+          'system',
+          ASSISTANT_NAME,
+          '服务已重启，正在恢复上次未完成的任务...',
+          now,
+          true,
+        );
+        broadcastNewMessage(virtualChatJid, {
+          id: noticeId,
+          chat_jid: virtualChatJid,
+          sender: 'system',
+          sender_name: ASSISTANT_NAME,
+          content: '服务已重启，正在恢复上次未完成的任务...',
+          timestamp: now,
+          is_from_me: true,
+          source_jid: virtualChatJid,
+        });
+
+        // Enqueue the agent conversation for processing
+        const taskId = `agent-recover:${agentId}:${Date.now()}`;
+        queue.enqueueTask(virtualChatJid, taskId, async () => {
+          await processAgentConversation(chatJid, agentId);
+        });
+      }
+    } catch (err) {
+      logger.error(
+        { err, agentId: agent.id, groupFolder: agent.group_folder },
+        'Recovery: failed to recover conversation agent, skipping',
       );
-    }
-
-    // Check for pending messages on the virtual JID
-    const virtualChatJid = `${chatJid}#agent:${agentId}`;
-    const sinceCursor = lastAgentTimestamp[virtualChatJid] || EMPTY_CURSOR;
-    const pending = getMessagesSince(virtualChatJid, sinceCursor);
-
-    if (pending.length > 0) {
-      logger.info(
-        { agentId, agentName: agent.name, pendingCount: pending.length },
-        'Recovery: re-triggering conversation agent with pending messages',
-      );
-
-      // Store a system notice so the user sees something in the chat
-      const now = new Date().toISOString();
-      const noticeId = `system-recover-${agentId}-${Date.now()}`;
-      storeMessageDirect(
-        noticeId,
-        virtualChatJid,
-        'system',
-        ASSISTANT_NAME,
-        '服务已重启，正在恢复上次未完成的任务...',
-        now,
-        true,
-      );
-      broadcastNewMessage(virtualChatJid, {
-        id: noticeId,
-        chat_jid: virtualChatJid,
-        sender: 'system',
-        sender_name: ASSISTANT_NAME,
-        content: '服务已重启，正在恢复上次未完成的任务...',
-        timestamp: now,
-        is_from_me: true,
-        source_jid: virtualChatJid,
-      });
-
-      // Enqueue the agent conversation for processing
-      const taskId = `agent-recover:${agentId}:${Date.now()}`;
-      queue.enqueueTask(virtualChatJid, taskId, async () => {
-        await processAgentConversation(chatJid, agentId);
-      });
     }
   }
 }
