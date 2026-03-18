@@ -57,10 +57,8 @@ ifeq ($(HAS_BUN),1)
 	  if [ ! -f "$$target" ] || [ -n "$$(find shared/ -newer "$$target" -name '*.ts' 2>/dev/null | head -1)" ]; then NEED_SYNC=1; break; fi; \
 	done; \
 	if [ "$$NEED_SYNC" = "1" ]; then echo "🔄 检测到 shared/ 类型变更，同步类型..."; $(MAKE) sync-types; fi
-	@echo "🔨 编译前端..."
-	@cd web && bun run build
-	@echo "🔨 编译 agent-runner..."
-	@cd container/agent-runner && bun run build
+	@if [ ! -f web/dist/index.html ] || [ -n "$$(find web/src/ -newer web/dist/index.html \( -name '*.ts' -o -name '*.tsx' -o -name '*.css' \) 2>/dev/null | head -1)" ]; then echo "🔨 检测到前端源码变更，重新编译前端..."; cd web && bun run build; else echo "✅ 前端无变更，跳过编译"; fi
+	@if [ ! -f container/agent-runner/dist/.tsbuildinfo ] || [ -n "$$(find container/agent-runner/src/ -newer container/agent-runner/dist/.tsbuildinfo \( -name '*.ts' \) 2>/dev/null | head -1)" ]; then echo "🔨 检测到 agent-runner 源码变更，重新编译..."; cd container/agent-runner && bun run build; else echo "✅ agent-runner 无变更，跳过编译"; fi
 	@echo "⚡ Bun 模式：直接运行 TypeScript，跳过后端编译"
 	bun src/index.ts
 else

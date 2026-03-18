@@ -212,6 +212,7 @@ function resolveStreamingPrev(current: StreamingState | undefined, event: Stream
   return current || { ...DEFAULT_STREAMING_STATE };
 }
 
+const MAX_STREAMING_TEXT = 8000;
 const MAX_EVENT_LOG = 30;
 const SDK_TASK_AUTO_CLOSE_MS = 3000;
 const SDK_TASK_TOOL_END_FALLBACK_CLOSE_MS = 1200;
@@ -259,12 +260,12 @@ function flushPendingDelta(
       const next = { ...prev };
       if (mergedText) {
         const combined = prev.partialText + mergedText;
-        next.partialText = combined.length > 8000 ? combined.slice(-8000) : combined;
+        next.partialText = combined.length > MAX_STREAMING_TEXT ? combined.slice(-MAX_STREAMING_TEXT) : combined;
         next.isThinking = false;
       }
       if (mergedThinking) {
         const combined = prev.thinkingText + mergedThinking;
-        next.thinkingText = combined.length > 8000 ? combined.slice(-8000) : combined;
+        next.thinkingText = combined.length > MAX_STREAMING_TEXT ? combined.slice(-MAX_STREAMING_TEXT) : combined;
         next.isThinking = true;
       }
       return { agentStreaming: { ...s.agentStreaming, [agentId]: next } };
@@ -273,7 +274,6 @@ function flushPendingDelta(
     set((s) => {
       if (!s.streaming[chatJid] && s.waiting[chatJid] === false) return s;
       if (s.streaming[chatJid]?.interrupted) return s;
-      const MAX_STREAMING_TEXT = 8000;
       const prev = s.streaming[chatJid] || { ...DEFAULT_STREAMING_STATE };
       const next = { ...prev };
       if (mergedText) {
@@ -1969,6 +1969,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   // 清除流式状态（保留仍在运行的后台 SDK Task 的 agentStreaming）
   clearStreaming: (chatJid, options) => {
+    // Cancel any pending rAF for this chatJid to prevent stale flushes
+    const mainKey = `main:${chatJid}`;
+    const mainEntry = pendingDeltas.get(mainKey);
+    if (mainEntry) {
+      cancelAnimationFrame(mainEntry.raf);
+      pendingDeltas.delete(mainKey);
+    }
     set((s) => {
       const next = { ...s.streaming };
       const thinkingText = next[chatJid]?.thinkingText;
@@ -2017,18 +2024,20 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   saveDraft: (jid, text) => {
     set((s) => {
-      const next = { ...s.drafts };
       if (text) {
-        next[jid] = text;
-      } else {
-        delete next[jid];
+        if (s.drafts[jid] === text) return s;
+        return { drafts: { ...s.drafts, [jid]: text } };
       }
+      if (!(jid in s.drafts)) return s;
+      const next = { ...s.drafts };
+      delete next[jid];
       return { drafts: next };
     });
   },
 
   clearDraft: (jid) => {
     set((s) => {
+      if (!(jid in s.drafts)) return s;
       const next = { ...s.drafts };
       delete next[jid];
       return { drafts: next };

@@ -133,7 +133,7 @@ import {
   RegisteredGroup,
 } from './types.js';
 import { logger } from './logger.js';
-import { stripAgentInternalTags } from './utils.js';
+import { stripAgentInternalTags, stripVirtualJidSuffix } from './utils.js';
 import { normalizeImageAttachments } from './message-attachments.js';
 import {
   startWebServer,
@@ -2670,6 +2670,39 @@ function startIpcWatcher(): void {
 
   const fsp = fs.promises;
 
+  /**
+   * Broadcast a message to all connected IM channels of a user that haven't
+   * already received it. Used by scheduled tasks to fan out to all IM channels.
+   */
+  function broadcastToOwnerIMChannels(
+    userId: string,
+    sourceFolder: string,
+    alreadySentJids: Set<string>,
+    sendFn: (jid: string) => void,
+  ): void {
+    const sentChannelTypes = new Set<string>();
+    for (const jid of alreadySentJids) {
+      const ct = getChannelType(jid);
+      if (ct) sentChannelTypes.add(ct);
+    }
+    const connectedTypes = imManager.getConnectedChannelTypes(userId);
+    const ownerGroups = getGroupsByOwner(userId);
+    for (const channelType of connectedTypes) {
+      if (sentChannelTypes.has(channelType)) continue;
+      const target =
+        ownerGroups.find(
+          (g) =>
+            getChannelType(g.jid) === channelType &&
+            g.folder === sourceFolder,
+        ) ||
+        ownerGroups.find((g) => getChannelType(g.jid) === channelType);
+      if (target) {
+        sendFn(target.jid);
+        sentChannelTypes.add(channelType);
+      }
+    }
+  }
+
   const processIpcFiles = async () => {
     if (shuttingDown) return;
     // Scan all group IPC directories (identity determined by directory)
@@ -2774,48 +2807,20 @@ function startIpcWatcher(): void {
 
                   // Scheduled task: broadcast to all connected IM channels of the owner
                   if (data.isScheduledTask && sourceGroupEntry?.created_by) {
-                    const sentChannelTypes = new Set<string>();
-                    // Mark already-sent channel types
-                    const primaryType = getChannelType(data.chatJid);
-                    if (primaryType) sentChannelTypes.add(primaryType);
-                    if (ipcImRoute) {
-                      const routeType = getChannelType(ipcImRoute);
-                      if (routeType) sentChannelTypes.add(routeType);
-                    }
-
-                    const connectedTypes = imManager.getConnectedChannelTypes(
-                      sourceGroupEntry.created_by,
+                    const alreadySent = new Set<string>(
+                      [data.chatJid, ipcImRoute].filter(Boolean) as string[],
                     );
-                    const ownerGroups = getGroupsByOwner(
-                      sourceGroupEntry.created_by,
+                    const taskLocalImages = extractLocalImImagePaths(
+                      data.text,
+                      sourceGroup,
                     );
-
-                    for (const channelType of connectedTypes) {
-                      if (sentChannelTypes.has(channelType)) continue;
-                      // Find an IM JID of this channel type (prefer same folder)
-                      const sameFolderGroup = ownerGroups.find(
-                        (g) =>
-                          getChannelType(g.jid) === channelType &&
-                          g.folder === sourceGroup,
-                      );
-                      const anyGroup =
-                        sameFolderGroup ||
-                        ownerGroups.find(
-                          (g) => getChannelType(g.jid) === channelType,
-                        );
-                      if (anyGroup) {
-                        const taskLocalImages = extractLocalImImagePaths(
-                          data.text,
-                          sourceGroup,
-                        );
-                        sendImWithFailTracking(
-                          anyGroup.jid,
-                          data.text,
-                          taskLocalImages,
-                        );
-                        sentChannelTypes.add(channelType);
-                      }
-                    }
+                    broadcastToOwnerIMChannels(
+                      sourceGroupEntry.created_by,
+                      sourceGroup,
+                      alreadySent,
+                      (jid) =>
+                        sendImWithFailTracking(jid, data.text, taskLocalImages),
+                    );
                   }
                   logger.info(
                     { chatJid: data.chatJid, sourceGroup, imRoute: ipcImRoute },
@@ -2904,52 +2909,23 @@ function startIpcWatcher(): void {
 
                     // Scheduled task: broadcast image to all connected IM channels
                     if (data.isScheduledTask && sourceGroupEntry?.created_by) {
-                      const sentImgChannelTypes = new Set<string>();
-                      const imgPrimaryType = getChannelType(data.chatJid);
-                      if (imgPrimaryType) sentImgChannelTypes.add(imgPrimaryType);
-                      if (imgImRoute) {
-                        const imgRouteType = getChannelType(imgImRoute);
-                        if (imgRouteType)
-                          sentImgChannelTypes.add(imgRouteType);
-                      }
-
-                      const imgConnectedTypes =
-                        imManager.getConnectedChannelTypes(
-                          sourceGroupEntry.created_by,
-                        );
-                      const imgOwnerGroups = getGroupsByOwner(
-                        sourceGroupEntry.created_by,
+                      const alreadySent = new Set<string>(
+                        [data.chatJid, imgImRoute].filter(Boolean) as string[],
                       );
-
-                      for (const ct of imgConnectedTypes) {
-                        if (sentImgChannelTypes.has(ct)) continue;
-                        const target =
-                          imgOwnerGroups.find(
-                            (g) =>
-                              getChannelType(g.jid) === ct &&
-                              g.folder === sourceGroup,
-                          ) ||
-                          imgOwnerGroups.find(
-                            (g) => getChannelType(g.jid) === ct,
-                          );
-                        if (target) {
+                      broadcastToOwnerIMChannels(
+                        sourceGroupEntry.created_by,
+                        sourceGroup,
+                        alreadySent,
+                        (jid) =>
                           imManager
-                            .sendImage(
-                              target.jid,
-                              imageBuffer,
-                              mimeType,
-                              caption,
-                              fileName,
-                            )
+                            .sendImage(jid, imageBuffer, mimeType, caption, fileName)
                             .catch((err) =>
                               logger.warn(
-                                { jid: target.jid, err },
+                                { jid, err },
                                 'Failed to broadcast task image to IM',
                               ),
-                            );
-                          sentImgChannelTypes.add(ct);
-                        }
-                      }
+                            ),
+                      );
                     }
 
                     logger.info(
@@ -5364,12 +5340,7 @@ async function main(): Promise<void> {
 
   queue.setProcessMessagesFn(processGroupMessages);
   queue.setHostModeChecker((groupJid: string) => {
-    // Strip virtual JID suffixes to resolve the actual registered group
-    let baseJid = groupJid;
-    const taskSep = baseJid.indexOf('#task:');
-    if (taskSep >= 0) baseJid = baseJid.slice(0, taskSep);
-    const agentSep = baseJid.indexOf('#agent:');
-    if (agentSep >= 0) baseJid = baseJid.slice(0, agentSep);
+    const baseJid = stripVirtualJidSuffix(groupJid);
 
     let group = registeredGroups[baseJid];
     if (!group) {
@@ -5418,12 +5389,7 @@ async function main(): Promise<void> {
   // Billing: user-level concurrent container limit
   queue.setUserConcurrentLimitChecker((groupJid: string) => {
     if (!isBillingEnabled()) return { allowed: true };
-    // Strip virtual JID suffixes
-    let baseJid = groupJid;
-    const taskSep = baseJid.indexOf('#task:');
-    if (taskSep >= 0) baseJid = baseJid.slice(0, taskSep);
-    const agentSep = baseJid.indexOf('#agent:');
-    if (agentSep >= 0) baseJid = baseJid.slice(0, agentSep);
+    const baseJid = stripVirtualJidSuffix(groupJid);
     const group = registeredGroups[baseJid];
     if (!group?.created_by) return { allowed: true };
     const owner = getUserById(group.created_by);
