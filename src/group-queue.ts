@@ -507,6 +507,25 @@ export class GroupQueue {
   }
 
   /**
+   * Remove leftover _drain and _close sentinel files from the IPC input
+   * directory.  Called in finally blocks after a runner exits so that a
+   * subsequent runner for the same folder does not immediately see stale
+   * sentinels and exit prematurely.
+   */
+  private cleanupIpcSentinels(groupFolder: string, agentId?: string | null): void {
+    const inputDir = agentId
+      ? path.join(DATA_DIR, 'ipc', groupFolder, 'agents', agentId, 'input')
+      : path.join(DATA_DIR, 'ipc', groupFolder, 'input');
+    for (const name of ['_drain', '_close']) {
+      try {
+        fs.unlinkSync(path.join(inputDir, name));
+      } catch {
+        // file may not exist – that's fine
+      }
+    }
+  }
+
+  /**
    * Signal the active container to finish the current query and then exit.
    * Unlike _close which exits immediately from waitForIpcMessage, _drain
    * is only checked after the current query completes, ensuring one-question-
@@ -850,6 +869,14 @@ export class GroupQueue {
       logger.error({ groupJid, err }, 'Error processing messages for group');
       this.scheduleRetry(groupJid, state);
     } finally {
+      // Clean up stale sentinel files before clearing groupFolder/agentId
+      if (state.groupFolder) {
+        try {
+          this.cleanupIpcSentinels(state.groupFolder, state.agentId);
+        } catch (err) {
+          logger.warn({ groupJid, err }, 'Failed to clean up IPC sentinels');
+        }
+      }
       state.active = false;
       state.drainSentinelWritten = false;
       state.lastActivityAt = null;
@@ -919,6 +946,14 @@ export class GroupQueue {
     } catch (err) {
       logger.error({ groupJid, taskId: task.id, err }, 'Error running task');
     } finally {
+      // Clean up stale sentinel files before clearing groupFolder/agentId
+      if (state.groupFolder) {
+        try {
+          this.cleanupIpcSentinels(state.groupFolder, state.agentId);
+        } catch (err) {
+          logger.warn({ groupJid, err }, 'Failed to clean up IPC sentinels');
+        }
+      }
       state.active = false;
       state.activeRunnerIsTask = false;
       state.drainSentinelWritten = false;
