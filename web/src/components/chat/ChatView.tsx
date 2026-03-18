@@ -8,6 +8,7 @@ import { FilePanel } from './FilePanel';
 import { ContainerEnvPanel } from './ContainerEnvPanel';
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { ConfirmDialog } from '@/components/common/ConfirmDialog';
+import { PromptDialog } from '@/components/common/PromptDialog';
 import { ArrowLeft, FolderOpen, Link, MessageSquare, Monitor, Moon, MoreHorizontal, PanelRightClose, PanelRightOpen, Server, Sun, Terminal, Users, Variable, X, Zap } from 'lucide-react';
 import { useDisplayMode } from '../../hooks/useDisplayMode';
 import { useTheme } from '../../hooks/useTheme';
@@ -67,6 +68,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
   const [mobileActionsOpen, setMobileActionsOpen] = useState(false);
   // null = dialog closed; MAIN_BINDING = main conversation; other = agent id
   const [bindingAgentId, setBindingAgentId] = useState<string | null>(null);
+  const [showNewConversation, setShowNewConversation] = useState(false);
   // Code / Plan mode toggle (per group)
   const [permissionMode, setPermissionMode] = useState<'bypassPermissions' | 'plan'>('bypassPermissions');
   const [imStatus, setImStatus] = useState<{ feishu: boolean; telegram: boolean } | null>(null);
@@ -530,14 +532,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
           }
           deleteAgentAction(groupJid, id);
         }}
-        onCreateConversation={() => {
-          const name = prompt('对话名称：');
-          if (name?.trim()) {
-            createConversation(groupJid, name.trim()).then((agent) => {
-              if (agent) setActiveAgentTab(groupJid, agent.id);
-            });
-          }
-        }}
+        onCreateConversation={() => setShowNewConversation(true)}
         onBindIm={setBindingAgentId}
         onBindMainIm={!isHome ? () => setBindingAgentId(MAIN_BINDING) : undefined}
       />
@@ -846,6 +841,19 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
           onClose={() => setBindingAgentId(null)}
         />
       )}
+
+      <PromptDialog
+        open={showNewConversation}
+        title="新建对话"
+        label="对话名称"
+        placeholder="输入对话名称"
+        onConfirm={(name) => {
+          createConversation(groupJid, name).then((agent) => {
+            if (agent) setActiveAgentTab(groupJid, agent.id);
+          });
+        }}
+        onClose={() => setShowNewConversation(false)}
+      />
     </div>
   );
 }

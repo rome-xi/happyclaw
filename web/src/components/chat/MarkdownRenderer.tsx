@@ -43,7 +43,7 @@ function MarkdownImageLightbox({ src, onClose }: { src: string; onClose: () => v
       <img
         src={src}
         alt="放大查看"
-        className="w-[90vw] h-[90vh] object-contain cursor-default"
+        className="max-w-[90vw] max-h-[90vh] object-contain cursor-default"
         onClick={(e) => e.stopPropagation()}
       />
     </div>,
