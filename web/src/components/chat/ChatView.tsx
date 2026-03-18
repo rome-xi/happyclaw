@@ -103,6 +103,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
   const agentStreaming = useChatStore(s => s.agentStreaming);
   const createConversation = useChatStore(s => s.createConversation);
   const loadAgentMessages = useChatStore(s => s.loadAgentMessages);
+  const refreshAgentMessages = useChatStore(s => s.refreshAgentMessages);
   const sendAgentMessage = useChatStore(s => s.sendAgentMessage);
   const agentMessages = useChatStore(s => s.agentMessages);
   const agentWaiting = useChatStore(s => s.agentWaiting);
@@ -194,10 +195,19 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
     restoreActiveState();
     const unsub = wsManager.on('connected', () => {
       restoreActiveState();
+      // Refresh conversation agent messages that may have been missed during WS disconnection
+      const state = useChatStore.getState();
+      const currentTab = state.activeAgentTab[groupJid];
+      if (currentTab) {
+        const agentInfo = (state.agents[groupJid] || []).find(a => a.id === currentTab);
+        if (agentInfo?.kind === 'conversation') {
+          refreshAgentMessages(groupJid, currentTab);
+        }
+      }
     });
     return () => { unsub(); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [groupJid]);
 
   // Derived: active agent info and kind
   const activeAgent = activeAgentTab ? agents.find(a => a.id === activeAgentTab) : null;
