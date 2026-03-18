@@ -33,9 +33,6 @@ export class StreamEventProcessor {
   // this accumulates all text_delta to produce the complete response.
   private fullTextAccumulator = '';
 
-  // <internal> tag filtering state — content inside <internal>...</internal> is suppressed
-  private insideInternal = false;
-
   // Top-level tool use tracking
   private activeTopLevelToolUseId: string | null = null;
   // Active Skill tool ID: tools called inside Skill may lack parent_tool_use_id
@@ -93,55 +90,12 @@ export class StreamEventProcessor {
     return b;
   }
 
-  /**
-   * Strip <internal>...</internal> blocks from text.
-   * Tracks state across calls so partial tags spanning multiple flushes are handled.
-   */
-  private filterInternalTags(text: string): string {
-    // If we're inside an <internal> block, look for the closing tag
-    if (this.insideInternal) {
-      const endIdx = text.indexOf('</internal>');
-      if (endIdx !== -1) {
-        this.insideInternal = false;
-        text = text.substring(endIdx + '</internal>'.length);
-      } else {
-        return ''; // Still inside, suppress all
-      }
-    }
-
-    // Strip complete <internal>...</internal> blocks
-    text = text.replace(/<internal>[\s\S]*?<\/internal>/g, '');
-
-    // Check for unclosed <internal> tag
-    const startIdx = text.indexOf('<internal>');
-    if (startIdx !== -1) {
-      this.insideInternal = true;
-      text = text.substring(0, startIdx);
-    }
-
-    // Handle potential partial "<internal" at end of buffer (at least 2 chars to avoid false matches on lone '<')
-    const partialIdx = text.lastIndexOf('<');
-    if (partialIdx !== -1 && partialIdx > text.length - '<internal>'.length) {
-      const tail = text.substring(partialIdx);
-      if (tail.length >= 2 && '<internal>'.startsWith(tail)) {
-        // Could be start of <internal>, hold back in buffer
-        text = text.substring(0, partialIdx);
-      }
-    }
-
-    return text;
-  }
-
   /** Flush all pending text/thinking buffers. */
   private flushBuffers(): void {
     for (const [key, buf] of this.streamBufs) {
       const pid = key === this.BUF_MAIN ? undefined : key;
       if (buf.text) {
-        // Filter <internal>...</internal> blocks from main text stream
-        const filtered = pid === undefined ? this.filterInternalTags(buf.text) : buf.text;
-        if (filtered) {
-          this.emit({ status: 'stream', result: null, streamEvent: { eventType: 'text_delta', text: filtered, parentToolUseId: pid } });
-        }
+        this.emit({ status: 'stream', result: null, streamEvent: { eventType: 'text_delta', text: buf.text, parentToolUseId: pid } });
         buf.text = '';
       }
       if (buf.think) {
@@ -795,23 +749,18 @@ export class StreamEventProcessor {
       this.flushBuffers();
       this.seenTextualResult = true;
     }
-    // Strip <internal>...</internal> from accumulated text before comparing
-    const cleanedAccumulator = this.fullTextAccumulator.replace(/<internal>[\s\S]*?<\/internal>/g, '');
-    const cleanedResult = textResult?.replace(/<internal>[\s\S]*?<\/internal>/g, '') || null;
     // Use fullTextAccumulator if it's more complete than SDK's result
-    const effectiveResult = cleanedAccumulator.length > (cleanedResult?.length || 0)
-      ? cleanedAccumulator
-      : cleanedResult;
-    // Reset accumulator and internal-tag state for next query loop
+    const effectiveResult = this.fullTextAccumulator.length > (textResult?.length || 0)
+      ? this.fullTextAccumulator
+      : (textResult || null);
+    // Reset accumulator for next query loop
     this.fullTextAccumulator = '';
-    this.insideInternal = false;
     return { effectiveResult, seenTextual: !!textResult };
   }
 
-  /** Reset the full text accumulator and internal-tag state (e.g., on context overflow). */
+  /** Reset the full text accumulator (e.g., on context overflow). */
   resetFullTextAccumulator(): void {
     this.fullTextAccumulator = '';
-    this.insideInternal = false;
   }
 
   /**

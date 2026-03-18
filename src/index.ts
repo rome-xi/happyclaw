@@ -2689,12 +2689,11 @@ function saveInterruptedStreamingMessages(): void {
     );
 
     for (const [jid, partialText] of activeTexts) {
-      const cleaned = stripAgentInternalTags(partialText);
-      if (!cleaned.trim()) {
+      if (!partialText.trim()) {
         shutdownSavedJids.add(jid);
         continue;
       }
-      const interruptedText = buildInterruptedReply(cleaned);
+      const interruptedText = buildInterruptedReply(partialText);
       const msgId = crypto.randomUUID();
       const timestamp = new Date().toISOString();
       ensureChatExists(jid);
@@ -2791,8 +2790,7 @@ function recoverStreamingBuffer(): void {
     for (const filename of txtFiles) {
       try {
         const jid = decodeJidFromFilename(filename);
-        const rawText = fs.readFileSync(path.join(STREAMING_BUFFER_DIR, filename), 'utf-8');
-        const text = stripAgentInternalTags(rawText);
+        const text = fs.readFileSync(path.join(STREAMING_BUFFER_DIR, filename), 'utf-8');
         if (text.trim()) {
           const interruptedText = buildInterruptedReply(text);
           const msgId = crypto.randomUUID();
