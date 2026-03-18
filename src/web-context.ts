@@ -61,6 +61,7 @@ export interface WebDeps {
   } | null>;
   clearImFailCounts?: (jid: string) => void;
   updateReplyRoute?: (folder: string, sourceJid: string | null) => void;
+  triggerTaskRun?: (taskId: string) => { success: boolean; error?: string };
 }
 
 export type Variables = {
