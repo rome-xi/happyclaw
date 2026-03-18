@@ -68,6 +68,7 @@ import {
   getRunningTaskAgentsByChat,
   markRunningTaskAgentsAsError,
   markAllRunningTaskAgentsAsError,
+  listActiveConversationAgents,
   getSession,
   listAgentsByJid,
   getGroupsByOwner,
@@ -4347,6 +4348,88 @@ function recoverPendingMessages(): void {
   }
 }
 
+/**
+ * Startup recovery for conversation agents.
+ * After restart, running conversation agents have dead processes.
+ * Reset their status and re-trigger processing if they have pending messages.
+ */
+function recoverConversationAgents(): void {
+  const agents = listActiveConversationAgents();
+  if (agents.length === 0) return;
+
+  logger.info(
+    { count: agents.length },
+    'Recovery: found active conversation agents from previous session',
+  );
+
+  for (const agent of agents) {
+    try {
+      const chatJid = agent.chat_jid;
+      const agentId = agent.id;
+
+      // Reset running → idle (process is dead)
+      if (agent.status === 'running') {
+        updateAgentStatus(agentId, 'idle');
+        broadcastAgentStatus(
+          chatJid,
+          agentId,
+          'idle',
+          agent.name,
+          agent.prompt,
+          agent.result_summary ?? undefined,
+          agent.kind,
+        );
+      }
+
+      // Check for pending messages on the virtual JID
+      const virtualChatJid = `${chatJid}#agent:${agentId}`;
+      const sinceCursor = lastAgentTimestamp[virtualChatJid] || EMPTY_CURSOR;
+      const pending = getMessagesSince(virtualChatJid, sinceCursor);
+
+      if (pending.length > 0) {
+        logger.info(
+          { agentId, agentName: agent.name, pendingCount: pending.length },
+          'Recovery: re-triggering conversation agent with pending messages',
+        );
+
+        // Store a system notice so the user sees something in the chat
+        const now = new Date().toISOString();
+        const noticeId = `system-recover-${agentId}-${Date.now()}`;
+        storeMessageDirect(
+          noticeId,
+          virtualChatJid,
+          'system',
+          ASSISTANT_NAME,
+          '服务已重启，正在恢复上次未完成的任务...',
+          now,
+          true,
+        );
+        broadcastNewMessage(virtualChatJid, {
+          id: noticeId,
+          chat_jid: virtualChatJid,
+          sender: 'system',
+          sender_name: ASSISTANT_NAME,
+          content: '服务已重启，正在恢复上次未完成的任务...',
+          timestamp: now,
+          is_from_me: true,
+          source_jid: virtualChatJid,
+        });
+
+        // Enqueue the agent conversation for processing
+        const taskId = `agent-recover:${agentId}:${Date.now()}`;
+        queue.enqueueTask(virtualChatJid, taskId, async () => {
+          await processAgentConversation(chatJid, agentId);
+        });
+      }
+    } catch (err) {
+      logger.error(
+        { err, agentId: agent.id, groupFolder: agent.group_folder },
+        'Recovery: failed to recover conversation agent, skipping',
+      );
+    }
+  }
+}
+
 async function ensureDockerRunning(): Promise<void> {
   // Skip all Docker checks when no groups use container mode
   if (!hasContainerModeGroups()) {
@@ -5510,6 +5593,7 @@ async function main(): Promise<void> {
 
   startIpcWatcher();
   recoverPendingMessages();
+  recoverConversationAgents();
   startMessageLoop();
 
   // --- IM Connection Pool: connect per-user IM channels ---
