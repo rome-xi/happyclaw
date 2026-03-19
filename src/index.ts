@@ -2708,7 +2708,7 @@ function saveInterruptedStreamingMessages(): void {
       storeMessageDirect(
         msgId,
         jid,
-        ASSISTANT_NAME,
+        'happyclaw-agent',
         ASSISTANT_NAME,
         interruptedText,
         timestamp,
@@ -2808,7 +2808,7 @@ function recoverStreamingBuffer(): void {
           storeMessageDirect(
             msgId,
             jid,
-            ASSISTANT_NAME,
+            'happyclaw-agent',
             ASSISTANT_NAME,
             interruptedText,
             timestamp,
