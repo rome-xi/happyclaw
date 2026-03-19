@@ -98,7 +98,6 @@ import {
   resolveLocationInfo,
   type WorkspaceInfo,
 } from './im-command-utils.js';
-import { analyzeIntent } from './intent-analyzer.js';
 import { invalidateSessionCache, getWebDeps } from './web-context.js';
 import {
   getFeishuProviderConfigWithSource,
@@ -4689,9 +4688,6 @@ async function startMessageLoop(): Promise<void> {
           const images = collectMessageImages(chatJid, messagesToSend);
           const imagesForAgent = images.length > 0 ? images : undefined;
 
-          const lastRawText = messagesToSend[messagesToSend.length - 1].content;
-          const intent = analyzeIntent(lastRawText);
-
           // Determine the IM source JID for route update on successful injection
           const lastSourceJidForRoute =
             messagesToSend[messagesToSend.length - 1]?.source_jid || chatJid;
@@ -4700,7 +4696,6 @@ async function startMessageLoop(): Promise<void> {
             chatJid,
             formatted,
             imagesForAgent,
-            intent,
             () => {
               // IPC write succeeded — update reply route for the running agent
               activeRouteUpdaters.get(group.folder)?.(lastSourceJidForRoute);
@@ -4715,24 +4710,6 @@ async function startMessageLoop(): Promise<void> {
               },
               'Piped messages to active container',
             );
-            const lastProcessed = messagesToSend[messagesToSend.length - 1];
-            lastAgentTimestamp[chatJid] = {
-              timestamp: lastProcessed.timestamp,
-              id: lastProcessed.id,
-            };
-            saveState();
-          } else if (sendResult === 'interrupted_stop') {
-            // Stop intent: update cursor, don't enqueue (agent stops)
-            const lastProcessed = messagesToSend[messagesToSend.length - 1];
-            lastAgentTimestamp[chatJid] = {
-              timestamp: lastProcessed.timestamp,
-              id: lastProcessed.id,
-            };
-            saveState();
-          } else if (sendResult === 'interrupted_correction') {
-            // Correction intent: update cursor; the IPC message was written so the
-            // interrupted agent will pick it up in its session loop after the abort.
-            // No enqueueMessageCheck needed — the existing agent handles it.
             const lastProcessed = messagesToSend[messagesToSend.length - 1];
             lastAgentTimestamp[chatJid] = {
               timestamp: lastProcessed.timestamp,
@@ -5220,27 +5197,19 @@ function shouldProcessGroupMessage(chatJid: string): boolean {
 }
 
 /**
- * 中断 fast-path 回调：IM 消息到达时立即触发中断，绕过 2s 轮询延迟。
- * 模块级函数，所有 IM 连接共享。
+ * 飞书流式卡片按钮中断回调。
+ * 仅由飞书卡片按钮触发，不涉及自动关键词检测。
  */
-function handleIMInterruptRequest(
-  chatJid: string,
-  intent: 'stop' | 'correction',
-): void {
+function handleCardInterrupt(chatJid: string): void {
   const interrupted = queue.interruptQuery(chatJid);
   if (interrupted) {
-    logger.info(
-      { chatJid, intent },
-      'Interrupt fast-path: query interrupted immediately',
-    );
+    logger.info({ chatJid }, 'Card interrupt: query interrupted');
   }
 
-  // Immediately abort the streaming card so the user sees "已中断" right away,
-  // without waiting for the agent-runner to process the interrupt sentinel.
   const session = getStreamingSession(chatJid);
   if (session?.isActive()) {
     session.abort('用户中断').catch((err) => {
-      logger.debug({ err, chatJid }, 'Failed to abort streaming card on interrupt');
+      logger.debug({ err, chatJid }, 'Failed to abort streaming card');
     });
   }
 }
@@ -5289,7 +5258,7 @@ async function connectUserIMChannels(
         onBotAddedToGroup,
         onBotRemovedFromGroup,
         shouldProcessGroupMessage,
-        onInterruptRequest: handleIMInterruptRequest,
+        onCardInterrupt: handleCardInterrupt,
       },
     );
   }
@@ -5312,7 +5281,6 @@ async function connectUserIMChannels(
         onAgentMessage,
         onBotAddedToGroup: buildTelegramBotAddedHandler(userId, homeFolder),
         onBotRemovedFromGroup,
-        onInterruptRequest: handleIMInterruptRequest,
       },
     );
   }
@@ -5334,7 +5302,6 @@ async function connectUserIMChannels(
         resolveGroupFolder,
         resolveEffectiveChatJid,
         onAgentMessage,
-        onInterruptRequest: handleIMInterruptRequest,
       },
     );
   }
@@ -5642,7 +5609,7 @@ async function main(): Promise<void> {
           onBotAddedToGroup: buildOnNewChat(adminUser.id, homeFolder),
           onBotRemovedFromGroup: buildOnBotRemovedFromGroup(),
           shouldProcessGroupMessage,
-          onInterruptRequest: handleIMInterruptRequest,
+          onCardInterrupt: handleCardInterrupt,
         },
       );
       if (connected) {
@@ -5701,7 +5668,6 @@ async function main(): Promise<void> {
             homeFolder,
           ),
           onBotRemovedFromGroup: buildOnBotRemovedFromGroup(),
-          onInterruptRequest: handleIMInterruptRequest,
         },
       );
       return connected;
@@ -5746,7 +5712,7 @@ async function main(): Promise<void> {
             onBotAddedToGroup: buildOnNewChat(userId, homeFolder),
             onBotRemovedFromGroup: buildOnBotRemovedFromGroup(),
             shouldProcessGroupMessage,
-            onInterruptRequest: handleIMInterruptRequest,
+            onCardInterrupt: handleCardInterrupt,
           },
         );
         logger.info(
@@ -5779,7 +5745,6 @@ async function main(): Promise<void> {
             onAgentMessage: buildOnAgentMessage(),
             onBotAddedToGroup: buildTelegramBotAddedHandler(userId, homeFolder),
             onBotRemovedFromGroup: buildOnBotRemovedFromGroup(),
-            onInterruptRequest: handleIMInterruptRequest,
           },
         );
         logger.info(
@@ -5812,7 +5777,6 @@ async function main(): Promise<void> {
               resolveEffectiveFolder(chatJid),
             resolveEffectiveChatJid: buildResolveEffectiveChatJid(),
             onAgentMessage: buildOnAgentMessage(),
-            onInterruptRequest: handleIMInterruptRequest,
           },
         );
         logger.info({ userId, connected }, 'User QQ connection hot-reloaded');

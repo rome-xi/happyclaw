@@ -16,7 +16,6 @@ import {
 } from './im-downloader.js';
 import { broadcastNewMessage } from './web.js';
 import { detectImageMimeType } from './image-detector.js';
-import { analyzeIntent } from './intent-analyzer.js';
 import {
   resolveJidByMessageId,
   getStreamingSession,
@@ -58,11 +57,8 @@ export interface ConnectOptions {
   onBotRemovedFromGroup?: (chatJid: string) => void;
   /** 群聊消息过滤：bot 未被 @mention 时调用，返回 true 则处理，false 则丢弃 */
   shouldProcessGroupMessage?: (chatJid: string) => boolean;
-  /** 中断 fast-path：消息到达时立即检测中断意图，绕过轮询延迟直接触发中断 */
-  onInterruptRequest?: (
-    chatJid: string,
-    intent: 'stop' | 'correction',
-  ) => void;
+  /** 飞书流式卡片按钮中断回调 */
+  onCardInterrupt?: (chatJid: string) => void;
 }
 
 export interface FeishuChatInfo {
@@ -769,7 +765,6 @@ export function createFeishuConnection(
       resolveEffectiveChatJid,
       onAgentMessage,
       shouldProcessGroupMessage,
-      onInterruptRequest,
     } = connectOptions || {};
     const {
       chatId,
@@ -1015,18 +1010,6 @@ export function createFeishuConnection(
     const agentRouting = resolveEffectiveChatJid?.(chatJid);
     const targetJid = agentRouting?.effectiveJid ?? chatJid;
 
-    // ── 中断 fast-path：消息到达时立即检测中断意图，绕过 2s 轮询延迟 ──
-    // 使用路由后的 targetJid 确保中断命中正确的 queue key
-    if (onInterruptRequest && text.length <= 50) {
-      const intent = analyzeIntent(text);
-      if (intent !== 'continue') {
-        onInterruptRequest(targetJid, intent);
-        logger.info(
-          { chatJid, targetJid, messageId, intent },
-          'Interrupt fast-path triggered from Feishu',
-        );
-      }
-    }
     const targetAgentId = agentRouting?.agentId;
 
     storeChatMetadata(targetJid, timestamp);
@@ -1413,7 +1396,7 @@ export function createFeishuConnection(
             }
 
             logger.info({ chatJid, messageId }, 'Card action: interrupt via button');
-            connectOptions?.onInterruptRequest?.(chatJid, 'stop');
+            connectOptions?.onCardInterrupt?.(chatJid);
           } catch (err) {
             logger.error({ err }, 'Error handling card action trigger');
           }

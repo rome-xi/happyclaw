@@ -82,7 +82,6 @@ import type {
 } from './types.js';
 import { WEB_PORT, SESSION_COOKIE_NAME, ASSISTANT_NAME } from './config.js';
 import { logger } from './logger.js';
-import { analyzeIntent } from './intent-analyzer.js';
 import { executeSessionReset } from './commands.js';
 import {
   normalizeImageAttachments,
@@ -338,13 +337,11 @@ async function handleWebUserMessage(
   // longer need to kill and restart the process (#99).
   let pipedToActive = false;
   const images = toAgentImages(normalizedAttachments);
-  const intent = analyzeIntent(content);
   const updateRoute = deps.updateReplyRoute;
   const sendResult = deps.queue.sendMessage(
     chatJid,
     formatted,
     images,
-    intent,
     () => {
       // IPC write succeeded — update reply route for home groups.
       // Web messages have no IM source, so clear the IM route.
@@ -352,12 +349,6 @@ async function handleWebUserMessage(
     },
   );
   if (sendResult === 'sent') {
-    pipedToActive = true;
-  } else if (sendResult === 'interrupted_stop') {
-    // Stop intent: cursor updated, no enqueue needed
-    pipedToActive = true;
-  } else if (sendResult === 'interrupted_correction') {
-    // Correction intent: IPC message written, agent handles it after interrupt
     pipedToActive = true;
   } else if (sendResult === 'queued') {
     // Message queued for next container run; don't advance cursor so
@@ -460,13 +451,11 @@ async function handleAgentConversationMessage(
   );
 
   // Try to pipe into running agent process
-  const agentIntent = analyzeIntent(content);
   const agentImages = toAgentImages(normalizedAttachments);
   const agentSendResult = deps.queue.sendMessage(
     virtualChatJid,
     formatted,
     agentImages,
-    agentIntent,
   );
   if (agentSendResult === 'no_active') {
     // No running process — start one via processAgentConversation
@@ -477,8 +466,7 @@ async function handleAgentConversationMessage(
       });
     }
   }
-  // 'sent', 'interrupted_stop', 'interrupted_correction' need no further action —
-  // for correction, the IPC message was written and the agent handles it after interrupt
+  // 'sent' needs no further action
 }
 
 // --- Static Files ---
