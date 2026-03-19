@@ -417,12 +417,6 @@ function sendImWithFailTracking(
   text: string,
   localImagePaths: string[],
 ): void {
-  // DEBUG: trace every IM send with caller stack
-  const stack = new Error().stack?.split('\n').slice(1, 4).map(l => l.trim()).join(' <- ') || '';
-  logger.info(
-    { imJid, textLen: text.length, preview: text.slice(0, 80), callerStack: stack },
-    '[DEBUG-IM-SEND] sendImWithFailTracking called',
-  );
   imManager
     .sendMessage(imJid, text, localImagePaths)
     .then(() => {
@@ -2066,6 +2060,27 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               }
             }
 
+            // ── Rebuild streaming card after compact_partial / overflow_partial ──
+            // The completed card was consumed; create a new one so post-compaction
+            // tool-call progress remains visible on Feishu (#223).
+            if (
+              streamingCardHandledIM &&
+              (result.sourceKind === 'compact_partial' || result.sourceKind === 'overflow_partial')
+            ) {
+              unregisterStreamingSession(streamingSessionJid);
+              streamingSession = imManager.createStreamingSession(
+                streamingSessionJid,
+                makeOnCardCreated(streamingSessionJid),
+              );
+              if (streamingSession) {
+                registerStreamingSession(streamingSessionJid, streamingSession);
+                logger.debug(
+                  { chatJid, sourceKind: result.sourceKind },
+                  'Rebuilt streaming card after partial output',
+                );
+              }
+            }
+
             // Skip IM send to the original chatJid when:
             // 1. Streaming card already handled the IM delivery, OR
             // 2. Reply route switched to a different IM channel (the routed IM
@@ -2623,10 +2638,6 @@ async function sendMessage(
   try {
     if (sendToIM && isIMChannel) {
       try {
-        logger.info(
-          { jid, textLen: text.length, preview: text.slice(0, 80) },
-          '[DEBUG-IM-SEND] sendMessage direct IM send',
-        );
         const localImagePaths =
           options.localImagePaths ??
           extractLocalImImagePaths(text, resolveEffectiveFolder(jid));
@@ -3861,7 +3872,7 @@ async function processAgentConversation(
   // only stream when the message originates from an IM channel (replySourceImJid).
   // Web-only interactions don't need a Feishu streaming card.
   const streamingSessionJid = replySourceImJid;
-  const agentStreamingSession = streamingSessionJid
+  let agentStreamingSession = streamingSessionJid
     ? imManager.createStreamingSession(
         streamingSessionJid,
         (messageId) => registerMessageIdMapping(messageId, streamingSessionJid),
@@ -4105,8 +4116,74 @@ async function processAgentConversation(
           }
         }
 
+        // ── Rebuild streaming card after compact_partial / overflow_partial ──
+        // The completed card was consumed; create a new one so post-compaction
+        // tool-call progress remains visible on Feishu (#223).
+        if (
+          streamingCardHandledIM &&
+          (output.sourceKind === 'compact_partial' || output.sourceKind === 'overflow_partial') &&
+          streamingSessionJid
+        ) {
+          agentStreamingAccText = '';
+          unregisterStreamingSession(streamingSessionJid);
+          agentStreamingSession = imManager.createStreamingSession(
+            streamingSessionJid,
+            (messageId) => registerMessageIdMapping(messageId, streamingSessionJid),
+          );
+          if (agentStreamingSession) {
+            registerStreamingSession(streamingSessionJid, agentStreamingSession);
+            logger.debug(
+              { chatJid, agentId, sourceKind: output.sourceKind },
+              'Rebuilt streaming card after partial output',
+            );
+          }
+        }
+
         if (replySourceImJid && !streamingCardHandledIM) {
-          sendImWithFailTracking(replySourceImJid, text, localImagePaths);
+          // Retry IM send with backoff — connection may be briefly down after
+          // compact / force-restart.  Without retry, fire-and-forget silently
+          // drops the message when findChannelForJid returns null (#221).
+          const IM_SEND_MAX_RETRIES = 3;
+          const IM_SEND_RETRY_DELAY_MS = 2_000;
+          let imSent = false;
+          for (let attempt = 0; attempt < IM_SEND_MAX_RETRIES; attempt++) {
+            try {
+              await imManager.sendMessage(
+                replySourceImJid,
+                text,
+                localImagePaths,
+              );
+              imSent = true;
+              break;
+            } catch (imErr) {
+              logger.warn(
+                { chatJid, agentId, replySourceImJid, sourceKind: output.sourceKind, attempt, err: imErr },
+                'Agent conversation: IM send attempt failed',
+              );
+              if (attempt < IM_SEND_MAX_RETRIES - 1) {
+                await new Promise(r => setTimeout(r, IM_SEND_RETRY_DELAY_MS * (attempt + 1)));
+              }
+            }
+          }
+          if (imSent) {
+            imSendFailCounts.delete(replySourceImJid);
+            logger.info(
+              { chatJid, agentId, replySourceImJid, sourceKind: output.sourceKind, textLen: text.length },
+              'Agent conversation: static IM message sent',
+            );
+          } else {
+            logger.error(
+              { chatJid, agentId, replySourceImJid, sourceKind: output.sourceKind },
+              'Agent conversation: IM send failed after all retries, message lost',
+            );
+            const count = (imSendFailCounts.get(replySourceImJid) ?? 0) + 1;
+            imSendFailCounts.set(replySourceImJid, count);
+          }
+        } else if (!replySourceImJid) {
+          logger.debug(
+            { chatJid, agentId, sourceKind: output.sourceKind },
+            'Agent conversation: no replySourceImJid, skip IM delivery',
+          );
         }
 
         // Optional mirror mode for linked IM channels
