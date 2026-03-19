@@ -22,10 +22,11 @@ import {
   buildContainerEnvLines,
   getClaudeProviderConfig,
   getContainerEnvConfig,
-  getCustomEnvForProfile,
+  getEnabledProviders,
+  getBalancingConfig,
   getSystemSettings,
   mergeClaudeEnvConfig,
-  resolveProfileToConfig,
+  resolveProviderById,
   shellQuoteEnvLines,
   writeCredentialsFile,
 } from './runtime-config.js';
@@ -155,6 +156,42 @@ function mkdirForContainer(dirPath: string): void {
 interface ResolvedProvider {
   config: ClaudeProviderConfig;
   customEnv: Record<string, string>;
+}
+
+/**
+ * Try to select a provider from the pool. Returns profileId + resolved config,
+ * or null if pool mode is off (≤1 enabled) / group has provider override / selection fails.
+ */
+function trySelectPoolProvider(
+  groupFolder: string,
+): { profileId: string; resolved: ResolvedProvider } | null {
+  const override = getContainerEnvConfig(groupFolder);
+  const hasOverride = !!(
+    override.anthropicApiKey ||
+    override.anthropicAuthToken ||
+    override.anthropicBaseUrl
+  );
+  if (hasOverride) return null;
+
+  // Refresh pool state from V4 config
+  const enabledProviders = getEnabledProviders();
+  if (enabledProviders.length <= 1) return null; // No pool needed for 0-1 providers
+
+  const balancing = getBalancingConfig();
+  providerPool.refreshFromConfig(enabledProviders, balancing);
+
+  try {
+    const profileId = providerPool.selectProvider();
+    const resolved = resolveProviderById(profileId);
+    providerPool.acquireSession(profileId);
+    return {
+      profileId,
+      resolved: { config: resolved.config, customEnv: resolved.customEnv },
+    };
+  } catch (err) {
+    logger.warn({ err }, 'Provider pool selection failed, falling back to active profile');
+    return null;
+  }
 }
 
 function buildVolumeMounts(
@@ -445,33 +482,9 @@ export async function runContainerAgent(
   mkdirForContainer(groupDir);
 
   // ─── Provider Pool selection ───
-  const containerOverrideForCheck = getContainerEnvConfig(group.folder);
-  const hasProviderOverride = !!(
-    containerOverrideForCheck.anthropicApiKey ||
-    containerOverrideForCheck.anthropicAuthToken ||
-    containerOverrideForCheck.anthropicBaseUrl
-  );
-
-  let selectedProfileId: string | null = null;
-  let resolvedProvider: ResolvedProvider | undefined;
-
-  if (!hasProviderOverride && providerPool.getConfig().mode === 'pool') {
-    try {
-      selectedProfileId = providerPool.selectProvider();
-      resolvedProvider = {
-        config: resolveProfileToConfig(selectedProfileId),
-        customEnv: getCustomEnvForProfile(selectedProfileId),
-      };
-      providerPool.acquireSession(selectedProfileId);
-    } catch (err) {
-      logger.warn(
-        { err },
-        'Provider pool selection failed, falling back to active profile',
-      );
-      selectedProfileId = null;
-      resolvedProvider = undefined;
-    }
-  }
+  const poolResult = trySelectPoolProvider(group.folder);
+  const selectedProfileId = poolResult?.profileId ?? null;
+  const resolvedProvider = poolResult?.resolved;
 
   try {
     // Determine if this is an admin home container (full privileges)
@@ -971,40 +984,16 @@ export async function runHostAgent(
 
   // ─── Provider Pool selection (host mode) ───
   const containerOverride = getContainerEnvConfig(group.folder);
-  const hasProviderOverride = !!(
-    containerOverride.anthropicApiKey ||
-    containerOverride.anthropicAuthToken ||
-    containerOverride.anthropicBaseUrl
-  );
-
-  let hostSelectedProfileId: string | null = null;
-  let hostProviderCustomEnv: Record<string, string> | undefined;
-  let globalConfig: ClaudeProviderConfig;
-
-  if (!hasProviderOverride && providerPool.getConfig().mode === 'pool') {
-    try {
-      hostSelectedProfileId = providerPool.selectProvider();
-      globalConfig = resolveProfileToConfig(hostSelectedProfileId);
-      hostProviderCustomEnv = getCustomEnvForProfile(hostSelectedProfileId);
-      providerPool.acquireSession(hostSelectedProfileId);
-    } catch (err) {
-      logger.warn(
-        { err },
-        'Provider pool selection failed in host mode, falling back',
-      );
-      hostSelectedProfileId = null;
-      globalConfig = getClaudeProviderConfig();
-    }
-  } else {
-    globalConfig = getClaudeProviderConfig();
-  }
+  const hostPoolResult = trySelectPoolProvider(group.folder);
+  const hostSelectedProfileId = hostPoolResult?.profileId ?? null;
+  const globalConfig = hostPoolResult?.resolved.config ?? getClaudeProviderConfig();
 
   try {
     // 配置层环境变量
     const envLines = buildContainerEnvLines(
       globalConfig,
       containerOverride,
-      hostProviderCustomEnv,
+      hostPoolResult?.resolved.customEnv,
     );
     for (const line of envLines) {
       const eqIdx = line.indexOf('=');

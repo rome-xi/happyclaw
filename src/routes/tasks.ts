@@ -16,6 +16,7 @@ import {
   deleteTask,
   getTaskRunLogs,
   getRegisteredGroup,
+  getAllRegisteredGroups,
 } from '../db.js';
 import type { AuthUser } from '../types.js';
 import { TIMEZONE } from '../config.js';
@@ -32,11 +33,12 @@ const tasksRoutes = new Hono<{ Variables: Variables }>();
 
 tasksRoutes.get('/', authMiddleware, (c) => {
   const authUser = c.get('user') as AuthUser;
+  const allGroups = getAllRegisteredGroups();
   const tasks = getAllTasks().filter((task) => {
-    const group = getRegisteredGroup(task.chat_jid);
+    const group = allGroups[task.chat_jid];
     // Conservative: if group can't be resolved, only admin can see (may be orphaned task)
     if (!group) return authUser.role === 'admin';
-    if (!canAccessGroup({ id: authUser.id, role: authUser.role }, group))
+    if (!canAccessGroup({ id: authUser.id, role: authUser.role }, { ...group, jid: task.chat_jid }))
       return false;
     if (isHostExecutionGroup(group) && !hasHostExecutionPermission(authUser))
       return false;

@@ -601,22 +601,84 @@ export const BugReportSubmitSchema = z.object({
   body: z.string().min(1).max(65536),
 });
 
-// ─── Provider Pool ──────────────────────────────────────────
+// ─── 统一供应商 (V4) ────────────────────────────────────────
 
-export const ProviderPoolSchema = z.object({
-  mode: z.enum(['fixed', 'pool']),
+export const UnifiedProviderCreateSchema = z
+  .object({
+    name: z.string().min(1).max(64),
+    type: z.enum(['official', 'third_party']),
+    anthropicBaseUrl: z.string().max(2000).optional(),
+    anthropicAuthToken: z.string().max(2000).optional(),
+    anthropicModel: z.string().max(128).optional(),
+    anthropicApiKey: z.string().max(2000).optional(),
+    claudeCodeOauthToken: z.string().max(2000).optional(),
+    claudeOAuthCredentials: ClaudeOAuthCredentialsSchema.optional(),
+    customEnv: z.record(z.string().max(256), z.string().max(4096)).optional(),
+    weight: z.number().int().min(1).max(100).optional(),
+    enabled: z.boolean().optional(),
+  })
+  .superRefine((data, ctx) => {
+    if (
+      data.type === 'third_party' &&
+      !data.anthropicBaseUrl?.trim() &&
+      !data.anthropicAuthToken?.trim()
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['anthropicBaseUrl'],
+        message: '第三方供应商需要提供 Base URL 或 Auth Token',
+      });
+    }
+  });
+
+export const UnifiedProviderPatchSchema = z
+  .object({
+    name: z.string().min(1).max(64).optional(),
+    anthropicBaseUrl: z.string().max(2000).optional(),
+    anthropicModel: z.string().max(128).optional(),
+    customEnv: z.record(z.string().max(256), z.string().max(4096)).optional(),
+    weight: z.number().int().min(1).max(100).optional(),
+  })
+  .refine(
+    (data) =>
+      data.name !== undefined ||
+      data.anthropicBaseUrl !== undefined ||
+      data.anthropicModel !== undefined ||
+      data.customEnv !== undefined ||
+      data.weight !== undefined,
+    { message: 'At least one field must be provided' },
+  );
+
+export const UnifiedProviderSecretsSchema = z
+  .object({
+    anthropicAuthToken: z.string().max(2000).optional(),
+    clearAnthropicAuthToken: z.boolean().optional(),
+    anthropicApiKey: z.string().max(2000).optional(),
+    clearAnthropicApiKey: z.boolean().optional(),
+    claudeCodeOauthToken: z.string().max(2000).optional(),
+    clearClaudeCodeOauthToken: z.boolean().optional(),
+    claudeOAuthCredentials: ClaudeOAuthCredentialsSchema.optional(),
+    clearClaudeOAuthCredentials: z.boolean().optional(),
+  })
+  .refine(
+    (data) => {
+      return (
+        typeof data.anthropicAuthToken === 'string' ||
+        data.clearAnthropicAuthToken === true ||
+        typeof data.anthropicApiKey === 'string' ||
+        data.clearAnthropicApiKey === true ||
+        typeof data.claudeCodeOauthToken === 'string' ||
+        data.clearClaudeCodeOauthToken === true ||
+        data.claudeOAuthCredentials !== undefined ||
+        data.clearClaudeOAuthCredentials === true
+      );
+    },
+    { message: 'At least one secret field must be provided' },
+  );
+
+export const BalancingConfigSchema = z.object({
   strategy: z
     .enum(['round-robin', 'weighted-round-robin', 'failover'])
-    .optional(),
-  members: z
-    .array(
-      z.object({
-        profileId: z.string().min(1).max(64),
-        weight: z.number().int().min(1).max(100).optional().default(1),
-        enabled: z.boolean().optional().default(true),
-      }),
-    )
-    .max(20)
     .optional(),
   unhealthyThreshold: z.number().int().min(1).max(20).optional(),
   recoveryIntervalMs: z.number().int().min(30000).max(3600000).optional(),

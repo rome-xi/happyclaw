@@ -2,25 +2,12 @@
  * Provider Pool — 多提供商负载均衡
  *
  * 支持三种策略：round-robin、weighted-round-robin、failover
- * 健康状态纯内存管理，配置持久化到 data/config/provider-pool.json
+ * 健康状态纯内存管理，配置由 runtime-config V4 注入（不再自行管理配置文件）
  */
-import fs from 'fs';
-import path from 'path';
-
-import { DATA_DIR } from './config.js';
 import { logger } from './logger.js';
+import type { BalancingConfig } from './runtime-config.js';
 
 // ─── 类型定义 ──────────────────────────────────────────────
-
-export interface StoredProviderPoolConfig {
-  version: 1;
-  mode: 'fixed' | 'pool';
-  strategy: 'round-robin' | 'weighted-round-robin' | 'failover';
-  members: ProviderPoolMember[];
-  unhealthyThreshold: number;
-  recoveryIntervalMs: number;
-  updatedAt: string;
-}
 
 export interface ProviderPoolMember {
   profileId: string;
@@ -40,23 +27,8 @@ export interface ProviderHealthStatus {
 
 // ─── 常量 ──────────────────────────────────────────────────
 
-const CLAUDE_CONFIG_DIR = path.join(DATA_DIR, 'config');
-const POOL_CONFIG_FILE = path.join(CLAUDE_CONFIG_DIR, 'provider-pool.json');
-
 const DEFAULT_UNHEALTHY_THRESHOLD = 3;
 const DEFAULT_RECOVERY_INTERVAL_MS = 300_000; // 5 minutes
-
-function defaultConfig(): StoredProviderPoolConfig {
-  return {
-    version: 1,
-    mode: 'fixed',
-    strategy: 'round-robin',
-    members: [],
-    unhealthyThreshold: DEFAULT_UNHEALTHY_THRESHOLD,
-    recoveryIntervalMs: DEFAULT_RECOVERY_INTERVAL_MS,
-    updatedAt: new Date().toISOString(),
-  };
-}
 
 function makeHealthStatus(profileId: string): ProviderHealthStatus {
   return {
@@ -73,77 +45,47 @@ function makeHealthStatus(profileId: string): ProviderHealthStatus {
 // ─── ProviderPool 类 ──────────────────────────────────────
 
 export class ProviderPool {
-  private config: StoredProviderPoolConfig;
+  private members: ProviderPoolMember[] = [];
+  private strategy: BalancingConfig['strategy'] = 'round-robin';
+  private unhealthyThreshold = DEFAULT_UNHEALTHY_THRESHOLD;
+  private recoveryIntervalMs = DEFAULT_RECOVERY_INTERVAL_MS;
   private healthMap: Map<string, ProviderHealthStatus> = new Map();
   private roundRobinIndex = 0;
-  private configMtimeMs = 0;
 
-  constructor() {
-    this.config = this.loadConfigFromDisk();
-  }
+  /**
+   * Refresh internal state from V4 provider config.
+   * Called by container-runner before selection, and by routes after config changes.
+   */
+  refreshFromConfig(
+    providers: Array<{ id: string; enabled: boolean; weight: number }>,
+    balancing: BalancingConfig,
+  ): void {
+    this.members = providers.map((p) => ({
+      profileId: p.id,
+      weight: Math.max(1, Math.min(100, p.weight || 1)),
+      enabled: p.enabled,
+    }));
+    this.strategy = balancing.strategy;
+    this.unhealthyThreshold = balancing.unhealthyThreshold;
+    this.recoveryIntervalMs = balancing.recoveryIntervalMs;
 
-  // ─── 配置管理 ────────────────────────────────────────────
-
-  private loadConfigFromDisk(): StoredProviderPoolConfig {
-    try {
-      if (!fs.existsSync(POOL_CONFIG_FILE)) return defaultConfig();
-      const content = fs.readFileSync(POOL_CONFIG_FILE, 'utf-8');
-      const parsed = JSON.parse(content) as StoredProviderPoolConfig;
-      if (parsed.version !== 1) return defaultConfig();
-      this.configMtimeMs = fs.statSync(POOL_CONFIG_FILE).mtimeMs;
-      return parsed;
-    } catch (err) {
-      logger.warn({ err }, 'Failed to read provider-pool.json, using defaults');
-      return defaultConfig();
+    // Clean up health entries for removed members
+    const memberIds = new Set(this.members.map((m) => m.profileId));
+    for (const key of this.healthMap.keys()) {
+      if (!memberIds.has(key)) this.healthMap.delete(key);
     }
   }
 
-  /** Reload config from disk if file changed */
-  reload(): void {
-    try {
-      if (!fs.existsSync(POOL_CONFIG_FILE)) {
-        this.config = defaultConfig();
-        this.configMtimeMs = 0;
-        return;
-      }
-      const stat = fs.statSync(POOL_CONFIG_FILE);
-      if (stat.mtimeMs === this.configMtimeMs) return; // unchanged
-      this.config = this.loadConfigFromDisk();
-      // Clean up health entries for removed members
-      const memberIds = new Set(this.config.members.map((m) => m.profileId));
-      for (const key of this.healthMap.keys()) {
-        if (!memberIds.has(key)) this.healthMap.delete(key);
-      }
-    } catch (err) {
-      logger.warn({ err }, 'Failed to reload provider-pool.json');
-    }
-  }
-
-  saveConfig(config: StoredProviderPoolConfig): void {
-    fs.mkdirSync(CLAUDE_CONFIG_DIR, { recursive: true });
-    const tmp = `${POOL_CONFIG_FILE}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(config, null, 2) + '\n', 'utf-8');
-    fs.renameSync(tmp, POOL_CONFIG_FILE);
-    this.config = config;
-    try {
-      this.configMtimeMs = fs.statSync(POOL_CONFIG_FILE).mtimeMs;
-    } catch {
-      /* ignore */
-    }
-  }
-
-  getConfig(): StoredProviderPoolConfig {
-    return this.config;
+  /** How many enabled members are currently configured */
+  getEnabledCount(): number {
+    return this.members.filter((m) => m.enabled).length;
   }
 
   // ─── 选择算法 ────────────────────────────────────────────
 
   /** 选择一个提供商，返回 profileId */
   selectProvider(): string {
-    // Auto-reload config if file changed on disk
-    this.reload();
-
-    const { strategy, members, recoveryIntervalMs } = this.config;
+    const { strategy, members, recoveryIntervalMs } = this;
     const now = Date.now();
 
     // Auto-recover unhealthy members (skip disabled ones)
@@ -184,7 +126,7 @@ export class ProviderPool {
         );
         return fallback.profileId;
       }
-      // No members at all — shouldn't happen if mode=pool, but be safe
+      // No members at all
       throw new Error('Provider pool has no members configured');
     }
 
@@ -199,22 +141,25 @@ export class ProviderPool {
       }
 
       case 'weighted-round-robin': {
-        // Build weighted array
-        const weighted: ProviderPoolMember[] = [];
+        const totalWeight = candidates.reduce(
+          (sum, c) => sum + Math.max(1, Math.min(100, c.weight || 1)),
+          0,
+        );
+        const target = this.roundRobinIndex % totalWeight;
+        let cumulative = 0;
+        selected = candidates[0];
         for (const c of candidates) {
-          const w = Math.max(1, Math.min(100, c.weight || 1));
-          for (let i = 0; i < w; i++) {
-            weighted.push(c);
+          cumulative += Math.max(1, Math.min(100, c.weight || 1));
+          if (target < cumulative) {
+            selected = c;
+            break;
           }
         }
-        const idx = this.roundRobinIndex % weighted.length;
-        selected = weighted[idx];
-        this.roundRobinIndex = idx + 1;
+        this.roundRobinIndex += 1;
         break;
       }
 
       case 'failover': {
-        // Return first healthy candidate (preserves original order)
         selected = candidates[0];
         break;
       }
@@ -225,7 +170,7 @@ export class ProviderPool {
       }
     }
 
-    logger.info(
+    logger.debug(
       { profileId: selected.profileId, strategy },
       'Selected provider for session',
     );
@@ -252,7 +197,7 @@ export class ProviderPool {
 
     if (
       health.healthy &&
-      health.consecutiveErrors >= this.config.unhealthyThreshold
+      health.consecutiveErrors >= this.unhealthyThreshold
     ) {
       health.healthy = false;
       health.unhealthySince = Date.now();
@@ -260,7 +205,7 @@ export class ProviderPool {
         {
           profileId,
           consecutiveErrors: health.consecutiveErrors,
-          threshold: this.config.unhealthyThreshold,
+          threshold: this.unhealthyThreshold,
         },
         'Provider marked unhealthy after consecutive failures',
       );
@@ -283,16 +228,17 @@ export class ProviderPool {
 
   getHealthStatuses(): ProviderHealthStatus[] {
     // Ensure all configured members have health entries
-    for (const member of this.config.members) {
+    for (const member of this.members) {
       this.getOrCreateHealth(member.profileId);
     }
-    return this.config.members.map(
-      (m) => this.healthMap.get(m.profileId) || makeHealthStatus(m.profileId),
-    );
+    return this.members.map((m) => ({
+      ...(this.healthMap.get(m.profileId) || makeHealthStatus(m.profileId)),
+    }));
   }
 
   getHealthStatus(profileId: string): ProviderHealthStatus {
-    return this.healthMap.get(profileId) || makeHealthStatus(profileId);
+    const health = this.healthMap.get(profileId);
+    return health ? { ...health } : makeHealthStatus(profileId);
   }
 
   resetHealth(profileId: string): void {
