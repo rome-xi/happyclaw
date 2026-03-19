@@ -161,6 +161,7 @@ const execFileAsync = promisify(execFile);
 const DEFAULT_MAIN_JID = 'web:main';
 const DEFAULT_MAIN_NAME = 'Main';
 const SAFE_REQUEST_ID_RE = /^[A-Za-z0-9_-]+$/;
+const OOM_EXIT_RE = /code 137/;
 
 /**
  * Feed a stream event into a Feishu streaming card controller.
@@ -482,34 +483,49 @@ function extractLocalImImagePaths(
 }
 
 /**
- * Send an IM message with retry + exponential backoff.
- * On final failure, increments imSendFailCounts and may auto-unbind the IM group.
- * Used by both main session and sub-agent paths for consistent reliability.
+ * Generic IM operation retry with linear backoff (2s, 4s, 6s).
+ * Returns true on success, false when all retries are exhausted.
  */
 const IM_SEND_MAX_RETRIES = 3;
 const IM_SEND_RETRY_DELAY_MS = 2_000;
 
-async function sendImWithRetry(
+async function retryImOperation(
+  label: string,
   imJid: string,
-  text: string,
-  localImagePaths: string[],
+  fn: () => Promise<void>,
 ): Promise<boolean> {
   for (let attempt = 0; attempt < IM_SEND_MAX_RETRIES; attempt++) {
     try {
-      await imManager.sendMessage(imJid, text, localImagePaths);
-      imSendFailCounts.delete(imJid);
+      await fn();
       return true;
     } catch (err) {
-      logger.warn(
-        { imJid, attempt, err },
-        'IM send attempt failed',
-      );
+      logger.warn({ imJid, attempt, label, err }, 'IM operation attempt failed');
       if (attempt < IM_SEND_MAX_RETRIES - 1) {
         await new Promise(r => setTimeout(r, IM_SEND_RETRY_DELAY_MS * (attempt + 1)));
       }
     }
   }
-  // All retries exhausted
+  logger.error({ imJid, label }, 'IM operation failed after all retries');
+  return false;
+}
+
+/**
+ * Send an IM message with retry.
+ * On final failure, increments imSendFailCounts and may auto-unbind the IM group.
+ */
+async function sendImWithRetry(
+  imJid: string,
+  text: string,
+  localImagePaths: string[],
+): Promise<boolean> {
+  const ok = await retryImOperation('send_message', imJid, () =>
+    imManager.sendMessage(imJid, text, localImagePaths),
+  );
+  if (ok) {
+    imSendFailCounts.delete(imJid);
+    return true;
+  }
+  // All retries exhausted — track cumulative failures
   const count = (imSendFailCounts.get(imJid) ?? 0) + 1;
   imSendFailCounts.set(imJid, count);
   if (count >= IM_SEND_FAIL_THRESHOLD) {
@@ -2455,8 +2471,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       return true;
     }
 
-    // ── OOM auto-recovery: detect consecutive exit code 137 (SIGKILL/OOM) ──
-    const isOom = /code 137|signal SIGKILL/.test(errorDetail);
+    // ── OOM auto-recovery: detect consecutive exit code 137 (OOM) ──
+    // Only match `code 137` (Docker cgroup OOM killer), not `signal SIGKILL`
+    // which is ambiguous for host processes (could be user stop, process tree
+    // kill, or actual OOM).  exitLabel is either `code N` or `signal X` —
+    // never both — so this only triggers on Docker container OOM exits.
+    const isOom = OOM_EXIT_RE.test(errorDetail);
     if (isOom) {
       const folder = effectiveGroup.folder;
       consecutiveOomExits[folder] = (consecutiveOomExits[folder] || 0) + 1;
@@ -3266,12 +3286,8 @@ function startIpcWatcher(): void {
                         ? data.chatJid
                         : activeImReplyRoutes.get(sourceGroup) ?? null;
                     if (imgImRoute) {
-                      await imManager.sendImage(
-                        imgImRoute,
-                        imageBuffer,
-                        mimeType,
-                        caption,
-                        fileName,
+                      await retryImOperation('send_image', imgImRoute, () =>
+                        imManager.sendImage(imgImRoute, imageBuffer, mimeType, caption, fileName),
                       );
                     }
 
@@ -3923,7 +3939,10 @@ async function processTaskIpc(
               ? data.chatJid
               : activeImReplyRoutes.get(sourceGroup) ?? null;
           if (fileImRoute) {
-            await imManager.sendFile(fileImRoute, resolvedPath, data.fileName);
+            const imFileName = data.fileName || path.basename(resolvedPath);
+            await retryImOperation('send_file', fileImRoute, () =>
+              imManager.sendFile(fileImRoute, resolvedPath, imFileName),
+            );
           } else {
             logger.debug(
               { chatJid: data.chatJid, sourceGroup },
@@ -4010,14 +4029,23 @@ async function processAgentConversation(
 
   // Fallback: if no IM source in current messages (e.g. web "继续" after
   // restart), recover from the persisted last_im_jid in the DB (#225).
+  // Verify the channel is actually connected — stale JIDs from disabled
+  // channels would cause unnecessary retries and eventual auto-unbind.
   if (!replySourceImJid) {
     const agentRow = getAgent(agentId);
-    if (agentRow?.last_im_jid && getChannelType(agentRow.last_im_jid) !== null) {
-      replySourceImJid = agentRow.last_im_jid;
-      logger.info(
-        { chatJid, agentId, recoveredImJid: replySourceImJid },
-        'Recovered IM routing from persisted last_im_jid',
-      );
+    if (agentRow?.last_im_jid) {
+      if (imManager.isChannelAvailableForJid(agentRow.last_im_jid)) {
+        replySourceImJid = agentRow.last_im_jid;
+        logger.info(
+          { chatJid, agentId, recoveredImJid: replySourceImJid },
+          'Recovered IM routing from persisted last_im_jid',
+        );
+      } else {
+        logger.info(
+          { chatJid, agentId, staleImJid: agentRow.last_im_jid },
+          'Skipped last_im_jid recovery: channel disconnected',
+        );
+      }
     }
   }
 

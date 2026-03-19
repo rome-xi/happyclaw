@@ -278,6 +278,16 @@ class IMConnectionManager {
     return types;
   }
 
+  /**
+   * Check if a specific JID has a connected channel available.
+   * Uses the same routing logic as sendMessage (group ownership + sibling fallback).
+   */
+  isChannelAvailableForJid(jid: string): boolean {
+    const channelType = getChannelType(jid);
+    if (!channelType) return false;
+    return !!this.findChannelForJid(jid, channelType);
+  }
+
   // ─── Convenience Methods (API-compatible wrappers) ──────────
 
   /**
