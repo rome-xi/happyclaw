@@ -407,7 +407,8 @@ export function initDatabase(): void {
       created_by TEXT,
       created_at TEXT NOT NULL,
       completed_at TEXT,
-      result_summary TEXT
+      result_summary TEXT,
+      last_im_jid TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_agents_group ON agents(group_folder);
     CREATE INDEX IF NOT EXISTS idx_agents_jid ON agents(chat_jid);
@@ -1159,7 +1160,17 @@ export function initDatabase(): void {
     })();
   }
 
-  const SCHEMA_VERSION = '29';
+  // v29 → v30: Add last_im_jid to agents table (#225)
+  if (
+    !db
+      .prepare("PRAGMA table_info('agents')")
+      .all()
+      .some((c: any) => c.name === 'last_im_jid')
+  ) {
+    db.exec('ALTER TABLE agents ADD COLUMN last_im_jid TEXT');
+  }
+
+  const SCHEMA_VERSION = '30';
   db.prepare(
     'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
   ).run('schema_version', SCHEMA_VERSION);
@@ -3698,6 +3709,16 @@ export function updateAgentStatus(
   ).run(status, completedAt, resultSummary ?? null, id);
 }
 
+export function updateAgentLastImJid(
+  id: string,
+  lastImJid: string | null,
+): void {
+  db.prepare('UPDATE agents SET last_im_jid = ? WHERE id = ?').run(
+    lastImJid,
+    id,
+  );
+}
+
 export function updateAgentInfo(
   id: string,
   name: string,
@@ -3781,6 +3802,8 @@ function mapAgentRow(row: Record<string, unknown>): SubAgent {
       typeof row.completed_at === 'string' ? row.completed_at : null,
     result_summary:
       typeof row.result_summary === 'string' ? row.result_summary : null,
+    last_im_jid:
+      typeof row.last_im_jid === 'string' ? row.last_im_jid : null,
   };
 }
 

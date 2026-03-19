@@ -63,6 +63,7 @@ import {
   createAgent,
   getAgent,
   updateAgentStatus,
+  updateAgentLastImJid,
   updateAgentInfo,
   deleteCompletedTaskAgents,
   getRunningTaskAgentsByChat,
@@ -1826,6 +1827,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                   created_at: new Date().toISOString(),
                   completed_at: null,
                   result_summary: null,
+                  last_im_jid: null,
                 });
               } else if (se.taskDescription) {
                 updateAgentInfo(
@@ -1913,6 +1915,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                   created_at: new Date().toISOString(),
                   completed_at: new Date().toISOString(),
                   result_summary: summary || null,
+                  last_im_jid: null,
                 });
                 broadcastAgentStatus(
                   chatJid,
@@ -3865,6 +3868,24 @@ async function processAgentConversation(
     if (lastSourceJid && getChannelType(lastSourceJid) !== null) {
       replySourceImJid = lastSourceJid;
     }
+  }
+
+  // Fallback: if no IM source in current messages (e.g. web "继续" after
+  // restart), recover from the persisted last_im_jid in the DB (#225).
+  if (!replySourceImJid) {
+    const agentRow = getAgent(agentId);
+    if (agentRow?.last_im_jid && getChannelType(agentRow.last_im_jid) !== null) {
+      replySourceImJid = agentRow.last_im_jid;
+      logger.info(
+        { chatJid, agentId, recoveredImJid: replySourceImJid },
+        'Recovered IM routing from persisted last_im_jid',
+      );
+    }
+  }
+
+  // Persist the IM routing target so it survives service restarts.
+  if (replySourceImJid) {
+    updateAgentLastImJid(agentId, replySourceImJid);
   }
 
   // ── Feishu Streaming Card (conversation agent) ──

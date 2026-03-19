@@ -291,6 +291,7 @@ export interface SubAgent {
   created_at: string;
   completed_at: string | null;
   result_summary: string | null;
+  last_im_jid: string | null;
 }
 
 // WebSocket message types
