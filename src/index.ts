@@ -2241,8 +2241,16 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   }
 
-  // runAgent threw — output is undefined, cannot proceed with post-processing
-  if (!output) return true;
+  // runAgent threw — output is undefined, cannot proceed with post-processing.
+  // If a reply was already sent, commit the cursor so we don't re-process.
+  // Otherwise return false to allow retry (H-1 audit fix).
+  if (!output) {
+    if (sentReply) {
+      commitCursor();
+      return true;
+    }
+    return false;
+  }
 
   // 不可恢复的转录错误（如超大图片/MIME 错配被固化在会话历史中）：无论是否已有回复，都必须重置会话
   const errorForReset = [lastError, output.error].filter(Boolean).join(' ');
@@ -2398,7 +2406,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         consecutiveOomExits[folder] = 0;
 
         // Clear session files and DB records (same as unrecoverable_transcript handling)
-        await clearSessionRuntimeFiles(folder);
+        try {
+          await clearSessionRuntimeFiles(folder);
+        } catch (err) {
+          logger.error({ folder, err }, 'Failed to clear session files during OOM auto-reset');
+        }
         try {
           deleteSession(folder);
           delete sessions[folder];
