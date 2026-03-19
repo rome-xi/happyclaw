@@ -246,12 +246,12 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, groupJ
             </tr>
           ),
           th: ({ children }) => (
-            <th className={`px-4 py-2 text-left font-semibold text-foreground border border-border break-words align-top ${tableTextClass}`}>
+            <th className={`px-4 py-2 text-left font-semibold text-foreground border border-border whitespace-nowrap align-top ${tableTextClass}`}>
               {children}
             </th>
           ),
           td: ({ children }) => (
-            <td className={`px-4 py-2 text-foreground border border-border break-words align-top ${tableTextClass}`}>
+            <td className={`px-4 py-2 text-foreground border border-border whitespace-nowrap align-top ${tableTextClass}`}>
               {children}
             </td>
           ),
