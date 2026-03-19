@@ -2799,8 +2799,8 @@ function buildInterruptedReply(partialText: string): string {
 function buildOverflowPartialReply(partialText: string): string {
   const trimmed = partialText.trimEnd();
   return trimmed
-    ? `${trimmed}\n\n---\n*⚠️ 上下文压缩中，以上为部分回复*`
-    : '*⚠️ 上下文压缩中*';
+    ? `${trimmed}\n\n---\n*⚠️ 上下文压缩中，稍后自动继续*`
+    : '*⚠️ 上下文压缩中，稍后自动继续*';
 }
 
 /**
