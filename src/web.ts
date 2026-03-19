@@ -630,7 +630,7 @@ function setupWebSocket(server: any): WebSocketServer {
         if (!g.active) continue;
         const jid = normalizeHomeJid(g.jid);
         const allowed = getGroupAllowedUserIds(g.jid);
-        if (allowed !== null && !allowed.has(userId)) continue;
+        if (allowed === null || !allowed.has(userId)) continue;
         try {
           ws.send(JSON.stringify({
             type: 'runner_state',
