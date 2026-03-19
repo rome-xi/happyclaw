@@ -198,6 +198,9 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
     restoreActiveState();
     const unsub = wsManager.on('connected', () => {
       restoreActiveState();
+      // Reconcile agent list with backend truth — picks up any agent_status
+      // events that were missed during WS disconnection.
+      loadAgents(groupJid);
       // Refresh conversation agent messages that may have been missed during WS disconnection
       const state = useChatStore.getState();
       const currentTab = state.activeAgentTab[groupJid];

@@ -619,6 +619,28 @@ function setupWebSocket(server: any): WebSocketServer {
       }
     }
 
+    // Push runner_state: 'running' for all active groups on WS connect.
+    // This prevents a race where a late-arriving new_message clears
+    // waiting=false after snapshot restore, blocking all subsequent
+    // stream events. The runner_state event resets waiting=true.
+    if (connSession && deps) {
+      const userId = connSession.user_id;
+      const queueStatus = deps.queue.getStatus();
+      for (const g of queueStatus.groups) {
+        if (!g.active) continue;
+        const jid = normalizeHomeJid(g.jid);
+        const allowed = getGroupAllowedUserIds(g.jid);
+        if (allowed !== null && !allowed.has(userId)) continue;
+        try {
+          ws.send(JSON.stringify({
+            type: 'runner_state',
+            chatJid: jid,
+            state: 'running',
+          } satisfies WsMessageOut));
+        } catch { /* client not ready */ }
+      }
+    }
+
     const cleanupTerminalForWs = () => {
       const termJid = wsTerminals.get(ws);
       if (!termJid) return;

@@ -2107,6 +2107,29 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // 冻结的中断状态不清除：等 new_message 或 fallback 定时器处理
       if (get().streaming[chatJid]?.interrupted) return;
       get().clearStreaming(chatJid);
+
+      // Runner idle → query 已结束，所有 SDK Task 应已完成。
+      // 如果有 task agent 仍显示 'running'，说明 agent_status WS 事件丢失，
+      // 在此强制标记完成并延迟清除，避免永久停留在 UI 上。
+      const currentAgents = get().agents[chatJid] || [];
+      const staleRunningTasks = currentAgents.filter(
+        (a) => a.kind === 'task' && a.status === 'running',
+      );
+      if (staleRunningTasks.length > 0) {
+        set((s) => {
+          const existing = s.agents[chatJid] || [];
+          const updated = existing.map((a) => {
+            if (a.kind === 'task' && a.status === 'running') {
+              return { ...a, status: 'completed' as const, completed_at: new Date().toISOString() };
+            }
+            return a;
+          });
+          return { agents: { ...s.agents, [chatJid]: updated } };
+        });
+        for (const agent of staleRunningTasks) {
+          scheduleDbTaskAgentCleanup(set, agent.id, chatJid);
+        }
+      }
     } else if (state === 'running') {
       // 新进程启动时重新设置 waiting=true，确保 handleStreamEvent 的防重入
       // guard（!streaming && waiting===false）不会丢弃新进程的 stream events。
