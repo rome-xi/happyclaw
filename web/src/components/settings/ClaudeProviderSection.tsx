@@ -180,6 +180,27 @@ export function ClaudeProviderSection({ setNotice, setError }: ClaudeProviderSec
     }
   }, [pendingDeleteProvider, loadProviders, setNotice, setError]);
 
+  // ─── 复制第三方提供商 ────────────────────────────────────────────
+  const handleDuplicate = useCallback(
+    async (provider: ProviderWithHealth) => {
+      try {
+        await api.post('/api/config/claude/providers', {
+          name: `${provider.name} (副本)`,
+          type: 'third_party',
+          anthropicBaseUrl: provider.anthropicBaseUrl,
+          anthropicModel: provider.anthropicModel,
+          customEnv: provider.customEnv,
+          enabled: false,
+        });
+        await loadProviders();
+        setNotice(`已复制提供商「${provider.name}」，密钥需要重新填写`);
+      } catch (err) {
+        setError(getErrorMessage(err, '复制提供商失败'));
+      }
+    },
+    [loadProviders, setNotice, setError],
+  );
+
   // ─── 编辑器回调 ───────────────────────────────────────────────
   const handleEditorSave = useCallback(() => {
     setEditorOpen(false);
@@ -231,6 +252,7 @@ export function ClaudeProviderSection({ setNotice, setError }: ClaudeProviderSec
         onDelete={(p) => setPendingDeleteProvider(p)}
         onToggle={handleToggle}
         onResetHealth={handleResetHealth}
+        onDuplicate={handleDuplicate}
         onAdd={() => {
           setEditingProvider(null);
           setEditorOpen(true);

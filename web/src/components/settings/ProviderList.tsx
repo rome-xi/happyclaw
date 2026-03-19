@@ -1,5 +1,6 @@
 import {
   Activity,
+  Copy,
   Edit3,
   Key,
   Loader2,
@@ -19,6 +20,7 @@ interface ProviderListProps {
   onDelete: (provider: ProviderWithHealth) => void;
   onToggle: (provider: ProviderWithHealth) => void;
   onResetHealth: (provider: ProviderWithHealth) => void;
+  onDuplicate: (provider: ProviderWithHealth) => void;
   onAdd: () => void;
   togglingId: string | null;
   deletingId: string | null;
@@ -102,6 +104,7 @@ export function ProviderList({
   onDelete,
   onToggle,
   onResetHealth,
+  onDuplicate,
   onAdd,
   togglingId,
   deletingId,
@@ -182,6 +185,18 @@ export function ProviderList({
                         <Edit3 className="size-3.5" />
                         编辑
                       </Button>
+                      {provider.type === 'third_party' && (
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          onClick={() => onDuplicate(provider)}
+                          disabled={disabled || toggling || deleting}
+                          className="h-7 px-2 text-xs"
+                        >
+                          <Copy className="size-3.5" />
+                          复制
+                        </Button>
+                      )}
                       <Button
                         size="sm"
                         variant="ghost"
