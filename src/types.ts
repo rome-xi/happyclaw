@@ -86,6 +86,7 @@ export type MessageSourceKind =
   | 'sdk_send_message'
   | 'interrupt_partial'
   | 'overflow_partial'
+  | 'compact_partial'
   | 'legacy';
 
 export type MessageFinalizationReason =
@@ -375,7 +376,7 @@ export type WsMessageOut =
           id: string;
           timestamp: number;
           text: string;
-          kind: string;
+          kind: 'tool' | 'skill' | 'hook' | 'status';
         }>;
         todos?: Array<{ id: string; content: string; status: string }>;
         systemStatus: string | null;

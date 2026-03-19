@@ -417,6 +417,12 @@ function sendImWithFailTracking(
   text: string,
   localImagePaths: string[],
 ): void {
+  // DEBUG: trace every IM send with caller stack
+  const stack = new Error().stack?.split('\n').slice(1, 4).map(l => l.trim()).join(' <- ') || '';
+  logger.info(
+    { imJid, textLen: text.length, preview: text.slice(0, 80), callerStack: stack },
+    '[DEBUG-IM-SEND] sendImWithFailTracking called',
+  );
   imManager
     .sendMessage(imJid, text, localImagePaths)
     .then(() => {
@@ -1125,7 +1131,7 @@ interface SendMessageOptions {
     turnId?: string;
     sessionId?: string;
     sdkMessageUuid?: string;
-    sourceKind?: 'sdk_final' | 'sdk_send_message' | 'interrupt_partial' | 'overflow_partial' | 'legacy';
+    sourceKind?: 'sdk_final' | 'sdk_send_message' | 'interrupt_partial' | 'overflow_partial' | 'compact_partial' | 'legacy';
     finalizationReason?: 'completed' | 'interrupted' | 'error';
   };
 }
@@ -2023,7 +2029,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               ? result.result
               : JSON.stringify(result.result);
           let text = stripAgentInternalTags(raw);
-          if (result.sourceKind === 'overflow_partial') {
+          if (result.sourceKind === 'overflow_partial' || result.sourceKind === 'compact_partial') {
             text = buildOverflowPartialReply(text);
           }
           logger.info(
@@ -2617,6 +2623,10 @@ async function sendMessage(
   try {
     if (sendToIM && isIMChannel) {
       try {
+        logger.info(
+          { jid, textLen: text.length, preview: text.slice(0, 80) },
+          '[DEBUG-IM-SEND] sendMessage direct IM send',
+        );
         const localImagePaths =
           options.localImagePaths ??
           extractLocalImImagePaths(text, resolveEffectiveFolder(jid));
@@ -2744,7 +2754,8 @@ function encodeJidForFilename(jid: string): string {
 }
 
 function decodeJidFromFilename(filename: string): string {
-  return Buffer.from(filename.replace('.txt', ''), 'base64url').toString();
+  const name = filename.endsWith('.txt') ? filename.slice(0, -4) : filename;
+  return Buffer.from(name, 'base64url').toString();
 }
 
 /** Write all active streaming texts to disk (atomic write per file). */
@@ -2950,8 +2961,11 @@ function startIpcWatcher(): void {
       const isHome = !!sourceGroupEntry?.is_home;
 
       // Collect all IPC roots: main group dir + agents/*/ + tasks-run/*/
+      // Tag agent roots with their agentId so we can route messages to virtual JIDs.
       const groupIpcRoot = path.join(ipcBaseDir, sourceGroup);
-      const ipcRoots = [groupIpcRoot];
+      const ipcRoots: Array<{ path: string; agentId: string | null }> = [
+        { path: groupIpcRoot, agentId: null },
+      ];
       try {
         const agentsDir = path.join(groupIpcRoot, 'agents');
         const agentEntries = await fsp.readdir(agentsDir, {
@@ -2959,7 +2973,10 @@ function startIpcWatcher(): void {
         });
         for (const entry of agentEntries) {
           if (entry.isDirectory()) {
-            ipcRoots.push(path.join(agentsDir, entry.name));
+            ipcRoots.push({
+              path: path.join(agentsDir, entry.name),
+              agentId: entry.name,
+            });
           }
         }
       } catch {
@@ -2972,14 +2989,17 @@ function startIpcWatcher(): void {
         });
         for (const entry of taskRunEntries) {
           if (entry.isDirectory()) {
-            ipcRoots.push(path.join(tasksRunDir, entry.name));
+            ipcRoots.push({
+              path: path.join(tasksRunDir, entry.name),
+              agentId: null,
+            });
           }
         }
       } catch {
         /* tasks-run dir may not exist */
       }
 
-      for (const ipcRoot of ipcRoots) {
+      for (const { path: ipcRoot, agentId: ipcAgentId } of ipcRoots) {
         const messagesDir = path.join(ipcRoot, 'messages');
         const tasksDir = path.join(ipcRoot, 'tasks');
 
@@ -3005,46 +3025,54 @@ function startIpcWatcher(): void {
                     targetGroup,
                   )
                 ) {
-                  await sendMessage(data.chatJid, data.text, {
+                  // Conversation agents: route to virtual JID so message appears
+                  // in the agent tab, not the main conversation.
+                  const effectiveChatJid = ipcAgentId
+                    ? `${data.chatJid}#agent:${ipcAgentId}`
+                    : data.chatJid;
+                  await sendMessage(effectiveChatJid, data.text, {
                     messageMeta: {
                       sourceKind: 'sdk_send_message',
                     },
                   });
-                  // Forward to IM channel when chatJid is a routed web JID
-                  // (e.g. 'web:main') but the message originated from an IM source.
-                  // Without this, IPC send_message only reaches Web + DB, not Feishu/TG.
-                  const ipcImRoute = activeImReplyRoutes.get(sourceGroup);
-                  if (
-                    ipcImRoute &&
-                    getChannelType(data.chatJid) === null &&
-                    ipcImRoute !== data.chatJid
-                  ) {
-                    const localImages = extractLocalImImagePaths(
-                      data.text,
-                      sourceGroup,
-                    );
-                    sendImWithFailTracking(ipcImRoute, data.text, localImages);
-                  }
 
-                  // Scheduled task: broadcast to all connected IM channels of the owner
-                  if (data.isScheduledTask && sourceGroupEntry?.created_by) {
-                    const alreadySent = new Set<string>(
-                      [data.chatJid, ipcImRoute].filter(Boolean) as string[],
-                    );
-                    const taskLocalImages = extractLocalImImagePaths(
-                      data.text,
-                      sourceGroup,
-                    );
-                    broadcastToOwnerIMChannels(
-                      sourceGroupEntry.created_by,
-                      sourceGroup,
-                      alreadySent,
-                      (jid) =>
-                        sendImWithFailTracking(jid, data.text, taskLocalImages),
-                    );
+                  // Forward to IM channel — but NOT for conversation agent messages.
+                  // Conversation agents handle their own IM routing in
+                  // processAgentConversation's wrappedOnOutput callback.
+                  if (!ipcAgentId) {
+                    const ipcImRoute = activeImReplyRoutes.get(sourceGroup);
+                    if (
+                      ipcImRoute &&
+                      getChannelType(data.chatJid) === null &&
+                      ipcImRoute !== data.chatJid
+                    ) {
+                      const localImages = extractLocalImImagePaths(
+                        data.text,
+                        sourceGroup,
+                      );
+                      sendImWithFailTracking(ipcImRoute, data.text, localImages);
+                    }
+
+                    // Scheduled task: broadcast to all connected IM channels of the owner
+                    if (data.isScheduledTask && sourceGroupEntry?.created_by) {
+                      const alreadySent = new Set<string>(
+                        [data.chatJid, ipcImRoute].filter(Boolean) as string[],
+                      );
+                      const taskLocalImages = extractLocalImImagePaths(
+                        data.text,
+                        sourceGroup,
+                      );
+                      broadcastToOwnerIMChannels(
+                        sourceGroupEntry.created_by,
+                        sourceGroup,
+                        alreadySent,
+                        (jid) =>
+                          sendImWithFailTracking(jid, data.text, taskLocalImages),
+                      );
+                    }
                   }
                   logger.info(
-                    { chatJid: data.chatJid, sourceGroup, imRoute: ipcImRoute },
+                    { chatJid: effectiveChatJid, sourceGroup, agentId: ipcAgentId },
                     'IPC message sent',
                   );
                 } else {
@@ -3078,11 +3106,11 @@ function startIpcWatcher(): void {
                     const caption = data.caption || undefined;
                     const fileName = data.fileName || undefined;
 
-                    // Send to IM channel (caption is included in the image message itself)
-                    // Determine which JID to actually send the image to:
-                    // if chatJid is a web JID, route via activeImReplyRoutes.
-                    const imgImRoute =
-                      getChannelType(data.chatJid) !== null
+                    // Conversation agents: skip IM forwarding (handled in wrappedOnOutput).
+                    // Non-agent: route to IM via activeImReplyRoutes.
+                    const imgImRoute = ipcAgentId
+                      ? null
+                      : getChannelType(data.chatJid) !== null
                         ? data.chatJid
                         : activeImReplyRoutes.get(sourceGroup) ?? null;
                     if (imgImRoute) {
@@ -3095,16 +3123,21 @@ function startIpcWatcher(): void {
                       );
                     }
 
+                    // Conversation agents: store in virtual JID (agent tab).
+                    const imgChatJid = ipcAgentId
+                      ? `${data.chatJid}#agent:${ipcAgentId}`
+                      : data.chatJid;
+
                     // Persist image message to DB and broadcast to WebSocket (same as sendMessage flow)
                     const displayText = caption
                       ? `[图片: ${fileName || 'image'}]\n${caption}`
                       : `[图片: ${fileName || 'image'}]`;
                     const imgMsgId = crypto.randomUUID();
                     const imgTimestamp = new Date().toISOString();
-                    ensureChatExists(data.chatJid);
+                    ensureChatExists(imgChatJid);
                     const persistedImgMsgId = storeMessageDirect(
                       imgMsgId,
-                      data.chatJid,
+                      imgChatJid,
                       'happyclaw-agent',
                       ASSISTANT_NAME,
                       displayText,
@@ -3112,9 +3145,9 @@ function startIpcWatcher(): void {
                       true,
                       { meta: { sourceKind: 'sdk_send_message' } },
                     );
-                    broadcastNewMessage(data.chatJid, {
+                    broadcastNewMessage(imgChatJid, {
                       id: persistedImgMsgId,
-                      chat_jid: data.chatJid,
+                      chat_jid: imgChatJid,
                       sender: 'happyclaw-agent',
                       sender_name: ASSISTANT_NAME,
                       content: displayText,
@@ -3126,10 +3159,11 @@ function startIpcWatcher(): void {
                       source_kind: 'sdk_send_message',
                       finalization_reason: null,
                     });
-                    broadcastToWebClients(data.chatJid, displayText);
+                    broadcastToWebClients(imgChatJid, displayText);
 
                     // Scheduled task: broadcast image to all connected IM channels
-                    if (data.isScheduledTask && sourceGroupEntry?.created_by) {
+                    // (not applicable for agent IPC)
+                    if (!ipcAgentId && data.isScheduledTask && sourceGroupEntry?.created_by) {
                       const alreadySent = new Set<string>(
                         [data.chatJid, imgImRoute].filter(Boolean) as string[],
                       );
@@ -3151,10 +3185,11 @@ function startIpcWatcher(): void {
 
                     logger.info(
                       {
-                        chatJid: data.chatJid,
+                        chatJid: imgChatJid,
                         sourceGroup,
                         mimeType,
                         size: imageBuffer.length,
+                        agentId: ipcAgentId,
                       },
                       'IPC image sent',
                     );
@@ -3257,6 +3292,7 @@ function startIpcWatcher(): void {
                 isAdminHome,
                 isHome,
                 sourceGroupEntry,
+                ipcAgentId,
               );
               await fsp.unlink(filePath);
             } catch (err) {
@@ -3332,6 +3368,7 @@ async function processTaskIpc(
   isAdminHome: boolean, // Whether source is admin home container
   isHome: boolean, // Whether source is a home container
   sourceGroupEntry: RegisteredGroup | undefined, // Source group's registered entry
+  ipcAgentId: string | null = null, // Non-null when IPC comes from a conversation agent
 ): Promise<void> {
   switch (data.type) {
     case 'schedule_task':
@@ -3727,9 +3764,10 @@ async function processTaskIpc(
             break;
           }
 
-          // Route to IM: if chatJid is a web JID, use activeImReplyRoutes
-          const fileImRoute =
-            getChannelType(data.chatJid) !== null
+          // Route to IM: skip for conversation agents (they handle their own IM).
+          const fileImRoute = ipcAgentId
+            ? null
+            : getChannelType(data.chatJid) !== null
               ? data.chatJid
               : activeImReplyRoutes.get(sourceGroup) ?? null;
           if (fileImRoute) {
@@ -4003,7 +4041,7 @@ async function processAgentConversation(
           ? output.result
           : JSON.stringify(output.result);
       let text = stripAgentInternalTags(raw);
-      if (output.sourceKind === 'overflow_partial') {
+      if (output.sourceKind === 'overflow_partial' || output.sourceKind === 'compact_partial') {
         text = buildOverflowPartialReply(text);
       }
       if (text) {
