@@ -4393,9 +4393,15 @@ async function processAgentConversation(
         'context_reset',
         `会话已自动重置：${detail}`,
       );
+      commitCursor();
     }
 
-    commitCursor();
+    // Only commit cursor if a reply was actually sent.  Without a reply the
+    // messages haven't been "processed" — leaving the cursor behind lets the
+    // recovery logic pick them up after a restart.
+    if (lastAgentReplyMsgId) {
+      commitCursor();
+    }
   } catch (err) {
     hadError = true;
     logger.error({ agentId, chatJid, err }, 'Agent conversation error');
