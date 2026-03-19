@@ -86,6 +86,7 @@ export type MessageSourceKind =
   | 'sdk_send_message'
   | 'interrupt_partial'
   | 'overflow_partial'
+  | 'compact_partial'
   | 'legacy';
 
 export type MessageFinalizationReason =
@@ -290,6 +291,7 @@ export interface SubAgent {
   created_at: string;
   completed_at: string | null;
   result_summary: string | null;
+  last_im_jid: string | null;
 }
 
 // WebSocket message types
@@ -375,7 +377,7 @@ export type WsMessageOut =
           id: string;
           timestamp: number;
           text: string;
-          kind: string;
+          kind: 'tool' | 'skill' | 'hook' | 'status';
         }>;
         todos?: Array<{ id: string; content: string; status: string }>;
         systemStatus: string | null;

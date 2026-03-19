@@ -133,15 +133,10 @@ class IMConnectionManager {
 
     const chatId = extractChatId(jid);
     const channel = this.findChannelForJid(jid, channelType);
-    if (channel) {
-      await channel.sendMessage(chatId, text, localImagePaths);
-      return;
+    if (!channel) {
+      throw new Error(`No IM channel available for ${jid} (${channelType})`);
     }
-
-    logger.warn(
-      { jid, channelType },
-      'No IM channel available to send message',
-    );
+    await channel.sendMessage(chatId, text, localImagePaths);
   }
 
   /**
