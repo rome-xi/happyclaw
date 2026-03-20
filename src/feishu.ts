@@ -145,6 +145,41 @@ function extractMessageContent(
   messageType: string,
   content: string,
 ): { text: string; imageKeys?: string[]; fileInfos?: FeishuFileInfo[] } {
+  // merge_forward: WebSocket 推送的内容是纯字符串 "Merged and Forwarded Message"（非 JSON），
+  // 必须在 JSON.parse 之前单独处理，否则 parse 失败导致消息被丢弃
+  if (messageType === 'merge_forward') {
+    let parsed: any;
+    try {
+      parsed = JSON.parse(content);
+    } catch {
+      return { text: '[合并转发消息]' };
+    }
+    const items = parsed.message_list || parsed.items || [];
+    if (!Array.isArray(items) || items.length === 0) {
+      return { text: '[合并转发消息]' };
+    }
+    const lines: string[] = ['[合并转发消息]:'];
+    for (const item of items.slice(0, 20)) {
+      const sender = item.sender_name || item.sender || '未知';
+      const body = item.body?.content || item.content || '';
+      let text = '';
+      try {
+        const subType = item.msg_type || item.message_type || 'text';
+        const sub = extractMessageContent(subType, body);
+        text = sub.text || '';
+      } catch {
+        text = typeof body === 'string' ? body : '';
+      }
+      if (text) {
+        lines.push(`> ${sender}: ${text.split('\n')[0].slice(0, 200)}`);
+      }
+    }
+    if (items.length > 20) {
+      lines.push(`> ... 共 ${items.length} 条消息`);
+    }
+    return { text: lines.join('\n') };
+  }
+
   try {
     const parsed = JSON.parse(content);
 
@@ -284,34 +319,6 @@ function extractMessageContent(
       return { text: `[分享用户: ${userName}]` };
     }
 
-    if (messageType === 'merge_forward') {
-      // 合并转发消息：递归提取子消息内容，格式化为引用块
-      const items = parsed.message_list || parsed.items || [];
-      if (!Array.isArray(items) || items.length === 0) {
-        return { text: '[合并转发消息]' };
-      }
-      const lines: string[] = ['[合并转发消息]:'];
-      for (const item of items.slice(0, 20)) {
-        const sender = item.sender_name || item.sender || '未知';
-        const body = item.body?.content || item.content || '';
-        let text = '';
-        try {
-          const subType = item.msg_type || item.message_type || 'text';
-          const sub = extractMessageContent(subType, body);
-          text = sub.text || '';
-        } catch {
-          text = typeof body === 'string' ? body : '';
-        }
-        if (text) {
-          lines.push(`> ${sender}: ${text.split('\n')[0].slice(0, 200)}`);
-        }
-      }
-      if (items.length > 20) {
-        lines.push(`> ... 共 ${items.length} 条消息`);
-      }
-      return { text: lines.join('\n') };
-    }
-
     if (messageType === 'system') {
       const body = parsed.body || parsed.content || '';
       const systemText =
@@ -355,14 +362,44 @@ function extractMessageContent(
       return { text: cardText || '[飞书卡片消息]' };
     }
 
-    // Ignore other unknown message types
-    return { text: '' };
+    if (messageType === 'media') {
+      return { text: '[视频消息]' };
+    }
+
+    if (messageType === 'location') {
+      return {
+        text: `[位置: ${parsed.name || parsed.address || '未知位置'}]`,
+      };
+    }
+
+    if (messageType === 'share_calendar_event') {
+      return {
+        text: `[日程分享: ${parsed.summary || parsed.event_id || ''}]`,
+      };
+    }
+
+    if (messageType === 'video_chat') {
+      return { text: `[视频会议: ${parsed.topic || ''}]` };
+    }
+
+    if (messageType === 'todo') {
+      return {
+        text: `[待办: ${parsed.task_id || parsed.summary || ''}]`,
+      };
+    }
+
+    if (messageType === 'hongbao') {
+      return { text: '[红包消息]' };
+    }
+
+    // 未知消息类型：返回类型占位符，避免静默丢弃
+    return { text: `[${messageType}]` };
   } catch (err) {
     logger.warn(
       { err, messageType, content },
       'Failed to parse message content',
     );
-    return { text: '' };
+    return { text: `[${messageType}]` };
   }
 }
 
