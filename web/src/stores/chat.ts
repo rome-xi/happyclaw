@@ -1914,7 +1914,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const normalizedAttachments = attachments && attachments.length > 0
       ? attachments.map(att => ({ type: 'image' as const, ...att }))
       : undefined;
-    wsManager.send({ type: 'send_message', chatJid: jid, content, agentId, attachments: normalizedAttachments });
+    const sent = wsManager.send({ type: 'send_message', chatJid: jid, content, agentId, attachments: normalizedAttachments });
+    if (!sent) {
+      showToast('发送失败', 'WebSocket 未连接，请稍后重试');
+      return;
+    }
     set((s) => ({
       agentWaiting: { ...s.agentWaiting, [agentId]: true },
     }));
