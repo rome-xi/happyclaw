@@ -266,6 +266,7 @@ export function createTelegramChannel(
           isChatAuthorized: opts.isChatAuthorized ?? (() => true),
           onPairAttempt: opts.onPairAttempt,
           onCommand: opts.onCommand,
+          ignoreMessagesBefore: opts.ignoreMessagesBefore,
           resolveGroupFolder: opts.resolveGroupFolder,
           resolveEffectiveChatJid: opts.resolveEffectiveChatJid,
           onAgentMessage: opts.onAgentMessage,

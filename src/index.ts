@@ -5294,6 +5294,7 @@ async function connectUserIMChannels(
       buildOnPairAttempt(userId),
       {
         onCommand: handleCommand,
+        ignoreMessagesBefore,
         resolveGroupFolder,
         resolveEffectiveChatJid,
         onAgentMessage,
@@ -5678,6 +5679,7 @@ async function main(): Promise<void> {
         buildOnPairAttempt(adminUser.id),
         {
           onCommand: handleCommand,
+          ignoreMessagesBefore: Date.now(),
           resolveGroupFolder: (chatJid) => resolveEffectiveFolder(chatJid),
           resolveEffectiveChatJid: buildResolveEffectiveChatJid(),
           onAgentMessage: buildOnAgentMessage(),
@@ -5757,6 +5759,7 @@ async function main(): Promise<void> {
           buildOnPairAttempt(userId),
           {
             onCommand: handleCommand,
+            ignoreMessagesBefore,
             resolveGroupFolder: (chatJid: string) =>
               resolveEffectiveFolder(chatJid),
             resolveEffectiveChatJid: buildResolveEffectiveChatJid(),

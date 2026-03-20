@@ -34,6 +34,8 @@ export interface TelegramConnectOpts {
   ) => Promise<boolean>;
   /** 斜杠指令回调（如 /clear），返回回复文本或 null */
   onCommand?: (chatJid: string, command: string) => Promise<string | null>;
+  /** 热重连时设置：丢弃 date 早于此时间戳（epoch ms）的消息，避免处理渠道关闭期间的堆积消息 */
+  ignoreMessagesBefore?: number;
   /** 根据 jid 解析群组 folder，用于下载文件/图片到工作区 */
   resolveGroupFolder?: (jid: string) => string | undefined;
   /** 将 IM chatJid 解析为绑定目标 JID（conversation agent 或工作区主对话） */
@@ -391,6 +393,18 @@ export function createTelegramConnection(
           }
           markSeen(msgId);
 
+          // Skip stale messages from before connection (hot-reload scenario)
+          if (opts.ignoreMessagesBefore) {
+            const msgTimeMs = ctx.message.date * 1000;
+            if (msgTimeMs < opts.ignoreMessagesBefore) {
+              logger.info(
+                { msgId, msgTime: msgTimeMs, threshold: opts.ignoreMessagesBefore },
+                'Skipping stale Telegram message from before reconnection',
+              );
+              return;
+            }
+          }
+
           const chatId = String(ctx.chat.id);
           const jid = `telegram:${chatId}`;
           const chatName =
@@ -582,6 +596,12 @@ export function createTelegramConnection(
           if (isDuplicate(msgId)) return;
           markSeen(msgId);
 
+          // Skip stale messages from before connection (hot-reload scenario)
+          if (opts.ignoreMessagesBefore) {
+            const msgTimeMs = ctx.message.date * 1000;
+            if (msgTimeMs < opts.ignoreMessagesBefore) return;
+          }
+
           const chatId = String(ctx.chat.id);
           const jid = `telegram:${chatId}`;
           const chatName =
@@ -722,6 +742,12 @@ export function createTelegramConnection(
             String(ctx.message.message_id) + ':' + String(ctx.chat.id);
           if (isDuplicate(msgId)) return;
           markSeen(msgId);
+
+          // Skip stale messages from before connection (hot-reload scenario)
+          if (opts.ignoreMessagesBefore) {
+            const msgTimeMs = ctx.message.date * 1000;
+            if (msgTimeMs < opts.ignoreMessagesBefore) return;
+          }
 
           const chatId = String(ctx.chat.id);
           const jid = `telegram:${chatId}`;
