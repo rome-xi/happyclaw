@@ -14,6 +14,7 @@ import http from 'node:http';
 import https from 'node:https';
 import WebSocket from 'ws';
 import { storeChatMetadata, storeMessageDirect, updateChatName } from './db.js';
+import { notifyNewImMessage } from './message-notifier.js';
 import { broadcastNewMessage } from './web.js';
 import { logger } from './logger.js';
 import { saveDownloadedFile, MAX_FILE_SIZE } from './im-downloader.js';
@@ -833,6 +834,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
         },
         agentRouting?.agentId ?? undefined,
       );
+      notifyNewImMessage();
 
       if (agentRouting?.agentId) {
         opts.onAgentMessage?.(jid, agentRouting.agentId);
@@ -1025,6 +1027,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
         },
         agentRouting?.agentId ?? undefined,
       );
+      notifyNewImMessage();
 
       if (agentRouting?.agentId) {
         opts.onAgentMessage?.(jid, agentRouting.agentId);

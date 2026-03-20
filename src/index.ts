@@ -17,6 +17,7 @@ import {
   POLL_INTERVAL,
   TIMEZONE,
 } from './config.js';
+import { interruptibleSleep } from './message-notifier.js';
 import {
   AvailableGroup,
   ContainerInput,
@@ -4758,7 +4759,7 @@ async function startMessageLoop(): Promise<void> {
       recoverStuckPendingGroups();
     }
 
-    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL));
+    await interruptibleSleep(POLL_INTERVAL);
   }
 }
 

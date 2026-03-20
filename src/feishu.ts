@@ -14,6 +14,7 @@ import {
   MAX_FILE_SIZE,
   FileTooLargeError,
 } from './im-downloader.js';
+import { notifyNewImMessage } from './message-notifier.js';
 import { broadcastNewMessage } from './web.js';
 import { detectImageMimeType } from './image-detector.js';
 import {
@@ -1110,6 +1111,7 @@ export function createFeishuConnection(
       },
       targetAgentId ?? undefined,
     );
+    notifyNewImMessage();
 
     if (agentRouting && agentRouting.agentId) {
       onAgentMessage?.(chatJid, agentRouting.agentId);
