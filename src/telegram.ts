@@ -361,6 +361,23 @@ export function createTelegramConnection(
     return msg.includes('Aborted delay') || msg.includes('AbortError');
   }
 
+  /** Return true if this message was sent before the current connection window. */
+  function isStaleMessage(
+    msgDate: number,
+    ignoreMessagesBefore: number | undefined,
+  ): boolean {
+    if (!ignoreMessagesBefore) return false;
+    const msgTimeMs = msgDate * 1000;
+    if (msgTimeMs < ignoreMessagesBefore) {
+      logger.info(
+        { msgTime: msgTimeMs, threshold: ignoreMessagesBefore },
+        'Skipping stale Telegram message from before reconnection',
+      );
+      return true;
+    }
+    return false;
+  }
+
   const connection: TelegramConnection = {
     async connect(opts: TelegramConnectOpts): Promise<void> {
       if (!config.botToken) {
@@ -394,17 +411,7 @@ export function createTelegramConnection(
           }
           markSeen(msgId);
 
-          // Skip stale messages from before connection (hot-reload scenario)
-          if (opts.ignoreMessagesBefore) {
-            const msgTimeMs = ctx.message.date * 1000;
-            if (msgTimeMs < opts.ignoreMessagesBefore) {
-              logger.info(
-                { msgId, msgTime: msgTimeMs, threshold: opts.ignoreMessagesBefore },
-                'Skipping stale Telegram message from before reconnection',
-              );
-              return;
-            }
-          }
+          if (isStaleMessage(ctx.message.date, opts.ignoreMessagesBefore)) return;
 
           const chatId = String(ctx.chat.id);
           const jid = `telegram:${chatId}`;
@@ -598,11 +605,7 @@ export function createTelegramConnection(
           if (isDuplicate(msgId)) return;
           markSeen(msgId);
 
-          // Skip stale messages from before connection (hot-reload scenario)
-          if (opts.ignoreMessagesBefore) {
-            const msgTimeMs = ctx.message.date * 1000;
-            if (msgTimeMs < opts.ignoreMessagesBefore) return;
-          }
+          if (isStaleMessage(ctx.message.date, opts.ignoreMessagesBefore)) return;
 
           const chatId = String(ctx.chat.id);
           const jid = `telegram:${chatId}`;
@@ -746,11 +749,7 @@ export function createTelegramConnection(
           if (isDuplicate(msgId)) return;
           markSeen(msgId);
 
-          // Skip stale messages from before connection (hot-reload scenario)
-          if (opts.ignoreMessagesBefore) {
-            const msgTimeMs = ctx.message.date * 1000;
-            if (msgTimeMs < opts.ignoreMessagesBefore) return;
-          }
+          if (isStaleMessage(ctx.message.date, opts.ignoreMessagesBefore)) return;
 
           const chatId = String(ctx.chat.id);
           const jid = `telegram:${chatId}`;

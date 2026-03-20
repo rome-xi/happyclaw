@@ -1,12 +1,6 @@
 import { create } from 'zustand';
-import { api, type ApiError } from '../api/client';
-
-function extractErrorMessage(err: unknown): string {
-  if (err instanceof Error) return err.message;
-  if (typeof err === 'object' && err !== null && 'message' in err)
-    return (err as ApiError).message;
-  return String(err);
-}
+import { api } from '../api/client';
+import { extractErrorMessage } from '../utils/error';
 
 export interface ScheduledTask {
   id: string;

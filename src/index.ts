@@ -2543,8 +2543,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         commitCursor();
         return true;
       }
-    } else {
-      // Non-OOM error: reset the consecutive counter
+    } else if (consecutiveOomExits[effectiveGroup.folder]) {
+      // Non-OOM error: reset the consecutive counter only if it was set
       delete consecutiveOomExits[effectiveGroup.folder];
       deleteRouterState(`oom_exits:${effectiveGroup.folder}`);
     }
@@ -2557,9 +2557,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     return false;
   }
 
-  // Reset OOM counter on successful exit
-  delete consecutiveOomExits[effectiveGroup.folder];
-  deleteRouterState(`oom_exits:${effectiveGroup.folder}`);
+  // Reset OOM counter on successful exit (only write DB if counter was set)
+  if (consecutiveOomExits[effectiveGroup.folder]) {
+    delete consecutiveOomExits[effectiveGroup.folder];
+    deleteRouterState(`oom_exits:${effectiveGroup.folder}`);
+  }
 
   // Final fallback for silent-success paths (no visible reply).
   commitCursor();

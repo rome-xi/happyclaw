@@ -7,7 +7,7 @@
  * to agent-runner or container-runner.
  */
 
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -141,8 +141,9 @@ function writeWorkspaceSettings(
 function syncMcpToSettings(
   group: RegisteredGroup & { jid: string },
   meta: WorkspaceMeta,
+  existingSettings?: Record<string, unknown>,
 ): void {
-  const settings = readWorkspaceSettings(group);
+  const settings = existingSettings ?? readWorkspaceSettings(group);
   const mcpServers: Record<string, Record<string, unknown>> = {};
 
   for (const [id, entry] of Object.entries(meta.mcpServers)) {
@@ -181,7 +182,7 @@ function syncMcpToSettings(
 // --- Middleware: resolve group + access check ---
 
 function resolveGroup(
-  c: any,
+  c: Context<{ Variables: Variables }>,
 ): (RegisteredGroup & { jid: string }) | null {
   const jid = c.req.param('jid');
   const authUser = c.get('user') as AuthUser;
@@ -619,7 +620,7 @@ workspaceConfigRoutes.delete(
     if (hadMeta) {
       writeWorkspaceMeta(group, meta);
     }
-    syncMcpToSettings(group, meta);
+    syncMcpToSettings(group, meta, settings);
 
     return c.json({ success: true });
   },

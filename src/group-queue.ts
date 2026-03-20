@@ -538,6 +538,38 @@ export class GroupQueue {
    * never consumed due to a race condition (process exiting before reading IPC).
    * See GitHub issue #240.
    */
+  /**
+   * Check for unconsumed IPC messages after agent/task exit and recover.
+   * Handles the race where sendMessage() wrote a file but the process
+   * exited before reading it (issue #240).
+   */
+  private recoverUnconsumedIpc(
+    groupJid: string,
+    state: GroupState,
+    context: string,
+  ): void {
+    if (!state.groupFolder) return;
+    try {
+      if (!this.hasRemainingIpcMessages(state.groupFolder, state.agentId, state.taskRunId)) return;
+
+      if (state.agentId && this.onUnconsumedAgentIpcFn) {
+        logger.warn(
+          { groupJid, agentId: state.agentId },
+          `Unconsumed IPC messages found after ${context}, re-enqueuing`,
+        );
+        this.onUnconsumedAgentIpcFn(groupJid, state.agentId);
+      } else if (!state.taskRunId) {
+        state.pendingMessages = true;
+        logger.warn(
+          { groupJid },
+          `Unconsumed IPC messages found after ${context}, marking pending`,
+        );
+      }
+    } catch (err) {
+      logger.warn({ groupJid, err }, 'Failed to check remaining IPC messages');
+    }
+  }
+
   private hasRemainingIpcMessages(
     groupFolder: string,
     agentId?: string | null,
@@ -910,28 +942,7 @@ export class GroupQueue {
         } catch (err) {
           logger.warn({ groupJid, err }, 'Failed to clean up IPC sentinels');
         }
-        // Check for unconsumed IPC message files (race condition: message written
-        // via sendMessage() but process exited before reading it). See issue #240.
-        try {
-          if (this.hasRemainingIpcMessages(state.groupFolder, state.agentId, state.taskRunId)) {
-            if (state.agentId && this.onUnconsumedAgentIpcFn) {
-              logger.warn(
-                { groupJid, agentId: state.agentId },
-                'Unconsumed IPC messages found after agent exit, re-enqueuing',
-              );
-              this.onUnconsumedAgentIpcFn(groupJid, state.agentId);
-            } else if (!state.taskRunId) {
-              // Main conversation: mark pending so drainGroup restarts processing
-              state.pendingMessages = true;
-              logger.warn(
-                { groupJid },
-                'Unconsumed IPC messages found after process exit, marking pending',
-              );
-            }
-          }
-        } catch (err) {
-          logger.warn({ groupJid, err }, 'Failed to check remaining IPC messages');
-        }
+        this.recoverUnconsumedIpc(groupJid, state, 'agent exit');
       }
       state.active = false;
       state.drainSentinelWritten = false;
@@ -1010,27 +1021,7 @@ export class GroupQueue {
         } catch (err) {
           logger.warn({ groupJid, err }, 'Failed to clean up IPC sentinels');
         }
-        // Check for unconsumed IPC message files (race: sendMessage 'sent' but
-        // process exited before consuming). See issue #240.
-        try {
-          if (this.hasRemainingIpcMessages(state.groupFolder, state.agentId, state.taskRunId)) {
-            if (state.agentId && this.onUnconsumedAgentIpcFn) {
-              logger.warn(
-                { groupJid, agentId: state.agentId },
-                'Unconsumed IPC messages found after agent task exit, re-enqueuing',
-              );
-              this.onUnconsumedAgentIpcFn(groupJid, state.agentId);
-            } else if (!state.taskRunId) {
-              state.pendingMessages = true;
-              logger.warn(
-                { groupJid },
-                'Unconsumed IPC messages found after task exit, marking pending',
-              );
-            }
-          }
-        } catch (err) {
-          logger.warn({ groupJid, err }, 'Failed to check remaining IPC messages');
-        }
+        this.recoverUnconsumedIpc(groupJid, state, 'task exit');
       }
       state.active = false;
       state.activeRunnerIsTask = false;

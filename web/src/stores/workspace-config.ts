@@ -4,6 +4,7 @@
  */
 import { create } from 'zustand';
 import { api } from '../api/client';
+import { extractErrorMessage } from '../utils/error';
 
 // --- Skills ---
 
@@ -82,12 +83,12 @@ export const useWorkspaceConfigStore = create<WorkspaceConfigState>((set, get) =
   skillsInstalling: false,
 
   loadWorkspaceSkills: async (jid) => {
-    set({ skillsLoading: true });
+    set({ skills: [], skillsLoading: true, skillsError: null });
     try {
       const data = await api.get<{ skills: WorkspaceSkill[] }>(`${groupBase(jid)}/skills`);
       set({ skills: data.skills, skillsLoading: false, skillsError: null });
     } catch (err) {
-      set({ skillsLoading: false, skillsError: err instanceof Error ? err.message : String(err) });
+      set({ skillsLoading: false, skillsError: extractErrorMessage(err) });
     }
   },
 
@@ -109,7 +110,7 @@ export const useWorkspaceConfigStore = create<WorkspaceConfigState>((set, get) =
       await api.patch(`${groupBase(jid)}/skills/${encodeURIComponent(id)}`, { enabled });
       await get().loadWorkspaceSkills(jid);
     } catch (err) {
-      set({ skillsError: err instanceof Error ? err.message : String(err) });
+      set({ skillsError: extractErrorMessage(err) });
     }
   },
 
@@ -118,7 +119,7 @@ export const useWorkspaceConfigStore = create<WorkspaceConfigState>((set, get) =
       await api.delete(`${groupBase(jid)}/skills/${encodeURIComponent(id)}`);
       await get().loadWorkspaceSkills(jid);
     } catch (err) {
-      set({ skillsError: err instanceof Error ? err.message : String(err) });
+      set({ skillsError: extractErrorMessage(err) });
       throw err;
     }
   },
@@ -129,12 +130,12 @@ export const useWorkspaceConfigStore = create<WorkspaceConfigState>((set, get) =
   mcpError: null,
 
   loadWorkspaceMcp: async (jid) => {
-    set({ mcpLoading: true });
+    set({ mcpServers: [], mcpLoading: true, mcpError: null });
     try {
       const data = await api.get<{ servers: WorkspaceMcpServer[] }>(`${groupBase(jid)}/mcp-servers`);
       set({ mcpServers: data.servers, mcpLoading: false, mcpError: null });
     } catch (err) {
-      set({ mcpLoading: false, mcpError: err instanceof Error ? err.message : String(err) });
+      set({ mcpLoading: false, mcpError: extractErrorMessage(err) });
     }
   },
 
@@ -144,7 +145,7 @@ export const useWorkspaceConfigStore = create<WorkspaceConfigState>((set, get) =
       set({ mcpError: null });
       await get().loadWorkspaceMcp(jid);
     } catch (err) {
-      set({ mcpError: err instanceof Error ? err.message : String(err) });
+      set({ mcpError: extractErrorMessage(err) });
       throw err;
     }
   },
@@ -155,7 +156,7 @@ export const useWorkspaceConfigStore = create<WorkspaceConfigState>((set, get) =
       set({ mcpError: null });
       await get().loadWorkspaceMcp(jid);
     } catch (err) {
-      set({ mcpError: err instanceof Error ? err.message : String(err) });
+      set({ mcpError: extractErrorMessage(err) });
       throw err;
     }
   },
@@ -166,7 +167,7 @@ export const useWorkspaceConfigStore = create<WorkspaceConfigState>((set, get) =
       set({ mcpError: null });
       await get().loadWorkspaceMcp(jid);
     } catch (err) {
-      set({ mcpError: err instanceof Error ? err.message : String(err) });
+      set({ mcpError: extractErrorMessage(err) });
     }
   },
 
@@ -176,7 +177,7 @@ export const useWorkspaceConfigStore = create<WorkspaceConfigState>((set, get) =
       set({ mcpError: null });
       await get().loadWorkspaceMcp(jid);
     } catch (err) {
-      set({ mcpError: err instanceof Error ? err.message : String(err) });
+      set({ mcpError: extractErrorMessage(err) });
       throw err;
     }
   },
