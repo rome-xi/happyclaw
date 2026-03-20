@@ -338,6 +338,7 @@ class IMConnectionManager {
     ) => Promise<boolean>,
     options?: {
       onCommand?: (chatJid: string, command: string) => Promise<string | null>;
+      ignoreMessagesBefore?: number;
       resolveGroupFolder?: (jid: string) => string | undefined;
       resolveEffectiveChatJid?: (
         chatJid: string,
@@ -365,6 +366,7 @@ class IMConnectionManager {
       isChatAuthorized,
       onPairAttempt,
       onCommand: options?.onCommand,
+      ignoreMessagesBefore: options?.ignoreMessagesBefore,
       resolveGroupFolder: options?.resolveGroupFolder,
       resolveEffectiveChatJid: options?.resolveEffectiveChatJid,
       onAgentMessage: options?.onAgentMessage,
