@@ -5,6 +5,7 @@ import https from 'node:https';
 import { Agent as HttpsAgent } from 'node:https';
 import { ProxyAgent } from 'proxy-agent';
 import { storeChatMetadata, storeMessageDirect, updateChatName } from './db.js';
+import { notifyNewImMessage } from './message-notifier.js';
 import { broadcastNewMessage } from './web.js';
 import { logger } from './logger.js';
 import {
@@ -549,6 +550,7 @@ export function createTelegramConnection(
             },
             agentRouting?.agentId ?? undefined,
           );
+          notifyNewImMessage();
 
           // 触发 agent 处理
           if (agentRouting?.agentId) {
@@ -701,6 +703,7 @@ export function createTelegramConnection(
             },
             agentRouting?.agentId ?? undefined,
           );
+          notifyNewImMessage();
 
           if (agentRouting?.agentId) {
             opts.onAgentMessage?.(jid, agentRouting.agentId);
@@ -783,6 +786,7 @@ export function createTelegramConnection(
               },
               earlyRouting?.agentId ?? undefined,
             );
+            notifyNewImMessage();
             return;
           }
 
@@ -845,6 +849,7 @@ export function createTelegramConnection(
             },
             agentRouting?.agentId ?? undefined,
           );
+          notifyNewImMessage();
 
           if (agentRouting?.agentId) {
             opts.onAgentMessage?.(jid, agentRouting.agentId);
