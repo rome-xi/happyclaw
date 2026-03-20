@@ -4968,6 +4968,20 @@ function buildOnNewChat(
       // Don't override groups with explicit IM routing configured.
       if (existing.target_agent_id || existing.target_main_jid) return;
 
+      // Backfill missing created_by without changing folder binding.
+      // Legacy IM groups may have NULL created_by after migration;
+      // we should claim ownership but preserve the user's chosen folder.
+      if (!existing.created_by) {
+        existing.created_by = userId;
+        setRegisteredGroup(chatJid, existing);
+        registeredGroups[chatJid] = existing;
+        logger.info(
+          { chatJid, chatName, userId, folder: existing.folder },
+          'Backfilled created_by for IM chat (preserved existing folder)',
+        );
+        return;
+      }
+
       // Different user's connection now owns this IM app.
       // Re-route the chat to the current user's home folder.
       // This handles the common case where the same Feishu app credentials
