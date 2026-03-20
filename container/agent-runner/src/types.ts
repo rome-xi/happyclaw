@@ -56,7 +56,7 @@ export interface SDKUserMessage {
     role: 'user';
     content:
       | string
-      | Array<{ type: 'text'; text: string } | { type: 'image'; source: { type: 'base64'; media_type: string; data: string } }>;
+      | Array<{ type: 'text'; text: string } | { type: 'image'; source: { type: 'base64'; media_type: 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp'; data: string } }>;
   };
   parent_tool_use_id: null;
   session_id: string;
