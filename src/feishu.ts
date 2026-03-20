@@ -319,6 +319,42 @@ function extractMessageContent(
       return { text: `[系统消息: ${systemText.slice(0, 200)}]` };
     }
 
+    if (messageType === 'interactive') {
+      // Extract title and text elements from interactive card messages
+      const parts: string[] = [];
+      if (parsed.title) {
+        parts.push(parsed.title);
+      }
+      if (Array.isArray(parsed.elements)) {
+        for (const row of parsed.elements) {
+          if (!Array.isArray(row)) continue;
+          for (const el of row) {
+            if (!el || typeof el !== 'object') continue;
+            if (el.tag === 'text' && typeof el.text === 'string') {
+              parts.push(el.text);
+            } else if (el.tag === 'a' && typeof el.text === 'string') {
+              parts.push(`[${el.text}](${el.href || ''})`);
+            } else if (
+              el.tag === 'note' &&
+              Array.isArray(el.elements)
+            ) {
+              const noteText = el.elements
+                .filter(
+                  (n: any) =>
+                    n.tag === 'text' && typeof n.text === 'string',
+                )
+                .map((n: any) => n.text)
+                .join('');
+              if (noteText) parts.push(noteText);
+            }
+            // Skip buttons, hr, select_static, img — not useful as text
+          }
+        }
+      }
+      const cardText = parts.filter(Boolean).join('\n');
+      return { text: cardText || '[飞书卡片消息]' };
+    }
+
     // Ignore other unknown message types
     return { text: '' };
   } catch (err) {
