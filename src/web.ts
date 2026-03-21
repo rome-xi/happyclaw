@@ -460,7 +460,9 @@ async function handleAgentConversationMessage(
     agentImages,
   );
   if (agentSendResult === 'no_active') {
-    // No running process — start one via processAgentConversation
+    // No running process — force close any stale state and start fresh.
+    // Mirrors the reliable IM path in buildOnAgentMessage() (#240).
+    deps.queue.closeStdin(virtualChatJid);
     if (deps.processAgentConversation) {
       const taskId = `agent-conv:${agentId}:${Date.now()}`;
       deps.queue.enqueueTask(virtualChatJid, taskId, async () => {
