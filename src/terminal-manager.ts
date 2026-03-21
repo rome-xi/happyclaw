@@ -30,6 +30,7 @@ interface PipeTerminalSession extends TerminalSessionBase {
   mode: 'pipe';
   process: ChildProcess;
   onData: (data: string) => void;
+  lineBuffer: string;
 }
 
 type TerminalSession = PtyTerminalSession | PipeTerminalSession;
@@ -58,6 +59,7 @@ export class TerminalManager {
     );
 
     const shellBootstrap =
+      'export TERM="${TERM:-xterm-256color}"; stty erase "^?" 2>/dev/null; ' +
       'if command -v zsh >/dev/null 2>&1; then exec zsh -il; ' +
       'elif command -v bash >/dev/null 2>&1; then exec bash -il; ' +
       'else exec sh -i; fi';
@@ -184,6 +186,7 @@ export class TerminalManager {
       mode: 'pipe',
       process: proc,
       onData,
+      lineBuffer: '',
       containerName,
       groupJid,
       createdAt: Date.now(),
@@ -228,13 +231,62 @@ export class TerminalManager {
       // Send write command to PTY worker via JSON line
       session.process.stdin?.write(JSON.stringify({ type: 'write', data }) + '\n');
     } else if (session.process.stdin?.writable) {
-      const normalized = data.replace(/\r/g, '\n');
-      session.process.stdin.write(normalized);
-      if (normalized.length > 0) {
-        const echoed = normalized
-          .replace(/\n/g, '\r\n')
-          .replace(/\u007f/g, '\b \b');
-        session.onData(echoed);
+      // Pipe mode: local line buffer with editing support.
+      // Characters are buffered locally; only the final edited line is sent
+      // to the shell on Enter. This is necessary because pipe stdin has no
+      // PTY line discipline to process backspace / Ctrl-U / etc.
+      for (let i = 0; i < data.length; i++) {
+        const ch = data[i];
+        if (ch === '\r' || ch === '\n') {
+          // Skip \n following \r (Windows CRLF from paste)
+          if (ch === '\r' && i + 1 < data.length && data[i + 1] === '\n') i++;
+          // Send the clean, edited line to the shell
+          session.process.stdin.write(session.lineBuffer + '\n');
+          session.onData('\r\n');
+          session.lineBuffer = '';
+        } else if (ch === '\x7f' || ch === '\b') {
+          // Backspace / DEL: remove last character
+          if (session.lineBuffer.length > 0) {
+            session.lineBuffer = session.lineBuffer.slice(0, -1);
+            session.onData('\b \b');
+          }
+        } else if (ch === '\x15') {
+          // Ctrl-U: kill entire line
+          const len = session.lineBuffer.length;
+          if (len > 0) {
+            session.onData('\b \b'.repeat(len));
+            session.lineBuffer = '';
+          }
+        } else if (ch === '\x17') {
+          // Ctrl-W: delete last word
+          const buf = session.lineBuffer;
+          const trimmed = buf.replace(/\s+$/, '');
+          const lastSpace = trimmed.lastIndexOf(' ');
+          const newBuf = lastSpace >= 0 ? buf.slice(0, lastSpace + 1) : '';
+          const removed = buf.length - newBuf.length;
+          if (removed > 0) {
+            session.onData('\b \b'.repeat(removed));
+            session.lineBuffer = newBuf;
+          }
+        } else if (ch === '\x03') {
+          // Ctrl-C: discard current line
+          session.onData('^C\r\n');
+          session.lineBuffer = '';
+        } else if (ch === '\x04') {
+          // Ctrl-D: send EOF if line is empty, otherwise ignore
+          if (session.lineBuffer.length === 0) {
+            session.process.stdin.end();
+          }
+        } else if (ch === '\t') {
+          // Tab: insert literal tab (no completion in pipe mode)
+          session.lineBuffer += ch;
+          session.onData(ch);
+        } else if (ch >= ' ') {
+          // Printable character
+          session.lineBuffer += ch;
+          session.onData(ch);
+        }
+        // Ignore other control characters (arrow keys, etc.)
       }
     }
   }
