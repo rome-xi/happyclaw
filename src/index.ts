@@ -223,6 +223,25 @@ function feedStreamEventToCard(
     case 'todo_update':
       if (se.todos) session.setTodos(se.todos);
       break;
+    case 'task_start':
+      if (se.toolUseId) {
+        const label = se.taskDescription ? `Task: ${se.taskDescription.slice(0, 40)}` : 'Task';
+        session.startTool(se.toolUseId, label);
+        session.pushRecentEvent(`🚀 ${label}`);
+      }
+      break;
+    case 'task_notification':
+      if (se.toolUseId || se.taskId) {
+        const id = se.toolUseId || se.taskId || '';
+        session.endTool(id, false);
+        const label = se.taskSummary ? `Task: ${se.taskSummary.slice(0, 40)}` : 'Task 完成';
+        session.pushRecentEvent(`✅ ${label}`);
+      }
+      break;
+    case 'hook_progress':
+      // Update hook state (no card push needed — card already shows hook indicator)
+      session.setHook({ hookName: se.hookName || '', hookEvent: se.hookEvent || '' });
+      break;
   }
 }
 
@@ -2330,16 +2349,18 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       }
     }
 
-    // ── 兜底：overflow 等异常导致累积文本未持久化 ──
+    // ── 兜底：进程异常退出导致累积文本未持久化 ──
+    // 使用 buildInterruptedReply 而非 buildOverflowPartialReply：
+    // 进程被杀（SIGTERM/错误）后不会自动继续，"上下文压缩中"提示会误导用户。
     if (!sentReply && !alreadySavedByShutdown && streamingAccumulatedText.trim()) {
       try {
-        const partialReply = buildOverflowPartialReply(streamingAccumulatedText);
+        const partialReply = buildInterruptedReply(streamingAccumulatedText);
         lastReplyMsgId = await sendMessage(chatJid, partialReply, {
           sendToIM: false,
           messageMeta: {
             turnId: lastProcessed.id,
             sessionId: activeSessionId,
-            sourceKind: 'overflow_partial',
+            sourceKind: 'interrupt_partial',
             finalizationReason: 'error',
           },
         });
@@ -4582,10 +4603,10 @@ async function processAgentConversation(
       }
     }
 
-    // ── 兜底：overflow 等异常导致累积文本未持久化 ──
+    // ── 兜底：进程异常退出导致累积文本未持久化 ──
     if (!cursorCommitted && agentStreamingAccText.trim()) {
       try {
-        const partialReply = buildOverflowPartialReply(agentStreamingAccText);
+        const partialReply = buildInterruptedReply(agentStreamingAccText);
         const msgId = crypto.randomUUID();
         const timestamp = new Date().toISOString();
         ensureChatExists(virtualChatJid);
@@ -4601,7 +4622,7 @@ async function processAgentConversation(
             meta: {
               turnId: lastProcessed.id,
               sessionId: currentAgentSessionId,
-              sourceKind: 'overflow_partial',
+              sourceKind: 'interrupt_partial',
               finalizationReason: 'error',
             },
           },
@@ -4613,12 +4634,12 @@ async function processAgentConversation(
           turn_id: lastProcessed.id,
           session_id: currentAgentSessionId,
           sdk_message_uuid: null,
-          source_kind: 'overflow_partial',
+          source_kind: 'interrupt_partial',
           finalization_reason: 'error',
         }, agentId);
         commitCursor();
       } catch (err) {
-        logger.warn({ err, chatJid, agentId }, 'Failed to save overflow partial agent text');
+        logger.warn({ err, chatJid, agentId }, 'Failed to save interrupted partial agent text');
       }
     }
 

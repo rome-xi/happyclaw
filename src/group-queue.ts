@@ -841,7 +841,18 @@ export class GroupQueue {
         this.closeStdin(targetJid);
       }
 
-      // Stop docker container and wait for it
+      // Give agent-runner time to detect _close sentinel and exit gracefully
+      // before sending SIGTERM.  The IPC poll interval is 500ms, so 2s is
+      // generous enough for the agent to finish its current operation and
+      // emit the final session ID.
+      if (state.groupFolder && !state.containerName) {
+        const graceStart = Date.now();
+        while (state.active && Date.now() - graceStart < 2000) {
+          await new Promise((r) => setTimeout(r, 200));
+        }
+      }
+
+      // Stop docker container / host process
       if (state.containerName) {
         const name = state.containerName;
         await new Promise<void>((resolve) => {
@@ -849,7 +860,7 @@ export class GroupQueue {
             resolve(),
           );
         });
-      } else if (state.process && !state.process.killed) {
+      } else if (state.active && state.process && !state.process.killed) {
         killProcessTree(state.process, 'SIGTERM');
       }
 

@@ -52,6 +52,9 @@ const IPC_POLL_MS = 500;
 let needsMemoryFlush = false;
 let hadCompaction = false;
 let currentPermissionMode: PermissionMode = 'bypassPermissions';
+// Module-level session ID so SIGTERM handler can emit it before exit.
+// Updated in main() whenever a query returns a new session.
+let latestSessionId: string | undefined;
 
 const DEFAULT_ALLOWED_TOOLS = [
   'Bash',
@@ -1071,9 +1074,10 @@ async function runQuery(
       systemPrompt: { type: 'preset' as const, preset: 'claude_code' as const, append: systemPromptAppend },
       allowedTools,
       ...(disallowedTools && { disallowedTools }),
-      maxThinkingTokens: 16384,
+      thinking: { type: 'adaptive' as const },
       permissionMode: currentPermissionMode,
       allowDangerouslySkipPermissions: true,
+      agentProgressSummaries: true,
       settingSources: ['project', 'user'],
       includePartialMessages: true,
       mcpServers: {
@@ -1136,7 +1140,19 @@ async function runQuery(
       continue;
     }
 
-    // Hook 事件
+    // Rate limit event — notify user and keep activity alive
+    if (message.type === 'rate_limit_event') {
+      const info = (message as any).rate_limit_info;
+      if (info?.status === 'rejected') {
+        const resetsAt = info.resetsAt ? new Date(info.resetsAt * 1000).toLocaleTimeString() : '未知';
+        processor.emitStatus(`API 限流中，预计 ${resetsAt} 恢复`);
+      } else if (info?.status === 'allowed_warning') {
+        processor.emitStatus(`接近 API 限流阈值`);
+      }
+      continue;
+    }
+
+    // System messages
     if (message.type === 'system') {
       const sys = message as any;
       if (processor.processSystemMessage(sys)) {
@@ -1400,6 +1416,7 @@ async function main(): Promise<void> {
   }
 
   let sessionId = containerInput.sessionId;
+  latestSessionId = sessionId;
   const { isHome, isAdminHome } = normalizeHomeFlags(containerInput);
 
   // Create in-process SDK MCP server (replaces the stdio subprocess)
@@ -1480,6 +1497,7 @@ async function main(): Promise<void> {
       );
       if (queryResult.newSessionId) {
         sessionId = queryResult.newSessionId;
+        latestSessionId = sessionId;
       }
       if (queryResult.lastAssistantUuid) {
         resumeAt = queryResult.lastAssistantUuid;
@@ -1489,6 +1507,7 @@ async function main(): Promise<void> {
       if (queryResult.sessionResumeFailed) {
         log(`Session resume failed, retrying with fresh session (old: ${sessionId})`);
         sessionId = undefined;
+        latestSessionId = undefined;
         resumeAt = undefined;
         // Rebuild MCP server to avoid "Already connected to a transport" error
         mcpServerConfig = buildMcpServerConfig();
@@ -1596,7 +1615,7 @@ async function main(): Promise<void> {
           MEMORY_FLUSH_ALLOWED_TOOLS,
           MEMORY_FLUSH_DISALLOWED_TOOLS,
         );
-        if (flushResult.newSessionId) sessionId = flushResult.newSessionId;
+        if (flushResult.newSessionId) { sessionId = flushResult.newSessionId; latestSessionId = sessionId; }
         if (flushResult.lastAssistantUuid) resumeAt = flushResult.lastAssistantUuid;
         log('Memory flush completed');
 
@@ -1686,6 +1705,13 @@ async function main(): Promise<void> {
  */
 process.on('SIGTERM', () => {
   log('Received SIGTERM, exiting gracefully');
+  // Emit latest session ID so the host can persist it before we exit.
+  // Without this, the host starts a fresh session on restart, losing context.
+  if (latestSessionId) {
+    try {
+      writeOutput({ status: 'success', result: null, newSessionId: latestSessionId });
+    } catch { /* stdout may be closed */ }
+  }
   forceExitWithSafetyNet(0);
 });
 
