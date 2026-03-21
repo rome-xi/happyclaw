@@ -51,6 +51,8 @@ export interface RegisteredGroup {
   reply_policy?: 'source_only' | 'mirror'; // IM 绑定的回复策略
   require_mention?: boolean; // 群聊是否需要 @机器人 才响应（默认 false）
   activation_mode?: 'auto' | 'always' | 'when_mentioned' | 'disabled'; // 消息门控模式（默认 'auto'，兼容 require_mention）
+  mcp_mode?: 'inherit' | 'custom'; // MCP 配置模式（默认 'inherit' 继承用户配置）
+  selected_mcps?: string[] | null; // custom 模式下选中的 MCP server IDs
 }
 
 export interface GroupMember {

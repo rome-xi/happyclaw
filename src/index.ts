@@ -4110,11 +4110,14 @@ async function processAgentConversation(
   // Unlike processGroupMessages which falls back to chatJid, conversation agents
   // only stream when the message originates from an IM channel (replySourceImJid).
   // Web-only interactions don't need a Feishu streaming card.
-  const streamingSessionJid = replySourceImJid;
-  let agentStreamingSession = streamingSessionJid
+  // Use agent-scoped key to avoid colliding with the main session's streaming card (#242).
+  const streamingSessionJid = replySourceImJid
+    ? `${replySourceImJid}#agent:${agentId}`
+    : undefined;
+  let agentStreamingSession = replySourceImJid
     ? imManager.createStreamingSession(
-        streamingSessionJid,
-        (messageId) => registerMessageIdMapping(messageId, streamingSessionJid),
+        replySourceImJid,
+        (messageId) => registerMessageIdMapping(messageId, streamingSessionJid!),
       )
     : undefined;
   let agentStreamingAccText = '';
@@ -4344,8 +4347,8 @@ async function processAgentConversation(
           agentStreamingAccText = '';
           unregisterStreamingSession(streamingSessionJid);
           agentStreamingSession = imManager.createStreamingSession(
-            streamingSessionJid,
-            (messageId) => registerMessageIdMapping(messageId, streamingSessionJid),
+            replySourceImJid!,
+            (messageId) => registerMessageIdMapping(messageId, streamingSessionJid!),
           );
           if (agentStreamingSession) {
             registerStreamingSession(streamingSessionJid, agentStreamingSession);
