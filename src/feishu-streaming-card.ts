@@ -1409,24 +1409,23 @@ export class StreamingCardController {
   async complete(finalText: string): Promise<void> {
     if (this.state !== 'streaming' && this.state !== 'creating') return;
 
+    const prevState = this.state;
     this.accumulatedText = finalText;
     this.state = 'completed';
     this.flushCtrl.dispose();
     this.textFlushCtrl?.dispose();
     this.auxFlushCtrl?.dispose();
 
-    if (this.backendMode === 'streaming' && this.streamingBackend) {
-      try {
+    try {
+      if (this.backendMode === 'streaming' && this.streamingBackend) {
         await this.finalizeStreamingCard('completed');
-      } catch (err) {
-        logger.debug({ err, chatId: this.chatId }, 'Streaming card: finalize failed');
-      }
-    } else if (this.messageId || this.multiCard) {
-      try {
+      } else if (this.messageId || this.multiCard) {
         await this.patchCard('completed');
-      } catch (err) {
-        logger.debug({ err, chatId: this.chatId }, 'Streaming card: final patch failed');
       }
+    } catch (err) {
+      // Revert state so abort() doesn't bail on the 'completed' check
+      this.state = prevState;
+      throw err;
     }
   }
 

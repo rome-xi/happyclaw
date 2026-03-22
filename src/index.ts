@@ -2201,6 +2201,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                   { err, chatJid },
                   'Streaming card complete failed, falling back to static message',
                 );
+                // Abort the card so it doesn't stay stuck in "streaming" state
+                await streamingSession.abort('回复已通过消息发送').catch(() => {});
                 // Fall through to normal sendMessage
               }
             }
@@ -4364,6 +4366,7 @@ async function processAgentConversation(
               { err, chatJid, agentId },
               'Agent streaming card complete failed, falling back to static message',
             );
+            await agentStreamingSession.abort('回复已通过消息发送').catch(() => {});
           }
         }
 
