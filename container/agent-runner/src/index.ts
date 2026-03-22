@@ -901,6 +901,14 @@ async function runQuery(
       ipcPolling = false;
       return;
     }
+    // Side-queries (emitOutput=false, e.g. memory flush / CLAUDE.md update) must NOT
+    // consume user IPC messages — those belong to the main query loop. Only sentinels
+    // are checked above. Without this guard, a user message arriving during a side-query
+    // gets silently consumed, leaving queryInFlight=true on the host forever (bug #259).
+    if (!emitOutput) {
+      setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
+      return;
+    }
     const { messages, modeChange } = drainIpcInput();
     if (modeChange) {
       currentPermissionMode = modeChange as PermissionMode;
