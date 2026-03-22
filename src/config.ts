@@ -33,12 +33,11 @@ export const TIMEZONE =
 export const WEB_PORT = parseInt(process.env.WEB_PORT || '3000', 10);
 
 // Cookie configuration
-// Production (non-localhost): use __Host- prefix (requires Secure; Path=/; no Domain)
-// Development (localhost): use plain name (no Secure flag needed)
-const isProduction = process.env.NODE_ENV === 'production';
-export const SESSION_COOKIE_NAME = isProduction
-  ? '__Host-happyclaw_session'
-  : 'happyclaw_session';
+// When accessed over HTTPS: use __Host- prefix (requires Secure; Path=/; no Domain)
+// When accessed over HTTP (localhost dev or no TLS): use plain name
+// Determined per-request via isSecureRequest(), not at startup
+export const SESSION_COOKIE_NAME_SECURE = '__Host-happyclaw_session';
+export const SESSION_COOKIE_NAME_PLAIN = 'happyclaw_session';
 const SESSION_SECRET_FILE = path.join(DATA_DIR, 'config', 'session-secret.key');
 
 function getOrCreateSessionSecret(): string {

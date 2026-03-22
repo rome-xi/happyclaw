@@ -81,7 +81,12 @@ import type {
   StreamEvent,
   UserRole,
 } from './types.js';
-import { WEB_PORT, SESSION_COOKIE_NAME, ASSISTANT_NAME } from './config.js';
+import {
+  WEB_PORT,
+  SESSION_COOKIE_NAME_SECURE,
+  SESSION_COOKIE_NAME_PLAIN,
+  ASSISTANT_NAME,
+} from './config.js';
 import { logger } from './logger.js';
 import { executeSessionReset } from './commands.js';
 import {
@@ -539,7 +544,8 @@ function setupWebSocket(server: any): WebSocketServer {
 
     // Verify session cookie
     const cookies = parseCookie(request.headers.cookie);
-    const token = cookies[SESSION_COOKIE_NAME];
+    const token =
+      cookies[SESSION_COOKIE_NAME_SECURE] || cookies[SESSION_COOKIE_NAME_PLAIN];
     if (!token) {
       socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
       socket.destroy();
