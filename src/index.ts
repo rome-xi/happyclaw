@@ -6288,6 +6288,10 @@ async function checkImBindingsHealth(): Promise<void> {
 
     try {
       const info = await imManager.getChatInfo(jid);
+      if (info === undefined) {
+        // Channel doesn't support getChatInfo (e.g. Telegram, QQ) — skip reachability check
+        continue;
+      }
       if (info === null) {
         // Chat not reachable — could be temporary (connection down, API permission issue)
         const count = (imHealthCheckFailCounts.get(jid) ?? 0) + 1;

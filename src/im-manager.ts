@@ -580,6 +580,11 @@ class IMConnectionManager {
   /**
    * Get chat info for an IM group by JID, auto-routing to the correct connection.
    * Used for health checks to detect disbanded groups.
+   *
+   * Returns:
+   * - object: chat info (reachable)
+   * - null: channel supports getChatInfo but chat is not reachable
+   * - undefined: channel does not support getChatInfo (e.g. Telegram, QQ)
    */
   async getChatInfo(jid: string): Promise<{
     avatar?: string;
@@ -587,7 +592,7 @@ class IMConnectionManager {
     user_count?: string;
     chat_type?: string;
     chat_mode?: string;
-  } | null> {
+  } | null | undefined> {
     const channelType = getChannelType(jid);
     if (!channelType) return null;
 
@@ -596,7 +601,8 @@ class IMConnectionManager {
     if (channel?.getChatInfo) {
       return channel.getChatInfo(chatId);
     }
-    return null;
+    // Channel doesn't implement getChatInfo — not a reachability failure
+    return undefined;
   }
 
   /** Get all user IDs with active connections */
