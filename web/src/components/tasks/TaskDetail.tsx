@@ -7,6 +7,7 @@ const CHANNEL_LABELS: Record<string, string> = {
   feishu: '飞书',
   telegram: 'Telegram',
   qq: 'QQ',
+  wechat: '微信',
 };
 
 interface TaskDetailProps {

@@ -14,7 +14,7 @@ export const TaskPatchSchema = z.object({
   script_command: z.string().max(4096).nullable().optional(),
   status: z.enum(['active', 'paused']).optional(),
   next_run: z.string().optional(),
-  notify_channels: z.array(z.enum(['feishu', 'telegram', 'qq'])).nullable().optional(),
+  notify_channels: z.array(z.enum(['feishu', 'telegram', 'qq', 'wechat'])).nullable().optional(),
 });
 
 // 简单 cron 表达式验证：5 或 6 段，每段允许 * 和常见 cron 语法
@@ -30,7 +30,7 @@ export const TaskCreateSchema = z
     context_mode: z.enum(['group', 'isolated']).optional(),
     execution_type: z.enum(['agent', 'script']).optional(),
     script_command: z.string().max(4096).optional(),
-    notify_channels: z.array(z.enum(['feishu', 'telegram', 'qq'])).nullable().optional(),
+    notify_channels: z.array(z.enum(['feishu', 'telegram', 'qq', 'wechat'])).nullable().optional(),
   })
   .superRefine((data, ctx) => {
     const execType = data.execution_type || 'agent';
@@ -671,4 +671,9 @@ export const BalancingConfigSchema = z.object({
     .optional(),
   unhealthyThreshold: z.number().int().min(1).max(20).optional(),
   recoveryIntervalMs: z.number().int().min(30000).max(3600000).optional(),
+});
+
+export const WeChatConfigSchema = z.object({
+  enabled: z.boolean().optional(),
+  clearBotToken: z.boolean().optional(),
 });
