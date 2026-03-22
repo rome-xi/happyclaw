@@ -244,6 +244,19 @@ function feedStreamEventToCard(
       // Update hook state (no card push needed — card already shows hook indicator)
       session.setHook({ hookName: se.hookName || '', hookEvent: se.hookEvent || '' });
       break;
+    case 'mode_change':
+      if (se.permissionMode === 'plan') {
+        session.setSystemStatus('📋 Plan 模式');
+      } else if (se.permissionMode) {
+        session.setSystemStatus(null);
+      }
+      break;
+    case 'usage':
+      if (se.usage) session.patchUsageNote(se.usage);
+      break;
+    case 'init':
+      // Internal signal, no card display needed
+      break;
   }
 }
 

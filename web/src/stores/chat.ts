@@ -711,6 +711,13 @@ function applyStreamEvent(
       }
       break;
     }
+    case 'usage':
+      // Token usage is handled at handleStreamEvent level (direct message table update).
+      // No streaming state mutation needed.
+      break;
+    case 'init':
+      // Internal signal, no UI handling needed.
+      break;
   }
 }
 
