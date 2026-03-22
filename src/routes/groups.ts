@@ -9,7 +9,7 @@ import {
 } from '../schemas.js';
 import type { AuthUser, RegisteredGroup, ExecutionMode } from '../types.js';
 import { checkGroupLimit } from '../billing.js';
-import { DATA_DIR, GROUPS_DIR } from '../config.js';
+import { DATA_DIR, GROUPS_DIR, isDockerAvailable } from '../config.js';
 import {
   isHostExecutionGroup,
   hasHostExecutionPermission,
@@ -375,7 +375,8 @@ groupRoutes.post('/', authMiddleware, async (c) => {
     return c.json({ error: 'Group name is required' }, 400);
   }
 
-  const executionMode = validation.data.execution_mode || 'container';
+  // If user didn't specify execution mode, pick based on Docker availability
+  const executionMode = validation.data.execution_mode || (await isDockerAvailable() ? 'container' : 'host');
   const customCwd = validation.data.custom_cwd; // Schema already trims and converts empty to undefined
   const initSourcePath = validation.data.init_source_path;
   const initGitUrl = validation.data.init_git_url;

@@ -15,6 +15,7 @@ import {
   MAIN_GROUP_FOLDER,
   POLL_INTERVAL,
   TIMEZONE,
+  isDockerAvailable,
 } from './config.js';
 import { interruptibleSleep } from './message-notifier.js';
 import {
@@ -1158,7 +1159,7 @@ function handleBindCommand(chatJid: string, rawSpec: string): string {
   return `已切换到 ${resolved.display}\n🔁 回复策略: source_only`;
 }
 
-function handleNewCommand(chatJid: string, rawName: string): string {
+async function handleNewCommand(chatJid: string, rawName: string): Promise<string> {
   const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
   if (!group) return '当前 IM 未绑定工作区';
   const userId = group.created_by;
@@ -1177,7 +1178,7 @@ function handleNewCommand(chatJid: string, rawName: string): string {
     name,
     folder,
     added_at: now,
-    executionMode: 'container',
+    executionMode: (await isDockerAvailable()) ? 'container' : 'host',
     created_by: userId,
   };
 
@@ -5213,35 +5214,11 @@ async function ensureDockerRunning(): Promise<void> {
     await execFileAsync('docker', ['info'], { timeout: 10000 });
     logger.debug('Docker daemon is running');
   } catch {
-    logger.error('Docker daemon is not running');
-    console.error(
-      '\n╔════════════════════════════════════════════════════════════════╗',
+    logger.warn(
+      'Docker is not available — container-mode workspaces will fail at message time. ' +
+      'Start Docker if you need container execution (macOS: Docker Desktop, Linux: sudo systemctl start docker).',
     );
-    console.error(
-      '║  FATAL: Docker is not running                                  ║',
-    );
-    console.error(
-      '║                                                                ║',
-    );
-    console.error(
-      '║  Agents cannot run without Docker. To fix:                     ║',
-    );
-    console.error(
-      '║  macOS: Start Docker Desktop                                   ║',
-    );
-    console.error(
-      '║  Linux: sudo systemctl start docker                            ║',
-    );
-    console.error(
-      '║                                                                ║',
-    );
-    console.error(
-      '║  Install from: https://docker.com/products/docker-desktop      ║',
-    );
-    console.error(
-      '╚════════════════════════════════════════════════════════════════╝\n',
-    );
-    throw new Error('Docker is required but not running');
+    return;
   }
 
   // Kill orphaned host agent-runner processes from previous runs
