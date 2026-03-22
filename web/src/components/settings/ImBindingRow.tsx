@@ -61,7 +61,7 @@ export function ImBindingRow({ group, isActioning, onRebind, onUnbind }: ImBindi
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2">
           <span className="text-sm font-medium truncate">{group.name}</span>
-          <span className={`text-[10px] px-1.5 py-0.5 rounded-full font-medium ${CHANNEL_COLORS[group.channel_type] || 'bg-slate-100 text-slate-600'}`}>
+          <span className={`text-[10px] px-1.5 py-0.5 rounded-full font-medium ${CHANNEL_COLORS[group.channel_type] || 'bg-muted text-muted-foreground'}`}>
             {CHANNEL_LABEL[group.channel_type] || group.channel_type}
           </span>
         </div>
@@ -72,7 +72,7 @@ export function ImBindingRow({ group, isActioning, onRebind, onUnbind }: ImBindi
               {group.member_count}
             </span>
           )}
-          <span className={hasBound ? 'text-primary dark:text-brand-400' : 'text-slate-400'}>
+          <span className={hasBound ? 'text-primary dark:text-brand-400' : 'text-muted-foreground'}>
             → {bindingLabel()}
           </span>
         </div>

@@ -525,7 +525,7 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
           </div>
 
           {/* Card */}
-          <div className="relative bg-surface rounded-xl border border-border/60 px-5 py-4 max-lg:bg-surface/90 max-lg:backdrop-blur-sm overflow-hidden font-serif shadow-[0_1px_3px_rgba(0,0,0,0.04)]">
+          <div className="relative bg-surface rounded-xl border border-border/60 px-5 py-4 max-lg:bg-surface/90 max-lg:backdrop-blur-sm overflow-hidden font-serif shadow-card">
             {/* Action buttons */}
             <div className="absolute top-2 right-2 flex items-center gap-0.5 lg:opacity-0 lg:group-hover:opacity-100 transition-opacity">
               <button
