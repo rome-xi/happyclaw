@@ -3542,36 +3542,35 @@ function buildEnvFallbackSettings(): SystemSettings {
 }
 
 export function getSystemSettings(): SystemSettings {
-  // Fast path: return cached value if file hasn't changed
-  try {
-    if (_settingsCache) {
-      if (!fs.existsSync(SYSTEM_SETTINGS_FILE)) return _settingsCache;
+  // Fast path: return cached value if file hasn't changed (single stat)
+  if (_settingsCache) {
+    try {
       const mtimeMs = fs.statSync(SYSTEM_SETTINGS_FILE).mtimeMs;
       if (mtimeMs === _settingsMtimeMs) return _settingsCache;
+    } catch {
+      return _settingsCache; // file gone or stat failed — cached value is still valid
     }
-  } catch {
-    // stat failed — fall through to full read
   }
 
   // 1. Try reading from file
   try {
-    if (fs.existsSync(SYSTEM_SETTINGS_FILE)) {
-      const settings = readSystemSettingsFromFile();
-      if (settings) {
-        _settingsCache = settings;
-        try {
-          _settingsMtimeMs = fs.statSync(SYSTEM_SETTINGS_FILE).mtimeMs;
-        } catch {
-          /* ignore */
-        }
-        return settings;
+    const settings = readSystemSettingsFromFile();
+    if (settings) {
+      _settingsCache = settings;
+      try {
+        _settingsMtimeMs = fs.statSync(SYSTEM_SETTINGS_FILE).mtimeMs;
+      } catch {
+        /* ignore */
       }
+      return settings;
     }
   } catch (err) {
-    logger.warn(
-      { err },
-      'Failed to read system settings, falling back to env/defaults',
-    );
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      logger.warn(
+        { err },
+        'Failed to read system settings, falling back to env/defaults',
+      );
+    }
   }
 
   // 2. Fall back to env vars, then hardcoded defaults

@@ -648,9 +648,12 @@ export function createFeishuConnection(
 
   function isDuplicate(msgId: string): boolean {
     const now = Date.now();
+    // Map preserves insertion order; stop at first non-expired entry
     for (const [id, ts] of msgCache.entries()) {
       if (now - ts > MSG_DEDUP_TTL) {
         msgCache.delete(id);
+      } else {
+        break;
       }
     }
     if (msgCache.size >= MSG_DEDUP_MAX) {

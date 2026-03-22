@@ -381,6 +381,7 @@ class IpcWatcherManager {
         logger.error({ err }, 'Error in IPC fallback scan');
       });
     }, 5000);
+    this.fallbackTimer.unref(); // Don't prevent process from naturally exiting
   }
 
   /** Close all watchers and timers. */
@@ -5195,16 +5196,14 @@ async function ensureDockerRunning(): Promise<void> {
     return;
   }
 
-  try {
-    await execFileAsync('docker', ['info'], { timeout: 10000 });
-    logger.debug('Docker daemon is running');
-  } catch {
+  if (!(await isDockerAvailable())) {
     logger.warn(
       'Docker is not available — container-mode workspaces will fail at message time. ' +
       'Start Docker if you need container execution (macOS: Docker Desktop, Linux: sudo systemctl start docker).',
     );
     return;
   }
+  logger.debug('Docker daemon is running');
 
   // Kill orphaned host agent-runner processes from previous runs
   try {
