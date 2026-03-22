@@ -2412,6 +2412,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               try {
                 await streamingSession.complete(text);
                 streamingCardHandledIM = true;
+                // Streaming card replaced the normal sendMessage path,
+                // so clear the ack reaction that would normally be cleared in sendMessage.
+                imManager.clearAckReaction(chatJid);
                 logger.debug(
                   { chatJid },
                   'Streaming card completed with final text',
@@ -2533,6 +2536,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   );
   } finally {
     await setTyping(chatJid, false);
+    // Always clear ack reaction in finally — covers error/interrupt/abort paths
+    // where the normal sendMessage (which clears it) is never called.
+    imManager.clearAckReaction(chatJid);
     if (idleTimer) clearTimeout(idleTimer);
     activeRouteUpdaters.delete(effectiveGroup.folder);
     activeImReplyRoutes.delete(effectiveGroup.folder);
