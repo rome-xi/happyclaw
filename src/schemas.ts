@@ -677,4 +677,5 @@ export const BalancingConfigSchema = z.object({
 export const WeChatConfigSchema = z.object({
   enabled: z.boolean().optional(),
   clearBotToken: z.boolean().optional(),
+  bypassProxy: z.boolean().optional(),
 });

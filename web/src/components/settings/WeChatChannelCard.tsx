@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Loader2, LogOut, QrCode } from 'lucide-react';
+import { Loader2, LogOut, QrCode, Shield, Smartphone } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
 import { ToggleSwitch } from '@/components/ui/toggle-switch';
@@ -12,6 +12,7 @@ interface UserWeChatConfig {
   ilinkBotId: string;
   hasBotToken: boolean;
   botTokenMasked: string | null;
+  bypassProxy: boolean;
   enabled: boolean;
   connected: boolean;
   updatedAt: string | null;
@@ -23,6 +24,7 @@ export function WeChatChannelCard({ setNotice, setError }: WeChatChannelCardProp
   const [config, setConfig] = useState<UserWeChatConfig | null>(null);
   const [loading, setLoading] = useState(true);
   const [toggling, setToggling] = useState(false);
+  const [togglingProxy, setTogglingProxy] = useState(false);
   const [disconnecting, setDisconnecting] = useState(false);
   const [qrDialogOpen, setQrDialogOpen] = useState(false);
 
@@ -59,6 +61,21 @@ export function WeChatChannelCard({ setNotice, setError }: WeChatChannelCardProp
     }
   };
 
+  const handleBypassProxyToggle = async (newBypass: boolean) => {
+    setTogglingProxy(true);
+    setNotice(null);
+    setError(null);
+    try {
+      const data = await api.put<UserWeChatConfig>('/api/config/user-im/wechat', { bypassProxy: newBypass });
+      setConfig(data);
+      setNotice(newBypass ? '已切换为直连模式（绕过代理）' : '已切换为代理模式');
+    } catch (err) {
+      setError(getErrorMessage(err, '切换直连模式失败'));
+    } finally {
+      setTogglingProxy(false);
+    }
+  };
+
   const handleDisconnect = async () => {
     setDisconnecting(true);
     setError(null);
@@ -80,6 +97,8 @@ export function WeChatChannelCard({ setNotice, setError }: WeChatChannelCardProp
     await loadConfig();
   };
 
+  const bypassProxy = config?.bypassProxy ?? true;
+
   return (
     <>
       <div className="rounded-xl border border-border bg-card overflow-hidden">
@@ -88,7 +107,7 @@ export function WeChatChannelCard({ setNotice, setError }: WeChatChannelCardProp
             <span className={`inline-block w-2 h-2 rounded-full ${config?.connected ? 'bg-emerald-500' : 'bg-slate-300'}`} />
             <div>
               <h3 className="text-sm font-semibold text-slate-800">微信</h3>
-              <p className="text-xs text-slate-500 mt-0.5">通过微信接收和回复消息</p>
+              <p className="text-xs text-slate-500 mt-0.5">通过微信 iLink Bot 接收和回复消息</p>
             </div>
           </div>
           <ToggleSwitch checked={enabled} disabled={loading || toggling} onChange={handleToggle} />
@@ -99,43 +118,81 @@ export function WeChatChannelCard({ setNotice, setError }: WeChatChannelCardProp
             <div className="text-sm text-slate-500">加载中...</div>
           ) : (
             <>
-              {/* Connection status */}
+              {/* Connected state */}
               {config?.connected ? (
-                <div className="flex items-center justify-between rounded-lg bg-emerald-50 px-4 py-3">
-                  <div>
-                    <div className="text-sm font-medium text-emerald-700">已连接</div>
+                <div className="space-y-3">
+                  <div className="rounded-lg bg-emerald-50 px-4 py-3 space-y-2">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <Smartphone className="size-4 text-emerald-600" />
+                        <span className="text-sm font-medium text-emerald-700">已连接</span>
+                      </div>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={handleDisconnect}
+                        disabled={disconnecting}
+                        className="text-red-600 hover:text-red-700 hover:bg-red-50 border-red-200"
+                      >
+                        {disconnecting ? <Loader2 className="size-3.5 animate-spin" /> : <LogOut className="size-3.5" />}
+                        退出登录
+                      </Button>
+                    </div>
                     {config.ilinkBotId && (
-                      <div className="text-xs text-emerald-600 mt-0.5">Bot ID: {config.ilinkBotId}</div>
+                      <div className="text-xs text-emerald-600">
+                        Bot ID: <span className="font-mono">{config.ilinkBotId}</span>
+                      </div>
+                    )}
+                    {config.botTokenMasked && (
+                      <div className="text-xs text-emerald-600">
+                        Token: <span className="font-mono">{config.botTokenMasked}</span>
+                      </div>
                     )}
                   </div>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={handleDisconnect}
-                    disabled={disconnecting}
-                    className="text-red-600 hover:text-red-700 hover:bg-red-50 border-red-200"
-                  >
-                    {disconnecting ? <Loader2 className="size-3.5 animate-spin" /> : <LogOut className="size-3.5" />}
-                    退出登录
-                  </Button>
                 </div>
               ) : (
                 <div className="space-y-3">
+                  {/* Expired session hint */}
                   {config?.hasBotToken && (
                     <div className="flex items-center justify-between rounded-lg bg-amber-50 px-4 py-3">
                       <div className="text-sm text-amber-700">Session 已过期，请重新扫码登录</div>
                     </div>
                   )}
-                  <Button onClick={() => setQrDialogOpen(true)}>
-                    <QrCode className="size-4" />
-                    扫码登录
-                  </Button>
-                  <p className="text-xs text-slate-400">
-                    点击扫码登录，使用微信扫描二维码完成绑定
-                  </p>
+
+                  {/* QR login button */}
+                  <div className="flex flex-col items-center gap-3 py-4 rounded-lg border border-dashed border-slate-200 bg-slate-50/50">
+                    <QrCode className="size-10 text-slate-400" />
+                    <div className="text-center">
+                      <p className="text-sm text-slate-600 font-medium">扫码绑定微信</p>
+                      <p className="text-xs text-slate-400 mt-1">点击下方按钮获取二维码，使用微信扫码完成绑定</p>
+                    </div>
+                    <Button onClick={() => setQrDialogOpen(true)} className="mt-1">
+                      <QrCode className="size-4" />
+                      扫码登录
+                    </Button>
+                  </div>
                 </div>
               )}
 
+              {/* Direct connection toggle */}
+              <div className="flex items-center justify-between rounded-lg bg-slate-50 px-4 py-3">
+                <div className="flex items-start gap-2">
+                  <Shield className="size-4 text-blue-500 mt-0.5 shrink-0" />
+                  <div>
+                    <p className="text-sm text-slate-700">直连模式</p>
+                    <p className="text-xs text-slate-400 mt-0.5">
+                      {bypassProxy
+                        ? '绕过 HTTP 代理直连微信服务，适合国内网络环境'
+                        : '通过系统代理访问微信服务'}
+                    </p>
+                  </div>
+                </div>
+                <ToggleSwitch
+                  checked={bypassProxy}
+                  disabled={togglingProxy}
+                  onChange={handleBypassProxyToggle}
+                />
+              </div>
             </>
           )}
         </div>
