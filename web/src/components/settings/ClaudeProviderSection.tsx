@@ -11,7 +11,6 @@ import type {
   ProvidersListResponse,
   BalancingConfig,
   ProviderHealthStatus,
-  SettingsNotification,
 } from './types';
 import { getErrorMessage } from './types';
 import { ProviderList } from './ProviderList';
