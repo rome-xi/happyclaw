@@ -1,6 +1,8 @@
 import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 
 export const ASSISTANT_NAME = process.env.ASSISTANT_NAME || 'HappyClaw';
 export const POLL_INTERVAL = 2000;
@@ -73,3 +75,18 @@ export const WEB_SESSION_SECRET = getOrCreateSessionSecret();
 // Proxy trust configuration
 // Set TRUST_PROXY=true when behind a reverse proxy (nginx, Cloudflare, etc.)
 export const TRUST_PROXY = process.env.TRUST_PROXY === 'true';
+
+// Docker availability check (cached for the lifetime of the process)
+const execFileAsync = promisify(execFile);
+let _dockerAvailable: boolean | null = null;
+
+export async function isDockerAvailable(): Promise<boolean> {
+  if (_dockerAvailable !== null) return _dockerAvailable;
+  try {
+    await execFileAsync('docker', ['info'], { timeout: 10000 });
+    _dockerAvailable = true;
+  } catch {
+    _dockerAvailable = false;
+  }
+  return _dockerAvailable;
+}
