@@ -357,16 +357,11 @@ async function handleWebUserMessage(
   );
   if (sendResult === 'sent') {
     pipedToActive = true;
-  } else if (sendResult === 'queued') {
-    // Message queued for next container run; don't advance cursor so
-    // processGroupMessages re-reads it from DB. Drain sentinel already
-    // written — the current runner will exit and drainGroup picks it up.
   } else {
     deps.queue.enqueueMessageCheck(chatJid);
   }
 
   // Only advance per-group cursor when we piped directly into a running container.
-  // For queued processing, processGroupMessages must still see this message from DB.
   //
   // When piped to active, we also mark the group as having pending IPC-injected
   // messages. If the agent crashes without processing them, the close handler

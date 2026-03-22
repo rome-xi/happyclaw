@@ -890,17 +890,16 @@ async function handleClearCommand(chatJid: string): Promise<string> {
   const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
   if (!group) return '未找到当前工作区';
 
-  // Only agent-bound IM groups support /clear (clears that agent's context).
-  // Main-conversation-bound groups (target_main_jid) should be cleared from Web.
-  if (group.target_main_jid && !group.target_agent_id) {
-    return '当前群组未绑定子对话，请在 Web 端清除上下文';
-  }
-
   const agentId = group.target_agent_id || undefined;
+  // IM 群绑定工作区主对话时，使用工作区 JID 清除上下文，
+  // 确保 divider 插入到工作区消息流（Web 端可见）。
+  const effectiveJid = (group.target_main_jid && !agentId)
+    ? group.target_main_jid
+    : chatJid;
 
   try {
     await executeSessionReset(
-      chatJid,
+      effectiveJid,
       group.folder,
       {
         queue,
@@ -2096,6 +2095,22 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           }
 
           // ── Feed stream events into Feishu streaming card ──
+          // IPC 注入的新 query 开始时，旧卡片已 complete()/abort()，
+          // 需要为新 query 重建流式卡片并重置会话级状态。
+          if (streamingSession && !streamingSession.isActive()) {
+            unregisterStreamingSession(streamingSessionJid);
+            streamingAccumulatedText = '';
+            sentReply = false;
+            streamInterrupted = false;
+            streamingSession = imManager.createStreamingSession(
+              streamingSessionJid,
+              makeOnCardCreated(streamingSessionJid),
+            );
+            if (streamingSession) {
+              registerStreamingSession(streamingSessionJid, streamingSession);
+              logger.debug({ chatJid }, 'Rebuilt streaming card for IPC-injected query');
+            }
+          }
           if (streamingSession) {
             feedStreamEventToCard(streamingSession, result.streamEvent, streamingAccumulatedText);
           }
@@ -5021,14 +5036,6 @@ async function startMessageLoop(): Promise<void> {
               id: lastProcessed.id,
             };
             saveState();
-          } else if (sendResult === 'queued') {
-            // Message queued for next container run. Don't advance cursor so
-            // processGroupMessages re-reads it from DB. Drain sentinel will
-            // cause the current container to exit, then drainGroup handles it.
-            logger.debug(
-              { chatJid },
-              'Message queued (drain mode), cursor not advanced',
-            );
           } else {
             // no_active — enqueue for a new one
             queue.enqueueMessageCheck(chatJid);
