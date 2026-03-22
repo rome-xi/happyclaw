@@ -12,7 +12,6 @@ import {
   DATA_DIR,
   GROUPS_DIR,
   STORE_DIR,
-  IPC_POLL_INTERVAL,
   MAIN_GROUP_FOLDER,
   POLL_INTERVAL,
   TIMEZONE,
@@ -260,6 +259,129 @@ let lastCommittedCursor: Record<string, MessageCursor> = {};
 let messageLoopRunning = false;
 let ipcWatcherRunning = false;
 let shuttingDown = false;
+
+// ── IPC Watcher Manager (event-driven fs.watch + fallback polling) ──
+
+class IpcWatcherManager {
+  private watchers = new Map<string, { watchers: fs.FSWatcher[], refCount: number }>();
+  private debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private processingFolders = new Set<string>();
+  private pendingReprocess = new Set<string>();
+  private fallbackTimer: ReturnType<typeof setInterval> | null = null;
+  private processGroupFn: ((folder: string) => Promise<void>) | null = null;
+  private processFullFn: (() => Promise<void>) | null = null;
+
+  /** Bind the per-group and full-scan processing functions (set once from startIpcWatcher). */
+  bind(
+    processGroup: (folder: string) => Promise<void>,
+    processFull: () => Promise<void>,
+  ): void {
+    this.processGroupFn = processGroup;
+    this.processFullFn = processFull;
+  }
+
+  /** Start watching a group's IPC directories. Called when a container/process starts. */
+  watchGroup(folder: string): void {
+    const existing = this.watchers.get(folder);
+    if (existing) {
+      existing.refCount++;
+      return;
+    }
+
+    const groupIpcRoot = path.join(DATA_DIR, 'ipc', folder);
+    const dirsToWatch = [
+      path.join(groupIpcRoot, 'messages'),
+      path.join(groupIpcRoot, 'tasks'),
+    ];
+
+    const folderWatchers: fs.FSWatcher[] = [];
+    for (const dir of dirsToWatch) {
+      try {
+        fs.mkdirSync(dir, { recursive: true });
+        // Listen to all event types — 'rename' covers atomic writes on Linux,
+        // but Docker bind mounts (macOS virtiofs) may emit 'change' instead.
+        const w = fs.watch(dir, () => {
+          this.debouncedProcess(folder);
+        });
+        w.on('error', () => {
+          // Watcher error — fallback polling will handle it
+        });
+        folderWatchers.push(w);
+      } catch {
+        // Watch failed — fallback polling will handle it
+      }
+    }
+    this.watchers.set(folder, { watchers: folderWatchers, refCount: 1 });
+  }
+
+  /** Stop watching a group's IPC directories. Called when a container/process stops. */
+  unwatchGroup(folder: string): void {
+    const entry = this.watchers.get(folder);
+    if (!entry) return;
+    entry.refCount--;
+    if (entry.refCount > 0) return;
+
+    for (const w of entry.watchers) { try { w.close(); } catch {} }
+    this.watchers.delete(folder);
+    const timer = this.debounceTimers.get(folder);
+    if (timer) {
+      clearTimeout(timer);
+      this.debounceTimers.delete(folder);
+    }
+  }
+
+  private debouncedProcess(folder: string): void {
+    const existing = this.debounceTimers.get(folder);
+    if (existing) clearTimeout(existing);
+    this.debounceTimers.set(folder, setTimeout(() => {
+      this.debounceTimers.delete(folder);
+      // Skip if a previous processGroupIpc call for this folder is still running;
+      // the pending flag ensures we re-process after the current run finishes.
+      if (this.processingFolders.has(folder)) {
+        this.pendingReprocess.add(folder);
+        return;
+      }
+      this.processingFolders.add(folder);
+      this.processGroupFn?.(folder)
+        .catch((err) => { logger.error({ err, folder }, 'Error processing IPC for group'); })
+        .finally(() => {
+          this.processingFolders.delete(folder);
+          // Files may have arrived during processing — run once more
+          if (this.pendingReprocess.delete(folder) && this.watchers.has(folder)) {
+            this.debouncedProcess(folder);
+          }
+        });
+    }, 100));
+  }
+
+  /** Start fallback polling (every 5s) as safety net for inotify failures. */
+  startFallback(): void {
+    this.fallbackTimer = setInterval(() => {
+      if (shuttingDown) return;
+      this.processFullFn?.().catch((err) => {
+        logger.error({ err }, 'Error in IPC fallback scan');
+      });
+    }, 5000);
+  }
+
+  /** Close all watchers and timers. */
+  closeAll(): void {
+    for (const [, entry] of this.watchers) {
+      for (const w of entry.watchers) { try { w.close(); } catch {} }
+    }
+    this.watchers.clear();
+    for (const [, timer] of this.debounceTimers) {
+      clearTimeout(timer);
+    }
+    this.debounceTimers.clear();
+    if (this.fallbackTimer) {
+      clearInterval(this.fallbackTimer);
+      this.fallbackTimer = null;
+    }
+  }
+}
+
+let ipcWatcherManager: IpcWatcherManager | null = null;
 /** JIDs already persisted by the shutdown handler — prevents finally blocks from duplicating. */
 const shutdownSavedJids = new Set<string>();
 
@@ -2843,6 +2965,7 @@ async function runAgent(
       }
     : undefined;
 
+  ipcWatcherManager?.watchGroup(group.folder);
   try {
     const executionMode = group.executionMode || 'container';
 
@@ -2933,6 +3056,8 @@ async function runAgent(
     const errorMsg = err instanceof Error ? err.message : String(err);
     logger.error({ group: group.name, err }, 'Agent error');
     return { status: 'error', error: errorMsg };
+  } finally {
+    ipcWatcherManager?.unwatchGroup(group.folder);
   }
 }
 
@@ -3257,22 +3382,8 @@ function startIpcWatcher(): void {
     }
   }
 
-  const processIpcFiles = async () => {
+  const processGroupIpc = async (sourceGroup: string) => {
     if (shuttingDown) return;
-    // Scan all group IPC directories (identity determined by directory)
-    let groupFolders: string[];
-    try {
-      const entries = await fsp.readdir(ipcBaseDir, { withFileTypes: true });
-      groupFolders = entries
-        .filter((e) => e.isDirectory() && e.name !== 'errors')
-        .map((e) => e.name);
-    } catch (err) {
-      logger.error({ err }, 'Error reading IPC base directory');
-      if (!shuttingDown) setTimeout(processIpcFiles, IPC_POLL_INTERVAL);
-      return;
-    }
-
-    for (const sourceGroup of groupFolders) {
       // Determine if this IPC directory belongs to an admin home group
       const sourceGroupEntry = Object.values(registeredGroups).find(
         (g) => g.folder === sourceGroup,
@@ -3662,13 +3773,39 @@ function startIpcWatcher(): void {
           }
         }
       } // end for (const ipcRoot of ipcRoots)
-    }
-
-    if (!shuttingDown) setTimeout(processIpcFiles, IPC_POLL_INTERVAL);
   };
 
-  processIpcFiles();
-  logger.info('IPC watcher started (per-group namespaces)');
+  const processIpcFilesFull = async () => {
+    if (shuttingDown) return;
+    let groupFolders: string[];
+    try {
+      const entries = await fsp.readdir(ipcBaseDir, { withFileTypes: true });
+      groupFolders = entries
+        .filter((e) => e.isDirectory() && e.name !== 'errors')
+        .map((e) => e.name);
+    } catch (err) {
+      logger.error({ err }, 'Error reading IPC base directory');
+      return;
+    }
+
+    for (const sourceGroup of groupFolders) {
+      await processGroupIpc(sourceGroup);
+    }
+  };
+
+  // Initialize the event-driven IPC watcher manager
+  ipcWatcherManager = new IpcWatcherManager();
+  ipcWatcherManager.bind(processGroupIpc, processIpcFilesFull);
+
+  // Initial full scan
+  processIpcFilesFull().catch((err) => {
+    logger.error({ err }, 'Error in initial IPC scan');
+  });
+
+  // Start fallback polling (5s instead of 1s)
+  ipcWatcherManager.startFallback();
+
+  logger.info('IPC watcher started (event-driven + 5s fallback)');
 }
 
 async function processTaskIpc(
@@ -4522,6 +4659,7 @@ async function processAgentConversation(
     }
   };
 
+  ipcWatcherManager?.watchGroup(effectiveGroup.folder);
   try {
     const executionMode = effectiveGroup.executionMode || 'container';
     const onProcessCb = (proc: ChildProcess, identifier: string) => {
@@ -4746,6 +4884,8 @@ async function processAgentConversation(
     // MUST be inside finally so status is reset even on unhandled exceptions (#227).
     updateAgentStatus(agentId, 'idle');
     broadcastAgentStatus(chatJid, agentId, 'idle', agent.name, agent.prompt);
+
+    ipcWatcherManager?.unwatchGroup(effectiveGroup.folder);
   }
 }
 
@@ -5799,6 +5939,12 @@ async function main(): Promise<void> {
     if (feishuSyncInterval) {
       clearInterval(feishuSyncInterval);
       feishuSyncInterval = null;
+    }
+
+    try {
+      ipcWatcherManager?.closeAll();
+    } catch (err) {
+      logger.warn({ err }, 'Error closing IPC watchers');
     }
 
     try {

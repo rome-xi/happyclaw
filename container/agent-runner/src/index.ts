@@ -46,7 +46,7 @@ const CLAUDE_MODEL = process.env.ANTHROPIC_MODEL || 'opus';
 
 const IPC_INPUT_DIR = path.join(WORKSPACE_IPC, 'input');
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
-const IPC_POLL_MS = 500;
+const IPC_FALLBACK_POLL_MS = 5000; // 后备轮询间隔（仅防止 inotify 事件丢失）
 
 
 let needsMemoryFlush = false;
@@ -676,40 +676,108 @@ function drainIpcInput(): IpcDrainResult {
 }
 
 /**
+ * Create a fs.watch() based IPC watcher for event-driven file detection.
+ * Falls back to periodic polling every IPC_FALLBACK_POLL_MS.
+ */
+function createIpcWatcher(onFileDetected: () => void): { close: () => void } {
+  let watcher: fs.FSWatcher | null = null;
+  let fallbackTimer: ReturnType<typeof setInterval> | null = null;
+  let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+  let closed = false;
+
+  const debouncedDetect = () => {
+    if (closed) return;
+    if (debounceTimer) clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => {
+      debounceTimer = null;
+      if (!closed) onFileDetected();
+    }, 50);
+  };
+
+  // Ensure IPC_INPUT_DIR exists
+  try { fs.mkdirSync(IPC_INPUT_DIR, { recursive: true }); } catch {}
+
+  try {
+    // Listen to all event types — 'rename' covers atomic writes on Linux,
+    // but Docker bind mounts (macOS virtiofs) may emit 'change' instead.
+    watcher = fs.watch(IPC_INPUT_DIR, () => {
+      debouncedDetect();
+    });
+    watcher.on('error', (err) => {
+      log(`IPC watcher error: ${err.message}, degrading to ${IPC_FALLBACK_POLL_MS}ms fallback polling`);
+      watcher?.close();
+      watcher = null;
+    });
+  } catch (err) {
+    log(`Failed to create IPC watcher: ${err instanceof Error ? err.message : String(err)}, using fallback polling`);
+  }
+
+  // Fallback polling for reliability
+  fallbackTimer = setInterval(() => {
+    if (!closed) onFileDetected();
+  }, IPC_FALLBACK_POLL_MS);
+  fallbackTimer.unref();  // Don't prevent process from naturally exiting
+
+  return {
+    close() {
+      closed = true;
+      watcher?.close();
+      watcher = null;
+      if (debounceTimer) { clearTimeout(debounceTimer); debounceTimer = null; }
+      if (fallbackTimer) { clearInterval(fallbackTimer); fallbackTimer = null; }
+    },
+  };
+}
+
+/**
  * Wait for a new IPC message or _close sentinel.
  * Returns the messages (with optional images), or null if _close.
  */
 function waitForIpcMessage(): Promise<{ text: string; images?: Array<{ data: string; mimeType?: string }> } | null> {
   return new Promise((resolve) => {
-    const poll = () => {
+    let resolved = false;
+    const tryDrain = () => {
+      if (resolved) return;
+
       if (shouldClose()) {
+        resolved = true;
+        ipcWatcher?.close();
         resolve(null);
         return;
       }
+
       if (shouldDrain()) {
         log('Drain sentinel received, exiting after completed query');
+        resolved = true;
+        ipcWatcher?.close();
         resolve(null);
         return;
       }
+
       if (shouldInterrupt()) {
         log('Interrupt sentinel received while idle, ignoring');
         clearInterruptRequested();
       }
+
       const { messages, modeChange } = drainIpcInput();
       if (modeChange) {
         currentPermissionMode = modeChange as PermissionMode;
         log(`Mode change during idle: ${modeChange}`);
       }
+
       if (messages.length > 0) {
-        // 合并多条消息的文本和图片
         const combinedText = messages.map((m) => m.text).join('\n');
         const allImages = messages.flatMap((m) => m.images || []);
+        resolved = true;
+        ipcWatcher?.close();
         resolve({ text: combinedText, images: allImages.length > 0 ? allImages : undefined });
         return;
       }
-      setTimeout(poll, IPC_POLL_MS);
     };
-    poll();
+
+    const ipcWatcher = createIpcWatcher(tryDrain);
+    // Initial check in case files already exist
+    tryDrain();
   });
 }
 
@@ -860,13 +928,18 @@ async function runQuery(
   const POST_RESULT_TIMEOUT_MS = 5_000;
   // queryRef is set just before the for-await loop so pollIpcDuringQuery can call interrupt()
   let queryRef: { interrupt(): Promise<void>; setPermissionMode(mode: PermissionMode): Promise<void> } | null = null;
+  let messageCount = 0;
+  let resultCount = 0;
+
   const pollIpcDuringQuery = () => {
     if (!ipcPolling) return;
+
     if (shouldClose()) {
       log('Close sentinel detected during query, ending stream');
       closedDuringQuery = true;
       stream.end();
       ipcPolling = false;
+      ipcQueryWatcher.close();
       return;
     }
     if (shouldInterrupt()) {
@@ -880,6 +953,7 @@ async function runQuery(
       queryRef?.interrupt().catch((err: unknown) => log(`Interrupt call failed: ${err}`));
       stream.end();
       ipcPolling = false;
+      ipcQueryWatcher.close();
       return;
     }
     // _drain: finish current query then exit. Once a result has been received,
@@ -890,6 +964,7 @@ async function runQuery(
       closedDuringQuery = true;
       stream.end();
       ipcPolling = false;
+      ipcQueryWatcher.close();
       return;
     }
     // ── 结果后超时：result 已收到，给 host 短暂时间写 _drain ──
@@ -900,6 +975,7 @@ async function runQuery(
       log(`Post-result timeout (${POST_RESULT_TIMEOUT_MS / 1000}s), closing stream`);
       stream.end();
       ipcPolling = false;
+      ipcQueryWatcher.close();
       return;
     }
     // Side-queries (emitOutput=false, e.g. memory flush / CLAUDE.md update) must NOT
@@ -907,9 +983,9 @@ async function runQuery(
     // are checked above. Without this guard, a user message arriving during a side-query
     // gets silently consumed, leaving queryInFlight=true on the host forever (bug #259).
     if (!emitOutput) {
-      setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
-      return;
+      return; // No setTimeout needed — watcher will trigger next check on file change
     }
+
     const { messages, modeChange } = drainIpcInput();
     if (modeChange) {
       currentPermissionMode = modeChange as PermissionMode;
@@ -925,9 +1001,15 @@ async function runQuery(
         emit({ status: 'success', result: `\u26a0\ufe0f ${reason}`, newSessionId: undefined });
       }
     }
-    setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
+    // No setTimeout needed — watcher will trigger next check on file change
   };
-  setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
+
+  const ipcQueryWatcher = createIpcWatcher(() => {
+    if (!ipcPolling) return;
+    pollIpcDuringQuery();
+  });
+  // Initial drain to process any pre-existing files
+  pollIpcDuringQuery();
 
   // Create the StreamEventProcessor with mode change callback
   const processor = new StreamEventProcessor(emit, log, (newMode) => {
@@ -937,9 +1019,6 @@ async function runQuery(
       log(`setPermissionMode failed: ${err}`),
     );
   });
-
-  let messageCount = 0;
-  let resultCount = 0;
 
   // Build system prompt: memory recall guidance + global CLAUDE.md (for non-admin-home)
   const { isHome, isAdminHome } = normalizeHomeFlags(containerInput);
@@ -1343,10 +1422,12 @@ async function runQuery(
   processor.cleanup();
 
   ipcPolling = false;
+  ipcQueryWatcher.close();
   log(`Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}, interruptedDuringQuery: ${interruptedDuringQuery}`);
   return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery };
   } catch (err) {
     ipcPolling = false;
+    ipcQueryWatcher.close();
     const errorMessage = err instanceof Error ? err.message : String(err);
 
     // 检测上下文溢出错误
