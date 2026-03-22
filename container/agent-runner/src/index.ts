@@ -22,6 +22,7 @@ import { detectImageMimeTypeFromBase64Strict } from './image-detector.js';
 import type {
   ContainerInput,
   ContainerOutput,
+  ImageMediaType,
   SessionsIndex,
   SDKUserMessage,
   ParsedMessage,
@@ -100,7 +101,6 @@ const IMAGE_MAX_DIMENSION = 8000; // Anthropic API 限制
  * - 若声明缺失或与内容不一致，使用内容识别值
  * - 最后兜底 image/jpeg
  */
-type ImageMediaType = 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
 function resolveImageMimeType(img: { data: string; mimeType?: string }): ImageMediaType {
   const declared =
     typeof img.mimeType === 'string' && img.mimeType.startsWith('image/')
@@ -212,7 +212,7 @@ class MessageStream {
 
     let content:
       | string
-      | Array<{ type: 'text'; text: string } | { type: 'image'; source: { type: 'base64'; media_type: 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp'; data: string } }>;
+      | Array<{ type: 'text'; text: string } | { type: 'image'; source: { type: 'base64'; media_type: ImageMediaType; data: string } }>;
 
     if (filteredImages && filteredImages.length > 0) {
       // 多模态消息：text + images

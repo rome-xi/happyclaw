@@ -251,12 +251,25 @@ let globalMessageCursor: MessageCursor = { timestamp: '', id: '' };
 let sessions: Record<string, string> = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, MessageCursor> = {};
-// Tracks the last message that was ACTUALLY PROCESSED by an agent (commitCursor).
-// Used by recoverPendingMessages() to detect IPC-injected but unprocessed messages.
-// lastAgentTimestamp may advance ahead of this when IPC injection succeeds but the
-// agent hasn't finished processing yet — if the service crashes in between, recovery
-// uses this cursor to find the gap.
+// Recovery-safe cursor: only advances when an agent actually finishes processing.
+// recoverPendingMessages() uses this to detect IPC-injected but unprocessed messages.
 let lastCommittedCursor: Record<string, MessageCursor> = {};
+
+/** Set both cursors directly (no max-merge) and persist. */
+function setCursors(jid: string, cursor: MessageCursor): void {
+  lastAgentTimestamp[jid] = cursor;
+  lastCommittedCursor[jid] = cursor;
+  saveState();
+}
+
+/** Advance cursors to `candidate`, never regressing behind existing position. */
+function advanceCursors(jid: string, candidate: MessageCursor): void {
+  const current = lastAgentTimestamp[jid];
+  const target = current && current.timestamp > candidate.timestamp ? current : candidate;
+  lastAgentTimestamp[jid] = target;
+  lastCommittedCursor[jid] = target;
+  saveState();
+}
 let messageLoopRunning = false;
 let ipcWatcherRunning = false;
 let shuttingDown = false;
@@ -353,6 +366,11 @@ class IpcWatcherManager {
           }
         });
     }, 100));
+  }
+
+  /** Trigger processing for a folder through the concurrency guard. */
+  triggerProcess(folder: string): void {
+    this.debouncedProcess(folder);
   }
 
   /** Start fallback polling (every 5s) as safety net for inotify failures. */
@@ -887,11 +905,7 @@ async function handleClearCommand(chatJid: string): Promise<string> {
         queue,
         sessions,
         broadcast: broadcastNewMessage,
-        setLastAgentTimestamp: (jid: string, cursor: MessageCursor) => {
-          lastAgentTimestamp[jid] = cursor;
-          lastCommittedCursor[jid] = cursor;
-          saveState();
-        },
+        setLastAgentTimestamp: setCursors,
       },
       agentId,
     );
@@ -1500,36 +1514,22 @@ function loadState(): void {
     timestamp: persistedTimestamp,
     id: lastTimestampId,
   };
-  const agentTs = getRouterState('last_agent_timestamp');
-  try {
-    const parsed = agentTs
-      ? (JSON.parse(agentTs) as Record<string, unknown>)
-      : {};
-    const normalized: Record<string, MessageCursor> = {};
-    for (const [jid, raw] of Object.entries(parsed)) {
-      normalized[jid] = normalizeCursor(raw);
+  const loadCursorMap = (key: string): Record<string, MessageCursor> => {
+    const raw = getRouterState(key);
+    try {
+      const parsed = raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
+      const normalized: Record<string, MessageCursor> = {};
+      for (const [jid, v] of Object.entries(parsed)) {
+        normalized[jid] = normalizeCursor(v);
+      }
+      return normalized;
+    } catch {
+      logger.warn(`Corrupted ${key} in DB, resetting`);
+      return {};
     }
-    lastAgentTimestamp = normalized;
-  } catch {
-    logger.warn('Corrupted last_agent_timestamp in DB, resetting');
-    lastAgentTimestamp = {};
-  }
-
-  // Load committed cursor (recovery-safe cursor that only advances on commitCursor)
-  const committedTs = getRouterState('last_committed_cursor');
-  try {
-    const parsed = committedTs
-      ? (JSON.parse(committedTs) as Record<string, unknown>)
-      : {};
-    const normalized: Record<string, MessageCursor> = {};
-    for (const [jid, raw] of Object.entries(parsed)) {
-      normalized[jid] = normalizeCursor(raw);
-    }
-    lastCommittedCursor = normalized;
-  } catch {
-    logger.warn('Corrupted last_committed_cursor in DB, resetting');
-    lastCommittedCursor = {};
-  }
+  };
+  lastAgentTimestamp = loadCursorMap('last_agent_timestamp');
+  lastCommittedCursor = loadCursorMap('last_committed_cursor');
 
   // Migration: if lastCommittedCursor is empty but lastAgentTimestamp has data,
   // seed lastCommittedCursor from lastAgentTimestamp to avoid re-processing all
@@ -2042,17 +2042,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   const commitCursor = (): void => {
     if (cursorCommitted) return;
-    // Use the higher of lastProcessed and the current lastAgentTimestamp.
-    // IPC injection may have advanced lastAgentTimestamp beyond lastProcessed
-    // (the initial batch); don't regress it.
-    const initial = { timestamp: lastProcessed.timestamp, id: lastProcessed.id };
-    const current = lastAgentTimestamp[chatJid];
-    const target =
-      current && current.timestamp > initial.timestamp ? current : initial;
-    lastAgentTimestamp[chatJid] = target;
-    // Mark this position as "actually processed by agent" for recovery safety.
-    lastCommittedCursor[chatJid] = target;
-    saveState();
+    advanceCursors(chatJid, { timestamp: lastProcessed.timestamp, id: lastProcessed.id });
     cursorCommitted = true;
   };
 
@@ -3790,7 +3780,8 @@ function startIpcWatcher(): void {
     }
 
     for (const sourceGroup of groupFolders) {
-      await processGroupIpc(sourceGroup);
+      // Route through the concurrency guard to prevent racing with event-driven triggers
+      ipcWatcherManager!.triggerProcess(sourceGroup);
     }
   };
 
@@ -4407,13 +4398,7 @@ async function processAgentConversation(
   const lastProcessed = missedMessages[missedMessages.length - 1];
   const commitCursor = (): void => {
     if (cursorCommitted) return;
-    const initial = { timestamp: lastProcessed.timestamp, id: lastProcessed.id };
-    const current = lastAgentTimestamp[virtualChatJid];
-    const target =
-      current && current.timestamp > initial.timestamp ? current : initial;
-    lastAgentTimestamp[virtualChatJid] = target;
-    lastCommittedCursor[virtualChatJid] = target;
-    saveState();
+    advanceCursors(virtualChatJid, { timestamp: lastProcessed.timestamp, id: lastProcessed.id });
     cursorCommitted = true;
   };
 
@@ -4982,13 +4967,7 @@ async function startMessageLoop(): Promise<void> {
 
                 // Advance cursor past these messages so they aren't re-processed
                 const lastMsg = groupMessages[groupMessages.length - 1];
-                const billingCursor = {
-                  timestamp: lastMsg.timestamp,
-                  id: lastMsg.id,
-                };
-                lastAgentTimestamp[chatJid] = billingCursor;
-                lastCommittedCursor[chatJid] = billingCursor;
-                saveState();
+                setCursors(chatJid, { timestamp: lastMsg.timestamp, id: lastMsg.id });
                 continue;
               }
             }
@@ -6234,11 +6213,7 @@ async function main(): Promise<void> {
     ensureTerminalContainerStarted,
     formatMessages,
     getLastAgentTimestamp: () => lastAgentTimestamp,
-    setLastAgentTimestamp: (jid: string, cursor: MessageCursor) => {
-      lastAgentTimestamp[jid] = cursor;
-      lastCommittedCursor[jid] = cursor;
-      saveState();
-    },
+    setLastAgentTimestamp: setCursors,
     advanceGlobalCursor: (cursor: MessageCursor) => {
       if (isCursorAfter(cursor, globalMessageCursor)) {
         globalMessageCursor = cursor;

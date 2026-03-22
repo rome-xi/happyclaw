@@ -13,7 +13,7 @@ import type { ContainerOutput, StreamEvent } from './types.js';
 import { extractSkillName, summarizeToolInput } from './utils.js';
 
 /** Tools with specialized input_json_delta handling — generic accumulation is skipped for these. */
-const SPECIAL_TOOLS = ['Skill', 'Task', 'AskUserQuestion', 'TodoWrite'];
+const SPECIAL_TOOLS = ['Skill', 'Task', 'Agent', 'AskUserQuestion', 'TodoWrite'];
 
 type EmitFn = (output: ContainerOutput) => void;
 type LogFn = (message: string) => void;
@@ -461,8 +461,15 @@ export class StreamEventProcessor {
     // Accumulate generic tool input JSON for toolInputSummary.
     // Only attempt JSON.parse when the accumulated string looks complete (ends with '}')
     // to avoid O(n^2) repeated parse failures on large tool inputs.
+    // Cap at 10KB to avoid unbounded memory growth on tools with large inputs (Write, Edit).
+    const GENERIC_INPUT_MAX = 10_240;
     const pendingGeneric = this.pendingGenericInput.get(blockIndex);
     if (pendingGeneric && !pendingGeneric.resolved) {
+      if (pendingGeneric.inputJson.length >= GENERIC_INPUT_MAX) {
+        pendingGeneric.resolved = true;
+        this.pendingGenericInput.delete(blockIndex);
+        return;
+      }
       pendingGeneric.inputJson += partialJson;
       const trimmed = pendingGeneric.inputJson.trimEnd();
       const summary = trimmed.endsWith('}') ? summarizeToolInput((() => {
@@ -504,7 +511,6 @@ export class StreamEventProcessor {
       },
     });
   }
-
 
   /**
    * Process a tool_use_summary message.
