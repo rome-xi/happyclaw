@@ -651,42 +651,42 @@ export function ProviderEditor({
             </div>
           )}
 
-          {/* ─── 模型选择（通用） ─── */}
+          {/* ─── 模型选择 ─── */}
           <div>
-            <label className="block text-xs text-slate-600 mb-1">模型</label>
-            {(() => {
-              const presets = ['', 'sonnet', 'opus', 'haiku'];
-              const isPreset = presets.includes(model);
-              return (
-                <div className="space-y-2">
-                  <select
-                    value={isPreset ? model : '__custom__'}
-                    onChange={(e) => setModel(e.target.value === '__custom__' ? '' : e.target.value)}
-                    disabled={saving}
-                    className="w-full rounded-md border border-slate-200 bg-background px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary/30"
-                  >
-                    <option value="">default（默认）</option>
-                    <option value="sonnet">sonnet</option>
-                    <option value="opus">opus</option>
-                    <option value="haiku">haiku</option>
-                    <option value="__custom__">自定义...</option>
-                  </select>
-                  {!isPreset && (
-                    <Input
-                      type="text"
-                      value={model}
-                      onChange={(e) => setModel(e.target.value)}
-                      disabled={saving}
-                      placeholder="如 claude-sonnet-4-6、claude-opus-4-6 等完整模型 ID"
-                      className="font-mono"
-                    />
-                  )}
-                </div>
-              );
-            })()}
-            <p className="text-xs text-slate-400 mt-1">
-              留空使用 default。自定义支持完整模型 ID。
-            </p>
+            <label className="block text-xs text-slate-600 mb-1">
+              {providerType === 'official' ? '模型' : 'ANTHROPIC_MODEL'}
+            </label>
+            {providerType === 'official' ? (
+              <>
+                <select
+                  value={model}
+                  onChange={(e) => setModel(e.target.value)}
+                  disabled={saving}
+                  className="w-full rounded-md border border-slate-200 bg-background px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary/30"
+                >
+                  <option value="">default（默认）</option>
+                  <option value="sonnet">sonnet</option>
+                  <option value="haiku">haiku</option>
+                </select>
+                <p className="text-xs text-slate-400 mt-1">
+                  别名自动解析为最新版本，留空使用 default。
+                </p>
+              </>
+            ) : (
+              <>
+                <Input
+                  type="text"
+                  value={model}
+                  onChange={(e) => setModel(e.target.value)}
+                  disabled={saving}
+                  placeholder="第三方 API 的模型名称"
+                  className="font-mono"
+                />
+                <p className="text-xs text-slate-400 mt-1">
+                  注入为 ANTHROPIC_MODEL 环境变量，值取决于第三方 API 支持的模型。
+                </p>
+              </>
+            )}
           </div>
 
           {/* ─── 自定义环境变量 ─── */}
