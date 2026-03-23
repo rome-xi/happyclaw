@@ -72,6 +72,43 @@ function getOrCreateSessionSecret(): string {
 
 export const WEB_SESSION_SECRET = getOrCreateSessionSecret();
 
+// Ensure WeChat iLink API domains bypass HTTP proxy.
+// These Chinese domestic services are unreachable through most overseas proxies.
+const WECHAT_NO_PROXY_DOMAINS = [
+  'ilinkai.weixin.qq.com',
+  'novac2c.cdn.weixin.qq.com',
+];
+
+/** Add or remove WeChat domains from NO_PROXY based on bypassProxy flag. */
+export function updateWeChatNoProxy(bypassProxy: boolean): void {
+  const current = process.env.NO_PROXY || process.env.no_proxy || '';
+  const existing = new Set(current.split(',').map((s) => s.trim()).filter(Boolean));
+
+  if (bypassProxy) {
+    const toAdd = WECHAT_NO_PROXY_DOMAINS.filter((d) => !existing.has(d));
+    if (toAdd.length) {
+      const updated = current ? `${current},${toAdd.join(',')}` : toAdd.join(',');
+      process.env.NO_PROXY = updated;
+      process.env.no_proxy = updated;
+    }
+  } else {
+    for (const d of WECHAT_NO_PROXY_DOMAINS) existing.delete(d);
+    const updated = [...existing].join(',');
+    process.env.NO_PROXY = updated;
+    process.env.no_proxy = updated;
+  }
+}
+
+/** Check if WeChat domains are currently in NO_PROXY. */
+export function isWeChatBypassingProxy(): boolean {
+  const current = process.env.NO_PROXY || process.env.no_proxy || '';
+  const existing = new Set(current.split(',').map((s) => s.trim()).filter(Boolean));
+  return WECHAT_NO_PROXY_DOMAINS.every((d) => existing.has(d));
+}
+
+// Apply default: bypass proxy on startup
+updateWeChatNoProxy(true);
+
 // Proxy trust configuration
 // Set TRUST_PROXY=true when behind a reverse proxy (nginx, Cloudflare, etc.)
 export const TRUST_PROXY = process.env.TRUST_PROXY === 'true';
