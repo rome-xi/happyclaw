@@ -242,7 +242,6 @@ export function ProviderEditor({
           }
           createBody.anthropicBaseUrl = trimmedBaseUrl;
           createBody.anthropicAuthToken = trimmedToken;
-          if (model.trim()) createBody.anthropicModel = model.trim();
         } else {
           // 官方模式 — 根据认证方式设置凭据
           if (authTab === 'setup_token') {
@@ -288,6 +287,8 @@ export function ProviderEditor({
             // 允许不带凭据创建，用户之后通过 OAuth 流程补充
           }
         }
+
+        if (model.trim()) createBody.anthropicModel = model.trim();
 
         await api.post('/api/config/claude/providers', createBody);
         setNotice('提供商已创建。');
@@ -606,18 +607,6 @@ export function ProviderEditor({
               </div>
 
               <div>
-                <label className="block text-xs text-slate-600 mb-1">ANTHROPIC_MODEL</label>
-                <Input
-                  type="text"
-                  value={model}
-                  onChange={(e) => setModel(e.target.value)}
-                  disabled={saving}
-                  placeholder="opus / sonnet / haiku 或完整模型 ID"
-                  className="font-mono"
-                />
-              </div>
-
-              <div>
                 <label className="block text-xs text-slate-600 mb-1">
                   ANTHROPIC_AUTH_TOKEN{' '}
                   {!isCreate && provider?.hasAnthropicAuthToken
@@ -661,6 +650,44 @@ export function ProviderEditor({
               </div>
             </div>
           )}
+
+          {/* ─── 模型选择（通用） ─── */}
+          <div>
+            <label className="block text-xs text-slate-600 mb-1">模型</label>
+            {(() => {
+              const presets = ['', 'sonnet', 'opus', 'haiku'];
+              const isPreset = presets.includes(model);
+              return (
+                <div className="space-y-2">
+                  <select
+                    value={isPreset ? model : '__custom__'}
+                    onChange={(e) => setModel(e.target.value === '__custom__' ? '' : e.target.value)}
+                    disabled={saving}
+                    className="w-full rounded-md border border-slate-200 bg-background px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary/30"
+                  >
+                    <option value="">default（默认）</option>
+                    <option value="sonnet">sonnet</option>
+                    <option value="opus">opus</option>
+                    <option value="haiku">haiku</option>
+                    <option value="__custom__">自定义...</option>
+                  </select>
+                  {!isPreset && (
+                    <Input
+                      type="text"
+                      value={model}
+                      onChange={(e) => setModel(e.target.value)}
+                      disabled={saving}
+                      placeholder="如 claude-sonnet-4-6、claude-opus-4-6 等完整模型 ID"
+                      className="font-mono"
+                    />
+                  )}
+                </div>
+              );
+            })()}
+            <p className="text-xs text-slate-400 mt-1">
+              留空使用 default。自定义支持完整模型 ID。
+            </p>
+          </div>
 
           {/* ─── 自定义环境变量 ─── */}
           <div className="border-t border-slate-100 pt-4">
