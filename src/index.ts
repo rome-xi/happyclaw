@@ -68,10 +68,11 @@ import {
   updateAgentStatus,
   updateAgentLastImJid,
   updateAgentInfo,
-  deleteCompletedTaskAgents,
+  deleteCompletedAgents,
   getRunningTaskAgentsByChat,
   markRunningTaskAgentsAsError,
   markAllRunningTaskAgentsAsError,
+  markStaleSpawnAgentsAsError,
   listActiveConversationAgents,
   getSession,
   listAgentsByJid,
@@ -4527,7 +4528,16 @@ async function processAgentConversation(
   // Get pending messages
   const sinceCursor = lastAgentTimestamp[virtualChatJid] || EMPTY_CURSOR;
   const missedMessages = getMessagesSince(virtualChatJid, sinceCursor);
-  if (missedMessages.length === 0) return;
+  if (missedMessages.length === 0) {
+    // Spawn agents are fire-and-forget: if no messages are found (race condition
+    // or cursor already advanced), mark as error so they don't stay idle forever.
+    if (agent.kind === 'spawn' && agent.status === 'idle') {
+      updateAgentStatus(agentId, 'error', '未找到待处理消息');
+      broadcastAgentStatus(chatJid, agentId, 'error', agent.name, agent.prompt, '未找到待处理消息');
+      logger.warn({ chatJid, agentId }, 'Spawn agent had no pending messages, marked as error');
+    }
+    return;
+  }
 
   const isHome = !!effectiveGroup.is_home;
   const isAdminHome = isHome && effectiveGroup.folder === MAIN_GROUP_FOLDER;
@@ -6127,12 +6137,12 @@ async function main(): Promise<void> {
   initDatabase();
   logger.info('Database initialized');
 
-  // Clean up stale completed task agents (older than 1 hour) to prevent DB bloat
+  // Clean up stale completed agents (task + spawn, older than 1 hour) to prevent DB bloat
   try {
     const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
-    const cleaned = deleteCompletedTaskAgents(oneHourAgo);
+    const cleaned = deleteCompletedAgents(oneHourAgo);
     if (cleaned > 0) {
-      logger.info({ cleaned }, 'Cleaned up stale completed task agents');
+      logger.info({ cleaned }, 'Cleaned up stale completed agents');
     }
   } catch (err) {
     logger.warn({ err }, 'Failed to clean up stale task agents');
@@ -6150,6 +6160,20 @@ async function main(): Promise<void> {
     }
   } catch (err) {
     logger.warn({ err }, 'Failed to mark stale running tasks at startup');
+  }
+
+  // Spawn agents (from /sw) lose their in-memory task callbacks on restart.
+  // Mark idle/running spawn agents as error so they don't render as "正在思考...".
+  try {
+    const marked = markStaleSpawnAgentsAsError();
+    if (marked > 0) {
+      logger.warn(
+        { marked },
+        'Marked stale spawn agents as error at startup',
+      );
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Failed to mark stale spawn agents at startup');
   }
 
   // Migrate system-level IM config → admin's per-user config (one-time)
@@ -6543,14 +6567,14 @@ async function main(): Promise<void> {
     60 * 60 * 1000,
   );
 
-  // Periodically clean completed task agents (every 10 minutes)
+  // Periodically clean completed agents (task + spawn, every 10 minutes)
   setInterval(
     () => {
       try {
         const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000).toISOString();
-        const cleaned = deleteCompletedTaskAgents(tenMinutesAgo);
+        const cleaned = deleteCompletedAgents(tenMinutesAgo);
         if (cleaned > 0) {
-          logger.info({ cleaned }, 'Periodic cleanup: removed completed task agents');
+          logger.info({ cleaned }, 'Periodic cleanup: removed completed agents');
         }
       } catch (err) {
         logger.warn({ err }, 'Failed periodic task agent cleanup');

@@ -50,7 +50,7 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
   // infinite re-render because Zustand sees a new array reference every time.
   const allAgentsForSpawn = useChatStore(s => groupJid ? s.agents[groupJid] : undefined);
   const spawnAgents = useMemo(
-    () => (allAgentsForSpawn ?? []).filter(a => a.kind === 'spawn' && (a.status === 'running' || a.status === 'idle')),
+    () => (allAgentsForSpawn ?? []).filter(a => a.kind === 'spawn' && a.status === 'running'),
     [allAgentsForSpawn],
   );
   const currentUser = useAuthStore(s => s.user);

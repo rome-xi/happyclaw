@@ -3773,10 +3773,10 @@ export function updateAgentInfo(
   );
 }
 
-export function deleteCompletedTaskAgents(beforeTimestamp: string): number {
+export function deleteCompletedAgents(beforeTimestamp: string): number {
   const result = db
     .prepare(
-      "DELETE FROM agents WHERE kind = 'task' AND status IN ('completed', 'error') AND completed_at IS NOT NULL AND completed_at < ?",
+      "DELETE FROM agents WHERE kind IN ('task', 'spawn') AND status IN ('completed', 'error') AND completed_at IS NOT NULL AND completed_at < ?",
     )
     .run(beforeTimestamp);
   return result.changes;
@@ -3808,6 +3808,24 @@ export function markAllRunningTaskAgentsAsError(
   const result = db
     .prepare(
       "UPDATE agents SET status = 'error', completed_at = ?, result_summary = COALESCE(result_summary, ?) WHERE kind = 'task' AND status = 'running'",
+    )
+    .run(now, summary);
+  return result.changes;
+}
+
+/**
+ * Mark stale spawn agents (idle/running) as error at startup.
+ * After a process restart, spawn agents that were idle or running can never
+ * resume — their in-memory task callbacks are lost. Mark them as error so
+ * they don't render as "正在思考..." in the frontend.
+ */
+export function markStaleSpawnAgentsAsError(
+  summary = '进程重启，并行任务中断',
+): number {
+  const now = new Date().toISOString();
+  const result = db
+    .prepare(
+      "UPDATE agents SET status = 'error', completed_at = ?, result_summary = COALESCE(result_summary, ?) WHERE kind = 'spawn' AND status IN ('idle', 'running')",
     )
     .run(now, summary);
   return result.changes;
