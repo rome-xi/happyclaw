@@ -256,10 +256,13 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, groupJ
             </td>
           ),
           ul: ({ children }) => (
-            <ul className="list-disc list-inside my-2 space-y-1">{children}</ul>
+            <ul className="list-disc pl-6 my-2 space-y-1">{children}</ul>
           ),
           ol: ({ children }) => (
-            <ol className="list-decimal list-inside my-2 space-y-1">{children}</ol>
+            <ol className="list-decimal pl-6 my-2 space-y-1">{children}</ol>
+          ),
+          li: ({ children }) => (
+            <li className="[&>p]:inline [&>p]:my-0">{children}</li>
           ),
           p: ({ children }) => <p className="my-2">{children}</p>,
           h1: ({ children }) => (
