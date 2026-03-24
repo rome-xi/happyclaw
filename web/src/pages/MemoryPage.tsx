@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { ArrowLeft, BookOpen, Loader2, RefreshCw, Save } from 'lucide-react';
+import { ArrowLeft, BookOpen, ChevronDown, ChevronRight, Loader2, RefreshCw, Save } from 'lucide-react';
 import { toast } from 'sonner';
 import { api } from '../api/client';
 import { Input } from '@/components/ui/input';
@@ -59,11 +59,54 @@ function scopeLabel(scope: MemorySource['scope']): string {
   }
 }
 
+function SourceItem({
+  source,
+  active,
+  hit,
+  onSelect,
+}: {
+  source: MemorySource;
+  active: boolean;
+  hit?: MemorySearchHit;
+  onSelect: (path: string) => void;
+}) {
+  // Show filename part only (strip folder prefix from label)
+  const displayLabel = source.label.includes(' / ')
+    ? source.label.split(' / ').slice(1).join(' / ')
+    : source.label;
+  return (
+    <button
+      onClick={() => onSelect(source.path)}
+      className={`w-full text-left rounded-lg border px-3 py-2 transition-colors ${
+        active
+          ? 'border-primary bg-brand-50'
+          : 'border-border hover:bg-muted/50'
+      }`}
+    >
+      <div className="text-sm font-medium text-foreground truncate">
+        {displayLabel}
+      </div>
+      <div className="text-[11px] text-muted-foreground truncate mt-0.5">
+        {source.path}
+      </div>
+      <div className="text-[11px] mt-1 text-muted-foreground">
+        {source.writable ? '可编辑' : '只读'} · {source.exists ? `${source.size} B` : '文件不存在'}
+      </div>
+      {hit && (
+        <div className="text-[11px] mt-1 text-primary truncate">
+          命中 {hit.hits} 次 · {hit.snippet}
+        </div>
+      )}
+    </button>
+  );
+}
+
 export function MemoryPage() {
   const [searchParams] = useSearchParams();
   const folderParam = searchParams.get('folder');
 
   const [sources, setSources] = useState<MemorySource[]>([]);
+  const [folderNames, setFolderNames] = useState<Record<string, string>>({});
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [content, setContent] = useState('');
   const [initialContent, setInitialContent] = useState('');
@@ -78,6 +121,21 @@ export function MemoryPage() {
 
   const isMobile = useMediaQuery('(max-width: 1023px)');
   const [showContent, setShowContent] = useState(false);
+
+  // Load folder → group name mapping
+  useEffect(() => {
+    api.get<{ groups: Record<string, { name: string; folder: string }> }>('/api/groups')
+      .then((data) => {
+        const map: Record<string, string> = {};
+        for (const info of Object.values(data.groups)) {
+          if (info.folder && info.name && !map[info.folder]) {
+            map[info.folder] = info.name;
+          }
+        }
+        setFolderNames(map);
+      })
+      .catch(() => {});
+  }, []);
 
   const dirty = useMemo(() => content !== initialContent, [content, initialContent]);
 
@@ -101,6 +159,43 @@ export function MemoryPage() {
     }
     return groups;
   }, [filteredSources]);
+
+  // Sub-group flow sources by folder name
+  const flowByFolder = useMemo(() => {
+    const map: Record<string, MemorySource[]> = {};
+    for (const source of groupedSources.flow) {
+      const folder = source.label.split(' / ')[0] || 'unknown';
+      if (!map[folder]) map[folder] = [];
+      map[folder].push(source);
+    }
+    return map;
+  }, [groupedSources.flow]);
+
+  // Collapsed state: scope-level and flow sub-group level
+  const [collapsedScopes, setCollapsedScopes] = useState<Record<string, boolean>>({
+    'user-global': true,
+    main: true,
+    flow: true,
+    session: true,
+  });
+  const [collapsedFolders, setCollapsedFolders] = useState<Record<string, boolean>>({});
+
+  const toggleScope = (scope: string) =>
+    setCollapsedScopes((prev) => ({ ...prev, [scope]: !prev[scope] }));
+  const toggleFolder = (folder: string) =>
+    setCollapsedFolders((prev) => ({ ...prev, [folder]: !prev[folder] }));
+
+  // Auto-expand scope/folder containing the selected file
+  useEffect(() => {
+    if (!selectedPath) return;
+    const selected = sources.find((s) => s.path === selectedPath);
+    if (!selected) return;
+    setCollapsedScopes((prev) => ({ ...prev, [selected.scope]: false }));
+    if (selected.scope === 'flow') {
+      const folder = selected.label.split(' / ')[0] || 'unknown';
+      setCollapsedFolders((prev) => ({ ...prev, [folder]: false }));
+    }
+  }, [selectedPath, sources]);
 
   const loadFile = useCallback(async (path: string) => {
     setLoadingFile(true);
@@ -287,47 +382,65 @@ export function MemoryPage() {
               </div>
             </div>
 
-            <div className="space-y-4 max-h-[calc(100dvh-280px)] lg:max-h-[560px] overflow-auto pr-1">
+            <div className="space-y-2 max-h-[calc(100dvh-280px)] lg:max-h-[560px] overflow-auto pr-1">
               {(['user-global', 'main', 'flow', 'session'] as const).map((scope) => {
                 const items = groupedSources[scope];
                 if (items.length === 0) return null;
+                const isCollapsed = !!collapsedScopes[scope];
                 return (
                   <div key={scope}>
-                    <div className="text-xs font-semibold text-muted-foreground mb-2">
+                    <button
+                      onClick={() => toggleScope(scope)}
+                      className="flex items-center gap-1 w-full text-left text-xs font-semibold text-muted-foreground mb-1 hover:text-foreground transition-colors"
+                    >
+                      {isCollapsed ? <ChevronRight className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
                       {scopeLabel(scope)} ({items.length})
-                    </div>
-                    <div className="space-y-1">
-                      {items.map((source) => {
-                        const active = source.path === selectedPath;
-                        const hit = searchHits[source.path];
-                        return (
-                          <button
-                            key={source.path}
-                            onClick={() => handleSelectSource(source.path)}
-                            className={`w-full text-left rounded-lg border px-3 py-2 transition-colors ${
-                              active
-                                ? 'border-primary bg-brand-50'
-                                : 'border-border hover:bg-muted/50'
-                            }`}
-                          >
-                            <div className="text-sm font-medium text-foreground truncate">
-                              {source.label}
-                            </div>
-                            <div className="text-[11px] text-muted-foreground truncate mt-0.5">
-                              {source.path}
-                            </div>
-                            <div className="text-[11px] mt-1 text-muted-foreground">
-                              {source.writable ? '可编辑' : '只读'} · {source.exists ? `${source.size} B` : '文件不存在'}
-                            </div>
-                            {hit && (
-                              <div className="text-[11px] mt-1 text-primary truncate">
-                                命中 {hit.hits} 次 · {hit.snippet}
+                    </button>
+                    {!isCollapsed && (
+                      <div className="space-y-1 ml-1">
+                        {scope === 'flow' ? (
+                          // Flow: sub-group by folder
+                          Object.entries(flowByFolder).map(([folder, folderItems]) => {
+                            const isFolderCollapsed = collapsedFolders[folder] !== false;
+                            return (
+                              <div key={folder}>
+                                <button
+                                  onClick={() => toggleFolder(folder)}
+                                  className="flex items-center gap-1 w-full text-left text-[11px] font-medium text-muted-foreground py-1 hover:text-foreground transition-colors"
+                                >
+                                  {isFolderCollapsed ? <ChevronRight className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+                                  {folderNames[folder] || folder}
+                                  <span className="text-muted-foreground/60 ml-1">({folderItems.length})</span>
+                                </button>
+                                {!isFolderCollapsed && (
+                                  <div className="space-y-1 ml-3">
+                                    {folderItems.map((source) => (
+                                      <SourceItem
+                                        key={source.path}
+                                        source={source}
+                                        active={source.path === selectedPath}
+                                        hit={searchHits[source.path]}
+                                        onSelect={handleSelectSource}
+                                      />
+                                    ))}
+                                  </div>
+                                )}
                               </div>
-                            )}
-                          </button>
-                        );
-                      })}
-                    </div>
+                            );
+                          })
+                        ) : (
+                          items.map((source) => (
+                            <SourceItem
+                              key={source.path}
+                              source={source}
+                              active={source.path === selectedPath}
+                              hit={searchHits[source.path]}
+                              onSelect={handleSelectSource}
+                            />
+                          ))
+                        )}
+                      </div>
+                    )}
                   </div>
                 );
               })}
