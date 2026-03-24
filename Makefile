@@ -57,14 +57,60 @@ ifeq ($(HAS_BUN),1)
 	  if [ ! -f "$$target" ] || [ -n "$$(find shared/ -newer "$$target" -name '*.ts' 2>/dev/null | head -1)" ]; then NEED_SYNC=1; break; fi; \
 	done; \
 	if [ "$$NEED_SYNC" = "1" ]; then echo "🔄 检测到 shared/ 类型变更，同步类型..."; $(MAKE) sync-types; fi
-	@if [ ! -f web/dist/index.html ] || [ -n "$$(find web/src/ -newer web/dist/index.html \( -name '*.ts' -o -name '*.tsx' -o -name '*.css' \) 2>/dev/null | head -1)" ]; then echo "🔨 检测到前端源码变更，重新编译前端..."; cd web && bun run build; else echo "✅ 前端无变更，跳过编译"; fi
-	@if [ ! -f container/agent-runner/dist/.tsbuildinfo ] || [ -n "$$(find container/agent-runner/src/ -newer container/agent-runner/dist/.tsbuildinfo \( -name '*.ts' \) 2>/dev/null | head -1)" ]; then echo "🔨 检测到 agent-runner 源码变更，重新编译..."; cd container/agent-runner && bun run build; else echo "✅ agent-runner 无变更，跳过编译"; fi
+	@NEED_WEB=0; \
+	if [ ! -f web/dist/index.html ]; then NEED_WEB=1; \
+	else \
+	  for f in web/package.json web/vite.config.ts web/index.html web/tsconfig.json; do \
+	    if [ -f "$$f" ] && [ "$$f" -nt web/dist/index.html ]; then NEED_WEB=1; break; fi; \
+	  done; \
+	  if [ "$$NEED_WEB" = "0" ] && [ -n "$$(find web/src/ -newer web/dist/index.html \( -name '*.ts' -o -name '*.tsx' -o -name '*.css' \) 2>/dev/null | head -1)" ]; then NEED_WEB=1; fi; \
+	fi; \
+	if [ "$$NEED_WEB" = "1" ]; then echo "🔨 检测到前端变更，重新编译前端..."; cd web && bun run build; else echo "✅ 前端无变更，跳过编译"; fi
+	@NEED_AR=0; \
+	if [ ! -f container/agent-runner/dist/.tsbuildinfo ]; then NEED_AR=1; \
+	else \
+	  for f in container/agent-runner/package.json container/agent-runner/tsconfig.json; do \
+	    if [ -f "$$f" ] && [ "$$f" -nt container/agent-runner/dist/.tsbuildinfo ]; then NEED_AR=1; break; fi; \
+	  done; \
+	  if [ "$$NEED_AR" = "0" ] && [ -n "$$(find container/agent-runner/src/ -newer container/agent-runner/dist/.tsbuildinfo -name '*.ts' 2>/dev/null | head -1)" ]; then NEED_AR=1; fi; \
+	fi; \
+	if [ "$$NEED_AR" = "1" ]; then echo "🔨 检测到 agent-runner 变更，重新编译..."; cd container/agent-runner && bun run build; else echo "✅ agent-runner 无变更，跳过编译"; fi
 	@echo "⚡ Bun 模式：直接运行 TypeScript，跳过后端编译"
 	bun src/index.ts
 else
-	@echo "🔨 编译全部..."
-	@$(MAKE) build
-	npm run start
+	@NEED_SYNC=0; \
+	for target in src/stream-event.types.ts web/src/stream-event.types.ts container/agent-runner/src/stream-event.types.ts src/image-detector.ts container/agent-runner/src/image-detector.ts src/channel-prefixes.ts container/agent-runner/src/channel-prefixes.ts; do \
+	  if [ ! -f "$$target" ] || [ -n "$$(find shared/ -newer "$$target" -name '*.ts' 2>/dev/null | head -1)" ]; then NEED_SYNC=1; break; fi; \
+	done; \
+	if [ "$$NEED_SYNC" = "1" ]; then echo "🔄 检测到 shared/ 类型变更，同步类型..."; $(MAKE) sync-types; fi
+	@NEED_BACKEND=0; \
+	if [ ! -f dist/index.js ]; then NEED_BACKEND=1; \
+	else \
+	  for f in package.json tsconfig.json; do \
+	    if [ "$$f" -nt dist/index.js ]; then NEED_BACKEND=1; break; fi; \
+	  done; \
+	  if [ "$$NEED_BACKEND" = "0" ] && [ -n "$$(find src/ -newer dist/index.js -name '*.ts' 2>/dev/null | head -1)" ]; then NEED_BACKEND=1; fi; \
+	fi; \
+	if [ "$$NEED_BACKEND" = "1" ]; then echo "🔨 检测到后端源码变更，重新编译后端..."; npm run build; else echo "✅ 后端无变更，跳过编译"; fi
+	@NEED_WEB=0; \
+	if [ ! -f web/dist/index.html ]; then NEED_WEB=1; \
+	else \
+	  for f in web/package.json web/vite.config.ts web/index.html web/tsconfig.json; do \
+	    if [ -f "$$f" ] && [ "$$f" -nt web/dist/index.html ]; then NEED_WEB=1; break; fi; \
+	  done; \
+	  if [ "$$NEED_WEB" = "0" ] && [ -n "$$(find web/src/ -newer web/dist/index.html \( -name '*.ts' -o -name '*.tsx' -o -name '*.css' \) 2>/dev/null | head -1)" ]; then NEED_WEB=1; fi; \
+	fi; \
+	if [ "$$NEED_WEB" = "1" ]; then echo "🔨 检测到前端变更，重新编译前端..."; cd web && npm run build; else echo "✅ 前端无变更，跳过编译"; fi
+	@NEED_AR=0; \
+	if [ ! -f container/agent-runner/dist/.tsbuildinfo ]; then NEED_AR=1; \
+	else \
+	  for f in container/agent-runner/package.json container/agent-runner/tsconfig.json; do \
+	    if [ -f "$$f" ] && [ "$$f" -nt container/agent-runner/dist/.tsbuildinfo ]; then NEED_AR=1; break; fi; \
+	  done; \
+	  if [ "$$NEED_AR" = "0" ] && [ -n "$$(find container/agent-runner/src/ -newer container/agent-runner/dist/.tsbuildinfo -name '*.ts' 2>/dev/null | head -1)" ]; then NEED_AR=1; fi; \
+	fi; \
+	if [ "$$NEED_AR" = "1" ]; then echo "🔨 检测到 agent-runner 变更，重新编译..."; cd container/agent-runner && npm run build; else echo "✅ agent-runner 无变更，跳过编译"; fi
+	node dist/index.js
 endif
 
 # ─── Quality ─────────────────────────────────────────────────
@@ -127,7 +173,7 @@ update-sdk: ## 更新 agent-runner 的 Claude Agent SDK 到最新版本
 
 ensure-latest-sdk: ## 启动前自动检测并更新 SDK（有新版才更新）
 	@LOCAL=$$(node -p "require('./container/agent-runner/node_modules/@anthropic-ai/claude-agent-sdk/package.json').version" 2>/dev/null || echo "0.0.0"); \
-	LATEST=$$(npm view @anthropic-ai/claude-agent-sdk version 2>/dev/null || echo "$$LOCAL"); \
+	LATEST=$$(npm view @anthropic-ai/claude-agent-sdk version --fetch-timeout=5000 2>/dev/null || echo "$$LOCAL"); \
 	if [ "$$LOCAL" != "$$LATEST" ]; then \
 		echo "🔄 Claude Agent SDK 有新版本: $$LOCAL → $$LATEST，正在更新..."; \
 		cd container/agent-runner && $(PKG) update @anthropic-ai/claude-agent-sdk && $(PKG) run build; \
