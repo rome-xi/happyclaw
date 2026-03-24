@@ -99,7 +99,7 @@ export function SettingsNav({ activeTab, onTabChange, canManageSystemConfig, can
                       active
                         ? 'bg-brand-50 text-primary font-medium'
                         : disabled
-                          ? 'text-slate-300 cursor-not-allowed'
+                          ? 'text-muted-foreground/50 cursor-not-allowed'
                           : 'text-muted-foreground hover:bg-muted hover:text-foreground'
                     }`}
                   >
@@ -143,7 +143,7 @@ export function SettingsNav({ activeTab, onTabChange, canManageSystemConfig, can
                           active
                             ? 'bg-brand-50 text-primary font-medium'
                             : disabled
-                              ? 'text-slate-300 cursor-not-allowed'
+                              ? 'text-muted-foreground/50 cursor-not-allowed'
                               : 'text-muted-foreground hover:bg-muted hover:text-foreground'
                         }`}
                       >

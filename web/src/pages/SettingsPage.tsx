@@ -120,12 +120,12 @@ export function SettingsPage() {
       >
         <button
           onClick={() => setNavOpen(true)}
-          className="p-1.5 -ml-1.5 rounded-lg hover:bg-slate-100 transition-colors"
+          className="p-1.5 -ml-1.5 rounded-lg hover:bg-muted transition-colors"
           aria-label="打开导航"
         >
-          <Menu className="w-5 h-5 text-slate-600" />
+          <Menu className="w-5 h-5 text-muted-foreground" />
         </button>
-        <span className="ml-3 text-sm font-semibold text-slate-900 truncate">{sectionTitle[activeTab]}</span>
+        <span className="ml-3 text-sm font-semibold text-foreground truncate">{sectionTitle[activeTab]}</span>
       </div>
 
       {/* Mobile horizontal tab bar */}
@@ -147,8 +147,8 @@ export function SettingsPage() {
                 isActive
                   ? 'bg-primary text-white'
                   : disabled
-                    ? 'text-slate-300'
-                    : 'text-slate-500 hover:bg-slate-100 hover:text-slate-700'
+                    ? 'text-muted-foreground/50'
+                    : 'text-muted-foreground hover:bg-muted hover:text-foreground'
               }`}
             >
               {tab.label}
