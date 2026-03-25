@@ -91,6 +91,7 @@ export interface ClaudeOAuthCredentials {
   refreshToken: string;
   expiresAt: number; // Unix timestamp (ms)
   scopes: string[];
+  subscriptionType?: string; // e.g. 'max', 'pro' — written to .credentials.json if present
 }
 
 export interface ClaudeProviderConfig {
@@ -590,6 +591,9 @@ function decryptSecrets(secrets: EncryptedSecrets): SecretPayload {
         refreshToken: creds.refreshToken,
         expiresAt: typeof creds.expiresAt === 'number' ? creds.expiresAt : 0,
         scopes: Array.isArray(creds.scopes) ? (creds.scopes as string[]) : [],
+        ...(typeof creds.subscriptionType === 'string'
+          ? { subscriptionType: creds.subscriptionType }
+          : {}),
       };
     }
   }
@@ -2746,14 +2750,29 @@ export function writeCredentialsFile(
   const creds = config.claudeOAuthCredentials;
   if (!creds) return;
 
-  const credentialsData = {
-    claudeAiOauth: {
-      accessToken: creds.accessToken,
-      refreshToken: creds.refreshToken,
-      expiresAt: creds.expiresAt,
-      scopes: creds.scopes,
-    },
+  // Claude CLI requires scopes to recognize the token as valid.
+  // Fall back to a sensible default when the stored credentials lack scopes
+  // (e.g. tokens imported before scopes were captured).
+  const DEFAULT_SCOPES = [
+    'user:inference',
+    'user:profile',
+    'user:sessions:claude_code',
+  ];
+  const scopes = creds.scopes?.length ? creds.scopes : DEFAULT_SCOPES;
+
+  const claudeAiOauth: Record<string, unknown> = {
+    accessToken: creds.accessToken,
+    refreshToken: creds.refreshToken,
+    expiresAt: creds.expiresAt,
+    scopes,
   };
+  // Only include subscriptionType when explicitly configured — avoids
+  // misleading Claude CLI when the actual subscription tier is unknown.
+  if (creds.subscriptionType) {
+    claudeAiOauth.subscriptionType = creds.subscriptionType;
+  }
+
+  const credentialsData = { claudeAiOauth };
 
   const filePath = path.join(sessionDir, '.credentials.json');
   const tmp = `${filePath}.tmp`;
