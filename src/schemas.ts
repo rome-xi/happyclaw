@@ -324,6 +324,7 @@ export const ClaudeOAuthCredentialsSchema = z.object({
   refreshToken: z.string().min(1),
   expiresAt: z.number(),
   scopes: z.array(z.string()).default([]),
+  subscriptionType: z.string().optional(),
 });
 
 export const ClaudeSecretsSchema = z
