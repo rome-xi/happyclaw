@@ -209,6 +209,7 @@ interface ChatState {
   setActiveAgentTab: (jid: string, agentId: string | null) => void;
   // Conversation agent actions
   createConversation: (jid: string, name: string, description?: string) => Promise<AgentInfo | null>;
+  renameConversation: (jid: string, agentId: string, name: string) => Promise<boolean>;
   loadAgentMessages: (jid: string, agentId: string, loadMore?: boolean) => Promise<void>;
   sendAgentMessage: (jid: string, agentId: string, content: string, attachments?: Array<{ data: string; mimeType: string }>) => void;
   refreshAgentMessages: (jid: string, agentId: string) => Promise<void>;
@@ -700,9 +701,6 @@ function applyStreamEvent(
       if (event.todos) {
         next.todos = event.todos;
       }
-      break;
-    case 'mode_change':
-      // Handled at ChatView level via onModeChange callback
       break;
     case 'status': {
       next.systemStatus = event.statusText || null;
@@ -1912,6 +1910,21 @@ export const useChatStore = create<ChatState>((set, get) => ({
     } catch (err) {
       set({ error: err instanceof Error ? err.message : String(err) });
       return null;
+    }
+  },
+
+  renameConversation: async (jid, agentId, name) => {
+    try {
+      await api.patch(`/api/groups/${encodeURIComponent(jid)}/agents/${agentId}`, { name });
+      set((s) => {
+        const agents = (s.agents[jid] || []).map((a) =>
+          a.id === agentId ? { ...a, name } : a,
+        );
+        return { agents: { ...s.agents, [jid]: agents } };
+      });
+      return true;
+    } catch {
+      return false;
     }
   },
 

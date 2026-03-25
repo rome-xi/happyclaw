@@ -242,7 +242,6 @@ export function ProviderEditor({
           }
           createBody.anthropicBaseUrl = trimmedBaseUrl;
           createBody.anthropicAuthToken = trimmedToken;
-          if (model.trim()) createBody.anthropicModel = model.trim();
         } else {
           // 官方模式 — 根据认证方式设置凭据
           if (authTab === 'setup_token') {
@@ -288,6 +287,8 @@ export function ProviderEditor({
             // 允许不带凭据创建，用户之后通过 OAuth 流程补充
           }
         }
+
+        if (model.trim()) createBody.anthropicModel = model.trim();
 
         await api.post('/api/config/claude/providers', createBody);
         setNotice('提供商已创建。');
@@ -394,15 +395,15 @@ export function ProviderEditor({
           {/* 类型选择（仅创建模式） */}
           {isCreate && (
             <div>
-              <label className="block text-xs text-slate-600 mb-1">提供商类型</label>
-              <div className="inline-flex rounded-lg border border-slate-200 p-1 bg-slate-50">
+              <label className="block text-xs text-muted-foreground mb-1">提供商类型</label>
+              <div className="inline-flex rounded-lg border border-border p-1 bg-muted">
                 <button
                   type="button"
                   onClick={() => setProviderType('official')}
                   className={`px-3 py-1.5 text-sm rounded-md transition-colors cursor-pointer ${
                     providerType === 'official'
                       ? 'bg-background text-primary shadow-sm'
-                      : 'text-slate-500'
+                      : 'text-muted-foreground'
                   }`}
                 >
                   官方
@@ -413,7 +414,7 @@ export function ProviderEditor({
                   className={`px-3 py-1.5 text-sm rounded-md transition-colors cursor-pointer ${
                     providerType === 'third_party'
                       ? 'bg-background text-primary shadow-sm'
-                      : 'text-slate-500'
+                      : 'text-muted-foreground'
                   }`}
                 >
                   第三方
@@ -424,7 +425,7 @@ export function ProviderEditor({
 
           {/* 名称 */}
           <div>
-            <label className="block text-xs text-slate-600 mb-1">名称</label>
+            <label className="block text-xs text-muted-foreground mb-1">名称</label>
             <Input
               type="text"
               value={name}
@@ -438,8 +439,8 @@ export function ProviderEditor({
           {providerType === 'official' && (
             <div className="space-y-4">
               <div>
-                <label className="block text-xs text-slate-600 mb-2">认证方式</label>
-                <div className="inline-flex rounded-lg border border-slate-200 p-1 bg-slate-50">
+                <label className="block text-xs text-muted-foreground mb-2">认证方式</label>
+                <div className="inline-flex rounded-lg border border-border p-1 bg-muted">
                   {(['oauth', 'setup_token', 'api_key'] as const).map((tab) => (
                     <button
                       key={tab}
@@ -448,7 +449,7 @@ export function ProviderEditor({
                       className={`px-3 py-1.5 text-xs rounded-md transition-colors cursor-pointer ${
                         authTab === tab
                           ? 'bg-background text-primary shadow-sm'
-                          : 'text-slate-500'
+                          : 'text-muted-foreground'
                       }`}
                     >
                       {tab === 'oauth' ? 'OAuth 登录' : tab === 'setup_token' ? 'Setup Token' : 'API Key'}
@@ -459,8 +460,8 @@ export function ProviderEditor({
 
               {authTab === 'oauth' && (
                 <div className="rounded-lg border border-teal-200 bg-teal-50/50 p-4 space-y-3">
-                  <div className="text-sm font-medium text-slate-800">一键登录 Claude（推荐）</div>
-                  <div className="text-xs text-slate-600">
+                  <div className="text-sm font-medium text-foreground">一键登录 Claude（推荐）</div>
+                  <div className="text-xs text-muted-foreground">
                     点击按钮后会打开 claude.ai 授权页面，完成授权后将页面上显示的授权码粘贴回来。
                   </div>
 
@@ -526,7 +527,7 @@ export function ProviderEditor({
 
               {authTab === 'setup_token' && (
                 <div className="space-y-2">
-                  <label className="block text-xs text-slate-600 mb-1">
+                  <label className="block text-xs text-muted-foreground mb-1">
                     setup-token 或 .credentials.json{' '}
                     {!isCreate && provider?.hasClaudeCodeOauthToken
                       ? `(${provider.claudeCodeOauthTokenMasked})`
@@ -543,9 +544,9 @@ export function ProviderEditor({
                         : '粘贴 setup-token 或 cat ~/.claude/.credentials.json 输出'
                     }
                   />
-                  <p className="text-xs text-slate-400">
+                  <p className="text-xs text-muted-foreground">
                     支持粘贴{' '}
-                    <code className="bg-slate-100 px-1 rounded">cat ~/.claude/.credentials.json</code>{' '}
+                    <code className="bg-muted px-1 rounded">cat ~/.claude/.credentials.json</code>{' '}
                     的 JSON 内容
                   </p>
                 </div>
@@ -553,7 +554,7 @@ export function ProviderEditor({
 
               {authTab === 'api_key' && (
                 <div className="space-y-2">
-                  <label className="block text-xs text-slate-600 mb-1">
+                  <label className="block text-xs text-muted-foreground mb-1">
                     <span className="flex items-center gap-1.5">
                       <Key className="w-3.5 h-3.5" />
                       ANTHROPIC_API_KEY{' '}
@@ -574,7 +575,7 @@ export function ProviderEditor({
                     }
                     className="font-mono"
                   />
-                  <p className="text-xs text-slate-400">
+                  <p className="text-xs text-muted-foreground">
                     直接使用 Anthropic 官方 API Key，从{' '}
                     <a
                       href="https://console.anthropic.com/settings/keys"
@@ -595,7 +596,7 @@ export function ProviderEditor({
           {providerType === 'third_party' && (
             <div className="space-y-4">
               <div>
-                <label className="block text-xs text-slate-600 mb-1">ANTHROPIC_BASE_URL</label>
+                <label className="block text-xs text-muted-foreground mb-1">ANTHROPIC_BASE_URL</label>
                 <Input
                   type="text"
                   value={baseUrl}
@@ -606,19 +607,7 @@ export function ProviderEditor({
               </div>
 
               <div>
-                <label className="block text-xs text-slate-600 mb-1">ANTHROPIC_MODEL</label>
-                <Input
-                  type="text"
-                  value={model}
-                  onChange={(e) => setModel(e.target.value)}
-                  disabled={saving}
-                  placeholder="opus / sonnet / haiku 或完整模型 ID"
-                  className="font-mono"
-                />
-              </div>
-
-              <div>
-                <label className="block text-xs text-slate-600 mb-1">
+                <label className="block text-xs text-muted-foreground mb-1">
                   ANTHROPIC_AUTH_TOKEN{' '}
                   {!isCreate && provider?.hasAnthropicAuthToken
                     ? `(${provider.anthropicAuthTokenMasked})`
@@ -642,7 +631,7 @@ export function ProviderEditor({
                   }
                 />
                 {!isCreate && provider?.hasAnthropicAuthToken && (
-                  <label className="mt-2 inline-flex items-center gap-2 text-xs text-slate-600">
+                  <label className="mt-2 inline-flex items-center gap-2 text-xs text-muted-foreground">
                     <input
                       type="checkbox"
                       checked={clearTokenOnSave}
@@ -662,10 +651,48 @@ export function ProviderEditor({
             </div>
           )}
 
+          {/* ─── 模型选择 ─── */}
+          <div>
+            <label className="block text-xs text-muted-foreground mb-1">
+              {providerType === 'official' ? '模型' : 'ANTHROPIC_MODEL'}
+            </label>
+            {providerType === 'official' ? (
+              <>
+                <select
+                  value={model}
+                  onChange={(e) => setModel(e.target.value)}
+                  disabled={saving}
+                  className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary/30"
+                >
+                  <option value="">default（默认）</option>
+                  <option value="sonnet">sonnet</option>
+                  <option value="haiku">haiku</option>
+                </select>
+                <p className="text-xs text-muted-foreground mt-1">
+                  别名自动解析为最新版本，留空使用 default。
+                </p>
+              </>
+            ) : (
+              <>
+                <Input
+                  type="text"
+                  value={model}
+                  onChange={(e) => setModel(e.target.value)}
+                  disabled={saving}
+                  placeholder="第三方 API 的模型名称"
+                  className="font-mono"
+                />
+                <p className="text-xs text-muted-foreground mt-1">
+                  注入为 ANTHROPIC_MODEL 环境变量，值取决于第三方 API 支持的模型。
+                </p>
+              </>
+            )}
+          </div>
+
           {/* ─── 自定义环境变量 ─── */}
-          <div className="border-t border-slate-100 pt-4">
+          <div className="border-t border-border pt-4">
             <div className="flex items-center justify-between mb-2">
-              <label className="text-xs text-slate-600">其他自定义环境变量（可选）</label>
+              <label className="text-xs text-muted-foreground">其他自定义环境变量（可选）</label>
               <button
                 type="button"
                 onClick={addRow}
@@ -675,12 +702,12 @@ export function ProviderEditor({
                 添加
               </button>
             </div>
-            <p className="mb-2 text-xs text-slate-500">
+            <p className="mb-2 text-xs text-muted-foreground">
               这些变量仅在当前提供商生效，不同提供商互不影响。
             </p>
 
             {customEnvRows.length === 0 ? (
-              <p className="text-xs text-slate-400">暂无</p>
+              <p className="text-xs text-muted-foreground">暂无</p>
             ) : (
               <div className="space-y-2">
                 {customEnvRows.map((row, idx) => (
@@ -702,7 +729,7 @@ export function ProviderEditor({
                     <button
                       type="button"
                       onClick={() => removeRow(idx)}
-                      className="w-8 h-8 rounded-md hover:bg-slate-100 text-slate-400 hover:text-red-500 flex items-center justify-center cursor-pointer"
+                      className="w-8 h-8 rounded-md hover:bg-muted text-muted-foreground hover:text-red-500 flex items-center justify-center cursor-pointer"
                       aria-label="删除环境变量"
                     >
                       <X className="w-4 h-4" />
@@ -714,17 +741,17 @@ export function ProviderEditor({
           </div>
 
           {/* ─── 高级设置 ─── */}
-          <div className="border-t border-slate-100 pt-3">
+          <div className="border-t border-border pt-3">
             <button
               type="button"
-              className="text-xs text-slate-500 hover:text-slate-700 cursor-pointer"
+              className="text-xs text-muted-foreground hover:text-foreground cursor-pointer"
               onClick={() => setShowAdvanced(!showAdvanced)}
             >
               {showAdvanced ? '收起高级设置' : '展开高级设置'}
             </button>
             {showAdvanced && (
               <div className="mt-2">
-                <label className="block text-xs text-slate-600 mb-1">
+                <label className="block text-xs text-muted-foreground mb-1">
                   权重（用于加权轮询策略）
                 </label>
                 <Input
@@ -736,7 +763,7 @@ export function ProviderEditor({
                   disabled={saving}
                   className="w-24"
                 />
-                <p className="text-xs text-slate-400 mt-1">
+                <p className="text-xs text-muted-foreground mt-1">
                   仅当负载均衡策略为「加权轮询」时生效，值越大分配到的请求越多。
                 </p>
               </div>

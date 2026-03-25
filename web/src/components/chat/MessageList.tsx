@@ -431,8 +431,8 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
                   />
                 </div>
                 <div>
-                  <h3 className="text-lg font-semibold text-slate-900">{aiName}</h3>
-                  <p className="text-sm text-slate-500 mt-1">有什么我可以帮你的吗？</p>
+                  <h3 className="text-lg font-semibold text-foreground">{aiName}</h3>
+                  <p className="text-sm text-muted-foreground mt-1">有什么我可以帮你的吗？</p>
                 </div>
               </div>
 
@@ -477,7 +477,7 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
           <button
             type="button"
             onClick={onInterrupt}
-            className="inline-flex items-center gap-1.5 px-4 py-1.5 text-xs text-slate-500 hover:text-red-600 bg-card/90 backdrop-blur-sm hover:bg-red-50 rounded-full border border-border shadow-sm transition-colors cursor-pointer"
+            className="inline-flex items-center gap-1.5 px-4 py-1.5 text-xs text-muted-foreground hover:text-red-600 bg-card/90 backdrop-blur-sm hover:bg-red-50 rounded-full border border-border shadow-sm transition-colors cursor-pointer"
           >
             <Square className="w-3 h-3" />
             中断

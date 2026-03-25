@@ -69,8 +69,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
   // null = dialog closed; MAIN_BINDING = main conversation; other = agent id
   const [bindingAgentId, setBindingAgentId] = useState<string | null>(null);
   const [showNewConversation, setShowNewConversation] = useState(false);
-  // Code / Plan mode toggle (per group)
-  const [permissionMode, setPermissionMode] = useState<'bypassPermissions' | 'plan'>('bypassPermissions');
+  const [renameTarget, setRenameTarget] = useState<{ agentId: string; name: string } | null>(null);
   const [imStatus, setImStatus] = useState<{ feishu: boolean; telegram: boolean } | null>(null);
   const [imBannerDismissed, setImBannerDismissed] = useState(() =>
     localStorage.getItem('im-banner-dismissed') === '1',
@@ -105,6 +104,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
   const deleteAgentAction = useChatStore(s => s.deleteAgentAction);
   const agentStreaming = useChatStore(s => s.agentStreaming);
   const createConversation = useChatStore(s => s.createConversation);
+  const renameConversation = useChatStore(s => s.renameConversation);
   const loadAgentMessages = useChatStore(s => s.loadAgentMessages);
   const refreshAgentMessages = useChatStore(s => s.refreshAgentMessages);
   const sendAgentMessage = useChatStore(s => s.sendAgentMessage);
@@ -240,11 +240,6 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
     const unsub1 = wsManager.on('stream_event', (data: any) => {
       if (data.chatJid === groupJid) {
         handleStreamEvent(groupJid, data.event, data.agentId);
-        // Sync permission mode when agent calls ExitPlanMode/EnterPlanMode
-        if (data.event?.eventType === 'mode_change' && data.event?.permissionMode) {
-          const newMode = data.event.permissionMode as 'bypassPermissions' | 'plan';
-          setPermissionMode(newMode);
-        }
       }
     });
     // 通过 new_message 立即添加消息到本地状态（消除轮询延迟导致的消息"丢失"）
@@ -294,24 +289,6 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
     setResetLoading(false);
     setShowResetConfirm(false);
     setResetAgentId(null);
-  };
-
-  const togglePermissionMode = async () => {
-    const newMode = permissionMode === 'bypassPermissions' ? 'plan' : 'bypassPermissions';
-    setPermissionMode(newMode);
-    try {
-      const res = await api.put<{ success: boolean; mode: string; applied: boolean }>(
-        `/api/groups/${encodeURIComponent(groupJid)}/mode`, { mode: newMode },
-      );
-      if (res.applied === false) {
-        const label = newMode === 'plan' ? 'Plan' : 'Code';
-        showToast(`已切换到 ${label} 模式`, '容器未运行，模式将在下次启动时生效');
-      }
-    } catch {
-      // Revert on failure
-      setPermissionMode(permissionMode);
-      showToast('模式切换失败', '请稍后重试');
-    }
   };
 
   // --- Drag resize handlers (mouse + touch) ---
@@ -409,7 +386,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
     return (
       <div className="h-full flex items-center justify-center bg-background">
         <div className="text-center">
-          <p className="text-slate-500">群组不存在</p>
+          <p className="text-muted-foreground">群组不存在</p>
         </div>
       </div>
     );
@@ -422,20 +399,20 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
         {onBack && (
           <button
             onClick={onBack}
-            className="lg:hidden p-2 -ml-2 hover:bg-slate-100 rounded-lg transition-colors cursor-pointer"
+            className="lg:hidden p-2 -ml-2 hover:bg-muted rounded-lg transition-colors cursor-pointer"
             aria-label="返回"
           >
-            <ArrowLeft className="w-5 h-5 text-slate-600" />
+            <ArrowLeft className="w-5 h-5 text-foreground/70" />
           </button>
         )}
         {headerLeft}
         <div className="flex-1 min-w-0">
-          <h2 className="font-semibold text-slate-900 text-[15px] truncate">{group.name}</h2>
-          <div className="flex items-center gap-1.5 text-xs text-slate-500">
+          <h2 className="font-semibold text-foreground text-[15px] truncate">{group.name}</h2>
+          <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
             <span>{isWaiting ? '正在思考...' : group.is_home ? '主 Agent' : 'Agent'}</span>
             {!isWaiting && group.is_shared && (
               <>
-                <span className="text-slate-300">·</span>
+                <span className="text-muted-foreground/40">·</span>
                 <span className="inline-flex items-center gap-0.5">
                   <Users className="w-3 h-3" />
                   {group.member_count ?? 0} 人协作
@@ -444,7 +421,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
             )}
             {!isWaiting && group.execution_mode && (
               <>
-                <span className="text-slate-300">·</span>
+                <span className="text-muted-foreground/40">·</span>
                 <span className={`inline-flex items-center px-1 py-px rounded text-[10px] font-medium ${group.execution_mode === 'host' ? 'bg-amber-100 text-amber-700' : 'bg-sky-100 text-sky-700'}`}>
                   {group.execution_mode === 'host' ? '宿主机' : 'Docker'}
                 </span>
@@ -452,7 +429,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
             )}
             {isOwnHome && imStatus && (imStatus.feishu || imStatus.telegram) && (
               <>
-                <span className="text-slate-300">·</span>
+                <span className="text-muted-foreground/40">·</span>
                 {imStatus.feishu && (
                   <span className="inline-flex items-center gap-0.5">
                     <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
@@ -548,6 +525,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
           }
           deleteAgentAction(groupJid, id);
         }}
+        onRenameAgent={(id, currentName) => setRenameTarget({ agentId: id, name: currentName })}
         onCreateConversation={() => setShowNewConversation(true)}
         onBindIm={setBindingAgentId}
         onBindMainIm={!isHome ? () => setBindingAgentId(MAIN_BINDING) : undefined}
@@ -601,8 +579,6 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
                 groupJid={groupJid}
                 onResetSession={() => { setResetAgentId(null); setShowResetConfirm(true); }}
                 onToggleTerminal={canUseTerminal ? handleTerminalToggle : undefined}
-                permissionMode={permissionMode}
-                onTogglePermissionMode={togglePermissionMode}
               />
             </>
           )}
@@ -670,13 +646,13 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
               onTouchStart={handleTouchDragStart}
               className="hidden lg:flex h-1 bg-muted hover:bg-brand-400 cursor-row-resize items-center justify-center transition-colors group"
             >
-              <div className="w-8 h-0.5 rounded-full bg-slate-400 group-hover:bg-primary transition-colors" />
+              <div className="w-8 h-0.5 rounded-full bg-muted-foreground group-hover:bg-primary transition-colors" />
             </div>
           )}
           {/* Terminal panel */}
           <div
             className={`hidden lg:block flex-shrink-0 overflow-hidden transition-[height] duration-200 ${
-              terminalVisible ? 'border-t border-slate-300' : 'border-t-0'
+              terminalVisible ? 'border-t border-border' : 'border-t-0'
             }`}
             style={{ height: terminalVisible ? terminalHeight : 0 }}
           >
@@ -873,6 +849,18 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
           });
         }}
         onClose={() => setShowNewConversation(false)}
+      />
+
+      <PromptDialog
+        open={renameTarget !== null}
+        title="重命名对话"
+        label="对话名称"
+        placeholder="输入新名称"
+        defaultValue={renameTarget?.name ?? ''}
+        onConfirm={(name) => {
+          if (renameTarget) renameConversation(groupJid, renameTarget.agentId, name);
+        }}
+        onClose={() => setRenameTarget(null)}
       />
     </div>
   );

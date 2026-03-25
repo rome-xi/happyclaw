@@ -60,7 +60,7 @@ function MarkdownImage({ src, alt, loading }: { src?: string; alt?: string; load
 
   if (error) {
     return (
-      <span className="inline-flex items-center gap-1 px-2 py-1 bg-slate-100 text-slate-500 rounded text-sm">
+      <span className="inline-flex items-center gap-1 px-2 py-1 bg-muted text-muted-foreground rounded text-sm">
         <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="1.5">
           <path strokeLinecap="round" strokeLinejoin="round" d="m2.25 15.75 5.159-5.159a2.25 2.25 0 0 1 3.182 0l5.159 5.159m-1.5-1.5 1.409-1.409a2.25 2.25 0 0 1 3.182 0l2.909 2.909M3.75 21h16.5A2.25 2.25 0 0 0 22.5 18.75V5.25A2.25 2.25 0 0 0 20.25 3H3.75A2.25 2.25 0 0 0 1.5 5.25v13.5A2.25 2.25 0 0 0 3.75 21Z" />
         </svg>
@@ -128,8 +128,8 @@ function CodeBlock({
   const [copied, setCopied] = useState(false);
   const match = /language-(\w+)/.exec(className || '');
   const lang = match?.[1];
-  const isBlock = Boolean(match);
   const codeString = extractText(children).replace(/\n$/, '');
+  const isBlock = Boolean(match) || codeString.includes('\n');
 
   if (lang === 'mermaid') {
     return <MermaidDiagram code={codeString} />;
@@ -162,7 +162,7 @@ function CodeBlock({
             )}
           </button>
         </div>
-        <pre className="!bg-[#f6f8fa] dark:!bg-[#22272e] rounded-lg p-4 overflow-x-auto">
+        <pre className="!bg-[var(--code-block-bg)] rounded-lg p-3.5 overflow-x-auto font-mono text-sm">
           <code className={className} {...props}>
             {children}
           </code>
@@ -175,8 +175,8 @@ function CodeBlock({
     <code
       className={
         variant === 'chat'
-          ? 'bg-primary/10 dark:bg-primary/20 text-primary px-1.5 py-0.5 rounded text-[0.9em] leading-relaxed font-mono break-all'
-          : 'bg-primary/10 dark:bg-primary/20 text-primary px-1.5 py-0.5 rounded text-sm font-mono break-all'
+          ? 'bg-[var(--inline-code-bg)] text-[var(--inline-code-text)] px-1 py-px rounded-md text-[0.9em] leading-relaxed font-mono break-all'
+          : 'bg-[var(--inline-code-bg)] text-[var(--inline-code-text)] px-1 py-px rounded-md text-sm font-mono break-all'
       }
       {...props}
     >
@@ -187,7 +187,7 @@ function CodeBlock({
 
 export const MarkdownRenderer = memo(function MarkdownRenderer({ content, groupJid, variant = 'chat', streaming = false }: MarkdownRendererProps) {
   const textSizeClass = variant === 'chat'
-    ? 'text-[15px] leading-7 text-foreground'
+    ? 'text-base leading-[1.65] text-foreground'
     : 'text-sm leading-6 text-foreground';
   const tableTextClass = variant === 'chat' ? 'text-[0.95em]' : 'text-sm';
 
@@ -256,10 +256,13 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, groupJ
             </td>
           ),
           ul: ({ children }) => (
-            <ul className="list-disc list-inside my-2 space-y-1">{children}</ul>
+            <ul className="list-disc pl-6 my-2 space-y-1">{children}</ul>
           ),
           ol: ({ children }) => (
-            <ol className="list-decimal list-inside my-2 space-y-1">{children}</ol>
+            <ol className="list-decimal pl-6 my-2 space-y-1">{children}</ol>
+          ),
+          li: ({ children }) => (
+            <li className="[&>p]:inline [&>p]:my-0">{children}</li>
           ),
           p: ({ children }) => <p className="my-2">{children}</p>,
           h1: ({ children }) => (
@@ -272,7 +275,7 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, groupJ
             <h3 className="text-lg font-semibold mt-4 mb-2 leading-snug">{children}</h3>
           ),
           blockquote: ({ children }) => (
-            <blockquote className="border-l-4 border-slate-300 pl-4 my-4 text-slate-600 italic">
+            <blockquote className="border-l-4 border-border pl-4 my-4 text-muted-foreground italic">
               {children}
             </blockquote>
           ),

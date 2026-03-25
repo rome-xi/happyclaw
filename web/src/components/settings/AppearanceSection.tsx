@@ -1,20 +1,20 @@
 import { useEffect, useState } from 'react';
-import { Loader2 } from 'lucide-react';
+import { Loader2, Bot } from 'lucide-react';
+import { toast } from 'sonner';
 
 import { useAuthStore } from '../../stores/auth';
 import { api } from '../../api/client';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
+import { Label } from '@/components/ui/label';
 import { EmojiAvatar } from '@/components/common/EmojiAvatar';
 import { EmojiPicker } from '@/components/common/EmojiPicker';
 import { ColorPicker } from '@/components/common/ColorPicker';
-import type { SettingsNotification } from './types';
 import { getErrorMessage } from './types';
+import { SettingsCard as Section } from './SettingsCard';
 import type { AppearanceConfig } from '../../stores/auth';
 
-interface AppearanceSectionProps extends SettingsNotification {}
-
-export function AppearanceSection({ setNotice, setError }: AppearanceSectionProps) {
+export function AppearanceSection() {
   const { hasPermission } = useAuthStore();
 
   const [appName, setAppName] = useState('');
@@ -27,6 +27,7 @@ export function AppearanceSection({ setNotice, setError }: AppearanceSectionProp
   const canManage = hasPermission('manage_system_config');
 
   useEffect(() => {
+    if (!canManage) { setLoading(false); return; }
     (async () => {
       setLoading(true);
       try {
@@ -36,17 +37,15 @@ export function AppearanceSection({ setNotice, setError }: AppearanceSectionProp
         setAiAvatarEmoji(data.aiAvatarEmoji);
         setAiAvatarColor(data.aiAvatarColor);
       } catch (err) {
-        setError(getErrorMessage(err, '加载外观配置失败'));
+        toast.error(getErrorMessage(err, '加载外观配置失败'));
       } finally {
         setLoading(false);
       }
     })();
-  }, [setError]);
+  }, [canManage]);
 
   const handleSave = async () => {
     setSaving(true);
-    setError(null);
-    setNotice(null);
     try {
       const data = await api.put<AppearanceConfig>('/api/config/appearance', {
         appName: appName.trim() || undefined,
@@ -59,9 +58,9 @@ export function AppearanceSection({ setNotice, setError }: AppearanceSectionProp
       setAiAvatarEmoji(data.aiAvatarEmoji);
       setAiAvatarColor(data.aiAvatarColor);
       useAuthStore.setState({ appearance: data });
-      setNotice('外观设置已保存');
+      toast.success('外观设置已保存');
     } catch (err) {
-      setError(getErrorMessage(err, '保存外观设置失败'));
+      toast.error(getErrorMessage(err, '保存外观设置失败'));
     } finally {
       setSaving(false);
     }
@@ -70,84 +69,59 @@ export function AppearanceSection({ setNotice, setError }: AppearanceSectionProp
   if (loading) {
     return (
       <div className="flex items-center justify-center py-12">
-        <Loader2 className="w-6 h-6 animate-spin text-slate-400" />
+        <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
       </div>
     );
   }
 
   if (!canManage) {
-    return <div className="text-sm text-slate-500">需要系统配置权限才能修改外观设置。</div>;
+    return <div className="text-sm text-muted-foreground">需要系统配置权限才能修改全局外观设置。</div>;
   }
 
   return (
-    <div className="space-y-6">
-      <p className="text-sm text-slate-500 bg-slate-50 rounded-lg px-4 py-3">
-        以下为全局默认值，对所有用户生效。用户可在「个人资料」中覆盖自己的 AI 外观。
+    <div className="space-y-4">
+      <p className="text-sm text-muted-foreground bg-muted rounded-lg px-4 py-3">
+        全局默认值，对所有用户生效。用户可在「个人资料」中覆盖 AI 外观和主题偏好。
       </p>
-      {/* Preview */}
-      <div>
-        <h3 className="text-base font-semibold text-slate-900 mb-4">预览</h3>
-        <div className="flex items-center gap-3 p-4 bg-slate-50 rounded-lg">
-          <EmojiAvatar
-            emoji={aiAvatarEmoji}
-            color={aiAvatarColor}
-            fallbackChar={aiName}
-            size="lg"
-          />
-          <div>
-            <div className="text-sm font-medium text-slate-900">{aiName || 'HappyClaw'}</div>
-            <div className="text-xs text-slate-500">AI 助手</div>
+
+      {/* ── AI Default Appearance ── */}
+      <Section icon={Bot} title="AI 默认外观" desc="所有用户看到的默认 AI 助手样式">
+        <div className="flex items-center gap-4">
+          <EmojiAvatar emoji={aiAvatarEmoji} color={aiAvatarColor} fallbackChar={aiName} size="lg" />
+          <div className="flex-1 min-w-0">
+            <div className="text-sm font-medium text-foreground">{aiName || 'HappyClaw'}</div>
+            <div className="text-xs text-muted-foreground mt-0.5">全局默认 · 用户可个人覆盖</div>
           </div>
         </div>
-      </div>
 
-      {/* App Name */}
-      <div>
-        <h3 className="text-base font-semibold text-slate-900 mb-4">项目名称</h3>
-        <Input
-          type="text"
-          value={appName}
-          onChange={(e) => setAppName(e.target.value)}
-          maxLength={32}
-          placeholder="HappyClaw"
-          className="max-w-xs"
-        />
-        <p className="text-xs text-slate-500 mt-1">显示在 Logo 旁边和欢迎页的项目名称</p>
-      </div>
+        <div>
+          <Label className="text-xs text-muted-foreground mb-1">AI 名称</Label>
+          <Input
+            type="text"
+            value={aiName}
+            onChange={(e) => setAiName(e.target.value)}
+            maxLength={32}
+            placeholder="HappyClaw"
+          />
+        </div>
 
-      {/* AI Name */}
-      <div>
-        <h3 className="text-base font-semibold text-slate-900 mb-4">AI 默认名称</h3>
-        <Input
-          type="text"
-          value={aiName}
-          onChange={(e) => setAiName(e.target.value)}
-          maxLength={32}
-          placeholder="HappyClaw"
-          className="max-w-xs"
-        />
-        <p className="text-xs text-slate-500 mt-1">所有用户看到的默认 AI 助手名称（用户可在个人资料中单独覆盖）</p>
-      </div>
-
-      {/* AI Avatar Emoji */}
-      <div>
-        <h3 className="text-base font-semibold text-slate-900 mb-4">AI 头像 Emoji</h3>
-        <EmojiPicker value={aiAvatarEmoji} onChange={setAiAvatarEmoji} />
-      </div>
-
-      {/* AI Avatar Color */}
-      <div>
-        <h3 className="text-base font-semibold text-slate-900 mb-4">AI 头像背景色</h3>
-        <ColorPicker value={aiAvatarColor} onChange={setAiAvatarColor} />
-      </div>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div>
+            <Label className="text-[11px] text-muted-foreground mb-1.5">头像 Emoji</Label>
+            <EmojiPicker value={aiAvatarEmoji} onChange={setAiAvatarEmoji} />
+          </div>
+          <div>
+            <Label className="text-[11px] text-muted-foreground mb-1.5">头像背景色</Label>
+            <ColorPicker value={aiAvatarColor} onChange={setAiAvatarColor} />
+          </div>
+        </div>
+      </Section>
 
       {/* Save */}
-      <div>
-        <Button onClick={handleSave} disabled={saving || !aiName.trim()}>
-          {saving && <Loader2 className="size-4 animate-spin" />}
-          保存外观设置
-        </Button>
-      </div>
+      <Button onClick={handleSave} disabled={saving || !aiName.trim()} className="w-full sm:w-auto">
+        {saving && <Loader2 className="size-4 animate-spin" />}
+        保存全局外观
+      </Button>
     </div>
   );
 }

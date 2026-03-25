@@ -3249,6 +3249,7 @@ export interface UserWeChatConfig {
   baseUrl?: string; // 默认 https://ilinkai.weixin.qq.com
   cdnBaseUrl?: string; // 默认 https://novac2c.cdn.weixin.qq.com/c2c
   getUpdatesBuf?: string; // 长轮询游标
+  bypassProxy?: boolean; // 直连模式：绕过 HTTP 代理（默认 true）
   enabled?: boolean;
   updatedAt: string | null;
 }
@@ -3259,6 +3260,7 @@ interface StoredWeChatProviderConfigV1 {
   baseUrl?: string;
   cdnBaseUrl?: string;
   getUpdatesBuf?: string;
+  bypassProxy?: boolean;
   enabled?: boolean;
   updatedAt: string;
   secret: EncryptedSecrets;
@@ -3319,6 +3321,7 @@ export function getUserWeChatConfig(userId: string): UserWeChatConfig | null {
       baseUrl: stored.baseUrl,
       cdnBaseUrl: stored.cdnBaseUrl,
       getUpdatesBuf: stored.getUpdatesBuf,
+      bypassProxy: stored.bypassProxy ?? true, // 默认直连
       enabled: stored.enabled,
       updatedAt: stored.updatedAt || null,
     };
@@ -3338,6 +3341,7 @@ export function saveUserWeChatConfig(
     baseUrl: next.baseUrl?.trim() || undefined,
     cdnBaseUrl: next.cdnBaseUrl?.trim() || undefined,
     getUpdatesBuf: next.getUpdatesBuf,
+    bypassProxy: next.bypassProxy ?? true,
     enabled: next.enabled,
     updatedAt: new Date().toISOString(),
   };
@@ -3348,6 +3352,7 @@ export function saveUserWeChatConfig(
     baseUrl: normalized.baseUrl,
     cdnBaseUrl: normalized.cdnBaseUrl,
     getUpdatesBuf: normalized.getUpdatesBuf,
+    bypassProxy: normalized.bypassProxy,
     enabled: normalized.enabled,
     updatedAt: normalized.updatedAt || new Date().toISOString(),
     secret: encryptWeChatSecret({ botToken: normalized.botToken }),
