@@ -24,6 +24,11 @@ import {
   type WeChatConnection,
   type WeChatConnectionConfig,
 } from './wechat.js';
+import {
+  createDingTalkConnection,
+  type DingTalkConnection,
+  type DingTalkConnectionConfig,
+} from './dingtalk.js';
 import { logger } from './logger.js';
 import {
   StreamingCardController,
@@ -85,7 +90,10 @@ export interface IMChannel {
   isConnected(): boolean;
   syncGroups?(): Promise<void>;
   /** Create a streaming card session for real-time card updates (Feishu only) */
-  createStreamingSession?(chatId: string, onCardCreated?: (messageId: string) => void): StreamingCardController | undefined;
+  createStreamingSession?(
+    chatId: string,
+    onCardCreated?: (messageId: string) => void,
+  ): StreamingCardController | undefined;
   getChatInfo?(chatId: string): Promise<{
     avatar?: string;
     name?: string;
@@ -102,6 +110,7 @@ export const CHANNEL_REGISTRY: Record<string, { prefix: string }> = {
   telegram: { prefix: 'telegram:' },
   qq: { prefix: 'qq:' },
   wechat: { prefix: 'wechat:' },
+  dingtalk: { prefix: 'dingtalk:' },
 };
 
 /**
@@ -227,7 +236,10 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
       return inner.getChatInfo(chatId);
     },
 
-    createStreamingSession(chatId: string, onCardCreated?: (messageId: string) => void): StreamingCardController | undefined {
+    createStreamingSession(
+      chatId: string,
+      onCardCreated?: (messageId: string) => void,
+    ): StreamingCardController | undefined {
       if (!inner) return undefined;
       const larkClient = inner.getLarkClient();
       if (!larkClient) return undefined;
@@ -429,9 +441,7 @@ export function createQQChannel(config: QQConnectionConfig): IMChannel {
 
 // ─── WeChat Adapter ─────────────────────────────────────────────
 
-export function createWeChatChannel(
-  config: WeChatConnectionConfig,
-): IMChannel {
+export function createWeChatChannel(config: WeChatConnectionConfig): IMChannel {
   let inner: WeChatConnection | null = null;
 
   const channel: IMChannel = {
@@ -478,6 +488,72 @@ export function createWeChatChannel(
     async setTyping(chatId: string, isTyping: boolean): Promise<void> {
       if (!inner) return;
       await inner.sendTyping(chatId, isTyping);
+    },
+
+    isConnected(): boolean {
+      return inner?.isConnected() ?? false;
+    },
+  };
+
+  return channel;
+}
+
+// ─── DingTalk Adapter ─────────────────────────────────────────────
+
+export function createDingTalkChannel(
+  config: DingTalkConnectionConfig,
+): IMChannel {
+  let inner: DingTalkConnection | null = null;
+
+  const channel: IMChannel = {
+    channelType: 'dingtalk',
+
+    async connect(opts: IMChannelConnectOpts): Promise<boolean> {
+      inner = createDingTalkConnection(config);
+      try {
+        const connected = await inner.connect({
+          onReady: opts.onReady,
+          onNewChat: opts.onNewChat,
+          isChatAuthorized: opts.isChatAuthorized ?? (() => true),
+          onPairAttempt: opts.onPairAttempt,
+          onCommand: opts.onCommand,
+          ignoreMessagesBefore: opts.ignoreMessagesBefore,
+          resolveGroupFolder: opts.resolveGroupFolder,
+          resolveEffectiveChatJid: opts.resolveEffectiveChatJid,
+          onAgentMessage: opts.onAgentMessage,
+          onBotAddedToGroup: opts.onBotAddedToGroup,
+          onBotRemovedFromGroup: opts.onBotRemovedFromGroup,
+          shouldProcessGroupMessage: opts.shouldProcessGroupMessage,
+        });
+        return connected;
+      } catch (err) {
+        logger.error({ err }, 'DingTalk channel connect failed');
+        inner = null;
+        return false;
+      }
+    },
+
+    async disconnect(): Promise<void> {
+      if (inner) {
+        await inner.disconnect();
+        inner = null;
+      }
+    },
+
+    async sendMessage(chatId: string, text: string): Promise<void> {
+      if (!inner) {
+        logger.warn(
+          { chatId },
+          'DingTalk channel not connected, skip sending message',
+        );
+        return;
+      }
+      await inner.sendMessage(chatId, text);
+    },
+
+    async setTyping(chatId: string, isTyping: boolean): Promise<void> {
+      if (!inner) return;
+      await inner.sendReaction(chatId, isTyping);
     },
 
     isConnected(): boolean {

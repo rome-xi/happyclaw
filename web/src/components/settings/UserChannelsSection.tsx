@@ -3,6 +3,7 @@ import { FeishuChannelCard } from './FeishuChannelCard';
 import { TelegramChannelCard } from './TelegramChannelCard';
 import { QQChannelCard } from './QQChannelCard';
 import { WeChatChannelCard } from './WeChatChannelCard';
+import { DingTalkChannelCard } from './DingTalkChannelCard';
 
 interface UserChannelsSectionProps extends SettingsNotification {}
 
@@ -16,6 +17,7 @@ export function UserChannelsSection({ setNotice, setError }: UserChannelsSection
       <TelegramChannelCard setNotice={setNotice} setError={setError} />
       <QQChannelCard setNotice={setNotice} setError={setError} />
       <WeChatChannelCard setNotice={setNotice} setError={setError} />
+      <DingTalkChannelCard setNotice={setNotice} setError={setError} />
     </div>
   );
 }
