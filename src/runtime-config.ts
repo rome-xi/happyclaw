@@ -86,6 +86,15 @@ const MAX_THIRD_PARTY_PROFILES = 20;
 
 type ClaudeProviderMode = 'official' | 'third_party';
 
+// Fallback scopes for .credentials.json when stored credentials lack scopes.
+// Differs from OAUTH_SCOPES in routes/config.ts (the authorize-flow request):
+// authorize requests org:create_api_key; credential files need user:sessions:claude_code.
+const DEFAULT_CREDENTIAL_SCOPES = [
+  'user:inference',
+  'user:profile',
+  'user:sessions:claude_code',
+];
+
 export interface ClaudeOAuthCredentials {
   accessToken: string;
   refreshToken: string;
@@ -2753,14 +2762,15 @@ export function writeCredentialsFile(
   // Claude CLI requires scopes to recognize the token as valid.
   // Fall back to a sensible default when the stored credentials lack scopes
   // (e.g. tokens imported before scopes were captured).
-  const DEFAULT_SCOPES = [
-    'user:inference',
-    'user:profile',
-    'user:sessions:claude_code',
-  ];
-  const scopes = creds.scopes?.length ? creds.scopes : DEFAULT_SCOPES;
+  const scopes = creds.scopes?.length ? creds.scopes : DEFAULT_CREDENTIAL_SCOPES;
 
-  const claudeAiOauth: Record<string, unknown> = {
+  const claudeAiOauth: {
+    accessToken: string;
+    refreshToken: string;
+    expiresAt: number;
+    scopes: string[];
+    subscriptionType?: string;
+  } = {
     accessToken: creds.accessToken,
     refreshToken: creds.refreshToken,
     expiresAt: creds.expiresAt,
@@ -2855,6 +2865,7 @@ function readLocalOAuthCredentials(): {
   refreshToken: string;
   expiresAt?: number;
   scopes?: string[];
+  subscriptionType?: string;
 } | null {
   const homeDir = process.env.HOME || '/root';
   const credFile = path.join(homeDir, '.claude', '.credentials.json');
@@ -2872,6 +2883,10 @@ function readLocalOAuthCredentials(): {
         expiresAt:
           typeof oauth.expiresAt === 'number' ? oauth.expiresAt : undefined,
         scopes: Array.isArray(oauth.scopes) ? oauth.scopes : undefined,
+        subscriptionType:
+          typeof oauth.subscriptionType === 'string'
+            ? oauth.subscriptionType
+            : undefined,
       };
     }
     return null;
@@ -2922,6 +2937,9 @@ export function importLocalClaudeCredentials(): ClaudeOAuthCredentials | null {
     refreshToken: oauth.refreshToken,
     expiresAt: oauth.expiresAt ?? Date.now() + 8 * 3600_000,
     scopes: oauth.scopes ?? [],
+    ...(oauth.subscriptionType
+      ? { subscriptionType: oauth.subscriptionType }
+      : {}),
   };
 }
 
