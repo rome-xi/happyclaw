@@ -29,21 +29,21 @@ export function stripAgentInternalTags(text: string): string {
  * Heuristic: text is "noise" if it is short (<= 30 chars) AND matches a
  * known system-acknowledgement pattern after normalisation.
  */
+const NOISE_PATTERNS = [
+  /^ok[.。!！]?$/,
+  /^好的[.。!！]?$/,
+  /^已更新/,
+  /^已完成/,
+  /^已刷新/,
+  /^记忆已/,
+  /^claude\.md\s*已/,
+  /^memory\s*(flush|updated)/i,
+];
+
 export function isSystemMaintenanceNoise(text: string): boolean {
   const normalized = text.trim().toLowerCase();
   if (!normalized) return true;
-  // Only apply heuristic to very short outputs to avoid false positives.
   if (normalized.length > 30) return false;
-  const NOISE_PATTERNS = [
-    /^ok[.。!！]?$/,
-    /^好的[.。!！]?$/,
-    /^已更新/,
-    /^已完成/,
-    /^已刷新/,
-    /^记忆已/,
-    /^claude\.md\s*已/,
-    /^memory\s*(flush|updated)/i,
-  ];
   return NOISE_PATTERNS.some((p) => p.test(normalized));
 }
 

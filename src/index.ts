@@ -1610,8 +1610,8 @@ interface SendMessageOptions {
     turnId?: string;
     sessionId?: string;
     sdkMessageUuid?: string;
-    sourceKind?: 'sdk_final' | 'sdk_send_message' | 'interrupt_partial' | 'overflow_partial' | 'compact_partial' | 'legacy' | 'auto_continue';
-    finalizationReason?: 'completed' | 'interrupted' | 'error';
+    sourceKind?: ContainerOutput['sourceKind'];
+    finalizationReason?: ContainerOutput['finalizationReason'];
   };
 }
 
