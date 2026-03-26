@@ -3,22 +3,25 @@ import { useSearchParams } from 'react-router-dom';
 import { ArrowLeft, BookOpen, ChevronDown, ChevronRight, Loader2, RefreshCw, Save } from 'lucide-react';
 import { toast } from 'sonner';
 import { api } from '../api/client';
+import { useGroupsStore } from '../stores/groups';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { useMediaQuery } from '@/hooks/useMediaQuery';
 
+type MemoryType = 'global' | 'heartbeat' | 'session' | 'date' | 'conversation';
+
 interface MemorySource {
   path: string;
   label: string;
-  scope: 'user-global' | 'main' | 'flow' | 'session';
-  kind: 'claude' | 'note' | 'session';
+  type: MemoryType;
   writable: boolean;
   exists: boolean;
   updatedAt: string | null;
   size: number;
   ownerName?: string;
+  folder?: string;
 }
 
 interface MemoryFile {
@@ -35,6 +38,9 @@ interface MemorySearchHit {
   snippet: string;
 }
 
+const MEMORY_TYPES: MemoryType[] = ['global', 'heartbeat', 'session', 'date', 'conversation'];
+const FOLDER_SUB_GROUPED: Set<MemoryType> = new Set(['session', 'date', 'conversation']);
+
 function getErrorMessage(err: unknown, fallback: string): string {
   if (typeof err === 'object' && err !== null && 'message' in err) {
     const msg = (err as { message?: unknown }).message;
@@ -44,18 +50,14 @@ function getErrorMessage(err: unknown, fallback: string): string {
   return fallback;
 }
 
-function scopeLabel(scope: MemorySource['scope']): string {
-  switch (scope) {
-    case 'user-global':
-      return '我的全局记忆';
-    case 'main':
-      return '主会话';
-    case 'flow':
-      return '会话流';
-    case 'session':
-      return '自动记忆';
-    default:
-      return '其他';
+function typeLabel(type: MemoryType): string {
+  switch (type) {
+    case 'global': return '全局记忆';
+    case 'heartbeat': return '每日心跳';
+    case 'session': return '会话记忆';
+    case 'date': return '日期记忆';
+    case 'conversation': return '对话归档';
+    default: return '其他';
   }
 }
 
@@ -101,12 +103,33 @@ function SourceItem({
   );
 }
 
+function subGroupByFolder(items: MemorySource[]): Record<string, MemorySource[]> {
+  const map: Record<string, MemorySource[]> = {};
+  for (const source of items) {
+    const folder = source.folder || 'unknown';
+    if (!map[folder]) map[folder] = [];
+    map[folder].push(source);
+  }
+  return map;
+}
+
 export function MemoryPage() {
   const [searchParams] = useSearchParams();
   const folderParam = searchParams.get('folder');
 
   const [sources, setSources] = useState<MemorySource[]>([]);
-  const [folderNames, setFolderNames] = useState<Record<string, string>>({});
+  const storeGroups = useGroupsStore((s) => s.groups);
+  const loadGroups = useGroupsStore((s) => s.loadGroups);
+  useEffect(() => { loadGroups(); }, [loadGroups]);
+  const folderNames = useMemo(() => {
+    const map: Record<string, string> = {};
+    for (const info of Object.values(storeGroups)) {
+      if (info.folder && info.name && !map[info.folder]) {
+        map[info.folder] = info.name;
+      }
+    }
+    return map;
+  }, [storeGroups]);
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [content, setContent] = useState('');
   const [initialContent, setInitialContent] = useState('');
@@ -122,21 +145,6 @@ export function MemoryPage() {
   const isMobile = useMediaQuery('(max-width: 1023px)');
   const [showContent, setShowContent] = useState(false);
 
-  // Load folder → group name mapping
-  useEffect(() => {
-    api.get<{ groups: Record<string, { name: string; folder: string }> }>('/api/groups')
-      .then((data) => {
-        const map: Record<string, string> = {};
-        for (const info of Object.values(data.groups)) {
-          if (info.folder && info.name && !map[info.folder]) {
-            map[info.folder] = info.name;
-          }
-        }
-        setFolderNames(map);
-      })
-      .catch(() => {});
-  }, []);
-
   const dirty = useMemo(() => content !== initialContent, [content, initialContent]);
 
   const filteredSources = useMemo(() => {
@@ -148,51 +156,42 @@ export function MemoryPage() {
   }, [sources, keyword, searchHits]);
 
   const groupedSources = useMemo(() => {
-    const groups: Record<MemorySource['scope'], MemorySource[]> = {
-      'user-global': [],
-      main: [],
-      flow: [],
+    const groups: Record<MemoryType, MemorySource[]> = {
+      global: [],
+      heartbeat: [],
       session: [],
+      date: [],
+      conversation: [],
     };
     for (const source of filteredSources) {
-      groups[source.scope].push(source);
+      groups[source.type].push(source);
     }
     return groups;
   }, [filteredSources]);
 
-  // Sub-group flow sources by folder name
-  const flowByFolder = useMemo(() => {
-    const map: Record<string, MemorySource[]> = {};
-    for (const source of groupedSources.flow) {
-      const folder = source.label.split(' / ')[0] || 'unknown';
-      if (!map[folder]) map[folder] = [];
-      map[folder].push(source);
-    }
-    return map;
-  }, [groupedSources.flow]);
-
-  // Collapsed state: scope-level and flow sub-group level
-  const [collapsedScopes, setCollapsedScopes] = useState<Record<string, boolean>>({
-    'user-global': true,
-    main: true,
-    flow: true,
+  // Collapsed state: type-level and folder sub-group level
+  const [collapsedTypes, setCollapsedTypes] = useState<Record<string, boolean>>({
+    global: true,
+    heartbeat: true,
     session: true,
+    date: true,
+    conversation: true,
   });
   const [collapsedFolders, setCollapsedFolders] = useState<Record<string, boolean>>({});
 
-  const toggleScope = (scope: string) =>
-    setCollapsedScopes((prev) => ({ ...prev, [scope]: !prev[scope] }));
+  const toggleType = (type: string) =>
+    setCollapsedTypes((prev) => ({ ...prev, [type]: !prev[type] }));
   const toggleFolder = (folder: string) =>
     setCollapsedFolders((prev) => ({ ...prev, [folder]: !prev[folder] }));
 
-  // Auto-expand scope/folder containing the selected file
+  // Auto-expand type/folder containing the selected file
   useEffect(() => {
     if (!selectedPath) return;
     const selected = sources.find((s) => s.path === selectedPath);
     if (!selected) return;
-    setCollapsedScopes((prev) => ({ ...prev, [selected.scope]: false }));
-    if (selected.scope === 'flow') {
-      const folder = selected.label.split(' / ')[0] || 'unknown';
+    setCollapsedTypes((prev) => ({ ...prev, [selected.type]: false }));
+    if (FOLDER_SUB_GROUPED.has(selected.type)) {
+      const folder = selected.folder || 'unknown';
       setCollapsedFolders((prev) => ({ ...prev, [folder]: false }));
     }
   }, [selectedPath, sources]);
@@ -224,20 +223,20 @@ export function MemoryPage() {
       let nextSelected = selectedPath && available.has(selectedPath) ? selectedPath : null;
 
       if (!nextSelected) {
-        // If folder param provided, try to find matching flow CLAUDE.md first
+        // If folder param provided, try to find matching session CLAUDE.md first
         if (folderParam) {
           nextSelected =
             data.sources.find(
-              (s) => s.scope === 'flow' && s.kind === 'claude' && s.path.includes(`/${folderParam}/`),
+              (s) => s.type === 'session' && s.path.includes(`/${folderParam}/`) && s.path.endsWith('CLAUDE.md'),
             )?.path || null;
         }
       }
 
       if (!nextSelected) {
-        // Default: first user-global CLAUDE.md, then main, then first available
+        // Default: global CLAUDE.md → first session CLAUDE.md → first available
         nextSelected =
-          data.sources.find((s) => s.scope === 'user-global' && s.kind === 'claude')?.path ||
-          data.sources.find((s) => s.scope === 'main' && s.kind === 'claude')?.path ||
+          data.sources.find((s) => s.type === 'global')?.path ||
+          data.sources.find((s) => s.type === 'session' && s.path.endsWith('CLAUDE.md'))?.path ||
           data.sources[0]?.path ||
           null;
       }
@@ -294,7 +293,6 @@ export function MemoryPage() {
 
   const handleSelectSource = async (path: string) => {
     if (path === selectedPath && isMobile) {
-      // Mobile: re-tap selected item to show content panel
       setShowContent(true);
       return;
     }
@@ -339,6 +337,51 @@ export function MemoryPage() {
     ? new Date(fileMeta.updatedAt).toLocaleString('zh-CN')
     : '未记录';
 
+  // Render a list of sources, optionally sub-grouped by folder
+  const renderSourceList = (type: MemoryType, items: MemorySource[]) => {
+    if (!FOLDER_SUB_GROUPED.has(type)) {
+      return items.map((source) => (
+        <SourceItem
+          key={source.path}
+          source={source}
+          active={source.path === selectedPath}
+          hit={searchHits[source.path]}
+          onSelect={handleSelectSource}
+        />
+      ));
+    }
+
+    const byFolder = subGroupByFolder(items);
+    return Object.entries(byFolder).map(([folder, folderItems]) => {
+      const isFolderCollapsed = collapsedFolders[folder] !== false;
+      return (
+        <div key={folder}>
+          <button
+            onClick={() => toggleFolder(folder)}
+            className="flex items-center gap-1 w-full text-left text-[11px] font-medium text-muted-foreground py-1 hover:text-foreground transition-colors"
+          >
+            {isFolderCollapsed ? <ChevronRight className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+            {folderNames[folder] || folder}
+            <span className="text-muted-foreground/60 ml-1">({folderItems.length})</span>
+          </button>
+          {!isFolderCollapsed && (
+            <div className="space-y-1 ml-3">
+              {folderItems.map((source) => (
+                <SourceItem
+                  key={source.path}
+                  source={source}
+                  active={source.path === selectedPath}
+                  hit={searchHits[source.path]}
+                  onSelect={handleSelectSource}
+                />
+              ))}
+            </div>
+          )}
+        </div>
+      );
+    });
+  };
+
   return (
     <div className="min-h-full bg-background p-4 lg:p-8">
       <div className="max-w-7xl mx-auto space-y-4">
@@ -351,7 +394,7 @@ export function MemoryPage() {
               <div>
                 <h1 className="text-2xl font-bold text-foreground">记忆管理</h1>
                 <p className="text-sm text-muted-foreground mt-0.5">
-                  管理个人全局记忆、主会话记忆、各会话流记忆，以及可读取的自动记忆文件。
+                  管理全局记忆、心跳摘要、会话记忆、日期记忆与对话归档。
                 </p>
               </div>
             </div>
@@ -383,62 +426,22 @@ export function MemoryPage() {
             </div>
 
             <div className="space-y-2 max-h-[calc(100dvh-280px)] lg:max-h-[560px] overflow-auto pr-1">
-              {(['user-global', 'main', 'flow', 'session'] as const).map((scope) => {
-                const items = groupedSources[scope];
+              {MEMORY_TYPES.map((type) => {
+                const items = groupedSources[type];
                 if (items.length === 0) return null;
-                const isCollapsed = !!collapsedScopes[scope];
+                const isCollapsed = !!collapsedTypes[type];
                 return (
-                  <div key={scope}>
+                  <div key={type}>
                     <button
-                      onClick={() => toggleScope(scope)}
+                      onClick={() => toggleType(type)}
                       className="flex items-center gap-1 w-full text-left text-xs font-semibold text-muted-foreground mb-1 hover:text-foreground transition-colors"
                     >
                       {isCollapsed ? <ChevronRight className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
-                      {scopeLabel(scope)} ({items.length})
+                      {typeLabel(type)} ({items.length})
                     </button>
                     {!isCollapsed && (
                       <div className="space-y-1 ml-1">
-                        {scope === 'flow' ? (
-                          // Flow: sub-group by folder
-                          Object.entries(flowByFolder).map(([folder, folderItems]) => {
-                            const isFolderCollapsed = collapsedFolders[folder] !== false;
-                            return (
-                              <div key={folder}>
-                                <button
-                                  onClick={() => toggleFolder(folder)}
-                                  className="flex items-center gap-1 w-full text-left text-[11px] font-medium text-muted-foreground py-1 hover:text-foreground transition-colors"
-                                >
-                                  {isFolderCollapsed ? <ChevronRight className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
-                                  {folderNames[folder] || folder}
-                                  <span className="text-muted-foreground/60 ml-1">({folderItems.length})</span>
-                                </button>
-                                {!isFolderCollapsed && (
-                                  <div className="space-y-1 ml-3">
-                                    {folderItems.map((source) => (
-                                      <SourceItem
-                                        key={source.path}
-                                        source={source}
-                                        active={source.path === selectedPath}
-                                        hit={searchHits[source.path]}
-                                        onSelect={handleSelectSource}
-                                      />
-                                    ))}
-                                  </div>
-                                )}
-                              </div>
-                            );
-                          })
-                        ) : (
-                          items.map((source) => (
-                            <SourceItem
-                              key={source.path}
-                              source={source}
-                              active={source.path === selectedPath}
-                              hit={searchHits[source.path]}
-                              onSelect={handleSelectSource}
-                            />
-                          ))
-                        )}
+                        {renderSourceList(type, items)}
                       </div>
                     )}
                   </div>
