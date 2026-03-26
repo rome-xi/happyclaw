@@ -120,7 +120,9 @@ export function MemoryPage() {
   const [sources, setSources] = useState<MemorySource[]>([]);
   const storeGroups = useGroupsStore((s) => s.groups);
   const loadGroups = useGroupsStore((s) => s.loadGroups);
-  useEffect(() => { loadGroups(); }, [loadGroups]);
+  useEffect(() => {
+    if (Object.keys(storeGroups).length === 0) loadGroups();
+  }, [loadGroups, storeGroups]);
   const folderNames = useMemo(() => {
     const map: Record<string, string> = {};
     for (const info of Object.values(storeGroups)) {
