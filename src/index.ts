@@ -148,6 +148,7 @@ import {
 import { logger } from './logger.js';
 import {
   ensureAgentDirectories,
+  isSystemMaintenanceNoise,
   stripAgentInternalTags,
   stripVirtualJidSuffix,
 } from './utils.js';
@@ -159,6 +160,7 @@ import {
   broadcastTyping,
   broadcastStreamEvent,
   broadcastAgentStatus,
+  broadcastGroupCreated,
   broadcastBillingUpdate,
   shutdownTerminals,
   shutdownWebServer,
@@ -171,6 +173,7 @@ import {
   syncHostSkillsForUser,
 } from './routes/skills.js';
 import { verifyPairingCode } from './telegram-pairing.js';
+import { sdkQuery } from './sdk-query.js';
 import { executeSessionReset } from './commands.js';
 
 const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -674,6 +677,43 @@ function writeUsageRecords(opts: {
       numTurns: usage.numTurns,
       source: 'agent',
     });
+  }
+}
+
+/**
+ * Detect Feishu interactive card JSON and extract readable text for web display.
+ * Returns null if the text is not a Feishu card.
+ */
+function extractFeishuCardText(text: string): string | null {
+  if (!text.startsWith('{"type":"interactive"')) return null;
+  try {
+    const card = JSON.parse(text);
+    if (card.type !== 'interactive' || !card.card) return null;
+    const parts: string[] = [];
+    // Extract header title
+    const title = card.card.header?.title?.content;
+    if (title) parts.push(`**${title}**\n`);
+    // Extract markdown content from elements
+    for (const el of card.card.elements || []) {
+      if (el.tag === 'markdown' && el.content) {
+        parts.push(el.content);
+      } else if (el.tag === 'column_set') {
+        for (const col of el.columns || []) {
+          for (const colEl of col.elements || []) {
+            if (colEl.tag === 'markdown' && colEl.content) {
+              parts.push(colEl.content);
+            }
+          }
+        }
+      } else if (el.tag === 'note') {
+        for (const noteEl of el.elements || []) {
+          if (noteEl.content) parts.push(`_${noteEl.content}_`);
+        }
+      }
+    }
+    return parts.length > 0 ? parts.join('\n\n') : null;
+  } catch {
+    return null;
   }
 }
 
@@ -1430,64 +1470,13 @@ async function handleRecallCommand(chatJid: string): Promise<string> {
 }
 
 /**
- * Call Claude CLI (`claude --print`) to summarize a conversation transcript.
- * Uses the same auth mechanism (OAuth / API Key) as normal agent conversations.
- * Returns null if CLI is unavailable or call fails.
+ * Summarize a conversation transcript using Claude Agent SDK.
+ * Uses the provider configured in the web settings page.
  */
 async function summarizeWithClaude(transcript: string): Promise<string | null> {
   const prompt = `请用简洁的中文总结以下对话的要点和进展，重点说明讨论了什么、达成了什么结论、还有什么待办事项。不要逐条翻译，而是提炼核心信息。\n\n${transcript}`;
-
-  return new Promise((resolve) => {
-    logger.info(
-      { promptLen: prompt.length },
-      'summarizeWithClaude: invoking claude CLI via stdin',
-    );
-
-    const model = process.env.RECALL_MODEL || '';
-    const args = ['--print'];
-    if (model) {
-      args.push('--model', model);
-    }
-
-    const child = execFile(
-      'claude',
-      args,
-      {
-        timeout: 30000,
-        maxBuffer: 1024 * 1024,
-        env: { ...process.env, CLAUDECODE: '' },
-      },
-      (err, stdout, stderr) => {
-        if (err) {
-          const e = err as Error & { code?: number | string };
-          logger.warn(
-            {
-              message: e.message?.slice(0, 200),
-              code: e.code,
-              stderr: stderr?.slice(0, 300),
-              stdout: stdout?.slice(0, 300),
-            },
-            'summarizeWithClaude: CLI call failed',
-          );
-          resolve(null);
-          return;
-        }
-        const text = stdout.trim();
-        logger.info(
-          {
-            stdoutLen: text.length,
-            stderr: stderr?.trim().slice(0, 200) || '',
-          },
-          'summarizeWithClaude: CLI returned',
-        );
-        resolve(text || null);
-      },
-    );
-
-    // Feed prompt via stdin to avoid arg length limits and special char issues
-    child.stdin?.write(prompt);
-    child.stdin?.end();
-  });
+  const model = process.env.RECALL_MODEL || undefined;
+  return sdkQuery(prompt, { model, timeout: 30_000 });
 }
 
 // ─── /sw & /spawn: parallel task spawning ────────────────────────
@@ -1709,14 +1698,8 @@ interface SendMessageOptions {
     turnId?: string;
     sessionId?: string;
     sdkMessageUuid?: string;
-    sourceKind?:
-      | 'sdk_final'
-      | 'sdk_send_message'
-      | 'interrupt_partial'
-      | 'overflow_partial'
-      | 'compact_partial'
-      | 'legacy';
-    finalizationReason?: 'completed' | 'interrupted' | 'error';
+    sourceKind?: ContainerOutput['sourceKind'];
+    finalizationReason?: ContainerOutput['finalizationReason'];
   };
 }
 
@@ -2745,6 +2728,23 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               result.sourceKind === 'compact_partial'
             ) {
               text = buildOverflowPartialReply(text);
+            }
+            // auto_continue outputs that consist solely of system-maintenance
+            // acknowledgements (e.g. "OK", "已更新 CLAUDE.md") are suppressed from
+            // IM delivery. These arise when the agent's session transcript contains
+            // memory-flush / CLAUDE.md-update context from the compaction pipeline
+            // and the agent echoes it back in the resumption query. Substantive
+            // user-facing continuations (longer replies or actual task resumption)
+            // pass through normally. See issue #275.
+            if (
+              result.sourceKind === 'auto_continue' &&
+              isSystemMaintenanceNoise(text)
+            ) {
+              logger.info(
+                { group: group.name, textLen: text.length },
+                'auto_continue output suppressed (system maintenance noise)',
+              );
+              return;
             }
             logger.info(
               { group: group.name },
@@ -3896,6 +3896,11 @@ function startIpcWatcher(): void {
       /* tasks-run dir may not exist */
     }
 
+    // Pre-resolve owner's home folder once per group (avoid repeated DB queries in the message loop)
+    const ownerHomeFolderForIm = sourceGroupEntry?.created_by
+      ? getUserHomeGroup(sourceGroupEntry.created_by)?.folder || sourceGroup
+      : sourceGroup;
+
     for (const {
       path: ipcRoot,
       agentId: ipcAgentId,
@@ -3929,7 +3934,10 @@ function startIpcWatcher(): void {
                 const effectiveChatJid = ipcAgentId
                   ? `${data.chatJid}#agent:${ipcAgentId}`
                   : data.chatJid;
-                await sendMessage(effectiveChatJid, data.text, {
+                // Feishu card JSON: store extracted markdown for web, send raw JSON to IM
+                const cardText = extractFeishuCardText(data.text);
+                const webText = cardText || data.text;
+                await sendMessage(effectiveChatJid, webText, {
                   messageMeta: {
                     sourceKind: 'sdk_send_message',
                   },
@@ -3969,7 +3977,7 @@ function startIpcWatcher(): void {
                     }
                     broadcastToOwnerIMChannels(
                       sourceGroupEntry.created_by,
-                      sourceGroup,
+                      ownerHomeFolderForIm,
                       alreadySent,
                       (jid) =>
                         sendImWithFailTracking(jid, data.text, taskLocalImages),
@@ -4104,7 +4112,7 @@ function startIpcWatcher(): void {
                     }
                     broadcastToOwnerIMChannels(
                       sourceGroupEntry.created_by,
-                      sourceGroup,
+                      ownerHomeFolderForIm,
                       alreadySent,
                       (jid) =>
                         imManager
@@ -4185,7 +4193,6 @@ function startIpcWatcher(): void {
 
       // Process tasks from this group's IPC directory
       try {
-        logger.info({ sourceGroup, tasksDir });
         const allEntries = await fsp.readdir(tasksDir, {
           withFileTypes: true,
         });
@@ -4225,11 +4232,6 @@ function startIpcWatcher(): void {
               !entry.name.startsWith('list_tasks_result_'),
           )
           .map((entry) => entry.name);
-        logger.info({
-          sourceGroup,
-          taskFiles,
-          allEntryNames: allEntries.map((e) => e.name),
-        });
         for (const file of taskFiles) {
           const filePath = path.join(tasksDir, file);
           try {
@@ -4324,6 +4326,7 @@ async function processTaskIpc(
     schedule_value?: string;
     context_mode?: string;
     execution_type?: string;
+    execution_mode?: string;
     script_command?: string;
     groupFolder?: string;
     chatJid?: string;
@@ -4443,6 +4446,10 @@ async function processTaskIpc(
           data.context_mode === 'group' || data.context_mode === 'isolated'
             ? data.context_mode
             : 'isolated';
+        const executionMode =
+          data.execution_mode === 'host' || data.execution_mode === 'container'
+            ? data.execution_mode
+            : null;
         createTask({
           id: taskId,
           group_folder: targetFolder,
@@ -4452,10 +4459,13 @@ async function processTaskIpc(
           schedule_value: data.schedule_value,
           context_mode: contextMode,
           execution_type: execType,
+          execution_mode: executionMode,
           script_command: data.script_command ?? null,
           next_run: nextRun,
           status: 'active',
           created_at: new Date().toISOString(),
+          created_by: sourceGroupEntry?.created_by,
+          notify_channels: null,
         });
         logger.info(
           { taskId, sourceGroup, targetFolder, contextMode, execType },
@@ -4856,15 +4866,6 @@ async function processTaskIpc(
             : getChannelType(data.chatJid) !== null
               ? data.chatJid
               : (activeImReplyRoutes.get(sourceGroup) ?? null);
-          logger.info(
-            {
-              data,
-              sourceGroup,
-              fileImRoute,
-              activeImReplyRoutesKeys: [...activeImReplyRoutes.keys()],
-            },
-            'send_file fileImRoute computation',
-          );
           if (fileImRoute) {
             const imFileName = data.fileName || path.basename(resolvedPath);
             const sent = await retryImOperation('send_file', fileImRoute, () =>
@@ -5220,6 +5221,19 @@ async function processAgentConversation(
         if (agent.kind !== 'spawn') {
           text = buildOverflowPartialReply(text);
         }
+      }
+      // Suppress system-maintenance noise from auto_continue outputs (issue #275).
+      // Short acknowledgements ("OK", "已更新 CLAUDE.md") that leak from the
+      // compaction pipeline are dropped; substantive continuations pass through.
+      if (
+        output.sourceKind === 'auto_continue' &&
+        isSystemMaintenanceNoise(text)
+      ) {
+        logger.info(
+          { chatJid, agentId, textLen: text.length },
+          'auto_continue output suppressed (system maintenance noise)',
+        );
+        return;
       }
       if (text) {
         const isFirstReply = !lastAgentReplyMsgId;
@@ -6109,9 +6123,14 @@ async function ensureDockerRunning(): Promise<void> {
  * Build the onNewChat callback for IM connections.
  * Feishu/Telegram chats auto-register to the user's home group folder.
  *
- * When the same Feishu app is transferred between users (e.g., admin disables
+ * When the same IM app is transferred between users (e.g., admin disables
  * their channel and a member enables the same credentials), existing chats
  * are re-routed to the new user's home folder on first message receipt.
+ *
+ * In multi-bot setups where the same human talks to multiple bots (each owned
+ * by a different HappyClaw user), re-routing is skipped — the chat stays with
+ * its original owner as long as that owner still has an active connection on
+ * the **same channel type** (feishu/telegram/qq/wechat).
  */
 function buildOnNewChat(
   userId: string,
@@ -6141,27 +6160,58 @@ function buildOnNewChat(
       }
 
       // Different user's connection now owns this IM app.
-      // Re-route the chat to the current user's home folder.
-      // This handles the common case where the same Feishu app credentials
-      // are moved from one user to another (e.g., admin → member for testing).
+      // Two possible scenarios:
+      //   1. Credential transfer: admin disables their Feishu channel, member
+      //      enables the same appId → re-route chat to the new user.
+      //   2. Multi-bot setup: same human talks to multiple bots, each owned by
+      //      a different HappyClaw user → do NOT re-route.
+      //
+      // Distinguish by checking whether the previous owner still has an active
+      // connection on the SAME channel type.  Checking all channel types would
+      // produce false positives (e.g., admin's Telegram is still online while
+      // their Feishu app was transferred → skip re-route incorrectly).
       if (!existing.is_home) {
-        const previousFolder = existing.folder;
         const previousOwner = existing.created_by;
-        existing.folder = homeFolder;
-        existing.created_by = userId;
-        setRegisteredGroup(chatJid, existing);
-        registeredGroups[chatJid] = existing;
-        logger.info(
-          {
-            chatJid,
-            chatName,
-            userId,
-            homeFolder,
-            previousFolder,
-            previousOwner,
-          },
-          'Re-routed IM chat to new user (IM credentials transferred)',
-        );
+        const channelType = getChannelType(chatJid);
+        const previousOwnerStillConnected = channelType
+          ? imManager
+              .getConnectedChannelTypes(previousOwner)
+              .includes(channelType)
+          : false;
+
+        if (previousOwnerStillConnected) {
+          // Multi-bot: previous owner still has the same channel type active
+          logger.debug(
+            {
+              chatJid,
+              chatName,
+              userId,
+              channelType,
+              existingOwner: previousOwner,
+              existingFolder: existing.folder,
+            },
+            'Skipped IM chat re-route (previous owner still connected on same channel type)',
+          );
+        } else {
+          // Credential transfer: previous owner no longer connected on this channel
+          const previousFolder = existing.folder;
+          existing.folder = homeFolder;
+          existing.created_by = userId;
+          setRegisteredGroup(chatJid, existing);
+          registeredGroups[chatJid] = existing;
+          logger.info(
+            {
+              chatJid,
+              chatName,
+              userId,
+              homeFolder,
+              previousFolder,
+              previousOwner,
+              channelType,
+            },
+            'Re-routed IM chat to new user (IM credentials transferred)',
+          );
+        }
       }
       return;
     }
@@ -7432,6 +7482,34 @@ async function main(): Promise<void> {
         taskRunId,
       ),
     sendMessage,
+    broadcastStreamEvent,
+    onWorkspaceCreated: broadcastGroupCreated,
+    storePromptMessage: (chatJid, senderId, senderName, text) => {
+      const msgId = crypto.randomUUID();
+      const now = new Date().toISOString();
+      ensureChatExists(chatJid);
+      storeMessageDirect(
+        msgId,
+        chatJid,
+        senderId,
+        senderName,
+        text,
+        now,
+        false,
+        {
+          meta: { sourceKind: 'scheduled_task_prompt' },
+        },
+      );
+      broadcastNewMessage(chatJid, {
+        id: msgId,
+        chat_jid: chatJid,
+        sender: senderId,
+        sender_name: senderName,
+        content: text,
+        timestamp: now,
+        is_from_me: false,
+      });
+    },
     assistantName: ASSISTANT_NAME,
     dailySummaryDeps: {
       logger,

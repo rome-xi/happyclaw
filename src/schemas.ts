@@ -11,6 +11,7 @@ export const TaskPatchSchema = z.object({
   schedule_value: z.string().optional(),
   context_mode: z.enum(['group', 'isolated']).optional(),
   execution_type: z.enum(['agent', 'script']).optional(),
+  execution_mode: z.enum(['host', 'container']).optional(),
   script_command: z.string().max(4096).nullable().optional(),
   status: z.enum(['active', 'paused']).optional(),
   next_run: z.string().optional(),
@@ -20,18 +21,20 @@ export const TaskPatchSchema = z.object({
     .optional(),
 });
 
-// 简单 cron 表达式验证：5 或 6 段，每段允许 * 和常见 cron 语法
-const CRON_REGEX = /^(\S+\s+){4,5}\S+$/;
+// Cron 表达式校验：5 段（分 时 日 月 周）或 6 段（秒 分 时 日 月 周）
+// 也允许预定义表达式如 @daily, @hourly 等
+const CRON_REGEX = /^(@(yearly|annually|monthly|weekly|daily|hourly|minutely|secondly)|(\S+\s+){4,5}\S+)$/;
 
 export const TaskCreateSchema = z
   .object({
-    group_folder: z.string().min(1),
-    chat_jid: z.string().min(1),
+    group_folder: z.string().min(1).optional(),
+    chat_jid: z.string().min(1).optional(),
     prompt: z.string().optional().default(''),
     schedule_type: z.enum(['cron', 'interval', 'once']),
     schedule_value: z.string().min(1),
     context_mode: z.enum(['group', 'isolated']).optional(),
     execution_type: z.enum(['agent', 'script']).optional(),
+    execution_mode: z.enum(['host', 'container']).optional(),
     script_command: z.string().max(4096).optional(),
     notify_channels: z
       .array(z.enum(['feishu', 'telegram', 'qq', 'wechat']))
@@ -330,6 +333,7 @@ export const ClaudeOAuthCredentialsSchema = z.object({
   refreshToken: z.string().min(1),
   expiresAt: z.number(),
   scopes: z.array(z.string()).default([]),
+  subscriptionType: z.string().optional(),
 });
 
 export const ClaudeSecretsSchema = z
@@ -560,16 +564,18 @@ export const RedeemCodeSchema = z.object({
 });
 
 // Memory types
+export type MemoryType = 'global' | 'heartbeat' | 'session' | 'date' | 'conversation';
+
 export interface MemorySource {
   path: string;
   label: string;
-  scope: 'user-global' | 'main' | 'flow' | 'session';
-  kind: 'claude' | 'note' | 'session';
+  type: MemoryType;
   writable: boolean;
   exists: boolean;
   updatedAt: string | null;
   size: number;
   ownerName?: string;
+  folder?: string;
 }
 
 export interface MemoryFilePayload {

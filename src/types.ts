@@ -87,7 +87,9 @@ export type MessageSourceKind =
   | 'overflow_partial'
   | 'compact_partial'
   | 'user_command'
-  | 'legacy';
+  | 'scheduled_task_prompt'
+  | 'legacy'
+  | 'auto_continue';
 
 export type MessageFinalizationReason =
   | 'completed'
@@ -117,10 +119,13 @@ export interface ScheduledTask {
   context_mode: 'group' | 'isolated';
   execution_type: 'agent' | 'script';
   script_command: string | null;
+  execution_mode?: 'host' | 'container' | null;
+  workspace_jid?: string | null;
+  workspace_folder?: string | null;
   next_run: string | null;
   last_run: string | null;
   last_result: string | null;
-  status: 'active' | 'paused' | 'completed';
+  status: 'active' | 'paused' | 'completed' | 'parsing';
   created_at: string;
   created_by?: string;
   notify_channels?: string[] | null;
@@ -358,6 +363,7 @@ export type WsMessageOut =
   | { type: 'terminal_started'; chatJid: string }
   | { type: 'terminal_stopped'; chatJid: string; reason?: string }
   | { type: 'terminal_error'; chatJid: string; error: string }
+  | { type: 'group_created'; jid: string; folder: string; name: string }
   | { type: 'docker_build_log'; line: string }
   | { type: 'docker_build_complete'; success: boolean; error?: string }
   | {
