@@ -26,6 +26,7 @@ import { broadcastNewMessage } from './web.js';
 import { logger } from './logger.js';
 import { saveDownloadedFile, MAX_FILE_SIZE } from './im-downloader.js';
 import { detectImageMimeType } from './image-detector.js';
+import { markdownToPlainText, splitTextChunks } from './im-utils.js';
 
 // ─── Constants ──────────────────────────────────────────────────
 
@@ -128,39 +129,7 @@ type RobotMessage = DTRobotMessage | DingTalkRobotMessage;
 
 // ─── Helpers ────────────────────────────────────────────────────
 
-/**
- * Convert Markdown to DingTalk plain text.
- * DingTalk cards support basic Markdown, but we strip some formatting for safety.
- */
-function markdownToPlainText(md: string): string {
-  let text = md;
-
-  // Code blocks: keep content, remove fences
-  text = text.replace(/```[\s\S]*?```/g, (match) => {
-    return match.replace(/^```\w*\n?/, '').replace(/\n?```$/, '');
-  });
-
-  // Inline code: remove backticks
-  text = text.replace(/`([^`]+)`/g, '$1');
-
-  // Links: [text](url) → text (url)
-  text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1 ($2)');
-
-  // Bold: **text** or __text__ → text
-  text = text.replace(/\*\*(.+?)\*\*/g, '$1');
-  text = text.replace(/__(.+?)__/g, '$1');
-
-  // Strikethrough: ~~text~~ → text
-  text = text.replace(/~~(.+?)~~/g, '$1');
-
-  // Italic: *text* → text
-  text = text.replace(/(?<!\w)\*(?!\s)(.+?)(?<!\s)\*(?!\w)/g, '$1');
-
-  // Headings: # text → text
-  text = text.replace(/^#{1,6}\s+(.+)$/gm, '$1');
-
-  return text;
-}
+// markdownToPlainText imported from ./im-utils.js
 
 /**
  * Convert standard Markdown to DingTalk markdown format.
@@ -192,38 +161,7 @@ function convertToDingTalkMarkdown(md: string): string {
   return text;
 }
 
-/**
- * Split text into chunks at safe boundaries.
- */
-function splitTextChunks(text: string, limit: number): string[] {
-  if (text.length <= limit) return [text];
-
-  const chunks: string[] = [];
-  let remaining = text;
-
-  while (remaining.length > 0) {
-    if (remaining.length <= limit) {
-      chunks.push(remaining);
-      break;
-    }
-
-    let splitIdx = remaining.lastIndexOf('\n\n', limit);
-    if (splitIdx < limit * 0.3) {
-      splitIdx = remaining.lastIndexOf('\n', limit);
-    }
-    if (splitIdx < limit * 0.3) {
-      splitIdx = remaining.lastIndexOf(' ', limit);
-    }
-    if (splitIdx < limit * 0.3) {
-      splitIdx = limit;
-    }
-
-    chunks.push(remaining.slice(0, splitIdx));
-    remaining = remaining.slice(splitIdx).trimStart();
-  }
-
-  return chunks;
-}
+// splitTextChunks imported from ./im-utils.js
 
 /**
  * Parse JID to determine chat type and extract conversation ID / staff ID.
@@ -1712,12 +1650,15 @@ export function createDingTalkConnection(
       readyFired = false;
 
       try {
-        // 🔧 Fix proxy issue: disable axios global proxy before importing dingtalk-stream
-        // The dingtalk-stream SDK uses axios internally, which can be affected by system PAC files
+        // 🔧 Fix proxy issue: dingtalk-stream SDK uses axios internally, which can be
+        // affected by system PAC files. We temporarily disable the global proxy default
+        // around DWClient creation, then restore the original value to avoid affecting
+        // other modules (e.g., @larksuiteoapi/node-sdk) that also use axios.
         const axios = (await import('axios')).default;
+        const originalProxy = axios.defaults?.proxy;
         if (axios.defaults) {
           axios.defaults.proxy = false;
-          logger.debug('Disabled axios global proxy for dingtalk-stream SDK');
+          logger.debug('Temporarily disabled axios global proxy for dingtalk-stream SDK');
         }
 
         // Create DWClient
@@ -1726,6 +1667,11 @@ export function createDingTalkConnection(
           clientSecret: config.clientSecret,
           debug: false,
         });
+
+        // Restore original axios proxy setting after DWClient creation
+        if (axios.defaults && originalProxy !== undefined) {
+          axios.defaults.proxy = originalProxy;
+        }
 
         // Register robot message callback using registerCallbackListener (not registerAllEventListener)
         client.registerCallbackListener(

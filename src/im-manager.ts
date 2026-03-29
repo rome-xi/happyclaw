@@ -317,7 +317,7 @@ class IMConnectionManager {
    */
   isChannelAvailableForJid(jid: string): boolean {
     const channelType = getChannelType(jid);
-    logger.info({ jid, channelType }, 'isChannelAvailableForJid check');
+    logger.debug({ jid, channelType }, 'isChannelAvailableForJid check');
     if (!channelType) return false;
     return !!this.findChannelForJid(jid, channelType);
   }

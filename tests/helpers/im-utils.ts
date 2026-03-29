@@ -1,74 +1,17 @@
 /**
  * Test helpers for Phase 0 constraint tests.
  *
- * These factories duplicate the private pure-function logic from IM channel files
- * (dingtalk.ts, qq.ts, wechat.ts) so we can test behavior without importing
- * the full modules (which have side-effects like SDK imports).
+ * Shared pure functions (markdownToPlainText, splitTextChunks) are re-exported
+ * from src/im-utils.ts — the single source of truth.
  *
- * When Phase 2 extracts these into src/im-utils.ts, the tests will import
- * from there instead — the assertions remain the same.
+ * Functions below that are NOT in src/im-utils.ts duplicate private logic from
+ * IM channel files (dingtalk.ts, qq.ts) for unit testing without importing
+ * the full modules (which have side-effects like SDK imports).
  */
 
-// ─── markdownToPlainText (identical in dingtalk.ts, qq.ts, wechat.ts) ───
+// ─── Re-exports from src/im-utils.ts (single source of truth) ───
 
-export function markdownToPlainText(md: string): string {
-  let text = md;
-
-  text = text.replace(/```[\s\S]*?```/g, (match) => {
-    return match.replace(/^```\w*\n?/, '').replace(/\n?```$/, '');
-  });
-
-  text = text.replace(/`([^`]+)`/g, '$1');
-  text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1 ($2)');
-  text = text.replace(/\*\*(.+?)\*\*/g, '$1');
-  text = text.replace(/__(.+?)__/g, '$1');
-  text = text.replace(/~~(.+?)~~/g, '$1');
-  text = text.replace(/(?<!\w)\*(?!\s)(.+?)(?<!\s)\*(?!\w)/g, '$1');
-  text = text.replace(/^#{1,6}\s+(.+)$/gm, '$1');
-
-  return text;
-}
-
-// ─── convertToDingTalkMarkdown (dingtalk.ts) ───
-
-export function convertToDingTalkMarkdown(md: string): string {
-  let text = md;
-  text = text.replace(/!\[([^\]]*)\]\([^)]+\)/g, '$1');
-  text = text.replace(/~~(.+?)~~/g, '$1');
-  return text;
-}
-
-// ─── splitTextChunks (identical in dingtalk.ts, qq.ts, wechat.ts) ───
-
-export function splitTextChunks(text: string, limit: number): string[] {
-  if (text.length <= limit) return [text];
-
-  const chunks: string[] = [];
-  let remaining = text;
-
-  while (remaining.length > 0) {
-    if (remaining.length <= limit) {
-      chunks.push(remaining);
-      break;
-    }
-
-    let splitIdx = remaining.lastIndexOf('\n\n', limit);
-    if (splitIdx < limit * 0.3) {
-      splitIdx = remaining.lastIndexOf('\n', limit);
-    }
-    if (splitIdx < limit * 0.3) {
-      splitIdx = remaining.lastIndexOf(' ', limit);
-    }
-    if (splitIdx < limit * 0.3) {
-      splitIdx = limit;
-    }
-
-    chunks.push(remaining.slice(0, splitIdx));
-    remaining = remaining.slice(splitIdx).trimStart();
-  }
-
-  return chunks;
-}
+export { markdownToPlainText, splitTextChunks } from '../../src/im-utils.js';
 
 // ─── parseDingTalkChatId (dingtalk.ts) ───
 
@@ -93,7 +36,7 @@ export function parseDingTalkChatId(
   return null;
 }
 
-// ─── parseQQChatId (qq.ts) ───
+// ─��─ parseQQChatId (qq.ts) ───
 
 export function parseQQChatId(
   chatId: string,
