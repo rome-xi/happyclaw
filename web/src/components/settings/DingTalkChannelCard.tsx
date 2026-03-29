@@ -5,7 +5,7 @@ import { toast } from 'sonner';
 
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
-import { ToggleSwitch } from '@/components/ui/toggle-switch';
+import { Switch } from '@/components/ui/switch';
 import { api } from '../../api/client';
 import { getErrorMessage } from './types';
 
@@ -130,11 +130,7 @@ export function DingTalkChannelCard() {
             </p>
           </div>
         </div>
-        <ToggleSwitch
-          checked={enabled}
-          disabled={loading || toggling}
-          onChange={handleToggle}
-        />
+        <Switch checked={enabled} disabled={loading || toggling} onCheckedChange={handleToggle} />
       </div>
 
       <div
