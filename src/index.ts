@@ -6899,7 +6899,11 @@ async function main(): Promise<void> {
     await Promise.allSettled([
       // Abort all active streaming cards before disconnecting IM,
       // so users see "服务维护中" instead of a stuck "生成中..." card.
-      abortAllStreamingSessions('服务维护中').catch((err) =>
+      // Race with a 5s timeout to avoid a hung Feishu API blocking shutdown.
+      Promise.race([
+        abortAllStreamingSessions('服务维护中'),
+        new Promise<void>((resolve) => setTimeout(resolve, 5000)),
+      ]).catch((err) =>
         logger.warn({ err }, 'Error aborting streaming sessions'),
       ),
       imManager
