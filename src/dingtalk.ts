@@ -593,6 +593,82 @@ export function createDingTalkConnection(
     await sendViaSessionWebhook(sessionWebhook, content, useMarkdown);
   }
 
+  /**
+   * Send a group message via the persistent robot/groupMessages API.
+   * Uses openConversationId (stable group ID) instead of ephemeral sessionWebhook.
+   * Ref: https://open.dingtalk.com/document/group/the-robot-sends-a-group-message
+   */
+  async function sendViaGroupMessagesAPI(
+    openConversationId: string,
+    msgKey: string,
+    msgParam: string,
+  ): Promise<void> {
+    const token = await getAccessToken();
+    const robotCode = config.clientId;
+    const body = JSON.stringify({
+      openConversationId,
+      robotCode,
+      msgKey,
+      msgParam,
+    });
+
+    return new Promise<void>((resolve, reject) => {
+      const req = https.request(
+        {
+          hostname: 'api.dingtalk.com',
+          path: '/v1.0/robot/groupMessages/send',
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-acs-dingtalk-access-token': token,
+          },
+        },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on('data', (chunk: Buffer) => chunks.push(chunk));
+          res.on('end', () => {
+            const respBody = Buffer.concat(chunks).toString('utf8');
+            if (res.statusCode && res.statusCode >= 400) {
+              reject(
+                new Error(
+                  `DingTalk groupMessages API HTTP failed (${res.statusCode}): ${respBody}`,
+                ),
+              );
+              return;
+            }
+            try {
+              const data = JSON.parse(respBody);
+              logger.info(
+                {
+                  statusCode: res.statusCode,
+                  errcode: data.errcode,
+                  errmsg: data.errmsg,
+                  processQueryKey: data.processQueryKey,
+                },
+                'DingTalk sendViaGroupMessagesAPI response',
+              );
+              if (data.errcode && data.errcode !== 0) {
+                reject(
+                  new Error(
+                    `DingTalk groupMessages API error: ${data.errcode} ${data.errmsg}`,
+                  ),
+                );
+                return;
+              }
+            } catch {
+              // Not JSON, ignore
+            }
+            resolve();
+          });
+          res.on('error', reject);
+        },
+      );
+      req.on('error', reject);
+      req.write(body);
+      req.end();
+    });
+  }
+
   // ─── File Download ─────────────────────────────────────────
 
   async function downloadDingTalkImageAsBase64(
@@ -1799,40 +1875,48 @@ export function createDingTalkConnection(
         return;
       }
 
-      // Group messages — use sessionWebhook (still valid for group reply scenarios)
-      const sessionWebhook = lastSessionWebhooks.get(jidKey);
-      if (!sessionWebhook) {
-        logger.error(
-          { chatId, jidKey },
-          'No session webhook found for DingTalk group chat',
-        );
-        return;
-      }
+      // Group messages — use the persistent groupMessages API (openConversationId is
+      // stable and does not expire like sessionWebhook). This also avoids the reconnect
+      // invalidation issue that plagued sendViaSessionWebhook for group chats.
+      const openConversationId = parsed.conversationId;
 
-      // Group chats support markdown. Try markdown first, fall back to plain text.
-      const useMarkdown = true;
+      // Group chats support markdown. Split first to stay within message size limits.
       const contentToSend = convertToDingTalkMarkdown(text);
       const chunks = splitTextChunks(contentToSend, MSG_SPLIT_LIMIT);
 
-      logger.info(
-        { chatId, jidKey, chunks: chunks.length, useMarkdown },
-        'DingTalk sendMessage: sending group via sessionWebhook',
-      );
-      try {
-        for (const chunk of chunks) {
-          await sendViaSessionWebhook(sessionWebhook, chunk, useMarkdown);
+      // Try markdown first, fall back to plain text on error.
+      let lastErr: unknown;
+      for (const chunk of chunks) {
+        const contentToSend = convertToDingTalkMarkdown(chunk);
+        const msgParam = JSON.stringify({
+          title: contentToSend.slice(0, 50),
+          text: contentToSend,
+        });
+        try {
+          await sendViaGroupMessagesAPI(
+            openConversationId,
+            'sampleMarkdown',
+            msgParam,
+          );
+        } catch (err) {
+          lastErr = err;
+          // Fall back to plain text
+          const plainContent = markdownToPlainText(chunk);
+          const plainMsgParam = JSON.stringify({ content: plainContent });
+          try {
+            await sendViaGroupMessagesAPI(
+              openConversationId,
+              'sampleText',
+              plainMsgParam,
+            );
+          } catch (plainErr) {
+            lastErr = plainErr;
+            throw plainErr;
+          }
         }
-      } catch (sendErr) {
-        // Fall back to plain text if markdown fails
-        const plainText = markdownToPlainText(text);
-        const plainChunks = splitTextChunks(plainText, MSG_SPLIT_LIMIT);
-        for (const plainChunk of plainChunks) {
-          await sendViaSessionWebhook(sessionWebhook, plainChunk, false);
-        }
-        logger.info({ chatId }, 'DingTalk: fell back to plain text for group');
       }
 
-      logger.info({ chatId }, 'DingTalk group message sent');
+      logger.info({ chatId }, 'DingTalk group message sent via persistent API');
     },
 
     async sendImage(
@@ -1859,8 +1943,6 @@ export function createDingTalkConnection(
         throw new Error(`DingTalk sendImage: unknown chat ${chatId}`);
       }
 
-      const targetUserId = senderStaffId || senderId;
-      const robotCode = config.clientId;
       const fname = fileName || `image.${mimeType.split('/')[1] || 'png'}`;
 
       // Upload image to DingTalk media API
@@ -1869,11 +1951,38 @@ export function createDingTalkConnection(
         throw new Error('DingTalk sendImage: media upload failed');
       }
 
+      // For group chats: use persistent groupMessages API.
+      // For C2C: use batchSend API.
+      const isGroup = parsed?.type === 'group';
+      const openConversationId = parsed?.conversationId;
+
+      if (isGroup && openConversationId) {
+        const msgParam = JSON.stringify({ photoURL: mediaId });
+        try {
+          await sendViaGroupMessagesAPI(
+            openConversationId,
+            'sampleImageMsg',
+            msgParam,
+          );
+          logger.info(
+            { chatId, mediaId, fileName: fname },
+            'DingTalk group image sent via persistent API',
+          );
+        } catch (err) {
+          logger.error({ err, chatId }, 'DingTalk sendImage: group API failed');
+          throw err;
+        }
+        return;
+      }
+
+      // C2C: use batchSend API
+      const targetUserId = senderStaffId || senderId;
+      const robotCode = config.clientId;
       try {
         await sendDingTalkImageMessage(targetUserId, robotCode, mediaId, fname);
         logger.info(
           { chatId, mediaId, fileName: fname },
-          'DingTalk image sent',
+          'DingTalk C2C image sent',
         );
       } catch (err) {
         logger.error({ err, chatId }, 'DingTalk sendImage: failed');
@@ -1950,16 +2059,53 @@ export function createDingTalkConnection(
         throw new Error('DingTalk sendFile: media upload failed');
       }
 
-      // robotCode is typically the clientId (AppKey) for 企业内部 bots
+      // For group chats: use the persistent groupMessages API (openConversationId
+      // is stable, unlike sessionWebhook which gets invalidated on reconnects).
+      // For C2C chats: use the batchSend API with senderStaffId/senderId.
+      const isGroup = parsed?.type === 'group';
+      const openConversationId = parsed?.conversationId;
+
+      if (isGroup && openConversationId) {
+        // Send via persistent groupMessages API
+        try {
+          if (mediaType === 'image') {
+            const msgParam = JSON.stringify({ photoURL: mediaId });
+            await sendViaGroupMessagesAPI(
+              openConversationId,
+              'sampleImageMsg',
+              msgParam,
+            );
+          } else {
+            const msgParam = JSON.stringify({
+              mediaId,
+              fileName,
+              fileType: ext,
+            });
+            await sendViaGroupMessagesAPI(
+              openConversationId,
+              'sampleFile',
+              msgParam,
+            );
+          }
+          logger.info(
+            { chatId, fileName, mediaId },
+            'DingTalk group file sent via persistent API',
+          );
+        } catch (err) {
+          logger.error(
+            { err, chatId, fileName },
+            'DingTalk sendFile: groupMessages API failed',
+          );
+          throw err;
+        }
+        return;
+      }
+
+      // C2C: use batchSend API
+      const targetUserId = senderStaffId || senderId;
       const robotCode = config.clientId;
 
-      // Prefer senderStaffId for batchSend (enterprise user ID)
-      // Falls back to senderId for C2C consumer users without staffId
-      const targetUserId = senderStaffId || senderId;
-
       try {
-        // Send file message via batchSend API
-        // Use sampleImageMsg for images, sampleFile for others
         if (mediaType === 'image') {
           await sendDingTalkImageMessage(
             targetUserId,
@@ -1978,7 +2124,7 @@ export function createDingTalkConnection(
         }
         logger.info(
           { chatId, fileName, mediaId, senderStaffId: !!senderStaffId },
-          'DingTalk file sent successfully',
+          'DingTalk C2C file sent successfully',
         );
       } catch (err) {
         logger.error(
