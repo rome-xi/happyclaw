@@ -107,7 +107,7 @@ export function TaskCard({
             {/* Badges */}
             <div className="flex flex-wrap items-center gap-1.5 mb-2">
               {task.execution_type === 'script' && (
-                <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-800">
+                <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-blue-100 dark:bg-blue-900/40 text-blue-800 dark:text-blue-300">
                   脚本
                 </span>
               )}
@@ -115,8 +115,8 @@ export function TaskCard({
                 <span
                   className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${
                     task.execution_mode === 'host'
-                      ? 'bg-purple-100 text-purple-800'
-                      : 'bg-cyan-100 text-cyan-800'
+                      ? 'bg-purple-100 dark:bg-purple-900/40 text-purple-800 dark:text-purple-300'
+                      : 'bg-cyan-100 dark:bg-cyan-900/40 text-cyan-800 dark:text-cyan-300'
                   }`}
                 >
                   {task.execution_mode === 'host' ? '宿主机' : 'Docker'}

@@ -230,7 +230,7 @@ export function GroupMembersPanel({ groupJid }: GroupMembersPanelProps) {
                         <button
                           onClick={() => handleRemove(member.user_id)}
                           disabled={removing === member.user_id}
-                          className="p-1.5 rounded-md hover:bg-red-50 text-muted-foreground hover:text-red-500 transition-colors cursor-pointer disabled:opacity-50"
+                          className="p-1.5 rounded-md hover:bg-red-50 dark:hover:bg-red-950/40 text-muted-foreground hover:text-red-500 dark:hover:text-red-400 transition-colors cursor-pointer disabled:opacity-50"
                           title="移除成员"
                         >
                           <Trash2 className="w-3.5 h-3.5" />
@@ -240,7 +240,7 @@ export function GroupMembersPanel({ groupJid }: GroupMembersPanelProps) {
                         <button
                           onClick={handleLeave}
                           disabled={removing === member.user_id}
-                          className="flex items-center gap-1 px-2 py-1 rounded-md text-xs text-muted-foreground hover:bg-red-50 hover:text-red-500 transition-colors cursor-pointer disabled:opacity-50"
+                          className="flex items-center gap-1 px-2 py-1 rounded-md text-xs text-muted-foreground hover:bg-red-50 dark:hover:bg-red-950/40 hover:text-red-500 dark:hover:text-red-400 transition-colors cursor-pointer disabled:opacity-50"
                         >
                           <LogOut className="w-3.5 h-3.5" />
                           退出

@@ -467,15 +467,15 @@ export function ProviderEditor({
 
                   {/* 编辑模式显示现有凭据 */}
                   {!isCreate && provider?.hasClaudeOAuthCredentials && (
-                    <div className="rounded-md border border-emerald-200 bg-emerald-50/50 p-3 space-y-1 text-xs">
-                      <div className="text-emerald-700">
+                    <div className="rounded-md border border-emerald-200 dark:border-emerald-800 bg-emerald-50/50 dark:bg-emerald-950/30 p-3 space-y-1 text-xs">
+                      <div className="text-emerald-700 dark:text-emerald-300">
                         Access Token: {provider.claudeOAuthCredentialsAccessTokenMasked || '***'}
                       </div>
                       {provider.claudeOAuthCredentialsExpiresAt && (
                         <div className={
                           provider.claudeOAuthCredentialsExpiresAt <= Date.now()
-                            ? 'text-red-700 font-medium'
-                            : 'text-emerald-700'
+                            ? 'text-red-700 dark:text-red-400 font-medium'
+                            : 'text-emerald-700 dark:text-emerald-300'
                         }>
                           过期时间: {new Date(provider.claudeOAuthCredentialsExpiresAt).toLocaleString('zh-CN')}
                           {provider.claudeOAuthCredentialsExpiresAt > Date.now()
