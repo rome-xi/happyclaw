@@ -821,13 +821,16 @@ export function createFeishuConnection(
   async function sendTextToChat(chatId: string, text: string): Promise<void> {
     if (!client) return;
     try {
-      await client.im.message.create({
+      const receive_id_type = chatId.startsWith('oc_')
+        ? 'chat_id'
+        : 'open_id';
+      await client.im.v1.message.create({
+        params: { receive_id_type },
         data: {
           receive_id: chatId,
           msg_type: 'text',
           content: JSON.stringify({ text }),
         },
-        params: { receive_id_type: 'chat_id' },
       });
     } catch (err) {
       logger.error({ chatId, err }, 'Failed to send Feishu text reply');
