@@ -18,9 +18,9 @@ interface TaskDetailProps {
 }
 
 const LOG_STATUS_STYLES: Record<string, { bg: string; text: string; label: string }> = {
-  running: { bg: 'bg-blue-100', text: 'text-blue-700', label: '运行中' },
-  success: { bg: 'bg-green-100', text: 'text-green-700', label: '成功' },
-  error: { bg: 'bg-red-100', text: 'text-red-700', label: '失败' },
+  running: { bg: 'bg-blue-100 dark:bg-blue-900/40', text: 'text-blue-700 dark:text-blue-300', label: '运行中' },
+  success: { bg: 'bg-green-100 dark:bg-green-900/40', text: 'text-green-700 dark:text-green-300', label: '成功' },
+  error: { bg: 'bg-red-100 dark:bg-red-900/40', text: 'text-red-700 dark:text-red-300', label: '失败' },
 };
 
 function RunLogStatusBadge({ status }: { status: string }) {
@@ -521,7 +521,7 @@ export function TaskDetail({ task }: TaskDetailProps) {
                     </td>
                     <td className="px-4 py-2.5 text-foreground truncate max-w-xs" title={log.error || log.result || ''}>
                       {log.error ? (
-                        <span className="text-red-600">{log.error.slice(0, 100)}</span>
+                        <span className="text-red-600 dark:text-red-400">{log.error.slice(0, 100)}</span>
                       ) : log.result ? (
                         log.result.slice(0, 100)
                       ) : log.status === 'running' ? (
