@@ -135,8 +135,20 @@ export function UnifiedSidebar({ collapsed, onToggleCollapse }: UnifiedSidebarPr
 
   const handleClearConfirm = async () => {
     setClearLoading(true);
-    try { const ok = await clearHistory(clearState.jid); if (ok) setClearState({ open: false, jid: '', name: '' }); }
-    finally { setClearLoading(false); }
+    try {
+      const ok = await clearHistory(clearState.jid);
+      if (ok) {
+        setClearState({ open: false, jid: '', name: '' });
+      } else {
+        alert('重建工作区失败，请稍后重试');
+        setClearState({ open: false, jid: '', name: '' });
+      }
+    } catch {
+      alert('重建工作区失败，请稍后重试');
+      setClearState({ open: false, jid: '', name: '' });
+    } finally {
+      setClearLoading(false);
+    }
   };
 
   const renderSections = (sections: DateSection[], showCollabBadge: boolean) =>
@@ -148,8 +160,7 @@ export function UnifiedSidebar({ collapsed, onToggleCollapse }: UnifiedSidebarPr
         {section.items.map((g) => (
           <ChatGroupItem
             key={g.jid} jid={g.jid} name={g.name} folder={g.folder}
-            lastMessage={g.lastMessage} executionMode={g.execution_mode}
-            isShared={showCollabBadge ? g.is_shared : undefined}
+            lastMessage={g.lastMessage}            isShared={showCollabBadge ? g.is_shared : undefined}
             memberRole={showCollabBadge ? g.member_role : undefined}
             memberCount={showCollabBadge ? g.member_count : undefined}
             isActive={currentGroup === g.jid} isHome={false}
@@ -230,7 +241,7 @@ export function UnifiedSidebar({ collapsed, onToggleCollapse }: UnifiedSidebarPr
             <button onClick={() => navigate('/settings?tab=profile')} className="w-full flex items-center gap-2 px-3 py-2 text-sm rounded-md hover:bg-accent text-foreground cursor-pointer">
               <UserCog className="w-4 h-4" /> 个人设置
             </button>
-            <button onClick={() => { useAuthStore.getState().logout(); navigate('/login'); }} className="w-full flex items-center gap-2 px-3 py-2 text-sm rounded-md hover:bg-destructive/10 text-destructive cursor-pointer">
+            <button onClick={async () => { await useAuthStore.getState().logout(); navigate('/login'); }} className="w-full flex items-center gap-2 px-3 py-2 text-sm rounded-md hover:bg-destructive/10 text-destructive cursor-pointer">
               <LogOut className="w-4 h-4" /> 退出登录
             </button>
           </PopoverContent>
@@ -278,8 +289,7 @@ export function UnifiedSidebar({ collapsed, onToggleCollapse }: UnifiedSidebarPr
                         </div>
                         <ChatGroupItem
                           jid={mainGroup.jid} name={mainGroup.name} folder={mainGroup.folder}
-                          lastMessage={mainGroup.lastMessage} executionMode={mainGroup.execution_mode}
-                          isActive={currentGroup === mainGroup.jid} isHome
+                          lastMessage={mainGroup.lastMessage}                          isActive={currentGroup === mainGroup.jid} isHome
                           isRunning={runnerStates[mainGroup.jid] === 'running'} editable
                           onSelect={handleGroupSelect}
                           onRename={(jid, name) => setRenameState({ open: true, jid, name })}
@@ -297,8 +307,7 @@ export function UnifiedSidebar({ collapsed, onToggleCollapse }: UnifiedSidebarPr
                         {pinnedGroups.map((g) => (
                           <ChatGroupItem
                             key={g.jid} jid={g.jid} name={g.name} folder={g.folder}
-                            lastMessage={g.lastMessage} executionMode={g.execution_mode}
-                            isShared={g.is_shared} memberRole={g.member_role} memberCount={g.member_count}
+                            lastMessage={g.lastMessage}                            isShared={g.is_shared} memberRole={g.member_role} memberCount={g.member_count}
                             isActive={currentGroup === g.jid} isHome={false} isPinned
                             isRunning={runnerStates[g.jid] === 'running'}
                             editable={g.editable} deletable={g.deletable}

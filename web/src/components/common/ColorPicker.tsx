@@ -1,3 +1,4 @@
+import { Check } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 export interface ColorPickerProps {
@@ -13,18 +14,21 @@ const COLORS = [
 
 export function ColorPicker({ value, onChange }: ColorPickerProps) {
   return (
-    <div className="grid grid-cols-8 gap-2">
+    <div className="grid grid-cols-6 gap-2">
       {COLORS.map((color) => (
         <button
           key={color}
           type="button"
+          aria-label={`选择颜色 ${color}`}
           onClick={() => onChange(color)}
           className={cn(
-            'w-8 h-8 rounded-full cursor-pointer transition-transform hover:scale-110',
-            value === color && 'ring-2 ring-primary ring-offset-2',
+            'w-8 h-8 rounded-full cursor-pointer transition-transform hover:scale-110 flex items-center justify-center',
+            value === color && 'ring-2 ring-primary ring-offset-2 ring-offset-background',
           )}
           style={{ backgroundColor: color }}
-        />
+        >
+          {value === color && <Check className="w-4 h-4 text-white" strokeWidth={2.5} />}
+        </button>
       ))}
     </div>
   );

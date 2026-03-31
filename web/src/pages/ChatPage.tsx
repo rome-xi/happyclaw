@@ -20,7 +20,15 @@ export function ChatPage() {
     setClearLoading(true);
     try {
       const ok = await clearHistory(clearState.jid);
-      if (ok) setClearState({ open: false, jid: '', name: '' });
+      if (ok) {
+        setClearState({ open: false, jid: '', name: '' });
+      } else {
+        alert('重建工作区失败，请稍后重试');
+        setClearState({ open: false, jid: '', name: '' });
+      }
+    } catch {
+      alert('重建工作区失败，请稍后重试');
+      setClearState({ open: false, jid: '', name: '' });
     } finally {
       setClearLoading(false);
     }
@@ -104,7 +112,7 @@ export function ChatPage() {
                   name={g.name}
                   folder={g.folder}
                   lastMessage={g.lastMessage}
-                  executionMode={g.execution_mode}
+
                   isActive={currentGroup === g.jid}
                   isHome={!!g.is_my_home}
                   isRunning={runnerStates[g.jid] === 'running'}

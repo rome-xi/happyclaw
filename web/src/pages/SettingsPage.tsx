@@ -50,10 +50,12 @@ export function SettingsPage() {
     const raw = searchParams.get('tab') as SettingsTab | null;
     if (raw && VALID_TABS.includes(raw)) {
       if (SYSTEM_TABS.includes(raw) && !canManageSystemConfig) return defaultTab;
+      if (raw === 'monitor' && !canManageSystemConfig) return defaultTab;
+      if (raw === 'users' && !canManageUsers) return defaultTab;
       return raw;
     }
     return defaultTab;
-  }, [searchParams, canManageSystemConfig, mustChangePassword, defaultTab]);
+  }, [searchParams, canManageSystemConfig, canManageUsers, mustChangePassword, defaultTab]);
 
   const handleTabChange = useCallback((tab: SettingsTab) => {
     setNavOpen(false);

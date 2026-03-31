@@ -13,7 +13,7 @@ export interface ChatGroupItemProps {
   name: string;
   folder: string;
   lastMessage?: string;
-  executionMode?: 'container' | 'host';
+
   isShared?: boolean;
   memberRole?: 'owner' | 'member';
   memberCount?: number;

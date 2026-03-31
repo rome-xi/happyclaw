@@ -5,7 +5,7 @@ import { useAuthStore } from '../../stores/auth';
 import { MessageBubble } from './MessageBubble';
 import { StreamingDisplay } from './StreamingDisplay';
 import { EmojiAvatar } from '../common/EmojiAvatar';
-import { Loader2, ChevronUp, ChevronDown, AlertTriangle, Square } from 'lucide-react';
+import { Loader2, ChevronUp, ChevronDown, AlertTriangle, Square, Code2, Zap, BookOpen, Wrench } from 'lucide-react';
 import { useDisplayMode } from '../../hooks/useDisplayMode';
 
 interface MessageListProps {
@@ -35,10 +35,10 @@ type FlatItem =
   | { type: 'message'; content: Message };
 
 const quickPrompts = [
-  { icon: '💻', title: '分析代码', desc: '帮我阅读和分析一段代码的逻辑' },
-  { icon: '⚡', title: '自动化脚本', desc: '编写一个自动化处理任务的脚本' },
-  { icon: '📖', title: '技术概念', desc: '用简单的语言解释一个技术概念' },
-  { icon: '🔧', title: '调试问题', desc: '帮我定位和修复一个 Bug' },
+  { icon: Code2, title: '分析代码', desc: '帮我阅读和分析一段代码的逻辑' },
+  { icon: Zap, title: '自动化脚本', desc: '编写一个自动化处理任务的脚本' },
+  { icon: BookOpen, title: '技术概念', desc: '用简单的语言解释一个技术概念' },
+  { icon: Wrench, title: '调试问题', desc: '帮我定位和修复一个 Bug' },
 ];
 
 export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrigger, groupJid, isWaiting, onInterrupt, agentId, onSend }: MessageListProps) {
@@ -454,7 +454,7 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
                       onClick={() => onSend(prompt.desc)}
                       className="group text-left p-4 rounded-2xl border border-border/60 bg-muted/30 hover:bg-muted/60 hover:border-border transition-all active:scale-[0.98] cursor-pointer"
                     >
-                      <span className="text-xl mb-2 block">{prompt.icon}</span>
+                      <prompt.icon className="w-5 h-5 mb-2 text-muted-foreground" strokeWidth={1.75} />
                       <span className="text-sm font-medium text-foreground block">{prompt.title}</span>
                       <span className="text-xs text-muted-foreground mt-0.5 block">{prompt.desc}</span>
                     </button>
