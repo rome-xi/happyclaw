@@ -115,21 +115,29 @@ function ensureTaskWorkspace(
 
   const executionMode = resolveTaskExecutionMode(task, deps);
 
+  // Resolve owner before creating the group so created_by is always populated.
+  // Prefer task.created_by; fall back to the source group's owner so that
+  // tasks scheduled via MCP from a workspace whose created_by is null still
+  // get a valid owner (fixes: task-* workspaces invisible / undeletable).
+  const ownerId =
+    task.created_by ||
+    Object.values(deps.registeredGroups()).find((g) => g.folder === task.group_folder)
+      ?.created_by ||
+    undefined;
+
   const group: RegisteredGroup = {
     name,
     folder,
     added_at: new Date().toISOString(),
     executionMode,
-    created_by: task.created_by,
+    // Use resolved ownerId so the workspace is always owned, even when
+    // the raw task.created_by was null.
+    created_by: ownerId,
   };
 
   setRegisteredGroup(jid, group);
   ensureChatExists(jid);
   updateChatName(jid, name);
-  // Resolve owner: prefer task.created_by, fallback to source group's owner
-  const ownerId = task.created_by
-    || Object.values(deps.registeredGroups()).find((g) => g.folder === task.group_folder)?.created_by
-    || null;
   if (ownerId) {
     addGroupMember(folder, ownerId, 'owner', ownerId);
   }
@@ -146,12 +154,12 @@ function ensureTaskWorkspace(
   task.workspace_folder = folder;
 
   logger.info(
-    { taskId: task.id, folder, jid, executionMode },
+    { taskId: task.id, folder, jid, executionMode, ownerId },
     'Created task workspace',
   );
 
   // Notify frontend via WebSocket so sidebar refreshes (scoped to task owner)
-  deps.onWorkspaceCreated?.(jid, folder, name, task.created_by ?? undefined);
+  deps.onWorkspaceCreated?.(jid, folder, name, ownerId);
 
   return { jid, folder };
 }
