@@ -376,8 +376,8 @@ export function MessageInput({
 
   return (
     <div
-      className="pt-1 pb-3 bg-surface dark:bg-background ios-pwa-bottom-safe max-lg:bg-background/60 max-lg:backdrop-blur-xl max-lg:saturate-[1.8] max-lg:border-t max-lg:border-border/40"
-      style={{ paddingBottom: `max(0.75rem, var(--keyboard-height, 0px))` }}
+      className="pt-1 pb-3 bg-surface dark:bg-background max-lg:bg-background/60 max-lg:backdrop-blur-xl max-lg:saturate-[1.8] max-lg:border-t max-lg:border-border/40"
+      style={{ paddingBottom: `max(0.75rem, env(safe-area-inset-bottom, 0px), var(--keyboard-height, 0px))` }}
     >
       {/* lg:pl-[60px] = avatar w-8 (32px) + gap-3 (12px) + visual balance (16px), aligns input left edge with message card content */}
       <div className={isCompact ? 'mx-auto px-4' : 'max-w-4xl mx-auto px-4 lg:pl-[60px]'}>

@@ -1,20 +1,28 @@
-import { useEffect, useMemo, useRef } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
+import { Plus, UserCog, LogOut } from 'lucide-react';
 import { useChatStore } from '../stores/chat';
 import { useAuthStore } from '../stores/auth';
 import { useGroupsStore } from '../stores/groups';
 import { ChatView } from '../components/chat/ChatView';
 import { ChatGroupItem } from '../components/chat/ChatGroupItem';
 import { ConfirmDialog } from '../components/common';
+import { CreateContainerDialog } from '../components/chat/CreateContainerDialog';
+import { EmojiAvatar } from '../components/common/EmojiAvatar';
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { useSwipeBack } from '../hooks/useSwipeBack';
 import { useClearWorkspace } from '../hooks/useClearWorkspace';
-import { compareByLastActivity } from '../utils/group-utils';
+import { type GroupEntry, compareByLastActivity, groupByDate } from '../utils/group-utils';
 
 export function ChatPage() {
   const { groupFolder } = useParams<{ groupFolder?: string }>();
   const navigate = useNavigate();
   const { groups, currentGroup, selectGroup, loadGroups } = useChatStore();
   const { clearState, clearLoading, openClear, closeClear, handleClearConfirm } = useClearWorkspace();
+  const [createOpen, setCreateOpen] = useState(false);
+  const user = useAuthStore((s) => s.user);
+  const appearance = useAuthStore((s) => s.appearance);
+  const userInitial = (user?.display_name || user?.username || '?')[0].toUpperCase();
 
   const routeGroupJid = useMemo(() => {
     if (!groupFolder) return null;
@@ -29,18 +37,31 @@ export function ChatPage() {
       Object.entries(groups).find(([_, info]) => info.folder === groupFolder);
     return entry?.[0] || null;
   }, [groupFolder, groups]);
-  const appearance = useAuthStore((s) => s.appearance);
   const runnerStates = useGroupsStore((s) => s.runnerStates);
   const hasGroups = Object.keys(groups).length > 0;
 
-  // Build sorted group list for mobile view
-  const sortedGroups = useMemo(() => {
-    const entries = Object.entries(groups).map(([jid, info]) => ({ jid, ...info }));
-    const home = entries.filter((g) => g.is_my_home);
-    const rest = entries.filter((g) => !g.is_my_home);
-    rest.sort(compareByLastActivity);
-    return [...home, ...rest];
+  // Build categorized group lists for mobile view (mirrors UnifiedSidebar)
+  const { mainGroup, pinnedGroups, mySections, collabSections } = useMemo(() => {
+    let main: GroupEntry | null = null;
+    const others: GroupEntry[] = [];
+    for (const [jid, info] of Object.entries(groups)) {
+      const entry = { jid, ...info };
+      if (info.is_my_home) main = entry;
+      else others.push(entry);
+    }
+    others.sort(compareByLastActivity);
+    const pinned: GroupEntry[] = [];
+    const my: GroupEntry[] = [];
+    const collab: GroupEntry[] = [];
+    others.forEach((g) => {
+      if (g.pinned_at) pinned.push(g);
+      else if (g.is_shared && (g.member_count ?? 0) >= 2) collab.push(g);
+      else my.push(g);
+    });
+    pinned.sort((a, b) => (a.pinned_at || '').localeCompare(b.pinned_at || ''));
+    return { mainGroup: main, pinnedGroups: pinned, mySections: groupByDate(my), collabSections: groupByDate(collab) };
   }, [groups]);
+  const hasAnyGroup = mainGroup || pinnedGroups.length > 0 || mySections.length > 0 || collabSections.length > 0;
 
   // Sync URL param to store selection. No auto-redirect to home container —
   // users land on the welcome screen and choose a container manually.
@@ -80,36 +101,128 @@ export function ChatPage() {
       {/* Mobile workspace list when no group selected */}
       {!groupFolder && (
         <div className="block lg:hidden w-full overflow-y-auto">
-          <div className="px-4 pt-4 pb-2">
-            <h2 className="text-lg font-semibold text-foreground">工作台</h2>
+          {/* Mobile header: horizontal logo + actions */}
+          <div className="flex items-center gap-3 px-4 pt-5 pb-3">
+            <img src={`${import.meta.env.BASE_URL}icons/logo-text.svg`} alt={appearance?.appName || 'HappyClaw'} className="h-8" />
+            <div className="flex-1" />
+            <button
+              onClick={() => setCreateOpen(true)}
+              className="w-9 h-9 rounded-lg flex items-center justify-center hover:bg-accent text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
+              aria-label="新工作区"
+            >
+              <Plus className="w-5 h-5" />
+            </button>
+            <Popover>
+              <PopoverTrigger asChild>
+                <button className="rounded-full hover:ring-2 hover:ring-brand-200 transition-all cursor-pointer" aria-label="用户菜单">
+                  <EmojiAvatar emoji={user?.avatar_emoji} color={user?.avatar_color} fallbackChar={userInitial} size="md" className="w-8 h-8" />
+                </button>
+              </PopoverTrigger>
+              <PopoverContent side="bottom" align="end" className="w-44 p-1">
+                <div className="px-3 py-2 text-xs font-medium text-muted-foreground truncate border-b border-border mb-1">{user?.display_name || user?.username}</div>
+                <button onClick={() => navigate('/settings?tab=profile')} className="w-full flex items-center gap-2 px-3 py-2 text-sm rounded-md hover:bg-accent text-foreground cursor-pointer">
+                  <UserCog className="w-4 h-4" /> 个人设置
+                </button>
+                <button onClick={async () => { await useAuthStore.getState().logout(); navigate('/login'); }} className="w-full flex items-center gap-2 px-3 py-2 text-sm rounded-md hover:bg-destructive/10 text-destructive cursor-pointer">
+                  <LogOut className="w-4 h-4" /> 退出登录
+                </button>
+              </PopoverContent>
+            </Popover>
           </div>
-          {sortedGroups.length > 0 ? (
-            <div className="px-2 pb-28">
-              {sortedGroups.map((g) => (
-                <ChatGroupItem
-                  key={g.jid}
-                  jid={g.jid}
-                  name={g.name}
-                  folder={g.folder}
-                  lastMessage={g.lastMessage}
-
-                  isActive={currentGroup === g.jid}
-                  isHome={!!g.is_my_home}
-                  isRunning={runnerStates[g.jid] === 'running'}
-                  editable={g.editable}
-                  onSelect={(jid, folder) => { selectGroup(jid); navigate(`/chat/${folder}`); }}
-                  onClearHistory={openClear}
-                />
-              ))}
+          {hasAnyGroup ? (
+            <div className="px-2 pb-nav-safe">
+              {/* 主工作区 */}
+              {mainGroup && (
+                <div className="mb-1">
+                  <div className="px-2 pt-1 pb-1">
+                    <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">主工作区</span>
+                  </div>
+                  <ChatGroupItem
+                    jid={mainGroup.jid} name={mainGroup.name} folder={mainGroup.folder}
+                    lastMessage={mainGroup.lastMessage}
+                    isActive={currentGroup === mainGroup.jid} isHome
+                    isRunning={runnerStates[mainGroup.jid] === 'running'} editable
+                    onSelect={(jid, folder) => { selectGroup(jid); navigate(`/chat/${folder}`); }}
+                    onClearHistory={openClear}
+                  />
+                </div>
+              )}
+              {/* 已固定 */}
+              {pinnedGroups.length > 0 && (
+                <div className="mb-1">
+                  <div className="px-2 pt-2 pb-1">
+                    <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">已固定</span>
+                  </div>
+                  {pinnedGroups.map((g) => (
+                    <ChatGroupItem
+                      key={g.jid} jid={g.jid} name={g.name} folder={g.folder}
+                      lastMessage={g.lastMessage}
+                      isActive={currentGroup === g.jid} isHome={false} isPinned
+                      isRunning={runnerStates[g.jid] === 'running'}
+                      editable={g.editable}
+                      onSelect={(jid, folder) => { selectGroup(jid); navigate(`/chat/${folder}`); }}
+                      onClearHistory={openClear}
+                    />
+                  ))}
+                </div>
+              )}
+              {/* 我的工作区 */}
+              {mySections.length > 0 && (
+                <div className="mb-1">
+                  <div className="px-2 pt-2 pb-1">
+                    <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">我的工作区</span>
+                  </div>
+                  {mySections.map((section) => (
+                    <div key={section.label} className="mb-1">
+                      <div className="px-2 pt-1 pb-1">
+                        <span className="text-[10px] text-muted-foreground/70 tracking-wide">{section.label}</span>
+                      </div>
+                      {section.items.map((g) => (
+                        <ChatGroupItem
+                          key={g.jid} jid={g.jid} name={g.name} folder={g.folder}
+                          lastMessage={g.lastMessage}
+                          isActive={currentGroup === g.jid} isHome={false}
+                          isRunning={runnerStates[g.jid] === 'running'}
+                          editable={g.editable}
+                          onSelect={(jid, folder) => { selectGroup(jid); navigate(`/chat/${folder}`); }}
+                          onClearHistory={openClear}
+                        />
+                      ))}
+                    </div>
+                  ))}
+                </div>
+              )}
+              {/* 协作工作区 */}
+              {collabSections.length > 0 && (
+                <div className="mb-1">
+                  <div className="px-2 pt-2 pb-1">
+                    <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-wider">协作工作区</span>
+                  </div>
+                  {collabSections.map((section) => (
+                    <div key={section.label} className="mb-1">
+                      <div className="px-2 pt-1 pb-1">
+                        <span className="text-[10px] text-muted-foreground/70 tracking-wide">{section.label}</span>
+                      </div>
+                      {section.items.map((g) => (
+                        <ChatGroupItem
+                          key={g.jid} jid={g.jid} name={g.name} folder={g.folder}
+                          lastMessage={g.lastMessage}
+                          isShared={g.is_shared} memberRole={g.member_role} memberCount={g.member_count}
+                          isActive={currentGroup === g.jid} isHome={false}
+                          isRunning={runnerStates[g.jid] === 'running'}
+                          editable={g.editable}
+                          onSelect={(jid, folder) => { selectGroup(jid); navigate(`/chat/${folder}`); }}
+                          onClearHistory={openClear}
+                        />
+                      ))}
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           ) : (
             <div className="flex flex-col items-center justify-center h-64 px-4">
-              <div className="w-16 h-16 rounded-2xl overflow-hidden mx-auto mb-6">
-                <img src={`${import.meta.env.BASE_URL}icons/icon-192.png`} alt="HappyClaw" className="w-full h-full object-cover" />
-              </div>
-              <h2 className="text-xl font-semibold text-foreground mb-2">
-                欢迎使用 {appearance?.appName || 'HappyClaw'}
-              </h2>
+              <img src={`${import.meta.env.BASE_URL}icons/logo-text.svg`} alt={appearance?.appName || 'HappyClaw'} className="h-12 mb-6" />
               <p className="text-muted-foreground text-sm">暂无工作区</p>
             </div>
           )}
@@ -150,6 +263,11 @@ export function ChatPage() {
         cancelText="取消"
         confirmVariant="danger"
         loading={clearLoading}
+      />
+      <CreateContainerDialog
+        open={createOpen}
+        onClose={() => setCreateOpen(false)}
+        onCreated={(jid, folder) => { selectGroup(jid); navigate(`/chat/${folder}`); }}
       />
     </div>
   );

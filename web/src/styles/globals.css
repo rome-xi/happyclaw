@@ -617,10 +617,11 @@ pre code.hljs {
     -webkit-tap-highlight-color: transparent;
   }
 
-  /* 聊天输入框底部安全区域 */
-  .ios-pwa-bottom-safe {
-    padding-bottom: max(env(safe-area-inset-bottom), 34px);
-  }
+}
+
+/* Bottom padding for content above floating nav — accounts for safe area */
+.pb-nav-safe {
+  padding-bottom: calc(7rem + env(safe-area-inset-bottom, 0px));
 }
 
 /* Floating Navigation (Liquid Glass Capsule) */
