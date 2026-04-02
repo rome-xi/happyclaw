@@ -93,6 +93,7 @@ export function UsageBars({ providerId }: { providerId: string }) {
   const buckets: { label: string; bucket: OAuthUsageBucket }[] = [];
   if (usage.data.five_hour) buckets.push({ label: '5h', bucket: usage.data.five_hour });
   if (usage.data.seven_day) buckets.push({ label: '7d', bucket: usage.data.seven_day });
+  if (usage.data.seven_day_opus) buckets.push({ label: '7dO', bucket: usage.data.seven_day_opus });
   if (usage.data.seven_day_sonnet) buckets.push({ label: '7dS', bucket: usage.data.seven_day_sonnet });
 
   if (buckets.length === 0) return null;

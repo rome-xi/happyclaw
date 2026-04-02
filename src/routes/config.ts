@@ -200,6 +200,17 @@ setInterval(() => {
 const OAUTH_USAGE_API = 'https://api.anthropic.com/api/oauth/usage';
 const USAGE_CACHE_TTL_MS = 3 * 60 * 1000; // 3 minutes
 const usageCache = new Map<string, CachedOAuthUsage>();
+const inFlightUsageRequests = new Map<string, Promise<CachedOAuthUsage>>();
+
+// Periodic cleanup of stale usage cache entries
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of usageCache) {
+    if (now - entry.fetchedAt >= USAGE_CACHE_TTL_MS) {
+      usageCache.delete(key);
+    }
+  }
+}, 60_000);
 
 async function fetchOAuthUsage(providerId: string): Promise<CachedOAuthUsage> {
   const cached = usageCache.get(providerId);
@@ -207,40 +218,56 @@ async function fetchOAuthUsage(providerId: string): Promise<CachedOAuthUsage> {
     return cached;
   }
 
+  // Deduplicate concurrent requests for the same provider
+  const inFlight = inFlightUsageRequests.get(providerId);
+  if (inFlight) return inFlight;
+
   const providers = getProviders();
   const provider = providers.find((p) => p.id === providerId);
-  if (!provider?.claudeOAuthCredentials) {
+  if (!provider) {
+    throw new Error('Provider not found');
+  }
+  if (!provider.claudeOAuthCredentials) {
     throw new Error('Provider has no OAuth credentials');
   }
 
-  const resp = await fetch(OAUTH_USAGE_API, {
-    headers: {
-      Authorization: `Bearer ${provider.claudeOAuthCredentials.accessToken}`,
-      'anthropic-beta': 'oauth-2025-04-20',
-    },
-  });
+  const requestPromise = (async () => {
+    try {
+      const resp = await fetch(OAUTH_USAGE_API, {
+        headers: {
+          Authorization: `Bearer ${provider.claudeOAuthCredentials!.accessToken}`,
+          'anthropic-beta': 'oauth-2025-04-20',
+        },
+      });
 
-  if (!resp.ok) {
-    // Return stale cache if available, otherwise throw
-    if (cached) {
-      const stale: CachedOAuthUsage = { ...cached, error: `HTTP ${resp.status}` };
-      usageCache.set(providerId, stale);
-      return stale;
+      if (!resp.ok) {
+        // Return stale cache if available, otherwise throw
+        if (cached) {
+          const stale: CachedOAuthUsage = { ...cached, error: `HTTP ${resp.status}` };
+          usageCache.set(providerId, stale);
+          return stale;
+        }
+        throw new Error(`Usage API returned ${resp.status}`);
+      }
+
+      const raw = (await resp.json()) as Record<string, unknown>;
+      const data: OAuthUsageResponse = {
+        five_hour: raw.five_hour as OAuthUsageResponse['five_hour'],
+        seven_day: raw.seven_day as OAuthUsageResponse['seven_day'],
+        seven_day_opus: raw.seven_day_opus as OAuthUsageResponse['seven_day_opus'],
+        seven_day_sonnet: raw.seven_day_sonnet as OAuthUsageResponse['seven_day_sonnet'],
+      };
+
+      const result: CachedOAuthUsage = { data, fetchedAt: Date.now() };
+      usageCache.set(providerId, result);
+      return result;
+    } finally {
+      inFlightUsageRequests.delete(providerId);
     }
-    throw new Error(`Usage API returned ${resp.status}`);
-  }
+  })();
 
-  const raw = (await resp.json()) as Record<string, unknown>;
-  const data: OAuthUsageResponse = {
-    five_hour: raw.five_hour as OAuthUsageResponse['five_hour'],
-    seven_day: raw.seven_day as OAuthUsageResponse['seven_day'],
-    seven_day_opus: raw.seven_day_opus as OAuthUsageResponse['seven_day_opus'],
-    seven_day_sonnet: raw.seven_day_sonnet as OAuthUsageResponse['seven_day_sonnet'],
-  };
-
-  const result: CachedOAuthUsage = { data, fetchedAt: Date.now() };
-  usageCache.set(providerId, result);
-  return result;
+  inFlightUsageRequests.set(providerId, requestPromise);
+  return requestPromise;
 }
 
 // --- Routes ---
