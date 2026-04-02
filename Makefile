@@ -1,7 +1,7 @@
-.PHONY: dev dev-backend dev-web build build-backend build-web start \
+.PHONY: dev dev-backend dev-web build build-backend build-web start stop restart \
        typecheck typecheck-backend typecheck-web typecheck-agent-runner \
        format format-check install clean reset-init update-sdk ensure-latest-sdk sync-types \
-       backup restore help _ensure-docker-image
+       backup restore help _ensure-docker-image _stop-pm2
 
 # ─── Runtime Detection ──────────────────────────────────────
 # 优先使用 bun（跳过编译、启动更快），fallback 到 npm + tsx + node
@@ -19,9 +19,19 @@ else
   PKG_PFX  = npm --prefix $(1) install
 endif
 
+# ─── PM2 Helper ──────────────────────────────────────────────
+
+PM2 := $(shell command -v pm2 2>/dev/null || echo "$(HOME)/.nvm/versions/node/v22.22.0/bin/pm2")
+
+_stop-pm2: ## (内部) 停止 PM2 管理的 happyclaw，避免端口冲突
+	@if $(PM2) list 2>/dev/null | grep -q happyclaw; then \
+		echo "⏹  停止 PM2 管理的 happyclaw（避免端口冲突）..."; \
+		$(PM2) stop happyclaw 2>/dev/null || true; \
+	fi
+
 # ─── Development ─────────────────────────────────────────────
 
-dev: ## 启动前后端（首次自动安装依赖和构建容器镜像）
+dev: _stop-pm2 ## 启动前后端（首次自动安装依赖和构建容器镜像）
 	@if [ ! -d node_modules ] || [ package.json -nt node_modules ] || [ web/package.json -nt web/node_modules ] || [ container/agent-runner/package.json -nt container/agent-runner/node_modules ]; then echo "📦 依赖有更新，安装依赖..."; $(MAKE) install; fi
 	@$(MAKE) _ensure-docker-image
 	@$(PKG) --prefix container/agent-runner run build --silent 2>/dev/null || $(PKG) --prefix container/agent-runner run build
@@ -48,15 +58,15 @@ build-web: ## 仅编译前端
 
 # ─── Production ──────────────────────────────────────────────
 
-start: ensure-latest-sdk ## 一键启动生产环境
+start: ensure-latest-sdk ## 通过 PM2 启动生产环境（自动编译变更部分）
 	@if [ ! -d node_modules ] || [ package.json -nt node_modules ] || [ web/package.json -nt web/node_modules ] || [ container/agent-runner/package.json -nt container/agent-runner/node_modules ]; then echo "📦 依赖有更新，安装依赖..."; $(MAKE) install; fi
 	@$(MAKE) _ensure-docker-image
-ifeq ($(HAS_BUN),1)
 	@NEED_SYNC=0; \
 	for target in src/stream-event.types.ts web/src/stream-event.types.ts container/agent-runner/src/stream-event.types.ts src/image-detector.ts container/agent-runner/src/image-detector.ts src/channel-prefixes.ts container/agent-runner/src/channel-prefixes.ts; do \
 	  if [ ! -f "$$target" ] || [ -n "$$(find shared/ -newer "$$target" -name '*.ts' 2>/dev/null | head -1)" ]; then NEED_SYNC=1; break; fi; \
 	done; \
 	if [ "$$NEED_SYNC" = "1" ]; then echo "🔄 检测到 shared/ 类型变更，同步类型..."; $(MAKE) sync-types; fi
+ifeq ($(HAS_BUN),1)
 	@NEED_WEB=0; \
 	if [ ! -f web/dist/index.html ]; then NEED_WEB=1; \
 	else \
@@ -75,14 +85,7 @@ ifeq ($(HAS_BUN),1)
 	  if [ "$$NEED_AR" = "0" ] && [ -n "$$(find container/agent-runner/src/ -newer container/agent-runner/dist/.tsbuildinfo -name '*.ts' 2>/dev/null | head -1)" ]; then NEED_AR=1; fi; \
 	fi; \
 	if [ "$$NEED_AR" = "1" ]; then echo "🔨 检测到 agent-runner 变更，重新编译..."; cd container/agent-runner && bun run build; else echo "✅ agent-runner 无变更，跳过编译"; fi
-	@echo "⚡ Bun 模式：直接运行 TypeScript，跳过后端编译"
-	bun src/index.ts
 else
-	@NEED_SYNC=0; \
-	for target in src/stream-event.types.ts web/src/stream-event.types.ts container/agent-runner/src/stream-event.types.ts src/image-detector.ts container/agent-runner/src/image-detector.ts src/channel-prefixes.ts container/agent-runner/src/channel-prefixes.ts; do \
-	  if [ ! -f "$$target" ] || [ -n "$$(find shared/ -newer "$$target" -name '*.ts' 2>/dev/null | head -1)" ]; then NEED_SYNC=1; break; fi; \
-	done; \
-	if [ "$$NEED_SYNC" = "1" ]; then echo "🔄 检测到 shared/ 类型变更，同步类型..."; $(MAKE) sync-types; fi
 	@NEED_BACKEND=0; \
 	if [ ! -f dist/index.js ]; then NEED_BACKEND=1; \
 	else \
@@ -110,8 +113,19 @@ else
 	  if [ "$$NEED_AR" = "0" ] && [ -n "$$(find container/agent-runner/src/ -newer container/agent-runner/dist/.tsbuildinfo -name '*.ts' 2>/dev/null | head -1)" ]; then NEED_AR=1; fi; \
 	fi; \
 	if [ "$$NEED_AR" = "1" ]; then echo "🔨 检测到 agent-runner 变更，重新编译..."; cd container/agent-runner && npm run build; else echo "✅ agent-runner 无变更，跳过编译"; fi
-	node dist/index.js
 endif
+	@$(PM2) start ecosystem.config.cjs 2>/dev/null && echo "✅ PM2 启动成功" || \
+		(echo "⚠️  PM2 不可用，fallback 到直接启动"; node dist/index.js)
+	@$(PM2) save 2>/dev/null || true
+
+stop: ## 停止 PM2 管理的 happyclaw
+	@$(PM2) stop happyclaw 2>/dev/null && echo "✅ 已停止" || echo "⚠️  happyclaw 未在运行"
+
+restart: ## 重启 PM2 管理的 happyclaw（先编译再重启）
+	@$(MAKE) build
+	@$(PM2) restart happyclaw 2>/dev/null && echo "✅ 已重启" || \
+		(echo "⚠️  happyclaw 未在 PM2 中，执行 start..."; $(MAKE) start)
+	@$(PM2) save 2>/dev/null || true
 
 # ─── Quality ─────────────────────────────────────────────────
 
