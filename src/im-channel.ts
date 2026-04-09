@@ -602,6 +602,11 @@ export function createDingTalkChannel(
       await inner.sendFile(chatId, filePath, fileName);
     },
 
+    clearAckReaction(chatId: string): void {
+      if (!inner) return;
+      inner.clearAckReaction(chatId);
+    },
+
     isConnected(): boolean {
       return inner?.isConnected() ?? false;
     },
