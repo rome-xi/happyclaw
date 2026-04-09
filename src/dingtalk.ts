@@ -415,6 +415,12 @@ export function createDingTalkConnection(
       }
       try {
         await apiRequest('POST', '/v1.0/robot/emotion/reply', body);
+        // Recall previous reaction before overwriting (e.g. second message
+        // arrives before the first is replied — prevents orphaned emoji)
+        const existing = ackReactionByChat.get(chatId);
+        if (existing) {
+          recallAckReaction(chatId).catch(() => {});
+        }
         ackReactionByChat.set(chatId, { msgId, conversationId });
         logger.debug({ msgId, chatId }, 'DingTalk ack reaction attached');
         return;
@@ -448,6 +454,14 @@ export function createDingTalkConnection(
         robotCode: config.clientId,
         openMsgId: stored.msgId,
         openConversationId: stored.conversationId,
+        emotionType: 2,
+        emotionName: '🤔思考中',
+        textEmotion: {
+          emotionId: '2659900',
+          emotionName: '🤔思考中',
+          text: '🤔思考中',
+          backgroundId: 'im_bg_1',
+        },
       });
       logger.debug({ chatId }, 'DingTalk ack reaction recalled');
     } catch (err: any) {
