@@ -253,6 +253,13 @@ class MessageStream {
   private done = false;
 
   push(text: string, images?: Array<{ data: string; mimeType?: string }>): string[] {
+    // Guard: reject push after stream has ended to prevent writing to a closed SDK transport.
+    // This can happen when an IPC message arrives between the for-await loop exit and
+    // the ipcPolling=false cleanup (race condition).
+    if (this.done) {
+      return ['Stream already ended, message will be processed in the next query'];
+    }
+
     const rejectedReasons: string[] = [];
     let filteredImages = images;
 
@@ -293,6 +300,10 @@ class MessageStream {
     });
     this.waiting?.();
     return rejectedReasons;
+  }
+
+  get ended(): boolean {
+    return this.done;
   }
 
   end(): void {
@@ -561,6 +572,52 @@ function createPreCompactHook(
 
     return {};
   };
+}
+
+/**
+ * Extract recent conversation history from a session's JSONL transcript.
+ * Used when session resume fails to inject context into the fresh session's prompt.
+ */
+function extractSessionHistory(oldSessionId: string, currentPrompt: string): string | null {
+  try {
+    const configDir = process.env.CLAUDE_CONFIG_DIR
+      || path.join(process.env.HOME || '/home/node', '.claude');
+    // SDK stores transcripts at: <configDir>/projects/<encoded-cwd>/<sessionId>.jsonl
+    // where encoded-cwd replaces '/' with '-'
+    const encodedCwd = WORKSPACE_GROUP.replace(/\//g, '-');
+    const transcriptPath = path.join(configDir, 'projects', encodedCwd, `${oldSessionId}.jsonl`);
+
+    if (!fs.existsSync(transcriptPath)) {
+      log(`Session transcript not found at ${transcriptPath}`);
+      return null;
+    }
+
+    const content = fs.readFileSync(transcriptPath, 'utf-8');
+    const messages = parseTranscript(content);
+    if (messages.length === 0) return null;
+
+    // Take the last N messages for context (similar to RECOVERY_HISTORY_LIMIT in index.ts)
+    const HISTORY_LIMIT = 20;
+    const recentMessages = messages.slice(-HISTORY_LIMIT);
+
+    const historyLines = recentMessages.map((m) => {
+      const role = m.role === 'user' ? 'User' : 'HappyClaw';
+      const truncated = m.content.length > 500 ? m.content.slice(0, 500) + '…' : m.content;
+      // Strip lone surrogates to avoid API JSON errors
+      const cleaned = truncated.replace(/[\uD800-\uDFFF]/g, '');
+      return `[${role}] ${cleaned}`;
+    });
+
+    log(`Extracted ${recentMessages.length} messages from old session ${oldSessionId} for context injection`);
+
+    return '<system_context>\n' +
+      '会话恢复失败，当前为新会话。以下是之前的对话记录，供你了解上下文（请基于这些上下文继续对话）：\n\n' +
+      historyLines.join('\n') +
+      '\n</system_context>\n\n';
+  } catch (err) {
+    log(`Failed to extract session history: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
 }
 
 function parseTranscript(content: string): ParsedMessage[] {
@@ -1038,6 +1095,17 @@ async function runQuery(
     // gets silently consumed, leaving queryInFlight=true on the host forever (bug #259).
     if (!emitOutput) {
       return; // No setTimeout needed — watcher will trigger next check on file change
+    }
+
+    // Guard: don't drain IPC messages if the stream has already ended.
+    // Messages arriving after the for-await loop exits but before ipcPolling=false
+    // would be consumed from IPC (deleted) but rejected by stream.push(),
+    // causing them to be lost. Leave them for waitForIpcMessage() to pick up.
+    if (stream.ended) {
+      log('Stream already ended, skipping IPC drain (messages will be picked up by waitForIpcMessage)');
+      ipcPolling = false;
+      ipcQueryWatcher.close();
+      return;
     }
 
     const { messages } = drainIpcInput();
@@ -1678,8 +1746,18 @@ async function main(): Promise<void> {
       }
 
       // Session resume 失败（SDK 无法恢复旧会话）：清除 session，以新会话重试
+      // 同时从旧会话的 JSONL 转录中提取最近对话历史，注入到 prompt 中，
+      // 避免新会话完全丢失上下文（类似 recoveryGroups 机制）。
       if (queryResult.sessionResumeFailed) {
         log(`Session resume failed, retrying with fresh session (old: ${sessionId})`);
+        // Extract recent history from the old session transcript before clearing
+        if (sessionId) {
+          const historyContext = extractSessionHistory(sessionId, prompt);
+          if (historyContext) {
+            prompt = historyContext + prompt;
+            log(`Injected session history context into prompt for fresh session retry`);
+          }
+        }
         sessionId = undefined;
         latestSessionId = undefined;
         resumeAt = undefined;
