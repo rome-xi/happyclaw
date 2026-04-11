@@ -253,9 +253,10 @@ class MessageStream {
   private done = false;
 
   push(text: string, images?: Array<{ data: string; mimeType?: string }>): string[] {
-    // Guard: reject push after stream has ended to prevent writing to a closed SDK transport.
-    // This can happen when an IPC message arrives between the for-await loop exit and
-    // the ipcPolling=false cleanup (race condition).
+    // 预防性 invariant：stream.done=true 后不应再有 caller 调用 push（pollIpcDuringQuery
+    // 已通过 stream.ended 守护拦住主路径）。此守护防止上游重构（例如 SDK write-pump 在
+    // transport.close() 后仍 drain 残留消息）或未来新增的 push 调用点引入崩溃，避免
+    // 写入已关闭的 SDK transport 触发 "ProcessTransport is not ready for writing"。
     if (this.done) {
       return ['Stream already ended, message will be processed in the next query'];
     }
@@ -596,9 +597,9 @@ function extractSessionHistory(oldSessionId: string): string | null {
     const messages = parseTranscript(content);
     if (messages.length === 0) return null;
 
-    // Take the last N messages for context (similar to RECOVERY_HISTORY_LIMIT in index.ts)
-    const HISTORY_LIMIT = 20;
-    const recentMessages = messages.slice(-HISTORY_LIMIT);
+    // Take the last N messages for context (aligned with RECOVERY_HISTORY_LIMIT in src/index.ts)
+    const RECOVERY_HISTORY_LIMIT = 20;
+    const recentMessages = messages.slice(-RECOVERY_HISTORY_LIMIT);
 
     const historyLines = recentMessages.map((m) => {
       const role = m.role === 'user' ? 'User' : 'HappyClaw';
@@ -1097,10 +1098,10 @@ async function runQuery(
       return; // No setTimeout needed — watcher will trigger next check on file change
     }
 
-    // Guard: don't drain IPC messages if the stream has already ended.
-    // Messages arriving after the for-await loop exits but before ipcPolling=false
-    // would be consumed from IPC (deleted) but rejected by stream.push(),
-    // causing them to be lost. Leave them for waitForIpcMessage() to pick up.
+    // 预防性 invariant：当前所有 stream.end() 路径（sentinel handlers / interrupt-before-query
+    // / immediate-interrupt）都在同一同步 tick 把 ipcPolling=false，理论上 !ipcPolling 早退
+    // 已覆盖 stream.ended=true 的情况；此守护保留作为未来重构时的 invariant 断言，
+    // 避免后续改动引入"流已关闭但 polling 未停"的竞态窗口（消息会被 drain 后又被 stream.push 拒绝丢失）。
     if (stream.ended) {
       log('Stream already ended, skipping IPC drain (messages will be picked up by waitForIpcMessage)');
       ipcPolling = false;
@@ -1715,6 +1716,10 @@ async function main(): Promise<void> {
   const MAX_OVERFLOW_RETRIES = 3;
   let consecutiveCompactions = 0;
   const MAX_CONSECUTIVE_COMPACTIONS = 3;
+  // 暂存的会话历史上下文：当 auto-continue 阶段发生 sessionResumeFailed 时，
+  // 历史无法直接拼到 auto-continue prompt（因为 fall-through 等下一条 IPC 消息后才重启 query），
+  // 需要在下一轮主循环 query 之前消费它，避免新会话完全丢失上下文。
+  let pendingHistoryContext: string | null = null;
   try {
     while (true) {
       // 清理残留的 _interrupt sentinel（空闲期间写入的中断信号不应影响下一次 query）。
@@ -1722,6 +1727,16 @@ async function main(): Promise<void> {
       // pollIpcDuringQuery 会在查询结果后检测到并正确退出容器。
       try { fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL); } catch { /* ignore */ }
       clearInterruptRequested();
+
+      // 消费 auto-continue 阶段暂存的 history context（如果存在）。
+      // 对应 sessionResumeFailed 在 auto-continue 路径上的镜像处理：
+      // 此时 sessionId 已被清空，pendingHistoryContext 是从旧 JSONL 转录中
+      // 提取的最近对话历史，需在 fresh session 启动前注入到 prompt 前面。
+      if (pendingHistoryContext) {
+        prompt = pendingHistoryContext + prompt;
+        log('Injected pending session history context (from auto-continue resume failure) into prompt');
+        pendingHistoryContext = null;
+      }
 
       log(`Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`);
 
@@ -1947,6 +1962,17 @@ async function main(): Promise<void> {
           // auto-continue is a standalone call we must check them explicitly).
           if (autoContResult.sessionResumeFailed) {
             log('WARN: Session resume failed during auto-continue, clearing session');
+            // 镜像主循环 sessionResumeFailed 的 history 注入逻辑：
+            // 在清空 sessionId 之前从旧 JSONL 转录中提取最近对话历史，
+            // 暂存到 pendingHistoryContext，下一轮主循环 query 会在用户消息前消费它。
+            // 与主循环不同，此处无法直接拼到 prompt（auto-continue 已结束，需等待下一条 IPC 消息）。
+            if (sessionId) {
+              const historyContext = extractSessionHistory(sessionId);
+              if (historyContext) {
+                pendingHistoryContext = historyContext;
+                log('Stashed session history context for next user-initiated query');
+              }
+            }
             sessionId = undefined;
             latestSessionId = undefined;
             resumeAt = undefined;
