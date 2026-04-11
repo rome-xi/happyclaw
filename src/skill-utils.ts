@@ -101,17 +101,30 @@ export function listFiles(
 ): Array<{ name: string; type: 'file' | 'directory'; size: number }> {
   try {
     const entries = fs.readdirSync(dir, { withFileTypes: true });
-    return entries
-      .filter((entry) => !entry.name.startsWith('.'))
-      .map((entry) => {
-        const fullPath = path.join(dir, entry.name);
+    const result: Array<{
+      name: string;
+      type: 'file' | 'directory';
+      size: number;
+    }> = [];
+    for (const entry of entries) {
+      if (entry.name.startsWith('.')) continue;
+      const fullPath = path.join(dir, entry.name);
+      try {
+        // Use statSync (follows symlinks) so that symlinks pointing to
+        // directories are correctly classified as 'directory' instead of
+        // 'file'. Dangling or circular symlinks throw and are skipped.
         const stats = fs.statSync(fullPath);
-        return {
+        const isDirectory = stats.isDirectory();
+        result.push({
           name: entry.name,
-          type: entry.isDirectory() ? 'directory' : 'file',
-          size: entry.isDirectory() ? 0 : stats.size,
-        };
-      });
+          type: isDirectory ? 'directory' : 'file',
+          size: isDirectory ? 0 : stats.size,
+        });
+      } catch {
+        // Skip dangling symlinks or unreadable entries
+      }
+    }
+    return result;
   } catch {
     return [];
   }
@@ -127,9 +140,17 @@ export function scanSkillDirectory(
   try {
     const entries = fs.readdirSync(rootDir, { withFileTypes: true });
     for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
+      if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
 
       const skillDir = path.join(rootDir, entry.name);
+      // Symlink must resolve to a directory
+      if (entry.isSymbolicLink()) {
+        try {
+          if (!fs.statSync(skillDir).isDirectory()) continue;
+        } catch {
+          continue; // dangling symlink
+        }
+      }
       const skillMdPath = path.join(skillDir, 'SKILL.md');
       const skillMdDisabledPath = path.join(skillDir, 'SKILL.md.disabled');
 
