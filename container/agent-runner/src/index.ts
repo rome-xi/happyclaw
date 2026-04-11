@@ -106,17 +106,6 @@ const SECURITY_RULES_PATH = path.join(
 );
 const SECURITY_RULES = fs.readFileSync(SECURITY_RULES_PATH, 'utf-8');
 
-// globalClaudeMd 截断保护：防止用户 CLAUDE.md 过大导致系统提示词膨胀
-const GLOBAL_CLAUDE_MD_MAX_CHARS = 8000;
-
-/** Head+Tail 截断：保留头 75% + 尾 25%，中间标记已截断 */
-function truncateWithHeadTail(content: string, maxChars: number): string {
-  if (content.length <= maxChars) return content;
-  const headSize = Math.floor(maxChars * 0.75);
-  const tailSize = Math.max(0, maxChars - headSize - 30);
-  return content.slice(0, headSize) + '\n\n[...内容过长，已截断...]\n\n' + content.slice(-tailSize);
-}
-
 /** 按渠道生成格式指南（仅 IM 渠道需要，Web 前端原生支持 Markdown + Mermaid） */
 function buildChannelGuidelines(channel: string): string {
   switch (channel) {
@@ -1129,19 +1118,12 @@ async function runQuery(
 
   const processor = new StreamEventProcessor(emit, log);
 
-  // Build system prompt: memory recall guidance + global CLAUDE.md (for non-admin-home)
+  // Build system prompt: memory recall guidance.
+  // 注：用户级 CLAUDE.md（WORKSPACE_GLOBAL/CLAUDE.md）由 SDK 通过
+  // additionalDirectories + settingSources:['project','user'] 自动发现加载，
+  // 不再手动读取和注入，避免同一份内容被 cache 两次（#377）。
   const { isHome, isAdminHome } = normalizeHomeFlags(containerInput);
-  const globalClaudeMdPath = path.join(WORKSPACE_GLOBAL, 'CLAUDE.md');
 
-  // Home containers: inject full global CLAUDE.md for immediate context.
-  // Non-home containers: global CLAUDE.md is accessible via filesystem (mounted readonly)
-  // but NOT injected into system prompt to avoid context pollution that causes
-  // the agent to "continue" unrelated previous work.
-  let globalClaudeMd = '';
-  if (isHome && fs.existsSync(globalClaudeMdPath)) {
-    globalClaudeMd = fs.readFileSync(globalClaudeMdPath, 'utf-8');
-    globalClaudeMd = truncateWithHeadTail(globalClaudeMd, GLOBAL_CLAUDE_MD_MAX_CHARS);
-  }
   const outputGuidelines = [
     '',
     '## 输出格式',
@@ -1257,8 +1239,9 @@ async function runQuery(
   const channelGuidelines = buildChannelGuidelines(channel);
 
   const systemPromptAppend = [
-    // L1: Identity — 用户身份与偏好（仅主容器注入）
-    globalClaudeMd && `<user-profile>\n${globalClaudeMd}\n</user-profile>`,
+    // L1: Identity — 用户级 CLAUDE.md 由 SDK 通过 additionalDirectories +
+    // settingSources:['project','user'] 自动发现加载，不再手动注入 <user-profile>，
+    // 避免同一份 globalClaudeMd 被 cache 两次（详见 #377）
 
     // L2: Behavior — 核心行为约束（始终注入所有容器）
     `<behavior>\n${interactionGuidelines}\n</behavior>`,
