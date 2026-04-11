@@ -2317,8 +2317,14 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         const role = m.is_from_me ? 'assistant' : m.sender_name;
         const truncated =
           m.content.length > 500 ? m.content.slice(0, 500) + '…' : m.content;
-        // Strip lone surrogates to avoid API JSON errors
-        const cleaned = truncated.replace(/[\uD800-\uDFFF]/g, '');
+        // Strip lone (unpaired) surrogates while preserving valid surrogate pairs
+        // such as emoji. Must stay byte-for-byte aligned with the matching regex
+        // in container/agent-runner/src/index.ts:extractSessionHistory — both
+        // sides feed the same Anthropic API and must produce identical strings.
+        const cleaned = truncated.replace(
+          /(?:[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF])/g,
+          '',
+        );
         return `[${role}] ${cleaned}`;
       });
       prompt =

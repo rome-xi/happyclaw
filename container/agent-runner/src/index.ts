@@ -32,6 +32,10 @@ import type {
 export type { StreamEventType, StreamEvent } from './types.js';
 
 import { sanitizeFilename, generateFallbackName } from './utils.js';
+import {
+  extractSessionHistory as extractSessionHistoryImpl,
+  parseTranscript,
+} from './session-history.js';
 import { StreamEventProcessor } from './stream-processor.js';
 import { PREDEFINED_AGENTS } from './agent-definitions.js';
 import { createMcpTools } from './mcp-tools.js';
@@ -565,75 +569,23 @@ function createPreCompactHook(
 }
 
 /**
- * Extract recent conversation history from a session's JSONL transcript.
- * Used when session resume fails to inject context into the fresh session's prompt.
+ * Wrapper around the pure extractSessionHistory implementation in
+ * session-history.ts. Resolves the SDK transcript directory using the
+ * runtime CLAUDE_CONFIG_DIR + WORKSPACE_GROUP layout, then delegates.
  */
 function extractSessionHistory(oldSessionId: string): string | null {
-  try {
-    const configDir = process.env.CLAUDE_CONFIG_DIR
-      || path.join(process.env.HOME || '/home/node', '.claude');
-    // SDK stores transcripts at: <configDir>/projects/<encoded-cwd>/<sessionId>.jsonl
-    // where encoded-cwd replaces '/' with '-'
-    const encodedCwd = WORKSPACE_GROUP.replace(/\//g, '-');
-    const transcriptPath = path.join(configDir, 'projects', encodedCwd, `${oldSessionId}.jsonl`);
-
-    if (!fs.existsSync(transcriptPath)) {
-      log(`Session transcript not found at ${transcriptPath}`);
-      return null;
-    }
-
-    const content = fs.readFileSync(transcriptPath, 'utf-8');
-    const messages = parseTranscript(content);
-    if (messages.length === 0) return null;
-
-    // Take the last N messages for context (aligned with RECOVERY_HISTORY_LIMIT in src/index.ts)
-    const RECOVERY_HISTORY_LIMIT = 20;
-    const recentMessages = messages.slice(-RECOVERY_HISTORY_LIMIT);
-
-    const historyLines = recentMessages.map((m) => {
-      const role = m.role === 'user' ? 'User' : 'HappyClaw';
-      const truncated = m.content.length > 500 ? m.content.slice(0, 500) + '…' : m.content;
-      // Strip lone surrogates (unpaired) to avoid API JSON errors, preserving valid surrogate pairs (emoji etc.)
-      const cleaned = truncated.replace(/(?:[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF])/g, '');
-      return `[${role}] ${cleaned}`;
-    });
-
-    log(`Extracted ${recentMessages.length} messages from old session ${oldSessionId} for context injection`);
-
-    return '<system_context>\n' +
-      '会话恢复失败，当前为新会话。以下是之前的对话记录，供你了解上下文（请基于这些上下文继续对话）：\n\n' +
-      historyLines.join('\n') +
-      '\n</system_context>\n\n';
-  } catch (err) {
-    log(`Failed to extract session history: ${err instanceof Error ? err.message : String(err)}`);
-    return null;
-  }
-}
-
-function parseTranscript(content: string): ParsedMessage[] {
-  const messages: ParsedMessage[] = [];
-
-  for (const line of content.split('\n')) {
-    if (!line.trim()) continue;
-    try {
-      const entry = JSON.parse(line);
-      if (entry.type === 'user' && entry.message?.content) {
-        const text = typeof entry.message.content === 'string'
-          ? entry.message.content
-          : entry.message.content.map((c: { text?: string }) => c.text || '').join('');
-        if (text) messages.push({ role: 'user', content: text });
-      } else if (entry.type === 'assistant' && entry.message?.content) {
-        const textParts = entry.message.content
-          .filter((c: { type: string }) => c.type === 'text')
-          .map((c: { text: string }) => c.text);
-        const text = textParts.join('');
-        if (text) messages.push({ role: 'assistant', content: text });
-      }
-    } catch {
-    }
-  }
-
-  return messages;
+  const configDir =
+    process.env.CLAUDE_CONFIG_DIR ||
+    path.join(process.env.HOME || '/home/node', '.claude');
+  // SDK stores transcripts at: <configDir>/projects/<encoded-cwd>/<sessionId>.jsonl
+  // where encoded-cwd replaces '/' with '-'
+  const encodedCwd = WORKSPACE_GROUP.replace(/\//g, '-');
+  const transcriptDir = path.join(configDir, 'projects', encodedCwd);
+  return extractSessionHistoryImpl({
+    transcriptDir,
+    sessionId: oldSessionId,
+    log,
+  });
 }
 
 function formatTranscriptMarkdown(messages: ParsedMessage[], title?: string | null): string {
