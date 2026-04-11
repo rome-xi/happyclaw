@@ -1204,13 +1204,11 @@ async function runQuery(
     `<memory-system>\n${memoryRecall}\n</memory-system>`,
     heartbeatContent && `<recent-work>\n${heartbeatContent}\n</recent-work>`,
 
-    // L4: Reference — 输出格式、网页访问、后台任务、渠道指南
+    // L4: Reference — 操作指南（合并输出格式 / 网页访问 / 后台任务，降低 XML 结构开销）
     // 这些规范必须 inline 注入：SDK settingSources 仅加载 ~/.claude/CLAUDE.md 本体，
     // 不会递归加载 ~/.claude/rules/ 下的独立文件；且 container 模式下容器内 $HOME
     // 指向会话目录，连宿主机 CLAUDE.md 都读不到。
-    `<output-format>\n${outputGuidelines}\n</output-format>`,
-    `<web-access>\n${webFetchGuidelines}\n</web-access>`,
-    `<background-tasks>\n${backgroundTaskGuidelines}\n</background-tasks>`,
+    `<guidelines>\n${outputGuidelines}\n${webFetchGuidelines}\n${backgroundTaskGuidelines}\n</guidelines>`,
     channelGuidelines && `<channel-format>\n${channelGuidelines}\n</channel-format>`,
 
     // Override: Sub-Agent 行为覆盖
