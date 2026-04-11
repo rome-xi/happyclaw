@@ -1088,15 +1088,6 @@ async function runQuery(
     'Web 界面会自动将 Mermaid 代码渲染为可视化图表。',
   ].join('\n');
 
-  const webFetchGuidelines = [
-    '',
-    '## 网页访问策略',
-    '',
-    '访问外部网页时优先使用 WebFetch（速度快）。',
-    '如果 WebFetch 失败（403、被拦截、内容为空或需要 JavaScript 渲染），',
-    '且 agent-browser 可用，立即改用 agent-browser 通过真实浏览器访问。不要反复重试 WebFetch。',
-  ].join('\n');
-
   // Read HEARTBEAT.md (recent work summary) — only for home containers.
   // Non-home containers are task-isolated and should not see unrelated work history,
   // which can mislead the agent into "continuing" previous tasks instead of
@@ -1122,6 +1113,42 @@ async function runQuery(
     }
   }
 
+  // Interaction guidelines to prevent the agent from confusing MCP tool
+  // descriptions with user input, or proactively describing available tools.
+  const interactionGuidelines = [
+    '',
+    '## 交互原则',
+    '',
+    '**始终专注于用户当前的实际消息。**',
+    '',
+    '- 你可能拥有多种 MCP 工具和 Skills，这些是你的辅助能力，**不是用户发送的内容**。',
+    '- **不要主动介绍、列举或描述你的可用工具**，除非用户明确询问「你能做什么」或「你有什么功能」。',
+    '- 当用户需要某个功能时，直接使用对应工具完成任务即可，无需事先解释工具的存在。',
+    '- 如果用户的消息很简短（如打招呼），简洁回应即可，不要用工具列表填充回复。',
+  ].join('\n');
+
+  // Skill routing directive: remind the model to consult the skills listing
+  // that the harness injects via <system-reminder> before falling back to
+  // basic tools.
+  const skillRoutingGuidelines = [
+    '',
+    '## 技能路由',
+    '',
+    '响应前检查 <system-reminder> 中列出的已安装 skills，将用户意图与 skill description 做匹配：',
+    '- 有明确匹配 → 使用 Skill 工具调用',
+    '- 不确定是否匹配 → 用 ToolSearch 搜索确认',
+    '- 无匹配 → 使用基础工具或直接回答',
+  ].join('\n');
+
+  const webFetchGuidelines = [
+    '',
+    '## 网页访问策略',
+    '',
+    '访问外部网页时优先使用 WebFetch（速度快）。',
+    '如果 WebFetch 失败（403、被拦截、内容为空或需要 JavaScript 渲染），',
+    '且 agent-browser 可用，立即改用 agent-browser 通过真实浏览器访问。不要反复重试 WebFetch。',
+  ].join('\n');
+
   const backgroundTaskGuidelines = [
     '',
     '## 后台任务',
@@ -1138,20 +1165,6 @@ async function runQuery(
     '- **禁止逐条回复**。不要对每条通知都调用 `send_message`，这会导致 IM 群刷屏。',
     '- **等待所有通知到齐后，汇总为一条消息回复用户**，例如：「N 个任务完成，M 个失败，失败原因：...」',
     '- 对于已知的无害失败（如浏览器进程被回收、临时资源超时），**不需要通知用户**，静默忽略即可。',
-  ].join('\n');
-
-  // Interaction guidelines to prevent the agent from confusing MCP tool
-  // descriptions with user input, or proactively describing available tools.
-  const interactionGuidelines = [
-    '',
-    '## 交互原则',
-    '',
-    '**始终专注于用户当前的实际消息。**',
-    '',
-    '- 你可能拥有多种 MCP 工具（如外卖点餐、优惠券查询等），这些是你的辅助能力，**不是用户发送的内容**。',
-    '- **不要主动介绍、列举或描述你的可用工具**，除非用户明确询问「你能做什么」或「你有什么功能」。',
-    '- 当用户需要某个功能时，直接使用对应工具完成任务即可，无需事先解释工具的存在。',
-    '- 如果用户的消息很简短（如打招呼），简洁回应即可，不要用工具列表填充回复。',
   ].join('\n');
 
   // Conversation agents (sub-conversations with agentId) get special behavioral guidelines
@@ -1180,13 +1193,17 @@ async function runQuery(
 
     // L2: Behavior — 核心行为约束（始终注入所有容器）
     `<behavior>\n${interactionGuidelines}\n</behavior>`,
+    `<skill-routing>\n${skillRoutingGuidelines}\n</skill-routing>`,
     `<security>\n${SECURITY_RULES}\n</security>`,
 
     // L3: Context — 记忆系统与工作背景
     `<memory-system>\n${memoryRecall}\n</memory-system>`,
     heartbeatContent && `<recent-work>\n${heartbeatContent}\n</recent-work>`,
 
-    // L4: Reference — 输出格式与工具使用指南
+    // L4: Reference — 输出格式、网页访问、后台任务、渠道指南
+    // 这些规范必须 inline 注入：SDK settingSources 仅加载 ~/.claude/CLAUDE.md 本体，
+    // 不会递归加载 ~/.claude/rules/ 下的独立文件；且 container 模式下容器内 $HOME
+    // 指向会话目录，连宿主机 CLAUDE.md 都读不到。
     `<output-format>\n${outputGuidelines}\n</output-format>`,
     `<web-access>\n${webFetchGuidelines}\n</web-access>`,
     `<background-tasks>\n${backgroundTaskGuidelines}\n</background-tasks>`,
@@ -1361,6 +1378,27 @@ async function runQuery(
     if (message.type === 'system' && message.subtype === 'init') {
       newSessionId = message.session_id;
       log(`Session initialized: ${newSessionId}`);
+
+      // Log skills and context usage for observability.
+      // getContextUsage() is a newer SDK API; feature-detect to avoid spamming
+      // error logs on older SDK versions where the method is absent.
+      const getCtxUsage = (q as unknown as { getContextUsage?: () => Promise<{
+        skills?: { includedSkills: number; totalSkills: number; tokens: number };
+        totalTokens: number;
+        maxTokens: number;
+        percentage: number;
+      }> }).getContextUsage;
+      if (typeof getCtxUsage === 'function') {
+        try {
+          const ctxUsage = await getCtxUsage.call(q);
+          if (ctxUsage.skills) {
+            log(`Skills: ${ctxUsage.skills.includedSkills}/${ctxUsage.skills.totalSkills} loaded, ${ctxUsage.skills.tokens} tokens`);
+          }
+          log(`Context: ${ctxUsage.totalTokens}/${ctxUsage.maxTokens} tokens (${ctxUsage.percentage.toFixed(1)}%)`);
+        } catch (ctxErr) {
+          log(`[debug] getContextUsage failed: ${ctxErr instanceof Error ? ctxErr.message : String(ctxErr)}`);
+        }
+      }
     }
 
     if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
