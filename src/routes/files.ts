@@ -118,49 +118,15 @@ const TEXT_EXTENSIONS = new Set([
   'svg',
 ]);
 
-// 允许 inline 预览的安全 MIME 类型（排除 HTML 和 SVG 以防止 XSS）
-const SAFE_PREVIEW_MIME_TYPES = new Set([
-  // 图片
-  'image/png',
-  'image/jpeg',
-  'image/gif',
-  'image/webp',
-  'image/bmp',
-  'image/x-icon',
-  // 文本
-  'text/plain',
-  'text/markdown',
-  'text/css',
-  'text/csv',
-  'text/yaml',
-  'text/x-python',
-  'text/x-go',
-  'text/x-rust',
-  'text/x-java',
-  'text/x-c',
-  'text/x-c++',
-  'text/x-sh',
-  'text/x-toml',
-  'text/javascript',
-  'text/typescript',
-  'application/json',
-  'application/xml',
-  // PDF
-  'application/pdf',
-  // 视频
-  'video/mp4',
-  'video/webm',
-  'video/quicktime',
-  'video/x-msvideo',
-  'video/x-matroska',
-  // 音频
-  'audio/mpeg',
-  'audio/wav',
-  'audio/ogg',
-  'audio/aac',
-  'audio/mp4',
-  'audio/flac',
-]);
+// 不安全的扩展名（HTML/SVG 有 XSS 风险，压缩包不可预览）
+const UNSAFE_PREVIEW_EXTENSIONS = new Set(['html', 'svg', 'zip', 'tar', 'gz', '7z']);
+
+// 允许 inline 预览的安全 MIME 类型（从 MIME_MAP 中排除不安全扩展名自动推导）
+const SAFE_PREVIEW_MIME_TYPES = new Set(
+  Object.entries(MIME_MAP)
+    .filter(([ext]) => !UNSAFE_PREVIEW_EXTENSIONS.has(ext))
+    .map(([, mime]) => mime),
+);
 
 /**
  * 获取文件操作的根目录覆盖。

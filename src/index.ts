@@ -6118,30 +6118,43 @@ async function startMessageLoop(): Promise<void> {
 }
 
 /**
- * Check if a process tree has actively working child processes.
- * Returns true if any descendant is consuming CPU (> 0.5%), indicating
- * real work (training, processing) rather than a network-blocked hang.
+ * Check if a process tree has actively working descendant processes.
+ * Returns true if any descendant (not just direct children) is consuming
+ * CPU (> 0.5%), indicating real work rather than a network-blocked hang.
  */
 async function hasActiveCpuDescendants(pid: number): Promise<boolean> {
   const execFileAsync = promisify(execFile);
   try {
-    // Get direct child PIDs using pgrep
-    const { stdout: pgrepOut } = await execFileAsync('pgrep', ['-P', String(pid)], {
-      timeout: 3000,
-    });
-    const pids = pgrepOut.trim();
-    if (!pids) return false;
+    const { stdout } = await execFileAsync(
+      'ps',
+      ['-eo', 'pid=,ppid=,pcpu='],
+      { timeout: 3000 },
+    );
 
-    // Check CPU usage of all child PIDs
-    const pidList = pids.split('\n').join(',');
-    const { stdout: psOut } = await execFileAsync('ps', ['-p', pidList, '-o', 'pid=,pcpu='], {
-      timeout: 3000,
-    });
-    if (!psOut.trim()) return false;
+    const children = new Map<number, number[]>();
+    const cpuByPid = new Map<number, number>();
+    for (const line of stdout.trim().split('\n')) {
+      const parts = line.trim().split(/\s+/);
+      if (parts.length < 3) continue;
+      const p = parseInt(parts[0], 10);
+      const pp = parseInt(parts[1], 10);
+      const cpu = parseFloat(parts[2]);
+      if (isNaN(p) || isNaN(pp)) continue;
+      if (!children.has(pp)) children.set(pp, []);
+      children.get(pp)!.push(p);
+      cpuByPid.set(p, cpu);
+    }
 
-    for (const line of psOut.trim().split('\n')) {
-      const cpu = parseFloat(line.trim().split(/\s+/)[1] || '0');
-      if (cpu > 0.5) return true;
+    // Walk the full descendant tree (not just direct children)
+    const stack = [pid];
+    while (stack.length > 0) {
+      const current = stack.pop()!;
+      const kids = children.get(current);
+      if (!kids) continue;
+      for (const kid of kids) {
+        if ((cpuByPid.get(kid) ?? 0) > 0.5) return true;
+        stack.push(kid);
+      }
     }
     return false;
   } catch {
@@ -6152,9 +6165,6 @@ async function hasActiveCpuDescendants(pid: number): Promise<boolean> {
 async function recoverStuckPendingGroups(): Promise<void> {
   const stuckGroups = queue.getStuckPendingGroups(STUCK_RUNNER_IDLE_MS);
   for (const { jid, idleMs } of stuckGroups) {
-    // Before restarting, check if the runner process has active child processes.
-    // If children exist, the agent is likely executing a long-running command
-    // (e.g. training, downloading datasets) — skip restart to avoid killing it.
     const pid = queue.getRunnerPid(jid);
     if (pid && (await hasActiveCpuDescendants(pid))) {
       logger.info(

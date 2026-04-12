@@ -26,6 +26,7 @@ import {
 import { useFileStore, FileEntry, toBase64Url } from '../../stores/files';
 import { useChatStore } from '../../stores/chat';
 import { useAuthStore } from '../../stores/auth';
+import { useEscapeKey } from '../../hooks/useEscapeKey';
 import { api } from '../../api/client';
 import { withBasePath } from '../../utils/url';
 import { downloadFromUrl } from '../../utils/download';
@@ -165,26 +166,24 @@ const PREVIEW_BLACKLIST_EXTENSIONS = new Set([
   'cache',
 ]);
 
-/** 判断文件是否应该显示预览/编辑按钮 */
+/** 判断文件是否可点击预览（排除系统文件和临时文件） */
 function isPreviewableFile(name: string, isSystem: boolean): boolean {
   if (isSystem) return false;
   const ext = getFileExt(name);
-  // 排除备份/临时文件
   if (PREVIEW_BLACKLIST_EXTENSIONS.has(ext)) return false;
   return true;
 }
 
-function isClickableFile(name: string, isSystem: boolean): boolean {
-  if (!isPreviewableFile(name, isSystem)) return false;
-  const ext = getFileExt(name);
-  // 图片、视频、音频、PDF 有专门预览
-  if (IMAGE_EXTENSIONS.has(ext)) return true;
-  if (VIDEO_EXTENSIONS.has(ext)) return true;
-  if (AUDIO_EXTENSIONS.has(ext)) return true;
-  if (PDF_EXTENSIONS.has(ext)) return true;
-  // 其他文件都走通用文本预览（后端会判断是否二进制）
-  return true;
-}
+// Preview state: only one overlay can be open at a time
+type PreviewState =
+  | null
+  | { kind: 'image'; file: FileEntry }
+  | { kind: 'edit'; file: FileEntry }
+  | { kind: 'markdown'; file: FileEntry }
+  | { kind: 'pdf'; file: FileEntry }
+  | { kind: 'video'; file: FileEntry }
+  | { kind: 'audio'; file: FileEntry }
+  | { kind: 'text'; file: FileEntry };
 
 // ─── Helpers ─────────────────────────────────────────────────────
 
@@ -199,6 +198,48 @@ function formatSize(bytes: number): string {
   return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`;
 }
 
+function buildPreviewUrl(groupJid: string, filePath: string): string {
+  return withBasePath(
+    `/api/groups/${encodeURIComponent(groupJid)}/files/preview/${toBase64Url(filePath)}`,
+  );
+}
+
+// ─── Media Overlay (shared shell for image/pdf/video) ──────────
+
+function MediaOverlay({
+  onClose,
+  children,
+  fileName,
+  bgOpacity = '80',
+}: {
+  onClose: () => void;
+  children: React.ReactNode;
+  fileName: string;
+  bgOpacity?: string;
+}) {
+  useEscapeKey(onClose);
+
+  return createPortal(
+    <div
+      className={`fixed inset-0 z-50 bg-black/${bgOpacity} flex items-center justify-center p-4`}
+      onClick={onClose}
+    >
+      <button
+        className="absolute top-4 right-4 text-white/70 hover:text-white transition-colors p-2 cursor-pointer z-10"
+        onClick={onClose}
+        aria-label="关闭预览"
+      >
+        <X className="w-8 h-8" />
+      </button>
+      <div className="absolute bottom-4 left-1/2 -translate-x-1/2 text-white/70 text-sm bg-black/50 px-3 py-1 rounded-full">
+        {fileName}
+      </div>
+      {children}
+    </div>,
+    document.body,
+  );
+}
+
 // ─── Image Preview Overlay ──────────────────────────────────────
 
 function ImagePreview({
@@ -210,41 +251,15 @@ function ImagePreview({
   file: FileEntry;
   onClose: () => void;
 }) {
-  useEffect(() => {
-    const handleEsc = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', handleEsc);
-    return () => window.removeEventListener('keydown', handleEsc);
-  }, [onClose]);
-
-  const previewUrl = withBasePath(
-    `/api/groups/${encodeURIComponent(groupJid)}/files/preview/${toBase64Url(file.path)}`,
-  );
-
-  return createPortal(
-    <div
-      className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4"
-      onClick={onClose}
-    >
-      <button
-        className="absolute top-4 right-4 text-white/70 hover:text-white transition-colors p-2 cursor-pointer z-10"
-        onClick={onClose}
-        aria-label="关闭预览"
-      >
-        <X className="w-8 h-8" />
-      </button>
-      <div className="absolute bottom-4 left-1/2 -translate-x-1/2 text-white/70 text-sm bg-black/50 px-3 py-1 rounded-full">
-        {file.name}
-      </div>
+  return (
+    <MediaOverlay onClose={onClose} fileName={file.name}>
       <img
-        src={previewUrl}
+        src={buildPreviewUrl(groupJid, file.path)}
         alt={file.name}
         className="max-w-full max-h-full object-contain rounded-lg"
         onClick={(e) => e.stopPropagation()}
       />
-    </div>,
-    document.body,
+    </MediaOverlay>
   );
 }
 
@@ -265,24 +280,19 @@ function TextEditor({
   const [saving, setSaving] = useState(false);
   const [dirty, setDirty] = useState(false);
 
+  useEscapeKey(onClose);
+
   useEffect(() => {
-    const handleEsc = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
     const handleSave = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key === 's') {
         e.preventDefault();
         handleSave_();
       }
     };
-    window.addEventListener('keydown', handleEsc);
     window.addEventListener('keydown', handleSave);
-    return () => {
-      window.removeEventListener('keydown', handleEsc);
-      window.removeEventListener('keydown', handleSave);
-    };
+    return () => window.removeEventListener('keydown', handleSave);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [onClose, content, dirty]);
+  }, [content, dirty]);
 
   useEffect(() => {
     let cancelled = false;
@@ -404,24 +414,19 @@ function MarkdownFileViewer({
     };
   }, []);
 
+  useEscapeKey(onClose);
+
   useEffect(() => {
-    const handleEsc = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
     const handleSaveKey = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key === 's') {
         e.preventDefault();
         doSave();
       }
     };
-    window.addEventListener('keydown', handleEsc);
     window.addEventListener('keydown', handleSaveKey);
-    return () => {
-      window.removeEventListener('keydown', handleEsc);
-      window.removeEventListener('keydown', handleSaveKey);
-    };
+    return () => window.removeEventListener('keydown', handleSaveKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [onClose, editContent, dirty, mode]);
+  }, [editContent, dirty, mode]);
 
   useEffect(() => {
     let cancelled = false;
@@ -603,41 +608,15 @@ function PdfPreview({
   file: FileEntry;
   onClose: () => void;
 }) {
-  useEffect(() => {
-    const handleEsc = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', handleEsc);
-    return () => window.removeEventListener('keydown', handleEsc);
-  }, [onClose]);
-
-  const previewUrl = withBasePath(
-    `/api/groups/${encodeURIComponent(groupJid)}/files/preview/${toBase64Url(file.path)}`,
-  );
-
-  return createPortal(
-    <div
-      className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4"
-      onClick={onClose}
-    >
-      <button
-        className="absolute top-4 right-4 text-white/70 hover:text-white transition-colors p-2 cursor-pointer z-10"
-        onClick={onClose}
-        aria-label="关闭预览"
-      >
-        <X className="w-8 h-8" />
-      </button>
-      <div className="absolute bottom-4 left-1/2 -translate-x-1/2 text-white/70 text-sm bg-black/50 px-3 py-1 rounded-full">
-        {file.name}
-      </div>
+  return (
+    <MediaOverlay onClose={onClose} fileName={file.name}>
       <iframe
-        src={previewUrl}
+        src={buildPreviewUrl(groupJid, file.path)}
         title={file.name}
         className="w-full h-full max-w-[90vw] max-h-[90vh] rounded-lg bg-white"
         onClick={(e) => e.stopPropagation()}
       />
-    </div>,
-    document.body,
+    </MediaOverlay>
   );
 }
 
@@ -652,42 +631,16 @@ function VideoPreview({
   file: FileEntry;
   onClose: () => void;
 }) {
-  useEffect(() => {
-    const handleEsc = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', handleEsc);
-    return () => window.removeEventListener('keydown', handleEsc);
-  }, [onClose]);
-
-  const previewUrl = withBasePath(
-    `/api/groups/${encodeURIComponent(groupJid)}/files/preview/${toBase64Url(file.path)}`,
-  );
-
-  return createPortal(
-    <div
-      className="fixed inset-0 z-50 bg-black/90 flex items-center justify-center p-4"
-      onClick={onClose}
-    >
-      <button
-        className="absolute top-4 right-4 text-white/70 hover:text-white transition-colors p-2 cursor-pointer z-10"
-        onClick={onClose}
-        aria-label="关闭预览"
-      >
-        <X className="w-8 h-8" />
-      </button>
-      <div className="absolute bottom-4 left-1/2 -translate-x-1/2 text-white/70 text-sm bg-black/50 px-3 py-1 rounded-full">
-        {file.name}
-      </div>
+  return (
+    <MediaOverlay onClose={onClose} fileName={file.name} bgOpacity="90">
       <video
-        src={previewUrl}
+        src={buildPreviewUrl(groupJid, file.path)}
         controls
         autoPlay
         className="max-w-[90vw] max-h-[90vh] rounded-lg"
         onClick={(e) => e.stopPropagation()}
       />
-    </div>,
-    document.body,
+    </MediaOverlay>
   );
 }
 
@@ -702,17 +655,7 @@ function AudioPreview({
   file: FileEntry;
   onClose: () => void;
 }) {
-  useEffect(() => {
-    const handleEsc = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', handleEsc);
-    return () => window.removeEventListener('keydown', handleEsc);
-  }, [onClose]);
-
-  const previewUrl = withBasePath(
-    `/api/groups/${encodeURIComponent(groupJid)}/files/preview/${toBase64Url(file.path)}`,
-  );
+  useEscapeKey(onClose);
 
   return createPortal(
     <div
@@ -739,7 +682,12 @@ function AudioPreview({
             <X className="w-5 h-5" />
           </button>
         </div>
-        <audio src={previewUrl} controls autoPlay className="w-full" />
+        <audio
+          src={buildPreviewUrl(groupJid, file.path)}
+          controls
+          autoPlay
+          className="w-full"
+        />
       </div>
     </div>,
     document.body,
@@ -762,13 +710,7 @@ function GenericTextPreview({
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(false);
 
-  useEffect(() => {
-    const handleEsc = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', handleEsc);
-    return () => window.removeEventListener('keydown', handleEsc);
-  }, [onClose]);
+  useEscapeKey(onClose);
 
   useEffect(() => {
     let cancelled = false;
@@ -871,16 +813,8 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
   }>({ open: false, path: '', name: '', isDir: false });
   const [deleteLoading, setDeleteLoading] = useState(false);
 
-  // Preview / Editor state
-  const [previewFile, setPreviewFile] = useState<FileEntry | null>(null);
-  const [editFile, setEditFile] = useState<FileEntry | null>(null);
-  const [mdViewFile, setMdViewFile] = useState<FileEntry | null>(null);
-  const [pdfViewFile, setPdfViewFile] = useState<FileEntry | null>(null);
-  const [videoViewFile, setVideoViewFile] = useState<FileEntry | null>(null);
-  const [audioViewFile, setAudioViewFile] = useState<FileEntry | null>(null);
-  const [genericTextFile, setGenericTextFile] = useState<FileEntry | null>(
-    null,
-  );
+  // Preview / Editor state — only one overlay can be open at a time
+  const [preview, setPreview] = useState<PreviewState>(null);
 
   const isStreaming = useChatStore((s) => !!s.streaming[groupJid]);
   const canOpenLocalFolder = useAuthStore((s) => s.user?.role === 'admin');
@@ -941,38 +875,19 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
 
       const ext = getFileExt(item.name);
 
-      // 图片 → 预览
       if (IMAGE_EXTENSIONS.has(ext)) {
-        setPreviewFile(item);
-        return;
+        setPreview({ kind: 'image', file: item });
+      } else if (PDF_EXTENSIONS.has(ext)) {
+        setPreview({ kind: 'pdf', file: item });
+      } else if (VIDEO_EXTENSIONS.has(ext)) {
+        setPreview({ kind: 'video', file: item });
+      } else if (AUDIO_EXTENSIONS.has(ext)) {
+        setPreview({ kind: 'audio', file: item });
+      } else if (ext === 'md' && !item.isSystem) {
+        setPreview({ kind: 'markdown', file: item });
+      } else {
+        setPreview({ kind: 'text', file: item });
       }
-
-      // PDF → 预览
-      if (PDF_EXTENSIONS.has(ext)) {
-        setPdfViewFile(item);
-        return;
-      }
-
-      // 视频 → 预览
-      if (VIDEO_EXTENSIONS.has(ext)) {
-        setVideoViewFile(item);
-        return;
-      }
-
-      // 音频 → 预览
-      if (AUDIO_EXTENSIONS.has(ext)) {
-        setAudioViewFile(item);
-        return;
-      }
-
-      // Markdown 文件（非系统） → Markdown 预览/编辑
-      if (ext === 'md' && !item.isSystem) {
-        setMdViewFile(item);
-        return;
-      }
-
-      // 其他文件 → 通用文本预览（后端会判断是否二进制）
-      setGenericTextFile(item);
     },
     [groupJid, navigateTo],
   );
@@ -1141,7 +1056,7 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
             {sortedFiles.map((item) => {
               const clickable =
                 item.type === 'directory' ||
-                isClickableFile(item.name, !!item.isSystem);
+                isPreviewableFile(item.name, !!item.isSystem);
               return (
                 <div
                   key={item.path}
@@ -1193,7 +1108,7 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
                           <button
                             onClick={(e) => {
                               e.stopPropagation();
-                              setEditFile(item);
+                              setPreview({ kind: 'edit', file: item });
                             }}
                             className="p-2.5 rounded hover:bg-brand-100 text-muted-foreground hover:text-primary transition-colors cursor-pointer"
                             title="编辑"
@@ -1329,67 +1244,27 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
         loading={deleteLoading}
       />
 
-      {/* Image Preview Overlay */}
-      {previewFile && (
-        <ImagePreview
-          groupJid={groupJid}
-          file={previewFile}
-          onClose={() => setPreviewFile(null)}
-        />
+      {/* Preview / Editor Overlays */}
+      {preview?.kind === 'image' && (
+        <ImagePreview groupJid={groupJid} file={preview.file} onClose={() => setPreview(null)} />
       )}
-
-      {/* Text Editor Overlay */}
-      {editFile && (
-        <TextEditor
-          groupJid={groupJid}
-          file={editFile}
-          onClose={() => setEditFile(null)}
-        />
+      {preview?.kind === 'edit' && (
+        <TextEditor groupJid={groupJid} file={preview.file} onClose={() => setPreview(null)} />
       )}
-
-      {/* Markdown Viewer Overlay */}
-      {mdViewFile && (
-        <MarkdownFileViewer
-          groupJid={groupJid}
-          file={mdViewFile}
-          onClose={() => setMdViewFile(null)}
-        />
+      {preview?.kind === 'markdown' && (
+        <MarkdownFileViewer groupJid={groupJid} file={preview.file} onClose={() => setPreview(null)} />
       )}
-
-      {/* PDF Viewer Overlay */}
-      {pdfViewFile && (
-        <PdfPreview
-          groupJid={groupJid}
-          file={pdfViewFile}
-          onClose={() => setPdfViewFile(null)}
-        />
+      {preview?.kind === 'pdf' && (
+        <PdfPreview groupJid={groupJid} file={preview.file} onClose={() => setPreview(null)} />
       )}
-
-      {/* Video Viewer Overlay */}
-      {videoViewFile && (
-        <VideoPreview
-          groupJid={groupJid}
-          file={videoViewFile}
-          onClose={() => setVideoViewFile(null)}
-        />
+      {preview?.kind === 'video' && (
+        <VideoPreview groupJid={groupJid} file={preview.file} onClose={() => setPreview(null)} />
       )}
-
-      {/* Audio Viewer Overlay */}
-      {audioViewFile && (
-        <AudioPreview
-          groupJid={groupJid}
-          file={audioViewFile}
-          onClose={() => setAudioViewFile(null)}
-        />
+      {preview?.kind === 'audio' && (
+        <AudioPreview groupJid={groupJid} file={preview.file} onClose={() => setPreview(null)} />
       )}
-
-      {/* Generic Text Viewer Overlay (for hidden files like .gitignore) */}
-      {genericTextFile && (
-        <GenericTextPreview
-          groupJid={groupJid}
-          file={genericTextFile}
-          onClose={() => setGenericTextFile(null)}
-        />
+      {preview?.kind === 'text' && (
+        <GenericTextPreview groupJid={groupJid} file={preview.file} onClose={() => setPreview(null)} />
       )}
     </div>
   );
