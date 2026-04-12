@@ -18,6 +18,7 @@ import {
   isDockerAvailable,
   updateWeChatNoProxy,
 } from './config.js';
+import { detectImageMimeType } from './image-detector.js';
 import { interruptibleSleep } from './message-notifier.js';
 import {
   AvailableGroup,
@@ -2926,11 +2927,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                 if (localImagePaths.length > 0 && replySourceImJid) {
                   for (const imgPath of localImagePaths) {
                     try {
-                      const imgBuf = fs.readFileSync(imgPath);
-                      const mimeType =
-                        path.extname(imgPath).toLowerCase() === '.png'
-                          ? 'image/png'
-                          : 'image/jpeg';
+                      const imgBuf = await fs.promises.readFile(imgPath);
+                      const mimeType = detectImageMimeType(imgBuf);
                       await imManager.sendImage(
                         replySourceImJid,
                         imgBuf,
@@ -6106,7 +6104,7 @@ async function startMessageLoop(): Promise<void> {
     stuckRunnerCheckCounter++;
     if (stuckRunnerCheckCounter >= STUCK_RUNNER_CHECK_INTERVAL_POLLS) {
       stuckRunnerCheckCounter = 0;
-      recoverStuckPendingGroups();
+      await recoverStuckPendingGroups();
     }
 
     await interruptibleSleep(POLL_INTERVAL);
@@ -6118,25 +6116,24 @@ async function startMessageLoop(): Promise<void> {
  * Returns true if any descendant is consuming CPU (> 0.5%), indicating
  * real work (training, processing) rather than a network-blocked hang.
  */
-function hasActiveCpuDescendants(pid: number): boolean {
+async function hasActiveCpuDescendants(pid: number): Promise<boolean> {
+  const execFileAsync = promisify(execFile);
   try {
-    const { execSync } = require('child_process');
-    // Get all descendant PIDs recursively using pgrep
-    const pids = execSync(`pgrep -P ${pid}`, {
+    // Get direct child PIDs using pgrep
+    const { stdout: pgrepOut } = await execFileAsync('pgrep', ['-P', String(pid)], {
       timeout: 3000,
-      encoding: 'utf8',
-    }).trim();
+    });
+    const pids = pgrepOut.trim();
     if (!pids) return false;
 
     // Check CPU usage of all child PIDs
     const pidList = pids.split('\n').join(',');
-    const psOutput = execSync(`ps -p ${pidList} -o pid=,pcpu=`, {
+    const { stdout: psOut } = await execFileAsync('ps', ['-p', pidList, '-o', 'pid=,pcpu='], {
       timeout: 3000,
-      encoding: 'utf8',
-    }).trim();
-    if (!psOutput) return false;
+    });
+    if (!psOut.trim()) return false;
 
-    for (const line of psOutput.split('\n')) {
+    for (const line of psOut.trim().split('\n')) {
       const cpu = parseFloat(line.trim().split(/\s+/)[1] || '0');
       if (cpu > 0.5) return true;
     }
@@ -6146,14 +6143,14 @@ function hasActiveCpuDescendants(pid: number): boolean {
   }
 }
 
-function recoverStuckPendingGroups(): void {
+async function recoverStuckPendingGroups(): Promise<void> {
   const stuckGroups = queue.getStuckPendingGroups(STUCK_RUNNER_IDLE_MS);
   for (const { jid, idleMs } of stuckGroups) {
     // Before restarting, check if the runner process has active child processes.
     // If children exist, the agent is likely executing a long-running command
     // (e.g. training, downloading datasets) — skip restart to avoid killing it.
     const pid = queue.getRunnerPid(jid);
-    if (pid && hasActiveCpuDescendants(pid)) {
+    if (pid && (await hasActiveCpuDescendants(pid))) {
       logger.info(
         { chatJid: jid, idleMs, pid },
         'Runner idle but has CPU-active child processes; skipping restart',
