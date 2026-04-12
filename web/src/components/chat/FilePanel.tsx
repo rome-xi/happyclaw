@@ -21,6 +21,7 @@ import {
   FileEdit,
   Film,
   Music,
+  AlertCircle,
 } from 'lucide-react';
 import { useFileStore, FileEntry, toBase64Url } from '../../stores/files';
 import { useChatStore } from '../../stores/chat';
@@ -759,6 +760,7 @@ function GenericTextPreview({
   const { getFileContent } = useFileStore();
   const [content, setContent] = useState('');
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState(false);
 
   useEffect(() => {
     const handleEsc = (e: KeyboardEvent) => {
@@ -772,11 +774,16 @@ function GenericTextPreview({
     let cancelled = false;
     (async () => {
       setLoading(true);
+      setLoadError(false);
       const text = await getFileContent(groupJid, file.path);
-      if (!cancelled && text !== null) {
-        setContent(text);
+      if (!cancelled) {
+        if (text !== null) {
+          setContent(text);
+        } else {
+          setLoadError(true);
+        }
+        setLoading(false);
       }
-      if (!cancelled) setLoading(false);
     })();
     return () => {
       cancelled = true;
@@ -814,6 +821,11 @@ function GenericTextPreview({
           {loading ? (
             <div className="flex items-center justify-center h-full">
               <Loader2 className="w-5 h-5 animate-spin text-muted-foreground" />
+            </div>
+          ) : loadError ? (
+            <div className="flex flex-col items-center justify-center h-full gap-3 text-muted-foreground">
+              <AlertCircle className="w-10 h-10" />
+              <p className="text-sm">此文件类型不支持预览</p>
             </div>
           ) : (
             <pre className="text-sm text-foreground whitespace-pre-wrap break-all font-mono">
