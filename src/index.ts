@@ -516,6 +516,36 @@ const RELATIVE_IMAGE_EXTENSIONS = new Set([
 ]);
 const FEISHU_THREAD_TITLE_MAX_LEN = 48;
 
+/**
+ * Resolve the IM JID that send_image / send_file / other media MCP tools
+ * should target. Three cases:
+ * - Conversation agent: use the agent-bound route map (IM channel the
+ *   conversation agent was started on).
+ * - Home container: prefer the route map because ctx.chatJid is frozen to
+ *   the first IM source, while the home container serves multiple channels
+ *   concurrently. Fall back to chatJid if it's an IM JID.
+ * - Regular group: prefer chatJid when it's an IM JID, fall back to the
+ *   route map.
+ */
+function resolveImRoute(opts: {
+  ipcAgentId: string | null | undefined;
+  isHome: boolean;
+  chatJid: string;
+  sourceGroup: string;
+}): string | null {
+  const { ipcAgentId, isHome, chatJid, sourceGroup } = opts;
+  if (ipcAgentId) {
+    return (
+      activeImReplyRoutes.get(`${chatJid}#agent:${ipcAgentId}`) ??
+      activeImReplyRoutes.get(sourceGroup) ??
+      null
+    );
+  }
+  const imFromJid = getChannelType(chatJid) !== null ? chatJid : null;
+  const imFromGroup = activeImReplyRoutes.get(sourceGroup) ?? null;
+  return isHome ? (imFromGroup ?? imFromJid) : (imFromJid ?? imFromGroup);
+}
+
 /** Unbind an IM group from its conversation agent or main conversation, syncing DB + in-memory cache + failure counters. */
 function unbindImGroup(jid: string, reason: string): void {
   const group = registeredGroups[jid] ?? getRegisteredGroup(jid);
@@ -4205,28 +4235,12 @@ function startIpcWatcher(): void {
                   const caption = data.caption || undefined;
                   const fileName = data.fileName || undefined;
 
-                  // For conversation agents, use activeImReplyRoutes (the IM
-                  // channel this conversation agent is bound to — e.g. DingTalk JID).
-                  // For home containers, always prefer activeImReplyRoutes because
-                  // the agent's ctx.chatJid is frozen to whichever IM channel
-                  // started the session, while home containers serve messages
-                  // from multiple IM channels concurrently — the route map is
-                  // the source of truth, updated via activeRouteUpdaters on each
-                  // IPC injection.
-                  const imgImRoute = ipcAgentId
-                    ? (activeImReplyRoutes.get(
-                        `${data.chatJid}#agent:${ipcAgentId}`,
-                      ) ??
-                      activeImReplyRoutes.get(sourceGroup) ??
-                      null)
-                    : isHome
-                      ? (activeImReplyRoutes.get(sourceGroup) ??
-                        (getChannelType(data.chatJid) !== null
-                          ? data.chatJid
-                          : null))
-                      : getChannelType(data.chatJid) !== null
-                        ? data.chatJid
-                        : (activeImReplyRoutes.get(sourceGroup) ?? null);
+                  const imgImRoute = resolveImRoute({
+                    ipcAgentId,
+                    isHome,
+                    chatJid: data.chatJid,
+                    sourceGroup,
+                  });
                   if (imgImRoute) {
                     const sent = await retryImOperation(
                       'send_image',
@@ -5071,22 +5085,12 @@ async function processTaskIpc(
             }
           }
 
-          // Route to IM: for conversation agents, use activeImReplyRoutes (the IM
-          // channel this conversation agent is bound to — e.g. DingTalk group JID).
-          // Home containers also prefer the route map because their ctx.chatJid
-          // is frozen to the session's first IM source, see send_image above.
-          const fileImRoute = ipcAgentId
-            ? (activeImReplyRoutes.get(`${data.chatJid}#agent:${ipcAgentId}`) ??
-              activeImReplyRoutes.get(sourceGroup) ??
-              null)
-            : isHome
-              ? (activeImReplyRoutes.get(sourceGroup) ??
-                (getChannelType(data.chatJid) !== null
-                  ? data.chatJid
-                  : null))
-              : getChannelType(data.chatJid) !== null
-                ? data.chatJid
-                : (activeImReplyRoutes.get(sourceGroup) ?? null);
+          const fileImRoute = resolveImRoute({
+            ipcAgentId,
+            isHome,
+            chatJid: data.chatJid,
+            sourceGroup,
+          });
           if (fileImRoute) {
             const imFileName = data.fileName || path.basename(resolvedPath);
             const sent = await retryImOperation('send_file', fileImRoute, () =>

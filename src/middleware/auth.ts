@@ -11,7 +11,7 @@ import {
   updateSessionLastActive,
   deleteUserSession,
 } from '../db.js';
-import { isSessionExpired, verifySessionToken, signSessionToken } from '../auth.js';
+import { isSessionExpired, verifySessionToken, setSessionCookie } from '../auth.js';
 import type { AuthUser, Permission } from '../types.js';
 import { hasPermission } from '../permissions.js';
 import {
@@ -19,7 +19,6 @@ import {
   SESSION_COOKIE_NAME_PLAIN,
 } from '../config.js';
 import { logger } from '../logger.js';
-import { isSecureRequest } from '../utils.js';
 
 /**
  * Extract ALL values for a given cookie name from the raw Cookie header.
@@ -42,17 +41,13 @@ export function getAllCookieValues(cookieHeader: string | undefined, name: strin
 
 /**
  * Try to verify a session token from a list of cookie values.
- * Returns { token, needsUpgrade } where needsUpgrade is true when
- * an unsigned legacy cookie was accepted.
+ * Returns { token, legacy } where `legacy` is true when an unsigned
+ * legacy cookie was accepted (caller should re-issue the cookie).
  */
-export function tryVerifyAny(values: string[]): { token: string; needsUpgrade: boolean } | null {
+export function tryVerifyAny(values: string[]): { token: string; legacy: boolean } | null {
   for (const v of values) {
-    const token = verifySessionToken(v);
-    if (token) {
-      // If the cookie value has no dot, it's an unsigned legacy token
-      const needsUpgrade = !v.includes('.');
-      return { token, needsUpgrade };
-    }
+    const verified = verifySessionToken(v);
+    if (verified) return verified;
   }
   return null;
 }
@@ -74,7 +69,7 @@ export const authMiddleware = async (c: any, next: any) => {
     return c.json({ error: 'Unauthorized' }, 401);
   }
 
-  const { token, needsUpgrade } = result;
+  const { token, legacy } = result;
 
   const session = getCachedSessionWithUser(token);
   if (!session) {
@@ -106,13 +101,9 @@ export const authMiddleware = async (c: any, next: any) => {
   } as AuthUser);
   c.set('sessionId', token);
 
-  // Transparently upgrade unsigned cookie to HMAC-signed
-  if (needsUpgrade) {
-    const secure = isSecureRequest(c);
-    const name = secure ? SESSION_COOKIE_NAME_SECURE : SESSION_COOKIE_NAME_PLAIN;
-    const secureSuffix = secure ? '; Secure' : '';
-    const signedToken = signSessionToken(token);
-    c.header('Set-Cookie', `${name}=${signedToken}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${30 * 24 * 60 * 60}${secureSuffix}`);
+  // Transparently upgrade unsigned legacy cookie to HMAC-signed
+  if (legacy) {
+    c.header('Set-Cookie', setSessionCookie(c, token));
     logger.info('Upgraded unsigned session cookie to HMAC-signed for user %s', session.username);
   }
 

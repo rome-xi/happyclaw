@@ -26,7 +26,6 @@ import { detectImageMimeType } from './image-detector.js';
 import {
   downloadAndDecryptMedia,
   uploadMediaBuffer,
-  uploadMediaFile,
 } from './wechat-crypto.js';
 import { markdownToPlainText, splitTextChunks } from './im-utils.js';
 
@@ -974,17 +973,20 @@ export function createWeChatConnection(
         return;
       }
 
-      const stat = await fs.promises.stat(filePath);
-      if (stat.size > MAX_FILE_SIZE) {
+      // Single readFile + size check, then pass buffer to uploadMediaBuffer —
+      // avoids stat + readFile double-I/O that uploadMediaFile would incur.
+      const buf = await fs.promises.readFile(filePath);
+      if (buf.length > MAX_FILE_SIZE) {
         throw new Error(
-          `WeChat file size ${stat.size} exceeds max ${MAX_FILE_SIZE}`,
+          `WeChat file size ${buf.length} exceeds max ${MAX_FILE_SIZE}`,
         );
       }
 
       try {
         // Upload raw bytes to WeChat CDN as FILE attachment (mediaType=3).
-        const upload = await uploadMediaFile({
-          filePath,
+        const upload = await uploadMediaBuffer({
+          buf,
+          fileName,
           toUserId: userId,
           baseUrl,
           token: config.botToken,
@@ -1031,7 +1033,7 @@ export function createWeChatConnection(
         }
 
         logger.info(
-          { chatId, size: stat.size, fileName },
+          { chatId, size: buf.length, fileName },
           'WeChat file sent',
         );
       } catch (err) {

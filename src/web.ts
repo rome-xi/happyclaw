@@ -543,11 +543,9 @@ function setupWebSocket(server: any): WebSocketServer {
       return;
     }
 
-    // Verify session cookie (HMAC signature + DB lookup)
-    // Reuse shared cookie parsing helpers to handle duplicate cookies
-    // (browsers may keep both old unsigned and new signed cookies).
-    // Note: WebSocket upgrade cannot return Set-Cookie, so we ignore
-    // `needsUpgrade` here — the next HTTP request will upgrade the cookie.
+    // Verify session cookie (HMAC signature + DB lookup).
+    // WebSocket upgrade cannot return Set-Cookie, so legacy cookies are
+    // accepted here but upgraded on the next HTTP request instead.
     const cookieHeader = request.headers.cookie as string | undefined;
     let allCookieValues = getAllCookieValues(cookieHeader, SESSION_COOKIE_NAME_SECURE);
     if (allCookieValues.length === 0) {
