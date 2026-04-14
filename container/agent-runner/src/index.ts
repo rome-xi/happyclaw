@@ -18,6 +18,7 @@ import fs from 'fs';
 import path from 'path';
 import { query, HookCallback, PreCompactHookInput, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
 import { detectImageMimeTypeFromBase64Strict } from './image-detector.js';
+import { pruneProcessedHistoryImagesInTranscript as pruneProcessedHistoryImagesInTranscriptFile } from './history-image-prune.js';
 import { getChannelFromJid } from './channel-prefixes.js';
 
 import type {
@@ -990,6 +991,22 @@ function loadUserMcpServers(): Record<string, unknown> {
   return {};
 }
 
+function pruneProcessedHistoryImagesInTranscript(sessionId: string | undefined): void {
+  const configDir = process.env.CLAUDE_CONFIG_DIR
+    || path.join(process.env.HOME || '/home/node', '.claude');
+  const result = pruneProcessedHistoryImagesInTranscriptFile({
+    claudeConfigDir: configDir,
+    sessionId,
+    getImageDimensions,
+  });
+  if (result.didMutate) {
+    log(
+      `History image prune: removed ${result.prunedImages} image block(s)` +
+      `${result.transcriptPath ? ` from ${result.transcriptPath}` : ''}`,
+    );
+  }
+}
+
 /**
  * Run a single query and stream results via writeOutput.
  * Uses MessageStream (AsyncIterable) to keep isSingleUserTurn=false,
@@ -1673,6 +1690,8 @@ async function main(): Promise<void> {
   let pendingHistoryContext: string | null = null;
   try {
     while (true) {
+      pruneProcessedHistoryImagesInTranscript(sessionId);
+
       // 清理残留的 _interrupt sentinel（空闲期间写入的中断信号不应影响下一次 query）。
       // 注意：_drain 不在此处清理 — 如果 _drain 存在，说明有待处理的消息，
       // pollIpcDuringQuery 会在查询结果后检测到并正确退出容器。
@@ -1732,6 +1751,8 @@ async function main(): Promise<void> {
         mcpServerConfig = buildMcpServerConfig();
         continue;
       }
+
+      pruneProcessedHistoryImagesInTranscript(sessionId);
 
       // 不可恢复的转录错误（如超大图片或 MIME 错配被固化在会话历史中）
       if (queryResult.unrecoverableTranscriptError) {
