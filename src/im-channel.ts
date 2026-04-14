@@ -450,7 +450,11 @@ export function createQQChannel(config: QQConnectionConfig): IMChannel {
       }
     },
 
-    async sendMessage(chatId: string, text: string): Promise<void> {
+    async sendMessage(
+      chatId: string,
+      text: string,
+      localImagePaths?: string[],
+    ): Promise<void> {
       if (!inner) {
         logger.warn(
           { chatId },
@@ -458,7 +462,7 @@ export function createQQChannel(config: QQConnectionConfig): IMChannel {
         );
         return;
       }
-      await inner.sendMessage(chatId, text);
+      await inner.sendMessage(chatId, text, localImagePaths);
     },
 
     async sendImage(
@@ -476,6 +480,21 @@ export function createQQChannel(config: QQConnectionConfig): IMChannel {
         return;
       }
       await inner.sendImage(chatId, imageBuffer, mimeType, caption, fileName);
+    },
+
+    async sendFile(
+      chatId: string,
+      filePath: string,
+      fileName: string,
+    ): Promise<void> {
+      if (!inner) {
+        logger.warn(
+          { chatId },
+          'QQ channel not connected, skip sending file',
+        );
+        return;
+      }
+      await inner.sendFile(chatId, filePath, fileName);
     },
 
     async setTyping(_chatId: string, _isTyping: boolean): Promise<void> {
