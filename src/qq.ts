@@ -282,6 +282,21 @@ export interface QQConnection {
   sendFile(chatId: string, filePath: string, fileName: string): Promise<void>;
   sendChatAction(chatId: string, action: 'typing'): Promise<void>;
   isConnected(): boolean;
+  /** Send a C2C stream message chunk. Returns { id } on first chunk. */
+  sendStreamMessage(
+    openid: string,
+    params: {
+      input_mode: string;
+      input_state: number;
+      content_type: string;
+      content_raw: string;
+      msg_seq: number;
+      index: number;
+      stream_msg_id?: string;
+    },
+  ): Promise<{ id?: string }>;
+  /** Get next msg_seq for a chat (for stream session). */
+  getNextMsgSeq(chatId: string): number;
 }
 
 interface TokenInfo {
@@ -1757,6 +1772,37 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
 
     isConnected(): boolean {
       return ws !== null && ws.readyState === WebSocket.OPEN;
+    },
+
+    async sendStreamMessage(
+      openid: string,
+      params: {
+        input_mode: string;
+        input_state: number;
+        content_type: string;
+        content_raw: string;
+        msg_seq: number;
+        index: number;
+        stream_msg_id?: string;
+      },
+    ): Promise<{ id?: string }> {
+      const endpoint = `/v2/users/${openid}/stream_messages`;
+      const body: Record<string, unknown> = {
+        input_mode: params.input_mode,
+        input_state: params.input_state,
+        content_type: params.content_type,
+        content_raw: params.content_raw,
+        msg_seq: params.msg_seq,
+        index: params.index,
+      };
+      if (params.stream_msg_id) {
+        body.stream_msg_id = params.stream_msg_id;
+      }
+      return apiRequest<{ id?: string }>('POST', endpoint, body);
+    },
+
+    getNextMsgSeq(chatId: string): number {
+      return getNextMsgSeq(chatId);
     },
   };
 
