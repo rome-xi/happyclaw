@@ -3484,6 +3484,9 @@ export interface SystemSettings {
   externalClaudeDir: string;
   // Claude Agent SDK 自动对话压缩触发点（tokens）。0 = 保留 SDK 默认（约 1M）
   autoCompactWindow: number;
+  // 关闭 admin host 模式下 HappyClaw 自带的 memory 注入层（MCP 工具、模板 CLAUDE.md、WORKSPACE_GLOBAL/MEMORY env）
+  // 启用后 admin 可以在 host 模式下完全按原生 Claude Code 的 Playbook 使用 ~/.claude/ 下的 memory/skills/rules
+  disableMemoryLayerForAdminHost: boolean;
 }
 
 const DEFAULT_SYSTEM_SETTINGS: SystemSettings = {
@@ -3503,6 +3506,7 @@ const DEFAULT_SYSTEM_SETTINGS: SystemSettings = {
   billingCurrencyRate: 1,
   externalClaudeDir: '',
   autoCompactWindow: 0,
+  disableMemoryLayerForAdminHost: false,
 };
 
 function parseIntEnv(envVar: string | undefined, fallback: number): number {
@@ -3593,6 +3597,10 @@ function readSystemSettingsFromFile(): SystemSettings | null {
       typeof raw.autoCompactWindow === 'number' && raw.autoCompactWindow >= 0
         ? raw.autoCompactWindow
         : DEFAULT_SYSTEM_SETTINGS.autoCompactWindow,
+    disableMemoryLayerForAdminHost:
+      typeof raw.disableMemoryLayerForAdminHost === 'boolean'
+        ? raw.disableMemoryLayerForAdminHost
+        : DEFAULT_SYSTEM_SETTINGS.disableMemoryLayerForAdminHost,
   };
 }
 
@@ -3654,6 +3662,9 @@ function buildEnvFallbackSettings(): SystemSettings {
       process.env.AUTO_COMPACT_WINDOW,
       DEFAULT_SYSTEM_SETTINGS.autoCompactWindow,
     ),
+    disableMemoryLayerForAdminHost:
+      process.env.DISABLE_MEMORY_LAYER_FOR_ADMIN_HOST === 'true' ||
+      DEFAULT_SYSTEM_SETTINGS.disableMemoryLayerForAdminHost,
   };
 }
 

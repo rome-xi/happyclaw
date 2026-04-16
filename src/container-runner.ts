@@ -1234,29 +1234,47 @@ export async function runHostAgent(
       hostEnv['AUTO_COMPACT_WINDOW'] = String(hostAutoCompact);
     }
 
+    // admin host 模式 + 系统设置 disableMemoryLayerForAdminHost 时启用原生 Claude Code 模式：
+    // 不注入 HappyClaw 的 memory 抽象，Agent 完全按用户本机 ~/.claude/ 的 Playbook 工作
+    const isCreatorAdmin = ownerHomeFolder === 'main';
+    const nativeClaudeMode =
+      isCreatorAdmin && getSystemSettings().disableMemoryLayerForAdminHost;
+
     // 路径映射
     hostEnv['HAPPYCLAW_WORKSPACE_GROUP'] = groupDir;
-    // Per-user global memory
-    const ownerId = group.created_by;
-    if (ownerId) {
-      const userGlobalDir = path.join(GROUPS_DIR, 'user-global', ownerId);
-      fs.mkdirSync(userGlobalDir, { recursive: true });
-      hostEnv['HAPPYCLAW_WORKSPACE_GLOBAL'] = userGlobalDir;
-    } else {
-      const legacyGlobalDir = path.join(GROUPS_DIR, 'global');
-      fs.mkdirSync(legacyGlobalDir, { recursive: true });
-      hostEnv['HAPPYCLAW_WORKSPACE_GLOBAL'] = legacyGlobalDir;
-    }
-    const memoryFolder = group.is_home
-      ? group.folder
-      : ownerHomeFolder || group.folder;
-    hostEnv['HAPPYCLAW_WORKSPACE_MEMORY'] = path.join(
-      DATA_DIR,
-      'memory',
-      memoryFolder,
-    );
     hostEnv['HAPPYCLAW_WORKSPACE_IPC'] = groupIpcDir;
-    hostEnv['CLAUDE_CONFIG_DIR'] = groupSessionsDir;
+
+    if (!nativeClaudeMode) {
+      // Per-user global memory（HappyClaw 自带 memory 层）
+      const ownerId = group.created_by;
+      if (ownerId) {
+        const userGlobalDir = path.join(GROUPS_DIR, 'user-global', ownerId);
+        fs.mkdirSync(userGlobalDir, { recursive: true });
+        hostEnv['HAPPYCLAW_WORKSPACE_GLOBAL'] = userGlobalDir;
+      } else {
+        const legacyGlobalDir = path.join(GROUPS_DIR, 'global');
+        fs.mkdirSync(legacyGlobalDir, { recursive: true });
+        hostEnv['HAPPYCLAW_WORKSPACE_GLOBAL'] = legacyGlobalDir;
+      }
+      const memoryFolder = group.is_home
+        ? group.folder
+        : ownerHomeFolder || group.folder;
+      hostEnv['HAPPYCLAW_WORKSPACE_MEMORY'] = path.join(
+        DATA_DIR,
+        'memory',
+        memoryFolder,
+      );
+    }
+
+    // 原生模式且配置了 customCwd 时不覆盖 CLAUDE_CONFIG_DIR，让 SDK 使用用户真实 $HOME/.claude/
+    // 未配 customCwd 时保留 override，避免 HappyClaw 的 cwd 污染 ~/.claude/projects/
+    if (!nativeClaudeMode || !group.customCwd) {
+      hostEnv['CLAUDE_CONFIG_DIR'] = groupSessionsDir;
+    }
+
+    if (nativeClaudeMode) {
+      hostEnv['HAPPYCLAW_NATIVE_CLAUDE_MODE'] = 'true';
+    }
     // 让 SDK 捕获 CLI 的 stderr 输出，便于排查启动失败
     hostEnv['DEBUG_CLAUDE_AGENT_SDK'] = '1';
     // CLI 禁止 root 用户使用 --dangerously-skip-permissions，

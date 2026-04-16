@@ -152,6 +152,7 @@ export function SystemSettingsSection() {
   const [billingCurrency, setBillingCurrency] = useState('USD');
   const [billingCurrencyRate, setBillingCurrencyRate] = useState(1);
   const [externalClaudeDir, setExternalClaudeDir] = useState('');
+  const [disableMemoryLayerForAdminHost, setDisableMemoryLayerForAdminHost] = useState(false);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
 
@@ -177,6 +178,7 @@ export function SystemSettingsSection() {
         setBillingCurrency(data.billingCurrency ?? 'USD');
         setBillingCurrencyRate(data.billingCurrencyRate ?? 1);
         setExternalClaudeDir(data.externalClaudeDir ?? '');
+        setDisableMemoryLayerForAdminHost(data.disableMemoryLayerForAdminHost ?? false);
       } catch (err) {
         toast.error(getErrorMessage(err, '加载系统参数失败'));
       } finally {
@@ -222,6 +224,7 @@ export function SystemSettingsSection() {
         billingCurrency,
         billingCurrencyRate,
         externalClaudeDir,
+        disableMemoryLayerForAdminHost,
       };
       for (const f of fields) {
         const val = displayValues[f.key];
@@ -241,6 +244,7 @@ export function SystemSettingsSection() {
       setBillingCurrency(data.billingCurrency ?? 'USD');
       setBillingCurrencyRate(data.billingCurrencyRate ?? 1);
       setExternalClaudeDir(data.externalClaudeDir ?? '');
+      setDisableMemoryLayerForAdminHost(data.disableMemoryLayerForAdminHost ?? false);
       // 刷新计费状态，更新导航栏可见性
       loadBillingStatus();
       toast.success('系统参数已保存，新参数将对后续启动的容器/进程生效');
@@ -417,6 +421,29 @@ export function SystemSettingsSection() {
             </div>
           </>
         )}
+      </div>
+
+      {/* 原生 Claude Code 模式（admin 宿主机专用） */}
+      <div className="border-t border-border pt-6 space-y-5">
+        <h3 className="text-sm font-semibold text-foreground">原生 Claude Code 模式</h3>
+
+        <div className="flex items-center justify-between">
+          <div className="flex-1 pr-4">
+            <Label>admin 宿主机关闭 HappyClaw 记忆层</Label>
+            <p className="text-xs text-muted-foreground mt-0.5">
+              启用后 admin 的 host 模式容器不再注入 memory_append/search/get MCP 工具、
+              不注入 WORKSPACE_GLOBAL/MEMORY 环境变量、不强制注入记忆系统提示，
+              让 Agent 完全按本机 ~/.claude/ 下的 Playbook（CLAUDE.md + rules/ + memory/）行事。
+              建议配合群组的 customCwd 使用，让 Agent cwd 指向真实项目目录。
+              仅影响 admin 的 host 模式；member 容器和非 admin 场景不受影响。
+            </p>
+          </div>
+          <Switch
+            checked={disableMemoryLayerForAdminHost}
+            onCheckedChange={setDisableMemoryLayerForAdminHost}
+            aria-label="admin 宿主机关闭 HappyClaw 记忆层"
+          />
+        </div>
       </div>
 
       <div>

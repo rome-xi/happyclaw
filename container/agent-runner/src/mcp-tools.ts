@@ -26,6 +26,9 @@ export interface McpContext {
   workspaceGroup: string;
   workspaceGlobal: string;
   workspaceMemory: string;
+  // 原生 Claude Code 模式：禁用 HappyClaw 的 memory MCP 工具（memory_append/search/get），
+  // 让 Agent 完全按用户本机 ~/.claude/ 下的 Playbook 约定管理记忆
+  nativeClaudeMode?: boolean;
 }
 
 function writeIpcFile(dir: string, data: object): string {
@@ -953,8 +956,8 @@ Use the skills panel in the UI to find the skill ID (directory name, e.g. "memor
     );
   }
 
-  // --- memory_append --- (only available for home containers)
-  if (ctx.isHome) {
+  // --- memory_append --- (only available for home containers, skipped in native Claude mode)
+  if (ctx.isHome && !ctx.nativeClaudeMode) {
     tools.push(
       tool(
         'memory_append',
@@ -1074,8 +1077,9 @@ Use the skills panel in the UI to find the skill ID (directory name, e.g. "memor
     );
   }
 
-  // --- memory_search --- (available for all containers)
-  tools.push(
+  // --- memory_search + memory_get --- (skipped in native Claude mode)
+  if (!ctx.nativeClaudeMode) {
+    tools.push(
     tool(
       'memory_search',
       `\u5728\u5de5\u4f5c\u533a\u7684\u8bb0\u5fc6\u6587\u4ef6\u4e2d\u641c\u7d22\uff08CLAUDE.md\u3001memory/\u3001conversations/ \u53ca\u5176\u4ed6 .md/.txt \u6587\u4ef6\uff09\u3002
@@ -1282,6 +1286,7 @@ Use the skills panel in the UI to find the skill ID (directory name, e.g. "memor
       },
     ),
   );
+  }
 
   return tools;
 }

@@ -564,6 +564,7 @@ function trimSessionJsonl(jsonlPath: string): void {
 function createPreCompactHook(
   isHome: boolean,
   _isAdminHome: boolean,
+  nativeClaudeMode: boolean,
   deps: { emit: (output: ContainerOutput) => void; getFullText: () => string; resetFullText: () => void },
 ): HookCallback {
   return async (input, _toolUseId, _context) => {
@@ -634,7 +635,8 @@ function createPreCompactHook(
     hadCompaction = true;
 
     // Flag memory flush for home containers (full memory write access)
-    if (isHome) {
+    // Skip in native Claude mode — user's ~/.claude/ Playbook handles memory persistence
+    if (isHome && !nativeClaudeMode) {
       needsMemoryFlush = true;
       log('PreCompact: flagged memory flush for home container');
     }
@@ -908,7 +910,11 @@ function waitForIpcMessage(): Promise<{ text: string; images?: Array<{ data: str
   });
 }
 
-function buildMemoryRecallPrompt(isHome: boolean, isAdminHome: boolean): string {
+function buildMemoryRecallPrompt(isHome: boolean, isAdminHome: boolean, nativeClaudeMode: boolean): string {
+  // 原生 Claude Code 模式：完全跳过 HappyClaw 的记忆系统提示，让用户本机 ~/.claude/ Playbook 接管
+  if (nativeClaudeMode) {
+    return '';
+  }
   if (isHome) {
     // Home container (admin or member): full memory system with read/write access to user's global CLAUDE.md
     return [
@@ -1162,6 +1168,7 @@ async function runQuery(
   const processor = new StreamEventProcessor(emit, log);
 
   const { isHome, isAdminHome } = normalizeHomeFlags(containerInput);
+  const nativeClaudeMode = process.env.HAPPYCLAW_NATIVE_CLAUDE_MODE === 'true';
 
   // Resumed sessions carry prior history — skip re-injecting HEARTBEAT.md to save cache tokens.
   let heartbeatContent = '';
@@ -1251,7 +1258,7 @@ async function runQuery(
         happyclaw: mcpServerConfig,  // 内置 SDK MCP 放最后，确保不被同名覆盖
       },
       hooks: {
-        PreCompact: [{ hooks: [createPreCompactHook(isHome, isAdminHome, {
+        PreCompact: [{ hooks: [createPreCompactHook(isHome, isAdminHome, nativeClaudeMode, {
           emit,
           getFullText: () => processor.getFullText(),
           resetFullText: () => processor.resetFullTextAccumulator(),
@@ -1624,6 +1631,9 @@ async function main(): Promise<void> {
   latestSessionId = sessionId;
   const { isHome, isAdminHome } = normalizeHomeFlags(containerInput);
 
+  // 原生 Claude Code 模式：关闭 HappyClaw 自带的 memory MCP 工具，让 Agent 按用户本机 Playbook 行事
+  const nativeClaudeMode = process.env.HAPPYCLAW_NATIVE_CLAUDE_MODE === 'true';
+
   // Create in-process SDK MCP server (replaces the stdio subprocess)
   const mcpToolsConfig = {
     chatJid: containerInput.chatJid,
@@ -1635,6 +1645,7 @@ async function main(): Promise<void> {
     workspaceGroup: WORKSPACE_GROUP,
     workspaceGlobal: WORKSPACE_GLOBAL,
     workspaceMemory: WORKSPACE_MEMORY,
+    nativeClaudeMode,
   };
   const buildMcpServerConfig = () => createSdkMcpServer({
     name: 'happyclaw',
@@ -1642,7 +1653,7 @@ async function main(): Promise<void> {
     tools: createMcpTools(mcpToolsConfig),
   });
   let mcpServerConfig = buildMcpServerConfig();
-  const memoryRecallPrompt = buildMemoryRecallPrompt(isHome, isAdminHome);
+  const memoryRecallPrompt = buildMemoryRecallPrompt(isHome, isAdminHome, nativeClaudeMode);
   fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
 
   // Clean up stale sentinels from previous container runs.
