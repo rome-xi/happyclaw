@@ -435,8 +435,12 @@ export function SystemSettingsSection() {
               不注入 WORKSPACE_GLOBAL/MEMORY 环境变量、不注入 HappyClaw 记忆系统提示、
               PreCompact 钩子不触发 memory flush，让 Agent 完全按本机
               ~/.claude/ 下的 Playbook（CLAUDE.md + rules/ + memory/）行事。
-              建议配合主容器的 customCwd 使用，让 Agent cwd 指向真实项目目录，
-              使 SDK auto-memory 与原生 Claude Code 共用 ~/.claude/projects/。
+            </p>
+            <p className="text-xs text-destructive mt-2">
+              <strong>前置要求</strong>：必须先在 admin 主容器配置 customCwd
+              指向真实项目目录。未配置时 CLAUDE_CONFIG_DIR 仍会指向 data/sessions/main/.claude，
+              SDK 既读不到 HappyClaw 记忆层也读不到 ~/.claude/，Agent 会变成空白沙箱。
+              后端会在保存时校验，未配置则拒绝启用。
             </p>
             <p className="text-xs text-muted-foreground mt-2">
               <strong>仅作用范围</strong>：admin 的主容器（is_home=1，folder=main）。admin

@@ -1278,6 +1278,18 @@ export async function runHostAgent(
 
     if (disableMemoryLayer) {
       hostEnv['HAPPYCLAW_DISABLE_MEMORY_LAYER'] = 'true';
+      // SDK 读的是 $CLAUDE_CONFIG_DIR/settings.json（此时指向 ~/.claude/），
+      // HappyClaw 写在 groupSessionsDir/settings.json 的 REQUIRED_SETTINGS_ENV 会丢。
+      // 直接注入到进程 env，SDK 按 process.env 读，绕开 settings.json 路径。
+      for (const [key, value] of Object.entries(REQUIRED_SETTINGS_ENV)) {
+        hostEnv[key] = value;
+      }
+      // 同样，per-user MCP servers 在 ~/.claude/settings.json 里没有，
+      // 通过 env 透传，agent-runner 合并进 SDK mcpServers 参数。
+      if (hostMcpServers && Object.keys(hostMcpServers).length > 0) {
+        hostEnv['HAPPYCLAW_USER_MCP_SERVERS_JSON'] =
+          JSON.stringify(hostMcpServers);
+      }
     }
     // 让 SDK 捕获 CLI 的 stderr 输出，便于排查启动失败
     hostEnv['DEBUG_CLAUDE_AGENT_SDK'] = '1';

@@ -981,8 +981,19 @@ function buildMemoryRecallPrompt(isHome: boolean, isAdminHome: boolean, disableM
   ].join('\n');
 }
 
-/** 从 settings.json 读取用户配置的 MCP servers（stdio/http/sse 类型） */
+/** 读取用户配置的 MCP servers（stdio/http/sse 类型） */
 function loadUserMcpServers(): Record<string, unknown> {
+  // 禁用记忆层模式下 CLAUDE_CONFIG_DIR 指向 ~/.claude/，HappyClaw 管理的 per-user MCP
+  // 不在那份 settings.json 里，container-runner 通过 env 透传。优先读 env。
+  const envJson = process.env.HAPPYCLAW_USER_MCP_SERVERS_JSON;
+  if (envJson) {
+    try {
+      const parsed = JSON.parse(envJson);
+      if (parsed && typeof parsed === 'object') {
+        return parsed as Record<string, unknown>;
+      }
+    } catch { /* fall through to settings.json */ }
+  }
   const configDir = process.env.CLAUDE_CONFIG_DIR
     || path.join(process.env.HOME || '/home/node', '.claude');
   const settingsFile = path.join(configDir, 'settings.json');
