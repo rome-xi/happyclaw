@@ -293,10 +293,14 @@ export interface QQConnection {
       msg_seq: number;
       index: number;
       stream_msg_id?: string;
+      msg_id?: string;
+      event_id?: string;
     },
   ): Promise<{ id?: string }>;
   /** Get next msg_seq for a chat (for stream session). */
   getNextMsgSeq(chatId: string): number;
+  /** Latest msg_id received from a C2C openid, for passive reply. */
+  getLastIncomingMsgId(openid: string): string | undefined;
 }
 
 interface TokenInfo {
@@ -353,6 +357,10 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
 
   // Per-chat msg_seq counter for active messages
   const msgSeqCounters = new Map<string, number>();
+
+  // Latest incoming msg_id per C2C openid, used as passive-reply reference
+  // for stream_messages (QQ API rejects the endpoint without msg_id).
+  const lastIncomingMsgId = new Map<string, string>();
 
   // Rate-limit rejection messages
   const rejectTimestamps = new Map<string, number>();
@@ -1338,6 +1346,10 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
       const userOpenId = data.author?.id || data.author?.user_openid;
       if (!userOpenId) return;
 
+      // Remember the latest incoming msg_id so stream_messages can use it as
+      // the passive-reply reference (the endpoint rejects requests without one).
+      lastIncomingMsgId.set(userOpenId, msgId);
+
       const jid = `qq:c2c:${userOpenId}`;
       const senderName = data.author?.username || `QQ用户`;
       const chatName = senderName;
@@ -1784,6 +1796,8 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
         msg_seq: number;
         index: number;
         stream_msg_id?: string;
+        msg_id?: string;
+        event_id?: string;
       },
     ): Promise<{ id?: string }> {
       const endpoint = `/v2/users/${openid}/stream_messages`;
@@ -1798,11 +1812,21 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
       if (params.stream_msg_id) {
         body.stream_msg_id = params.stream_msg_id;
       }
+      if (params.msg_id) {
+        body.msg_id = params.msg_id;
+      }
+      if (params.event_id) {
+        body.event_id = params.event_id;
+      }
       return apiRequest<{ id?: string }>('POST', endpoint, body);
     },
 
     getNextMsgSeq(chatId: string): number {
       return getNextMsgSeq(chatId);
+    },
+
+    getLastIncomingMsgId(openid: string): string | undefined {
+      return lastIncomingMsgId.get(openid);
     },
   };
 

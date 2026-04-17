@@ -521,13 +521,25 @@ export function createQQChannel(config: QQConnectionConfig): IMChannel {
       const openid = chatId.startsWith('c2c:') ? chatId.slice(4) : chatId;
       const chatKey = `c2c:${openid}`;
       const msgSeq = inner.getNextMsgSeq(chatKey);
+      const passiveMsgId = inner.getLastIncomingMsgId(openid);
       const conn = inner;
+
+      if (!passiveMsgId) {
+        // QQ stream_messages endpoint rejects requests without a passive
+        // msg_id reference. Without it there's no point starting a session.
+        logger.debug(
+          { openid },
+          'QQ streaming session skipped: no incoming msg_id yet',
+        );
+        return undefined;
+      }
 
       return new QQStreamingController({
         openid,
         msgSeq,
         sendStreamChunk: (oid, params) => conn.sendStreamMessage(oid, params),
         fallbackSend: (text) => conn.sendMessage(chatKey, text),
+        passiveMsgId,
       });
     },
   };

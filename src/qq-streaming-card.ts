@@ -16,7 +16,6 @@
  */
 
 import { logger } from './logger.js';
-import { markdownToPlainText } from './im-utils.js';
 
 // ─── Constants ───────────────────────────────────────────────
 
@@ -35,6 +34,8 @@ export type SendStreamChunkFn = (
     msg_seq: number;
     index: number;
     stream_msg_id?: string;
+    msg_id?: string;
+    event_id?: string;
   },
 ) => Promise<{ id?: string }>;
 
@@ -58,12 +59,15 @@ export class QQStreamingController {
   // Throttle
   private lastUpdateTime = 0;
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
+  private currentFlushPromise: Promise<void> | null = null;
+  private flushPending = false;
 
   // Dependencies
   private openid: string;
   private sendStreamChunk: SendStreamChunkFn;
   private fallbackSend: FallbackSendFn;
   private fallbackUsed = false;
+  private passiveMsgId: string | undefined;
 
   // Auxiliary state (thinking, tools, status)
   private thinking = false;
@@ -96,11 +100,14 @@ export class QQStreamingController {
     msgSeq: number;
     sendStreamChunk: SendStreamChunkFn;
     fallbackSend: FallbackSendFn;
+    /** Latest incoming msg_id from this openid. Required by QQ stream API. */
+    passiveMsgId?: string;
   }) {
     this.openid = opts.openid;
     this.msgSeq = opts.msgSeq;
     this.sendStreamChunk = opts.sendStreamChunk;
     this.fallbackSend = opts.fallbackSend;
+    this.passiveMsgId = opts.passiveMsgId;
   }
 
   // ─── StreamingSession interface ─────────────────────────────
@@ -111,9 +118,16 @@ export class QQStreamingController {
 
   append(text: string): void {
     if (!this.isActive()) return;
+    const isFirst = this.accumulatedText.length === 0;
     this.accumulatedText = text;
     this.thinkingText = '';
     this.thinking = false;
+    if (isFirst) {
+      logger.info(
+        { openid: this.openid, textLen: text.length },
+        'QQ streaming first append()',
+      );
+    }
     this.scheduleFlush();
   }
 
@@ -121,6 +135,21 @@ export class QQStreamingController {
     if (this.state === 'completed' || this.state === 'aborted') return;
     this.accumulatedText = finalText;
     this.clearTimers();
+
+    // Wait for any in-flight flush to settle so we don't race the DONE chunk
+    if (this.currentFlushPromise) {
+      await this.currentFlushPromise.catch(() => {});
+    }
+
+    logger.info(
+      {
+        openid: this.openid,
+        state: this.state,
+        sentChunks: this.sentChunkCount,
+        textLen: finalText.length,
+      },
+      'QQ streaming complete() entry',
+    );
 
     if (!finalText.trim()) {
       this.state = 'completed';
@@ -131,6 +160,10 @@ export class QQStreamingController {
     if (this.state === 'idle' || this.sentChunkCount === 0) {
       await this.tryStartStream(finalText);
       if (!this.streamMsgId) {
+        logger.warn(
+          { openid: this.openid },
+          'QQ streaming never started, falling back to plain message',
+        );
         await this.tryFallback(finalText);
         this.state = 'completed';
         return;
@@ -138,8 +171,7 @@ export class QQStreamingController {
     }
 
     try {
-      const content = markdownToPlainText(finalText);
-      await this.doSendChunk(content, 10); // DONE
+      await this.doSendChunk(finalText, 10); // DONE — raw text, monotonic with prior chunks
       this.state = 'completed';
       logger.info(
         { openid: this.openid, chunks: this.sentChunkCount },
@@ -159,9 +191,13 @@ export class QQStreamingController {
     if (this.state === 'completed' || this.state === 'aborted') return;
     this.clearTimers();
 
+    if (this.currentFlushPromise) {
+      await this.currentFlushPromise.catch(() => {});
+    }
+
     if (this.streamMsgId) {
       const abortText = this.accumulatedText
-        ? markdownToPlainText(this.accumulatedText) + `\n\n⚠️ 已中断: ${reason ?? '用户取消'}`
+        ? this.accumulatedText + `\n\n⚠️ 已中断: ${reason ?? '用户取消'}`
         : `⚠️ 已中断: ${reason ?? '用户取消'}`;
       try {
         await this.doSendChunk(abortText, 10); // DONE
@@ -323,62 +359,60 @@ export class QQStreamingController {
   // ─── Internal: streaming ────────────────────────────────────
 
   private scheduleFlush(): void {
-    if (this.flushTimer) return;
+    this.flushPending = true;
+    // Serialize: only one flush in-flight at a time.
+    // If another is running or scheduled, mark pending and let it reschedule itself.
+    if (this.flushTimer || this.currentFlushPromise) return;
     const elapsed = Date.now() - this.lastUpdateTime;
     const delay = Math.max(0, STREAM_UPDATE_INTERVAL - elapsed);
     this.flushTimer = setTimeout(() => {
       this.flushTimer = null;
-      this.doFlush().catch((err: any) => {
-        logger.debug({ err: err.message }, 'QQ streaming flush failed');
-      });
+      this.flushPending = false;
+      this.currentFlushPromise = this.doFlush()
+        .catch((err: any) => {
+          logger.debug({ err: err.message }, 'QQ streaming flush failed');
+        })
+        .finally(() => {
+          this.currentFlushPromise = null;
+          if (this.flushPending && this.isActive()) {
+            this.scheduleFlush();
+          }
+        });
     }, delay);
   }
 
   private scheduleAuxFlush(): void {
-    if (this.auxFlushTimer) return;
-    const elapsed = Date.now() - this.lastAuxFlushTime;
-    const delay = Math.max(
-      0,
-      QQStreamingController.AUX_FLUSH_INTERVAL - elapsed,
-    );
-    this.auxFlushTimer = setTimeout(() => {
-      this.auxFlushTimer = null;
-      this.lastAuxFlushTime = Date.now();
-      const content = this.buildAuxPrefix() + markdownToPlainText(this.accumulatedText);
-      if (this.streamMsgId) {
-        this.doSendChunk(content, 1).catch((err: any) => {
-          logger.debug({ err: err.message }, 'QQ streaming aux flush failed');
-        });
-      }
-    }, delay);
+    // Disabled: aux prefix (thinking/tools) mutates during stream, which
+    // breaks QQ's strict prefix-stability requirement. Aux state is tracked
+    // internally only; not surfaced to user during streaming.
   }
 
   private async doFlush(): Promise<void> {
     const rawText = this.accumulatedText;
-    if (!rawText.trim() && !this.thinking && !this.thinkingText) return;
+    if (!rawText.trim()) return;
 
-    const content = this.buildAuxPrefix() + markdownToPlainText(rawText);
-
+    // CRITICAL: QQ stream API requires strict prefix stability across chunks.
+    // - Never transform markdown (markdownToPlainText is non-monotonic:
+    //   incomplete `**bold` stays literal, later completed `**bold**` gets stripped).
+    // - Never prepend aux info (thinking/tools state changes during stream).
+    // Send raw text as-is; QQ renders content_type: markdown natively.
     if (!this.streamMsgId) {
-      await this.tryStartStream(content);
+      await this.tryStartStream(rawText);
       if (!this.streamMsgId) return; // Failed, will retry next flush
     } else {
       try {
-        await this.doSendChunk(content, 1); // GENERATING
+        await this.doSendChunk(rawText, 1); // GENERATING
         this.lastUpdateTime = Date.now();
       } catch (err: any) {
-        logger.debug({ err: err.message }, 'QQ streaming chunk failed');
+        logger.warn({ err: err.message, contentLen: rawText.length }, 'QQ streaming chunk failed');
       }
     }
   }
 
   private async tryStartStream(content: string): Promise<void> {
     try {
-      const plainContent = content.includes('---\n\n')
-        ? content // Already built with aux prefix
-        : markdownToPlainText(content);
-      // Show at least a "thinking" placeholder if content is empty
-      const displayContent = plainContent.trim() || '💭 思考中...';
+      // Raw content only — no transformation. Prefix must stay stable across chunks.
+      const displayContent = content.trim() || '💭 思考中...';
       const resp = await this.sendStreamChunk(this.openid, {
         input_mode: 'replace',
         input_state: 1, // GENERATING
@@ -386,6 +420,8 @@ export class QQStreamingController {
         content_raw: displayContent,
         msg_seq: this.msgSeq,
         index: this.streamIndex++,
+        msg_id: this.passiveMsgId,
+        event_id: this.passiveMsgId,
       });
 
       if (resp.id) {
@@ -398,7 +434,10 @@ export class QQStreamingController {
           'QQ streaming started',
         );
       } else {
-        logger.warn({ openid: this.openid }, 'QQ stream API returned no id');
+        logger.warn(
+          { openid: this.openid, resp },
+          'QQ stream API returned no id',
+        );
       }
     } catch (err: any) {
       logger.warn(
@@ -421,6 +460,8 @@ export class QQStreamingController {
       msg_seq: this.msgSeq,
       index: this.streamIndex++,
       stream_msg_id: this.streamMsgId ?? undefined,
+      msg_id: this.passiveMsgId,
+      event_id: this.passiveMsgId,
     });
     this.sentChunkCount++;
   }
