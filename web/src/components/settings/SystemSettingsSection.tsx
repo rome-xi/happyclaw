@@ -451,6 +451,12 @@ export function SystemSettingsSection() {
               下的模板 CLAUDE.md 和 data/memory/ 下 memory_append 累积的日记。
               若有有价值的内容，建议迁移到 ~/.claude/memory/ 下再启用。
             </p>
+            <p className="text-xs text-muted-foreground mt-2">
+              <strong>Auto-memory 共享</strong>：启用后 SDK auto-memory 会写入
+              ~/.claude/projects/{'{cwd-slug}'}/memory/，与本机原生 Claude Code 共享。
+              如果 HappyClaw Agent 和你本人的风格/语言偏好不同，两边会互相污染 —
+              介意就不要开这个开关。
+            </p>
           </div>
           <Switch
             checked={disableMemoryLayerForAdminHost}
