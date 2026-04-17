@@ -719,6 +719,18 @@ export class StreamEventProcessor {
     const content = message.message?.content;
     if (!Array.isArray(content)) return;
 
+    // Emit thinking_delta for main-agent thinking blocks. Opus 4.6/4.7 sends
+    // thinking as a complete content block without streaming deltas, so the
+    // delta path never fires — we must emit from the complete message.
+    for (const block of content) {
+      if (block.type === 'thinking' && block.thinking) {
+        this.emit({
+          status: 'stream', result: null,
+          streamEvent: { eventType: 'thinking_delta', text: block.thinking },
+        });
+      }
+    }
+
     // Fallback: extract skill name from complete assistant message
     for (const block of content) {
       if (block.type === 'tool_use' && block.name === 'Skill' && block.id && block.input) {
