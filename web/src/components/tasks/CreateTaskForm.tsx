@@ -17,7 +17,7 @@ import { INTERVAL_UNITS, CHANNEL_OPTIONS, toggleNotifyChannel } from '../../util
 import { useConnectedChannels } from '../../hooks/useConnectedChannels';
 import { useTasksStore } from '../../stores/tasks';
 import { useGroupsStore } from '../../stores/groups';
-import { CHANNEL_LABEL } from '../settings/channel-meta';
+import { formatGroupLabel } from '../settings/channel-meta';
 
 interface CreateTaskFormProps {
   onSubmit: (data: {
@@ -101,13 +101,6 @@ export function CreateTaskForm({ onSubmit, onClose, isAdmin }: CreateTaskFormPro
     if (aWeb !== bWeb) return aWeb - bWeb;
     return a.localeCompare(b);
   });
-
-  const formatGroupLabel = (jid: string, name: string) => {
-    const channelType = jid.split(':')[0];
-    const channelLabel = CHANNEL_LABEL[channelType] || (channelType === 'web' ? 'Web' : channelType);
-    const shortId = jid.split(':').slice(1).join(':');
-    return `[${channelLabel}] ${name} (${shortId})`;
-  };
 
   const renderTargetWorkspace = () => (
     <div>

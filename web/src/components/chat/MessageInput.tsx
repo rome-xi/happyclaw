@@ -34,16 +34,14 @@ const MAX_IMAGE_SIZE_BYTES = 5 * 1024 * 1024;
 
 interface MessageInputProps {
   /**
-   * 发送回调。必须返回 boolean（或 Promise<boolean>）表示发送是否成功：
+   * 发送回调。返回 boolean 表示发送是否成功：
    * - true：MessageInput 清空输入框和附件
    * - false：保留输入框内容和附件，用户可重试（弱网/断网场景）
-   *
-   * 允许返回 void 以兼容仍未改造的调用方，此时按 true 处理。
    */
   onSend: (
     content: string,
     attachments?: Array<{ data: string; mimeType: string }>,
-  ) => Promise<boolean | void> | boolean | void;
+  ) => Promise<boolean> | boolean;
   groupJid?: string;
   disabled?: boolean;
   onResetSession?: () => void;
@@ -185,9 +183,7 @@ export function MessageInput({
 
     let ok = false;
     try {
-      const result = await onSend(message, attachments);
-      // onSend 返回 void 视为成功（兼容尚未改造的调用方）；显式 false 视为失败。
-      ok = result !== false;
+      ok = await onSend(message, attachments);
     } catch {
       ok = false;
     }
