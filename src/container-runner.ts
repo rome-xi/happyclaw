@@ -1319,11 +1319,11 @@ export async function runHostAgent(
     }
     // 让 SDK 捕获 CLI 的 stderr 输出，便于排查启动失败
     hostEnv['DEBUG_CLAUDE_AGENT_SDK'] = '1';
-    // CLI 禁止 root 用户使用 --dangerously-skip-permissions，
-    // 通过 IS_SANDBOX 标记告知 CLI 当前运行在受控环境中以绕过此限制
-    if (typeof process.getuid === 'function' && process.getuid() === 0) {
-      hostEnv['IS_SANDBOX'] = '1';
-    }
+    // Claude Code 2.1.114+ 禁止 root 使用 --dangerously-skip-permissions，
+    // IS_SANDBOX=1 告知 CLI 当前运行在受控环境中以绕过此限制。
+    // host 模式由 happyclaw 主进程托管（见 permissionMode: 'bypassPermissions'），
+    // 相当于显式沙箱，故无条件声明而不再仅限 root —— 非 root 部署也保留语义对齐。
+    hostEnv['IS_SANDBOX'] = '1';
 
     // 5b. Host capability preflight — detect external tools & inject env vars
     const capResult = await checkHostCapabilities();
