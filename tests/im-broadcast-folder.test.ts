@@ -342,6 +342,45 @@ describe('broadcastToOwnerIMChannels — target_main_jid binding (ImBindingDialo
     expect(sendFn).toHaveBeenCalledWith('feishu:F-orphan');
   });
 
+  test('legacy target_main_jid format `web:{folder}` still resolves (DB-migration compat)', () => {
+    // Historical data shape: some old DBs stored target_main_jid as
+    // `web:{folder}` (using the folder name as a pseudo-jid) instead of the
+    // canonical `web:{uuid}` the current writer uses. The production
+    // resolveJidFolder delegates to resolveWorkspaceJid which folds this shape
+    // back to the real registered jid. This test exercises the shape
+    // contract: a resolveJidFolder impl that interprets the legacy shape
+    // correctly (returns a folder) must still hit the broadcast path.
+    const sendFn = vi.fn<(jid: string) => void>();
+    const deps: BroadcastToOwnerIMChannelsDeps = {
+      getConnectedChannelTypes: () => ['feishu'],
+      getGroupsByOwner: () => [
+        {
+          jid: 'feishu:F-legacy',
+          folder: 'home-u',
+          // Legacy shape: `web:{folder-name}`, not `web:{uuid}`.
+          target_main_jid: 'web:flow-legacy-42',
+        },
+      ],
+      getChannelType: fakeGetChannelType,
+      // Simulate resolveWorkspaceJid's legacy fallback: legacy shape inputs
+      // are translated to the canonical folder rather than returning null.
+      resolveJidFolder: (jid) =>
+        jid === 'web:flow-legacy-42' ? 'flow-legacy-42' : null,
+    };
+
+    broadcastToOwnerIMChannels(
+      'user-1',
+      'flow-legacy-42',
+      new Set<string>(),
+      sendFn,
+      undefined,
+      deps,
+    );
+
+    expect(sendFn).toHaveBeenCalledTimes(1);
+    expect(sendFn).toHaveBeenCalledWith('feishu:F-legacy');
+  });
+
   test('group with target_main_jid=null / undefined behaves like legacy folder-only match', () => {
     // Regression guard: ensure adding the target_main_jid code path didn't
     // break the existing folder-equality behavior for groups without binding.
