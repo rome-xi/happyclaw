@@ -1260,29 +1260,63 @@ export async function runHostAgent(
       hostEnv['AUTO_COMPACT_WINDOW'] = String(hostAutoCompact);
     }
 
+    // admin 主容器 + 系统设置 disableMemoryLayerForAdminHost 时禁用 HappyClaw 记忆层：
+    // 不注入 memory MCP 工具 / WORKSPACE_GLOBAL/MEMORY env / 记忆提示，
+    // 让 Agent 完全按用户本机 ~/.claude/ 的 Playbook 工作。
+    // 仅作用于 admin 主容器（is_home=1, folder=main），不影响 admin 创建的其他子群组。
+    const isCreatorAdmin = ownerHomeFolder === 'main';
+    const disableMemoryLayer =
+      isCreatorAdmin &&
+      !!group.is_home &&
+      getSystemSettings().disableMemoryLayerForAdminHost;
+
     // 路径映射
     hostEnv['HAPPYCLAW_WORKSPACE_GROUP'] = groupDir;
-    // Per-user global memory
-    const ownerId = group.created_by;
-    if (ownerId) {
-      const userGlobalDir = path.join(GROUPS_DIR, 'user-global', ownerId);
-      fs.mkdirSync(userGlobalDir, { recursive: true });
-      hostEnv['HAPPYCLAW_WORKSPACE_GLOBAL'] = userGlobalDir;
-    } else {
-      const legacyGlobalDir = path.join(GROUPS_DIR, 'global');
-      fs.mkdirSync(legacyGlobalDir, { recursive: true });
-      hostEnv['HAPPYCLAW_WORKSPACE_GLOBAL'] = legacyGlobalDir;
-    }
-    const memoryFolder = group.is_home
-      ? group.folder
-      : ownerHomeFolder || group.folder;
-    hostEnv['HAPPYCLAW_WORKSPACE_MEMORY'] = path.join(
-      DATA_DIR,
-      'memory',
-      memoryFolder,
-    );
     hostEnv['HAPPYCLAW_WORKSPACE_IPC'] = groupIpcDir;
-    hostEnv['CLAUDE_CONFIG_DIR'] = groupSessionsDir;
+
+    if (!disableMemoryLayer) {
+      // Per-user global memory（HappyClaw 自带 memory 层）
+      const ownerId = group.created_by;
+      if (ownerId) {
+        const userGlobalDir = path.join(GROUPS_DIR, 'user-global', ownerId);
+        fs.mkdirSync(userGlobalDir, { recursive: true });
+        hostEnv['HAPPYCLAW_WORKSPACE_GLOBAL'] = userGlobalDir;
+      } else {
+        const legacyGlobalDir = path.join(GROUPS_DIR, 'global');
+        fs.mkdirSync(legacyGlobalDir, { recursive: true });
+        hostEnv['HAPPYCLAW_WORKSPACE_GLOBAL'] = legacyGlobalDir;
+      }
+      const memoryFolder = group.is_home
+        ? group.folder
+        : ownerHomeFolder || group.folder;
+      hostEnv['HAPPYCLAW_WORKSPACE_MEMORY'] = path.join(
+        DATA_DIR,
+        'memory',
+        memoryFolder,
+      );
+    }
+
+    // 禁用记忆层且配置了 customCwd 时不覆盖 CLAUDE_CONFIG_DIR，让 SDK 使用用户真实 $HOME/.claude/
+    // 未配 customCwd 时保留 override，避免 HappyClaw 的 cwd 污染 ~/.claude/projects/
+    if (!disableMemoryLayer || !group.customCwd) {
+      hostEnv['CLAUDE_CONFIG_DIR'] = groupSessionsDir;
+    }
+
+    if (disableMemoryLayer) {
+      hostEnv['HAPPYCLAW_DISABLE_MEMORY_LAYER'] = 'true';
+      // SDK 读的是 $CLAUDE_CONFIG_DIR/settings.json（此时指向 ~/.claude/），
+      // HappyClaw 写在 groupSessionsDir/settings.json 的 REQUIRED_SETTINGS_ENV 会丢。
+      // 直接注入到进程 env，SDK 按 process.env 读，绕开 settings.json 路径。
+      for (const [key, value] of Object.entries(REQUIRED_SETTINGS_ENV)) {
+        hostEnv[key] = value;
+      }
+      // 同样，per-user MCP servers 在 ~/.claude/settings.json 里没有，
+      // 通过 env 透传，agent-runner 合并进 SDK mcpServers 参数。
+      if (hostMcpServers && Object.keys(hostMcpServers).length > 0) {
+        hostEnv['HAPPYCLAW_USER_MCP_SERVERS_JSON'] =
+          JSON.stringify(hostMcpServers);
+      }
+    }
     // 让 SDK 捕获 CLI 的 stderr 输出，便于排查启动失败
     hostEnv['DEBUG_CLAUDE_AGENT_SDK'] = '1';
     // CLI 禁止 root 用户使用 --dangerously-skip-permissions，

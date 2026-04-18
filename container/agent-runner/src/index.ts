@@ -564,6 +564,7 @@ function trimSessionJsonl(jsonlPath: string): void {
 function createPreCompactHook(
   isHome: boolean,
   _isAdminHome: boolean,
+  disableMemoryLayer: boolean,
   deps: { emit: (output: ContainerOutput) => void; getFullText: () => string; resetFullText: () => void },
 ): HookCallback {
   return async (input, _toolUseId, _context) => {
@@ -634,7 +635,8 @@ function createPreCompactHook(
     hadCompaction = true;
 
     // Flag memory flush for home containers (full memory write access)
-    if (isHome) {
+    // Skip in native Claude mode — user's ~/.claude/ Playbook handles memory persistence
+    if (isHome && !disableMemoryLayer) {
       needsMemoryFlush = true;
       log('PreCompact: flagged memory flush for home container');
     }
@@ -919,7 +921,11 @@ function waitForIpcMessage(): Promise<{ text: string; images?: Array<{ data: str
   });
 }
 
-function buildMemoryRecallPrompt(isHome: boolean, isAdminHome: boolean): string {
+function buildMemoryRecallPrompt(isHome: boolean, isAdminHome: boolean, disableMemoryLayer: boolean): string {
+  // 禁用记忆层：完全跳过 HappyClaw 的记忆系统提示，让用户本机 ~/.claude/ Playbook 接管
+  if (disableMemoryLayer) {
+    return '';
+  }
   if (isHome) {
     // Home container (admin or member): full memory system with read/write access to user's global CLAUDE.md
     return [
@@ -986,8 +992,19 @@ function buildMemoryRecallPrompt(isHome: boolean, isAdminHome: boolean): string 
   ].join('\n');
 }
 
-/** 从 settings.json 读取用户配置的 MCP servers（stdio/http/sse 类型） */
+/** 读取用户配置的 MCP servers（stdio/http/sse 类型） */
 function loadUserMcpServers(): Record<string, unknown> {
+  // 禁用记忆层模式下 CLAUDE_CONFIG_DIR 指向 ~/.claude/，HappyClaw 管理的 per-user MCP
+  // 不在那份 settings.json 里，container-runner 通过 env 透传。优先读 env。
+  const envJson = process.env.HAPPYCLAW_USER_MCP_SERVERS_JSON;
+  if (envJson) {
+    try {
+      const parsed = JSON.parse(envJson);
+      if (parsed && typeof parsed === 'object') {
+        return parsed as Record<string, unknown>;
+      }
+    } catch { /* fall through to settings.json */ }
+  }
   const configDir = process.env.CLAUDE_CONFIG_DIR
     || path.join(process.env.HOME || '/home/node', '.claude');
   const settingsFile = path.join(configDir, 'settings.json');
@@ -1179,10 +1196,12 @@ async function runQuery(
   const processor = new StreamEventProcessor(emit, log);
 
   const { isHome, isAdminHome } = normalizeHomeFlags(containerInput);
+  const disableMemoryLayer = process.env.HAPPYCLAW_DISABLE_MEMORY_LAYER === 'true';
 
   // Resumed sessions carry prior history — skip re-injecting HEARTBEAT.md to save cache tokens.
+  // HEARTBEAT.md 住在 HappyClaw 记忆层（WORKSPACE_GLOBAL），禁用该层时不读取。
   let heartbeatContent = '';
-  if (isHome && !sessionId) {
+  if (isHome && !sessionId && !disableMemoryLayer) {
     const heartbeatPath = path.join(WORKSPACE_GLOBAL, 'HEARTBEAT.md');
     if (fs.existsSync(heartbeatPath)) {
       try {
@@ -1213,7 +1232,7 @@ async function runQuery(
     `<behavior>\n${INTERACTION_GUIDELINES}\n</behavior>`,
     `<skill-routing>\n${SKILL_ROUTING_GUIDELINES}\n</skill-routing>`,
     `<security>\n${SECURITY_RULES}\n</security>`,
-    `<memory-system>\n${memoryRecall}\n</memory-system>`,
+    memoryRecall && `<memory-system>\n${memoryRecall}\n</memory-system>`,
     heartbeatContent && `<recent-work>\n${heartbeatContent}\n</recent-work>`,
     GUIDELINES_BLOCK,
     channelGuidelines && `<channel-format>\n${channelGuidelines}\n</channel-format>`,
@@ -1223,9 +1242,13 @@ async function runQuery(
   // Home containers (admin & member) can access global and memory directories.
   // Non-home containers only access memory directory; global CLAUDE.md is NOT
   // injected into systemPrompt but remains accessible via filesystem (readonly mount).
-  const extraDirs = isHome
-    ? [WORKSPACE_GLOBAL, WORKSPACE_MEMORY]
-    : [WORKSPACE_MEMORY];
+  // 禁用记忆层时 WORKSPACE_GLOBAL/MEMORY 环境变量未设置，fallback 到 /workspace/xxx
+  // 容器路径在宿主机不存在，会让 SDK 报警告；此时直接给空数组。
+  const extraDirs = disableMemoryLayer
+    ? []
+    : isHome
+      ? [WORKSPACE_GLOBAL, WORKSPACE_MEMORY]
+      : [WORKSPACE_MEMORY];
 
   if (shouldInterrupt()) {
     log('Interrupt sentinel detected before query start, skipping query');
@@ -1268,7 +1291,7 @@ async function runQuery(
         happyclaw: mcpServerConfig,  // 内置 SDK MCP 放最后，确保不被同名覆盖
       },
       hooks: {
-        PreCompact: [{ hooks: [createPreCompactHook(isHome, isAdminHome, {
+        PreCompact: [{ hooks: [createPreCompactHook(isHome, isAdminHome, disableMemoryLayer, {
           emit,
           getFullText: () => processor.getFullText(),
           resetFullText: () => processor.resetFullTextAccumulator(),
@@ -1641,6 +1664,9 @@ async function main(): Promise<void> {
   latestSessionId = sessionId;
   const { isHome, isAdminHome } = normalizeHomeFlags(containerInput);
 
+  // 禁用 HappyClaw 记忆层：不注册 memory MCP 工具，让 Agent 按用户本机 Playbook 行事
+  const disableMemoryLayer = process.env.HAPPYCLAW_DISABLE_MEMORY_LAYER === 'true';
+
   // Create in-process SDK MCP server (replaces the stdio subprocess)
   // NOTE: currentTaskId is mutated in-place by the main loop below so that
   // createMcpTools() closures observe updates via ctx reference. See the
@@ -1656,6 +1682,7 @@ async function main(): Promise<void> {
     workspaceGroup: WORKSPACE_GROUP,
     workspaceGlobal: WORKSPACE_GLOBAL,
     workspaceMemory: WORKSPACE_MEMORY,
+    disableMemoryLayer,
   };
   const buildMcpServerConfig = () => createSdkMcpServer({
     name: 'happyclaw',
@@ -1663,7 +1690,7 @@ async function main(): Promise<void> {
     tools: createMcpTools(mcpToolsConfig),
   });
   let mcpServerConfig = buildMcpServerConfig();
-  const memoryRecallPrompt = buildMemoryRecallPrompt(isHome, isAdminHome);
+  const memoryRecallPrompt = buildMemoryRecallPrompt(isHome, isAdminHome, disableMemoryLayer);
   fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
 
   // Clean up stale sentinels from previous container runs.
