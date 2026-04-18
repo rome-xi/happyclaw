@@ -77,8 +77,8 @@ function stmts() {
       storeMessageInsert: db.prepare(
         `INSERT OR REPLACE INTO messages (
           id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me,
-          attachments, token_usage, turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          attachments, token_usage, turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason, task_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ),
       insertUsageInsert: db.prepare(
         `INSERT INTO usage_records (id, user_id, group_folder, agent_id, message_id, model,
@@ -124,7 +124,7 @@ function stmts() {
          )`,
       ),
       getMessagesSince: db.prepare(
-        `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, attachments
+        `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, attachments, task_id
          FROM messages
          WHERE chat_jid = ? AND (timestamp > ? OR (timestamp = ? AND id > ?)) AND is_from_me = 0
          ORDER BY timestamp ASC, id ASC`,
@@ -142,7 +142,7 @@ function getNewMessagesStmt(jidCount: number): any {
   if (!s) {
     const placeholders = Array(jidCount).fill('?').join(',');
     s = db.prepare(
-      `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, attachments
+      `SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, attachments, task_id
        FROM messages
        WHERE (timestamp > ? OR (timestamp = ? AND id > ?))
          AND chat_jid IN (${placeholders})
@@ -161,6 +161,7 @@ interface StoredMessageMeta {
   sdkMessageUuid?: string | null;
   sourceKind?: MessageSourceKind | null;
   finalizationReason?: MessageFinalizationReason | null;
+  taskId?: string | null;
 }
 
 function hasColumn(tableName: string, columnName: string): boolean {
@@ -700,6 +701,7 @@ export function initDatabase(): void {
   ensureColumn('messages', 'sdk_message_uuid', 'TEXT');
   ensureColumn('messages', 'source_kind', 'TEXT');
   ensureColumn('messages', 'finalization_reason', 'TEXT');
+  ensureColumn('messages', 'task_id', 'TEXT');
   ensureColumn('agents', 'source_kind', 'TEXT');
   ensureColumn('agents', 'thread_id', 'TEXT');
   ensureColumn('agents', 'root_message_id', 'TEXT');
@@ -1233,7 +1235,7 @@ export function initDatabase(): void {
     db.exec('ALTER TABLE agents ADD COLUMN spawned_from_jid TEXT');
   }
 
-  const SCHEMA_VERSION = '34';
+  const SCHEMA_VERSION = '35';
   db.prepare(
     'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
   ).run('schema_version', SCHEMA_VERSION);
@@ -1376,6 +1378,7 @@ export function storeMessageDirect(
     meta?.sdkMessageUuid ?? null,
     meta?.sourceKind ?? null,
     meta?.finalizationReason ?? null,
+    meta?.taskId ?? null,
   );
   return effectiveMsgId;
 }
@@ -2916,6 +2919,8 @@ export function getGroupsByOwner(
     created_by: string | null;
     is_home: number;
     selected_skills: string | null;
+    target_main_jid: string | null;
+    target_agent_id: string | null;
   }>;
 
   return rows.map((row) => ({
@@ -2932,6 +2937,8 @@ export function getGroupsByOwner(
     initGitUrl: row.init_git_url ?? undefined,
     created_by: row.created_by ?? undefined,
     is_home: row.is_home === 1,
+    target_main_jid: row.target_main_jid ?? undefined,
+    target_agent_id: row.target_agent_id ?? undefined,
   }));
 }
 
