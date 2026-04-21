@@ -16,6 +16,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import { execFileSync } from 'child_process';
 import { query, HookCallback, PreCompactHookInput, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
 import { detectImageMimeTypeFromBase64Strict } from './image-detector.js';
 import { pruneProcessedHistoryImagesInTranscript as pruneProcessedHistoryImagesInTranscriptFile } from './history-image-prune.js';
@@ -1107,6 +1108,9 @@ async function runQuery(
   let queryRef: { interrupt(): Promise<void> } | null = null;
   let messageCount = 0;
   let resultCount = 0;
+  // SDK transport is not ready until system/init is received. Piping user messages
+  // before init causes "ProcessTransport is not ready for writing" unhandled rejection.
+  let sdkTransportReady = false;
 
   const pollIpcDuringQuery = () => {
     if (!ipcPolling) return;
@@ -1171,6 +1175,13 @@ async function runQuery(
       log('Stream already ended, skipping IPC drain (messages will be picked up by waitForIpcMessage)');
       ipcPolling = false;
       ipcQueryWatcher.close();
+      return;
+    }
+
+    // Don't pipe user messages before system/init — the SDK ProcessTransport is not
+    // ready yet and streamInput() will throw "ProcessTransport is not ready for writing".
+    // IPC files remain on disk; we'll drain them once sdkTransportReady is set.
+    if (!sdkTransportReady) {
       return;
     }
 
@@ -1267,10 +1278,37 @@ async function runQuery(
     flagSettings.autoCompactWindow = autoCompactWindow;
   }
 
+  // Resolve the actual claude CLI path using `which`.
+  // SDK 的 optionalDependencies（@anthropic-ai/claude-agent-sdk-linux-x64 等）在 npm 上是空包，
+  // 无法通过 node_modules/.bin/ 找到 working binary。通过 which 找到实际路径后传给 SDK。
+  let pathToClaudeCodeExecutable: string | undefined;
+  try {
+    const resolvedPath = execFileSync('which', ['claude'], { timeout: 5_000, encoding: 'utf-8' }).trim();
+    if (resolvedPath) {
+      pathToClaudeCodeExecutable = resolvedPath;
+    }
+  } catch {
+    // Fallback: try to find it in common locations
+    const commonPaths = [
+      '/usr/local/bin/claude',
+      '/usr/bin/claude',
+      path.join(process.env.HOME || '/root', '.local/bin/claude'),
+      // 容器内 agent-runner 的本地依赖（package.json 声明了 @anthropic-ai/claude-code）
+      '/app/node_modules/.bin/claude',
+    ];
+    for (const p of commonPaths) {
+      if (fs.existsSync(p)) {
+        pathToClaudeCodeExecutable = p;
+        break;
+      }
+    }
+  }
+
   try {
     const q = query({
     prompt: stream,
     options: {
+      ...(pathToClaudeCodeExecutable && { pathToClaudeCodeExecutable }),
       model: CLAUDE_MODEL,
       cwd: WORKSPACE_GROUP,
       additionalDirectories: extraDirs,
@@ -1417,6 +1455,9 @@ async function runQuery(
     if (message.type === 'system' && message.subtype === 'init') {
       newSessionId = message.session_id;
       log(`Session initialized: ${newSessionId}`);
+      // Mark transport ready and drain any IPC messages that arrived before init.
+      sdkTransportReady = true;
+      pollIpcDuringQuery();
 
       // Log skills and context usage for observability.
       // getContextUsage() is a newer SDK API; feature-detect to avoid spamming
@@ -2153,6 +2194,14 @@ process.on('unhandledRejection', (reason: unknown) => {
   }
   if (isWithinInterruptGraceWindow()) {
     console.error('Unhandled rejection during interrupt (non-fatal):', reason);
+    return;
+  }
+  // SDK throws this when streamInput() is called before the ProcessTransport is ready.
+  // The sdkTransportReady guard in pollIpcDuringQuery should prevent this, but catch
+  // it here as a safety net to avoid crashing the agent on any residual race windows.
+  const msg = reason instanceof Error ? reason.message : String(reason);
+  if (msg.includes('ProcessTransport is not ready for writing')) {
+    console.error('Suppressing ProcessTransport race (non-fatal):', reason);
     return;
   }
   console.error('Unhandled rejection:', reason);

@@ -132,6 +132,7 @@ import {
   getUserDiscordConfig,
   getSystemSettings,
   saveUserFeishuConfig,
+  saveFeishuOwnerOpenId,
   saveUserTelegramConfig,
   updateAllSessionCredentials,
 } from './runtime-config.js';
@@ -1070,6 +1071,7 @@ async function handleCommand(
   chatJid: string,
   command: string,
   senderImId?: string,
+  mentions?: Array<{ key?: string; name?: string; id?: { open_id?: string } }>,
 ): Promise<string | null> {
   const parts = command.split(/\s+/);
   const cmd = parts[0].toLowerCase();
@@ -1101,6 +1103,12 @@ async function handleCommand(
     case 'sw':
     case 'spawn':
       return handleSpawnCommand(chatJid, rawArgs, chatJid);
+    case 'allow':
+      return handleAllowCommand(chatJid, senderImId, mentions);
+    case 'disallow':
+      return handleDisallowCommand(chatJid, senderImId, mentions);
+    case 'allowlist':
+      return handleAllowlistCommand(chatJid);
     default:
       return null;
   }
@@ -1531,6 +1539,129 @@ function handleOwnerMentionCommand(chatJid: string, senderImId?: string): string
   return `已开启「仅我响应」模式\n\n你的 IM 标识: ${senderImId}\n只有你 @机器人 时才会响应，其他人的 @mention 将被静默忽略。\n\n发送 /require_mention false 可恢复为全量响应。`;
 }
 
+
+/**
+ * /allow @成员 命令：将 @提及的成员加入发言者白名单（仅 owner 可操作）。
+ */
+function handleAllowCommand(
+  chatJid: string,
+  senderImId?: string,
+  mentions?: Array<{ key?: string; name?: string; id?: { open_id?: string } }>,
+): string {
+  if (!senderImId) return '无法识别发送者身份';
+  let group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
+  if (!group) return '未找到当前会话';
+
+  // Backfill owner_im_id if the group was registered before the user-level
+  // ownerOpenId was known (e.g., bot added to group first, owner DM'd later).
+  // Only backfill when the sender matches the user-level ownerOpenId.
+  if (!group.owner_im_id && group.created_by) {
+    const userOwnerOpenId = getUserFeishuConfig(group.created_by)?.ownerOpenId;
+    if (userOwnerOpenId && userOwnerOpenId === senderImId) {
+      const updated: RegisteredGroup = { ...group, owner_im_id: senderImId };
+      setRegisteredGroup(chatJid, updated);
+      registeredGroups[chatJid] = updated;
+      group = updated;
+      logger.info(
+        { chatJid, senderImId },
+        'Backfilled owner_im_id via /allow (matched user-level ownerOpenId)',
+      );
+    }
+  }
+
+  if (!group.owner_im_id) {
+    return '尚未识别到 owner，请先向机器人发一条私信以完成身份识别';
+  }
+  if (group.owner_im_id !== senderImId) {
+    return '只有 bot owner 才能修改白名单';
+  }
+
+  const toAdd = (mentions ?? [])
+    .map((m) => m.id?.open_id)
+    .filter((id): id is string => !!id && id !== senderImId);
+
+  if (toAdd.length === 0) {
+    return '请 @提及 要加入白名单的群成员：/allow @成员';
+  }
+
+  const current = group.sender_allowlist ?? [senderImId];
+  const newIds = toAdd.filter((id) => !current.includes(id));
+  if (newIds.length === 0) {
+    return '这些成员已在白名单中';
+  }
+
+  const updated: RegisteredGroup = {
+    ...group,
+    sender_allowlist: [...current, ...newIds],
+  };
+  setRegisteredGroup(chatJid, updated);
+  registeredGroups[chatJid] = updated;
+  logger.info({ chatJid, senderImId, added: newIds }, 'Members added to sender allowlist');
+
+  return `已将 ${newIds.length} 名成员加入白名单（当前共 ${updated.sender_allowlist!.length} 人）`;
+}
+
+/**
+ * /disallow @成员 命令：将 @提及的成员从发言者白名单移除（仅 owner 可操作）。
+ * owner 本人不能被移除。
+ */
+function handleDisallowCommand(
+  chatJid: string,
+  senderImId?: string,
+  mentions?: Array<{ key?: string; name?: string; id?: { open_id?: string } }>,
+): string {
+  if (!senderImId) return '无法识别发送者身份';
+  const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
+  if (!group) return '未找到当前会话';
+
+  if (!group.owner_im_id || group.owner_im_id !== senderImId) {
+    return '只有 bot owner 才能修改白名单';
+  }
+  if (!group.sender_allowlist || group.sender_allowlist.length === 0) {
+    return '白名单为空';
+  }
+
+  const toRemove = (mentions ?? [])
+    .map((m) => m.id?.open_id)
+    .filter((id): id is string => !!id);
+
+  if (toRemove.length === 0) {
+    return '请 @提及 要从白名单移除的群成员：/disallow @成员';
+  }
+  if (toRemove.includes(senderImId)) {
+    return 'Owner 不能将自己移出白名单';
+  }
+
+  const updated_list = group.sender_allowlist.filter((id) => !toRemove.includes(id));
+  const updated: RegisteredGroup = { ...group, sender_allowlist: updated_list };
+  setRegisteredGroup(chatJid, updated);
+  registeredGroups[chatJid] = updated;
+  logger.info({ chatJid, senderImId, removed: toRemove }, 'Members removed from sender allowlist');
+
+  const removedCount = group.sender_allowlist.length - updated_list.length;
+  return `已将 ${removedCount} 名成员从白名单移除（当前共 ${updated_list.length} 人）`;
+}
+
+/**
+ * /allowlist 命令：查看当前群组的发言者白名单。
+ */
+function handleAllowlistCommand(chatJid: string): string {
+  const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
+  if (!group) return '未找到当前会话';
+
+  const allowlist = group.sender_allowlist;
+  if (allowlist === undefined || allowlist === null) {
+    return '当前群组未启用白名单模式（所有人均可触发）';
+  }
+  if (allowlist.length === 0) {
+    return `白名单模式已启用，当前无人可触发。\nOwner: ${group.owner_im_id ?? '未识别（请先向机器人发一条私信）'}`;
+  }
+
+  const ownerMark = (id: string) => (id === group.owner_im_id ? ' (owner)' : '');
+  const lines = allowlist.map((id, i) => `${i + 1}. ${id}${ownerMark(id)}`);
+  return `白名单（${allowlist.length} 人）：\n${lines.join('\n')}`;
+}
+
 const recallCooldowns = new Map<string, number>();
 
 async function handleRecallCommand(chatJid: string): Promise<string> {
@@ -1640,6 +1771,101 @@ async function summarizeWithClaude(transcript: string): Promise<string | null> {
   const prompt = `请用简洁的中文总结以下对话的要点和进展，重点说明讨论了什么、达成了什么结论、还有什么待办事项。不要逐条翻译，而是提炼核心信息。\n\n${transcript}`;
   const model = process.env.RECALL_MODEL || undefined;
   return sdkQuery(prompt, { model, timeout: 30_000 });
+}
+
+/**
+ * After an agent conversation's first reply finalizes, upgrade the placeholder
+ * title to an LLM-generated one. Fire-and-forget; optimistically flips
+ * title_source to 'auto' up-front so concurrent replies don't double-trigger.
+ */
+async function generateAndApplyLLMTitle(
+  agentId: string,
+  chatJid: string,
+  virtualChatJid: string,
+): Promise<void> {
+  updateAgentContextInfo(agentId, { title_source: 'auto' });
+
+  // Notify clients that title generation has started → show loading indicator.
+  const startAgent = getAgent(agentId);
+  if (startAgent) {
+    broadcastAgentStatus(
+      chatJid,
+      agentId,
+      startAgent.status as import('./types.js').AgentStatus,
+      startAgent.name,
+      startAgent.prompt,
+      undefined,
+      undefined,
+      true,
+    );
+  }
+
+  let finalName: string | undefined;
+  try {
+    const recent = getMessagesPage(virtualChatJid, undefined, 6)
+      .slice()
+      .reverse();
+    const firstUser = recent.find((m) => !m.is_from_me);
+    const firstAI = recent.find((m) => m.is_from_me);
+    if (!firstUser) return;
+
+    const userText = (firstUser.content || '').slice(0, 500);
+    const aiText = (firstAI?.content || '').slice(0, 500);
+    const prompt =
+      `根据以下对话生成一个简洁的中文标题，用于在会话列表中展示。要求：\n` +
+      `- 不超过 16 个字符\n` +
+      `- 概括用户的核心诉求\n` +
+      `- 不要加标点、引号、emoji、括号\n` +
+      `- 直接输出标题，不要解释\n\n` +
+      `用户: ${userText}\n` +
+      (aiText ? `AI: ${aiText}\n` : '');
+
+    const raw = await sdkQuery(prompt, { timeout: 20_000 });
+    if (!raw) return;
+
+    const cleaned = raw
+      .trim()
+      .split('\n')[0]
+      .replace(/^["'「『《【\[(]+|["'」』》】\])]+$/g, '')
+      .trim()
+      .slice(0, 20);
+    if (!cleaned) return;
+
+    // Re-check title_source: user may have manually renamed during the LLM window.
+    const currentAgent = getAgent(agentId);
+    if (currentAgent?.title_source !== 'auto') {
+      logger.info(
+        `[llm-title] skip applying generated title for agent=${agentId} because title_source=${currentAgent?.title_source}`,
+      );
+    } else {
+      updateAgentContextInfo(agentId, { name: cleaned });
+      updateChatName(virtualChatJid, cleaned);
+      finalName = cleaned;
+    }
+  } catch (err) {
+    logger.warn(
+      {
+        err: (err as Error).message?.slice(0, 200),
+        agentId,
+      },
+      'LLM title generation failed',
+    );
+  } finally {
+    // Always clear loading indicator, whether LLM succeeded, returned empty, or threw.
+    const endAgent = getAgent(agentId);
+    if (endAgent) {
+      broadcastAgentStatus(
+        chatJid,
+        agentId,
+        endAgent.status as import('./types.js').AgentStatus,
+        finalName ?? endAgent.name,
+        endAgent.prompt,
+        undefined,
+        undefined,
+        false,
+      );
+    }
+  }
 }
 
 // ─── /sw & /spawn: parallel task spawning ────────────────────────
@@ -5588,6 +5814,14 @@ async function processAgentConversation(
           agentId,
         );
 
+        // Async LLM title upgrade after the first substantive reply.
+        if (isFirstReply && agent.kind === 'conversation') {
+          const fresh = getAgent(agentId);
+          if (fresh?.title_source === 'auto_pending') {
+            void generateAndApplyLLMTitle(agentId, chatJid, virtualChatJid);
+          }
+        }
+
         const localImagePaths = extractLocalImImagePaths(
           text,
           effectiveGroup.folder,
@@ -6508,6 +6742,7 @@ async function ensureDockerRunning(): Promise<void> {
 function buildOnNewChat(
   userId: string,
   homeFolder: string,
+  getOwnerOpenId?: () => string | undefined,
 ): (chatJid: string, chatName: string) => void {
   return (chatJid, chatName) => {
     const existing = registeredGroups[chatJid];
@@ -6597,11 +6832,18 @@ function buildOnNewChat(
       }
       return;
     }
+    const ownerOpenId = getOwnerOpenId?.();
     registerGroup(chatJid, {
       name: chatName,
       folder: homeFolder,
       added_at: new Date().toISOString(),
       created_by: userId,
+      owner_im_id: ownerOpenId,
+      // Only Feishu path (getOwnerOpenId provided) opts into the default
+      // allowlist lock. Other channels leave allowlist unrestricted.
+      sender_allowlist: getOwnerOpenId
+        ? (ownerOpenId ? [ownerOpenId] : [])
+        : undefined,
     });
     logger.info(
       { chatJid, chatName, userId, homeFolder },
@@ -6650,6 +6892,39 @@ function buildTelegramBotAddedHandler(
           'Failed to send Telegram group welcome message',
         ),
       );
+  };
+}
+
+/**
+ * Build the onBotAddedToGroup handler for Feishu connections.
+ * Registers the new group (locked by default) and sends a one-time welcome message.
+ */
+function buildFeishuBotAddedHandler(
+  userId: string,
+  homeFolder: string,
+  getOwnerOpenId?: () => string | undefined,
+): (chatJid: string, chatName: string) => void {
+  const onNewChat = buildOnNewChat(userId, homeFolder, getOwnerOpenId);
+  return (chatJid: string, chatName: string) => {
+    const isNew = !registeredGroups[chatJid] && !getRegisteredGroup(chatJid);
+    onNewChat(chatJid, chatName);
+    if (isNew) {
+      const ownerKnown = !!getOwnerOpenId?.();
+      const welcome =
+        `已加入「${chatName}」。\n\n` +
+        `当前群聊已启用发言者白名单，仅 bot owner 可触发我。\n` +
+        (ownerKnown
+          ? `Owner 已自动从私聊中识别。\n`
+          : `请先向机器人发一条私信，系统将自动识别您的 owner 身份。\n`) +
+        `\n/allow @成员 — 将群成员加入白名单\n` +
+        `/disallow @成员 — 从白名单移除成员\n` +
+        `/allowlist — 查看白名单`;
+      imManager
+        .sendMessage(chatJid, welcome)
+        .catch((err) =>
+          logger.warn({ chatJid, err }, 'Failed to send Feishu group welcome message'),
+        );
+    }
   };
 }
 
@@ -7032,6 +7307,20 @@ function isGroupOwnerMessage(chatJid: string, senderImId?: string): boolean {
 }
 
 /**
+ * 群聊发言者白名单检查。
+ * sender_allowlist 为 null/undefined 时不限制（默认），为空数组时无人可触发，
+ * 为字符串数组时仅列表中的 open_id 可触发。
+ */
+function isSenderAllowedInGroup(chatJid: string, senderImId?: string): boolean {
+  const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
+  if (!group) return false;
+  const allowlist = group.sender_allowlist;
+  if (allowlist === undefined || allowlist === null) return true;
+  if (!senderImId) return false;
+  return allowlist.includes(senderImId);
+}
+
+/**
  * 飞书流式卡片按钮中断回调。
  * 仅由飞书卡片按钮触发，不涉及自动关键词检测。
  */
@@ -7071,13 +7360,24 @@ async function connectUserIMChannels(
   dingtalk: boolean;
   discord: boolean;
 }> {
-  const onNewChat = buildOnNewChat(userId, homeFolder);
+  // Per-user mutable ref for Feishu owner open_id auto-detection via P2P messages
+  const feishuOwnerRef = { value: feishuConfig ? (getUserFeishuConfig(userId)?.ownerOpenId ?? undefined) : undefined };
+  const getFeishuOwnerOpenId = () => feishuOwnerRef.value;
+  const onFeishuP2pSender = (senderOpenId: string) => {
+    if (!feishuOwnerRef.value) {
+      feishuOwnerRef.value = senderOpenId;
+      saveFeishuOwnerOpenId(userId, senderOpenId);
+      logger.info({ userId, senderOpenId }, 'Feishu owner open_id auto-detected from P2P message');
+    }
+  };
+
+  const onNewChat = buildOnNewChat(userId, homeFolder, getFeishuOwnerOpenId);
   const resolveGroupFolder = (chatJid: string): string | undefined => {
     return resolveEffectiveFolder(chatJid);
   };
   const resolveEffectiveChatJid = buildResolveEffectiveChatJid();
   const onAgentMessage = buildOnAgentMessage();
-  const onBotAddedToGroup = buildOnNewChat(userId, homeFolder); // reuse same logic: auto-register
+  const onBotAddedToGroup = buildFeishuBotAddedHandler(userId, homeFolder, getFeishuOwnerOpenId);
   const onBotRemovedFromGroup = buildOnBotRemovedFromGroup();
 
   // 各渠道互相独立，并发连接避免启动时延 N×M 累加
@@ -7096,7 +7396,9 @@ async function connectUserIMChannels(
           onBotRemovedFromGroup,
           shouldProcessGroupMessage,
           isGroupOwnerMessage,
+          isSenderAllowedInGroup,
           onCardInterrupt: handleCardInterrupt,
+          onP2pSender: onFeishuP2pSender,
         })
       : Promise.resolve(false);
 
@@ -7524,7 +7826,16 @@ async function main(): Promise<void> {
     if (config.enabled !== false && config.appId && config.appSecret) {
       const homeGroup = getUserHomeGroup(adminUser.id);
       const homeFolder = homeGroup?.folder || MAIN_GROUP_FOLDER;
-      const onNewChat = buildOnNewChat(adminUser.id, homeFolder);
+      const adminOwnerRef = { value: getUserFeishuConfig(adminUser.id)?.ownerOpenId ?? undefined };
+      const getAdminOwnerOpenId = () => adminOwnerRef.value;
+      const onAdminP2pSender = (senderOpenId: string) => {
+        if (!adminOwnerRef.value) {
+          adminOwnerRef.value = senderOpenId;
+          saveFeishuOwnerOpenId(adminUser.id, senderOpenId);
+          logger.info({ userId: adminUser.id, senderOpenId }, 'Feishu owner open_id auto-detected from P2P message');
+        }
+      };
+      const onNewChat = buildOnNewChat(adminUser.id, homeFolder, getAdminOwnerOpenId);
       const connected = await imManager.connectUserFeishu(
         adminUser.id,
         config,
@@ -7532,11 +7843,13 @@ async function main(): Promise<void> {
         {
           ignoreMessagesBefore: Date.now(),
           onCommand: handleCommand,
-          onBotAddedToGroup: buildOnNewChat(adminUser.id, homeFolder),
+          onBotAddedToGroup: buildFeishuBotAddedHandler(adminUser.id, homeFolder, getAdminOwnerOpenId),
           onBotRemovedFromGroup: buildOnBotRemovedFromGroup(),
           shouldProcessGroupMessage,
           isGroupOwnerMessage,
+          isSenderAllowedInGroup,
           onCardInterrupt: handleCardInterrupt,
+          onP2pSender: onAdminP2pSender,
         },
       );
       if (connected) {
@@ -7618,8 +7931,8 @@ async function main(): Promise<void> {
       return false;
     }
     const homeFolder = homeGroup.folder;
-    const onNewChat = buildOnNewChat(userId, homeFolder);
     const ignoreMessagesBefore = Date.now();
+    const onNewChat = buildOnNewChat(userId, homeFolder);
 
     if (channel === 'feishu') {
       await imManager.disconnectUserFeishu(userId);
@@ -7630,6 +7943,16 @@ async function main(): Promise<void> {
         config.appId &&
         config.appSecret
       ) {
+        const reloadOwnerRef = { value: config.ownerOpenId ?? undefined };
+        const getReloadOwnerOpenId = () => reloadOwnerRef.value;
+        const onReloadP2pSender = (senderOpenId: string) => {
+          if (!reloadOwnerRef.value) {
+            reloadOwnerRef.value = senderOpenId;
+            saveFeishuOwnerOpenId(userId, senderOpenId);
+            logger.info({ userId, senderOpenId }, 'Feishu owner open_id auto-detected from P2P message');
+          }
+        };
+        const onNewChat = buildOnNewChat(userId, homeFolder, getReloadOwnerOpenId);
         const connected = await imManager.connectUserFeishu(
           userId,
           config,
@@ -7637,11 +7960,13 @@ async function main(): Promise<void> {
           {
             ignoreMessagesBefore,
             onCommand: handleCommand,
-            onBotAddedToGroup: buildOnNewChat(userId, homeFolder),
+            onBotAddedToGroup: buildFeishuBotAddedHandler(userId, homeFolder, getReloadOwnerOpenId),
             onBotRemovedFromGroup: buildOnBotRemovedFromGroup(),
             shouldProcessGroupMessage,
             isGroupOwnerMessage,
+            isSenderAllowedInGroup,
             onCardInterrupt: handleCardInterrupt,
+            onP2pSender: onReloadP2pSender,
           },
         );
         logger.info(

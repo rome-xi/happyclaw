@@ -7,6 +7,7 @@
 # ─── Runtime Detection ──────────────────────────────────────
 # 优先使用 bun（跳过编译、启动更快），fallback 到 npm + tsx + node
 HAS_BUN := $(shell command -v bun >/dev/null 2>&1 && echo 1 || echo 0)
+PORT    ?= $(or $(WEB_PORT),3000)
 
 ifeq ($(HAS_BUN),1)
   PKG     := bun
@@ -20,14 +21,28 @@ endif
 
 # ─── Development ─────────────────────────────────────────────
 
-dev: ## 启动前后端（首次自动安装依赖和构建容器镜像）
+dev: ## 启动前后端（首次自动安装依赖和构建容器镜像）；自动暂停 pm2，退出后恢复
 	@if [ ! -d node_modules ] || [ package.json -nt node_modules ] || [ web/package.json -nt web/node_modules ] || [ container/agent-runner/package.json -nt container/agent-runner/node_modules ]; then echo "📦 依赖有更新，安装依赖..."; $(MAKE) install; fi
 	@$(MAKE) _ensure-docker-image
 	@$(PKG) --prefix container/agent-runner run build --silent 2>/dev/null || $(PKG) --prefix container/agent-runner run build
-	@echo "🚀 使用 $(PKG) 启动..."
+	@PM2_WAS_RUNNING=0; \
+	if command -v pm2 >/dev/null 2>&1 && pm2 show happyclaw 2>/dev/null | grep -q 'online'; then \
+	  PM2_WAS_RUNNING=1; \
+	  echo "⏸  暂停 pm2 happyclaw..."; \
+	  pm2 stop happyclaw; \
+	fi; \
+	trap "if [ \"$$PM2_WAS_RUNNING\" = '1' ]; then echo '▶  恢复 pm2 happyclaw...'; pm2 start happyclaw; fi" EXIT INT TERM; \
+	echo "🚀 使用 $(PKG) 启动..."; \
 	$(PKG) run dev:all
 
-dev-backend: ## 仅启动后端（bun 直接跑 TS，node 用 tsx）
+dev-backend: ## 仅启动后端（bun 直接跑 TS，node 用 tsx）；自动暂停 pm2，退出后恢复
+	@PM2_WAS_RUNNING=0; \
+	if command -v pm2 >/dev/null 2>&1 && pm2 show happyclaw 2>/dev/null | grep -q 'online'; then \
+	  PM2_WAS_RUNNING=1; \
+	  echo "⏸  暂停 pm2 happyclaw..."; \
+	  pm2 stop happyclaw; \
+	fi; \
+	trap "if [ \"$$PM2_WAS_RUNNING\" = '1' ]; then echo '▶  恢复 pm2 happyclaw...'; pm2 start happyclaw; fi" EXIT INT TERM; \
 	$(RUNNER)
 
 dev-web: ## 仅启动前端
@@ -49,9 +64,9 @@ build-web: ## 仅编译前端
 
 start: ensure-latest-sdk ## 一键启动生产环境（前台阻塞运行）
 	@# 检查端口是否被占用
-	@if lsof -ti:3000 -sTCP:LISTEN >/dev/null 2>&1; then \
-	  echo "❌ 端口 3000 已被占用，请先停掉旧进程：make stop"; \
-	  lsof -ti:3000 -sTCP:LISTEN | xargs ps -fp 2>/dev/null | tail -1; \
+	@if lsof -ti:$(PORT) -sTCP:LISTEN >/dev/null 2>&1; then \
+	  echo "❌ 端口 $(PORT) 已被占用，请先停掉旧进程：make stop"; \
+	  lsof -ti:$(PORT) -sTCP:LISTEN | xargs ps -fp 2>/dev/null | tail -1; \
 	  exit 1; \
 	fi
 	@if [ ! -d node_modules ] || [ package.json -nt node_modules ] || [ web/package.json -nt web/node_modules ] || [ container/agent-runner/package.json -nt container/agent-runner/node_modules ]; then echo "📦 依赖有更新，安装依赖..."; $(MAKE) install; fi
@@ -114,16 +129,16 @@ _build-backend-if-stale: ## (内部) 后端变更时重新编译（Node 模式�
 logs: ## 实时查看日志（需配合手动后台运行：make start > /tmp/happyclaw.log 2>&1 &）
 	@tail -f /tmp/happyclaw.log
 
-stop: ## 停止占用 3000 端口的服务（前台运行时请直接 Ctrl+C）
-	@-lsof -ti:3000 -sTCP:LISTEN 2>/dev/null | xargs kill 2>/dev/null && echo "✅ 已停止 HappyClaw (端口 3000)" || echo "⚠️  端口 3000 未被占用，无需停止"
+stop: ## 停止占用 WEB_PORT 端口的服务（前台运行时请直接 Ctrl+C）
+	@-lsof -ti:$(PORT) -sTCP:LISTEN 2>/dev/null | xargs kill 2>/dev/null && echo "✅ 已停止 HappyClaw (端口 $(PORT))" || echo "⚠️  端口 $(PORT) 未被占用，无需停止"
 
 status: ## 查看服务运行状态
 	@echo "=== HappyClaw 服务状态 ==="
-	@if lsof -ti:3000 -sTCP:LISTEN >/dev/null 2>&1; then \
-	  echo "✅ 后端进程: 运行中 (端口 3000)"; \
-	  curl -s http://localhost:3000/api/health 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(f\"   健康状态: {d.get('status','unknown')}\")" 2>/dev/null || echo "   健康状态: 无法获取"; \
+	@if lsof -ti:$(PORT) -sTCP:LISTEN >/dev/null 2>&1; then \
+	  echo "✅ 后端进程: 运行中 (端口 $(PORT))"; \
+	  curl -s http://localhost:$(PORT)/api/health 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(f\"   健康状态: {d.get('status','unknown')}\")" 2>/dev/null || echo "   健康状态: 无法获取"; \
 	else \
-	  echo "❌ 后端进程: 未运行 (端口 3000 未占用)"; \
+	  echo "❌ 后端进程: 未运行 (端口 $(PORT) 未占用)"; \
 	fi
 	@echo ""
 	@echo "=== 日志文件 ==="
