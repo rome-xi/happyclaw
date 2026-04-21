@@ -1028,12 +1028,23 @@ export function createFeishuConnection(
       }
     }
 
-    // ── 群聊发言者白名单过滤（命令已处理后，非白名单发言者直接丢弃） ──
+    // ── 群聊发言者白名单过滤（命令已处理后，非白名单发言者丢弃或软拒绝） ──
     if (chatType === 'group' && isSenderAllowedInGroup && !isSenderAllowedInGroup(chatJid, senderOpenId)) {
-      logger.debug(
-        { chatJid, messageId, senderOpenId },
-        'Dropped group message: sender not in allowlist',
-      );
+      // 被 @bot 时回 SILENT 表情表达「看到但故意不回复」，让发言者知道 bot 并非无响应而是被白名单挡掉；
+      // 未 @bot 时静默丢弃，避免把群聊闲聊污染成一堆表情。
+      const isBotMentioned = !!botOpenId && (mentions?.some((m) => m.id?.open_id === botOpenId) ?? false);
+      if (isBotMentioned) {
+        addReaction(messageId, 'SILENT').catch(() => {});
+        logger.debug(
+          { chatJid, messageId, senderOpenId },
+          'Soft-rejected group message with SILENT reaction: sender not in allowlist',
+        );
+      } else {
+        logger.debug(
+          { chatJid, messageId, senderOpenId },
+          'Dropped group message: sender not in allowlist',
+        );
+      }
       return;
     }
 
