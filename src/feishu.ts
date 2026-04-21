@@ -44,8 +44,8 @@ export interface ConnectOptions {
   onNewChat?: (chatJid: string, chatName: string) => void;
   /** 热重连时设置：丢弃 create_time 早于此时间戳（epoch ms）的消息，避免处理渠道关闭期间的堆积消息 */
   ignoreMessagesBefore?: number;
-  /** 斜杠指令回调（如 /clear），返回回复文本或 null */
-  onCommand?: (chatJid: string, command: string, senderImId?: string) => Promise<string | null>;
+  /** 斜杠指令回调（如 /clear），返回回复文本或 null；mentions 仅飞书渠道传入，用于 /allow 等命令 */
+  onCommand?: (chatJid: string, command: string, senderImId?: string, mentions?: FeishuMentionLike[]) => Promise<string | null>;
   /** 根据 chatJid 解析群组 folder，用于下载文件/图片到工作区 */
   resolveGroupFolder?: (chatJid: string) => string | undefined;
   /** 将 IM chatJid 解析为绑定目标 JID（conversation agent 或工作区主对话） */
@@ -63,8 +63,12 @@ export interface ConnectOptions {
   shouldProcessGroupMessage?: (chatJid: string, senderImId?: string) => boolean;
   /** owner_mentioned 模式下检查发送者是否为 owner */
   isGroupOwnerMessage?: (chatJid: string, senderImId?: string) => boolean;
+  /** 发言者白名单：命令处理之后、mention 门控之前调用；返回 false 则丢弃 */
+  isSenderAllowedInGroup?: (chatJid: string, senderImId?: string) => boolean;
   /** 飞书流式卡片按钮中断回调 */
   onCardInterrupt?: (chatJid: string) => void;
+  /** P2P（私聊）消息到达时调用，用于自动检测 bot owner 的 open_id */
+  onP2pSender?: (senderOpenId: string) => void;
 }
 
 export interface FeishuChatInfo {
@@ -798,6 +802,8 @@ export function createFeishuConnection(
       onAgentMessage,
       shouldProcessGroupMessage,
       isGroupOwnerMessage,
+      isSenderAllowedInGroup,
+      onP2pSender,
     } = connectOptions || {};
     const {
       chatId,
@@ -865,6 +871,11 @@ export function createFeishuConnection(
 
     // 先注册会话，确保 resolveGroupFolder 能正确解析 folder（含首条文件消息场景）
     onNewChat?.(chatJid, resolvedChatName);
+
+    // P2P 消息：通知调用方用于自动检测 owner open_id
+    if (chatType === 'p2p' && senderOpenId && onP2pSender) {
+      onP2pSender(senderOpenId);
+    }
 
     let attachmentsJson: string | undefined;
 
@@ -985,7 +996,7 @@ export function createFeishuConnection(
         'Feishu slash command detected',
       );
       try {
-        const reply = await onCommand(chatJid, cmdBody, senderOpenId);
+        const reply = await onCommand(chatJid, cmdBody, senderOpenId, mentions);
         logger.info(
           {
             chatJid,
@@ -1015,6 +1026,26 @@ export function createFeishuConnection(
         }
         return;
       }
+    }
+
+    // ── 群聊发言者白名单过滤（命令已处理后，非白名单发言者丢弃或软拒绝） ──
+    if (chatType === 'group' && isSenderAllowedInGroup && !isSenderAllowedInGroup(chatJid, senderOpenId)) {
+      // 被 @bot 时回 SILENT 表情表达「看到但故意不回复」，让发言者知道 bot 并非无响应而是被白名单挡掉；
+      // 未 @bot 时静默丢弃，避免把群聊闲聊污染成一堆表情。
+      const isBotMentioned = !!botOpenId && (mentions?.some((m) => m.id?.open_id === botOpenId) ?? false);
+      if (isBotMentioned) {
+        addReaction(messageId, 'SILENT').catch(() => {});
+        logger.debug(
+          { chatJid, messageId, senderOpenId },
+          'Soft-rejected group message with SILENT reaction: sender not in allowlist',
+        );
+      } else {
+        logger.debug(
+          { chatJid, messageId, senderOpenId },
+          'Dropped group message: sender not in allowlist',
+        );
+      }
+      return;
     }
 
     // ── 群聊 Mention 过滤：require_mention / owner_mentioned 模式下过滤 ──
