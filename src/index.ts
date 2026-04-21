@@ -1549,8 +1549,25 @@ function handleAllowCommand(
   mentions?: Array<{ key?: string; name?: string; id?: { open_id?: string } }>,
 ): string {
   if (!senderImId) return '无法识别发送者身份';
-  const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
+  let group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
   if (!group) return '未找到当前会话';
+
+  // Backfill owner_im_id if the group was registered before the user-level
+  // ownerOpenId was known (e.g., bot added to group first, owner DM'd later).
+  // Only backfill when the sender matches the user-level ownerOpenId.
+  if (!group.owner_im_id && group.created_by) {
+    const userOwnerOpenId = getUserFeishuConfig(group.created_by)?.ownerOpenId;
+    if (userOwnerOpenId && userOwnerOpenId === senderImId) {
+      const updated: RegisteredGroup = { ...group, owner_im_id: senderImId };
+      setRegisteredGroup(chatJid, updated);
+      registeredGroups[chatJid] = updated;
+      group = updated;
+      logger.info(
+        { chatJid, senderImId },
+        'Backfilled owner_im_id via /allow (matched user-level ownerOpenId)',
+      );
+    }
+  }
 
   if (!group.owner_im_id) {
     return '尚未识别到 owner，请先向机器人发一条私信以完成身份识别';
@@ -6719,7 +6736,11 @@ function buildOnNewChat(
       added_at: new Date().toISOString(),
       created_by: userId,
       owner_im_id: ownerOpenId,
-      sender_allowlist: ownerOpenId ? [ownerOpenId] : [],
+      // Only Feishu path (getOwnerOpenId provided) opts into the default
+      // allowlist lock. Other channels leave allowlist unrestricted.
+      sender_allowlist: getOwnerOpenId
+        ? (ownerOpenId ? [ownerOpenId] : [])
+        : undefined,
     });
     logger.info(
       { chatJid, chatName, userId, homeFolder },
