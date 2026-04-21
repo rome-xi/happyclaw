@@ -1697,12 +1697,20 @@ async function generateAndApplyLLMTitle(
       .split('\n')[0]
       .replace(/^["'「『《【\[(]+|["'」』》】\])]+$/g, '')
       .trim()
-      .slice(0, 30);
+      .slice(0, 20);
     if (!cleaned) return;
 
-    updateAgentContextInfo(agentId, { name: cleaned });
-    updateChatName(virtualChatJid, cleaned);
-    finalName = cleaned;
+    // Re-check title_source: user may have manually renamed during the LLM window.
+    const currentAgent = getAgent(agentId);
+    if (currentAgent?.title_source !== 'auto') {
+      logger.info(
+        `[llm-title] skip applying generated title for agent=${agentId} because title_source=${currentAgent?.title_source}`,
+      );
+    } else {
+      updateAgentContextInfo(agentId, { name: cleaned });
+      updateChatName(virtualChatJid, cleaned);
+      finalName = cleaned;
+    }
   } catch (err) {
     logger.warn(
       {
