@@ -42,13 +42,15 @@ import {
 } from './feishu-streaming-card.js';
 import type { DingTalkStreamingCardController } from './dingtalk-streaming-card.js';
 import type { DiscordStreamingEditController } from './discord-streaming-edit.js';
+import type { QQStreamingController } from './qq-streaming-card.js';
 import { CHANNEL_PREFIXES } from './channel-prefixes.js';
 
-/** Union type for any streaming card controller (Feishu, DingTalk, or Discord) */
+/** Union type for any streaming card controller (Feishu, DingTalk, Discord, or QQ) */
 export type StreamingSession =
   | StreamingCardController
   | DingTalkStreamingCardController
-  | DiscordStreamingEditController;
+  | DiscordStreamingEditController
+  | QQStreamingController;
 
 // ─── Unified Interface ──────────────────────────────────────────
 
@@ -511,6 +513,40 @@ export function createQQChannel(config: QQConnectionConfig): IMChannel {
 
     isConnected(): boolean {
       return inner?.isConnected() ?? false;
+    },
+
+    async createStreamingSession(
+      chatId: string,
+      _onCardCreated?: (messageId: string) => void,
+    ): Promise<StreamingSession | undefined> {
+      if (!inner) return undefined;
+      // Stream messages only work for C2C (private chat)
+      if (chatId.startsWith('group:')) return undefined;
+
+      const { QQStreamingController } = await import('./qq-streaming-card.js');
+      const openid = chatId.startsWith('c2c:') ? chatId.slice(4) : chatId;
+      const chatKey = `c2c:${openid}`;
+      const msgSeq = inner.getNextMsgSeq(chatKey);
+      const passiveMsgId = inner.getLastIncomingMsgId(openid);
+      const conn = inner;
+
+      if (!passiveMsgId) {
+        // QQ stream_messages endpoint rejects requests without a passive
+        // msg_id reference. Without it there's no point starting a session.
+        logger.debug(
+          { openid },
+          'QQ streaming session skipped: no incoming msg_id yet',
+        );
+        return undefined;
+      }
+
+      return new QQStreamingController({
+        openid,
+        msgSeq,
+        sendStreamChunk: (oid, params) => conn.sendStreamMessage(oid, params),
+        fallbackSend: (text) => conn.sendMessage(chatKey, text),
+        passiveMsgId,
+      });
     },
   };
 

@@ -262,7 +262,7 @@ class IMConnectionManager {
     onCardCreated?: (messageId: string) => void,
   ): Promise<StreamingSession | undefined> {
     const channelType = getChannelType(jid);
-    if (channelType !== 'feishu' && channelType !== 'dingtalk' && channelType !== 'discord')
+    if (channelType !== 'feishu' && channelType !== 'dingtalk' && channelType !== 'discord' && channelType !== 'qq')
       return undefined;
 
     // Check DingTalk streaming mode: if text mode, skip streaming session creation
