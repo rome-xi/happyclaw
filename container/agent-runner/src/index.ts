@@ -1283,6 +1283,8 @@ async function runQuery(
       '/usr/local/bin/claude',
       '/usr/bin/claude',
       path.join(process.env.HOME || '/root', '.local/bin/claude'),
+      // 容器内 agent-runner 的本地依赖（package.json 声明了 @anthropic-ai/claude-code）
+      '/app/node_modules/.bin/claude',
     ];
     for (const p of commonPaths) {
       if (fs.existsSync(p)) {
