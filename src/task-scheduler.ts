@@ -521,7 +521,10 @@ async function runTask(
           ownerId: workspaceGroup.created_by || undefined,
           notifyChannels: task.notify_channels,
           sourceKind: 'sdk_final',
-          workspaceFolder: workspace.folder,
+          // Use source workspace folder for IM routing — isolated tasks run in
+          // ephemeral workspaces (task-xxxxxx) that have no IM group bindings.
+          // task.group_folder is the workspace where the task was created.
+          workspaceFolder: task.group_folder || undefined,
         });
       } catch (err) {
         logger.error(
