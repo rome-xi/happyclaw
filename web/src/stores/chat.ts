@@ -1073,13 +1073,23 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   resetSession: async (jid: string, agentId?: string) => {
+    // Hold the clearing lock for main-session reset so late-arriving stream
+    // events from the soon-to-be-killed process can't repopulate UI state
+    // (same lock clearHistory uses at chat.ts ~1105). Agent-specific reset
+    // is scoped narrowly enough that the lock isn't needed.
+    // Release the lock BEFORE calling refreshMessages/loadAgentMessages,
+    // which themselves honor `clearing[jid]` and would otherwise skip.
+    const useLock = !agentId;
+    if (useLock) {
+      set((s) => ({ clearing: { ...s.clearing, [jid]: true } }));
+    }
+    let succeeded = false;
     try {
       await api.post<{ success: boolean; dividerMessageId: string }>(
         `/api/groups/${encodeURIComponent(jid)}/reset-session`,
         agentId ? { agentId } : undefined,
       );
       if (agentId) {
-        // Agent-specific: clear agent streaming and refresh agent messages
         set((s) => {
           const nextStreaming = { ...s.agentStreaming };
           delete nextStreaming[agentId];
@@ -1087,17 +1097,25 @@ export const useChatStore = create<ChatState>((set, get) => ({
           delete nextWaiting[agentId];
           return { agentStreaming: nextStreaming, agentWaiting: nextWaiting };
         });
-        await get().loadAgentMessages(jid, agentId);
       } else {
         get().clearStreaming(jid, { preserveThinking: false });
-        // Refresh messages to pick up the divider message
-        await get().refreshMessages(jid);
       }
-      return true;
+      succeeded = true;
     } catch (err) {
       set({ error: err instanceof Error ? err.message : String(err) });
-      return false;
+    } finally {
+      if (useLock) {
+        set((s) => {
+          const { [jid]: _, ...nextClearing } = s.clearing;
+          return { clearing: nextClearing };
+        });
+      }
     }
+    if (succeeded) {
+      if (agentId) await get().loadAgentMessages(jid, agentId);
+      else await get().refreshMessages(jid);
+    }
+    return succeeded;
   },
 
   clearHistory: async (jid: string) => {
@@ -1119,6 +1137,41 @@ export const useChatStore = create<ChatState>((set, get) => ({
         const { [jid]: _pending, ...nextPendingThinking } = s.pendingThinking;
         const { [jid]: _clearing, ...nextClearing } = s.clearing;
 
+        // Collect sub-agent IDs that belonged to this workspace so we can
+        // scrub their per-agent state — backend has deleted the agent rows
+        // already, leaving these Maps orphaned otherwise.
+        const staleAgentIds = (s.agents[jid] || []).map((a) => a.id);
+        const nextAgents = { ...s.agents };
+        delete nextAgents[jid];
+        const nextAgentMessages = { ...s.agentMessages };
+        const nextAgentStreaming = { ...s.agentStreaming };
+        const nextAgentWaiting = { ...s.agentWaiting };
+        for (const aid of staleAgentIds) {
+          delete nextAgentMessages[aid];
+          delete nextAgentStreaming[aid];
+          delete nextAgentWaiting[aid];
+        }
+
+        // Reset UI-scoped state tied to this workspace jid.
+        const nextDrafts = { ...s.drafts };
+        delete nextDrafts[jid];
+        const nextActiveAgentTab = { ...s.activeAgentTab };
+        delete nextActiveAgentTab[jid];
+
+        // Purge SDK Task state that originated from this workspace.
+        const nextSdkTasks = { ...s.sdkTasks };
+        const droppedTaskKeys = new Set<string>();
+        for (const [taskKey, info] of Object.entries(s.sdkTasks)) {
+          if (info.chatJid === jid) {
+            delete nextSdkTasks[taskKey];
+            droppedTaskKeys.add(taskKey);
+          }
+        }
+        const nextSdkTaskAliases = { ...s.sdkTaskAliases };
+        for (const [alias, canonical] of Object.entries(s.sdkTaskAliases)) {
+          if (droppedTaskKeys.has(canonical)) delete nextSdkTaskAliases[alias];
+        }
+
         return {
           messages: nextMessages,
           waiting: { ...s.waiting, [jid]: false },
@@ -1130,6 +1183,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
             nextMessages,
             s.thinkingCache,
           ),
+          agents: nextAgents,
+          agentMessages: nextAgentMessages,
+          agentStreaming: nextAgentStreaming,
+          agentWaiting: nextAgentWaiting,
+          drafts: nextDrafts,
+          activeAgentTab: nextActiveAgentTab,
+          sdkTasks: nextSdkTasks,
+          sdkTaskAliases: nextSdkTaskAliases,
           error: null,
         };
       });

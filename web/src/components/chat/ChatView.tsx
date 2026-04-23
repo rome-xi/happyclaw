@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { toast } from 'sonner';
 import { useChatStore } from '../../stores/chat';
 import { useAuthStore } from '../../stores/auth';
 import { MessageList } from './MessageList';
@@ -355,10 +356,13 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
 
   const handleResetSession = async () => {
     setResetLoading(true);
-    await resetSession(groupJid, resetAgentId ?? undefined);
+    const ok = await resetSession(groupJid, resetAgentId ?? undefined);
     setResetLoading(false);
     setShowResetConfirm(false);
     setResetAgentId(null);
+    if (!ok) {
+      toast.error('清除上下文失败，请稍后重试');
+    }
   };
 
   // --- Drag resize handlers (mouse + touch) ---
@@ -969,7 +973,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
         title="清除上下文"
         message={resetAgentId
           ? '将清除该子对话的 Claude 会话上下文，下次发送消息时将开始全新会话。聊天记录不受影响。'
-          : '将清除 Claude 会话上下文并停止运行中的工作区进程，下次发送消息时将开始全新会话。聊天记录不受影响。'
+          : '将清除主会话的 Claude 上下文并停止运行中的主工作区进程，下次发送消息时将开始全新会话。聊天记录和子对话不受影响。'
         }
         confirmText="清除"
         confirmVariant="danger"
