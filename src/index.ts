@@ -8123,6 +8123,7 @@ async function main(): Promise<void> {
   startWebServer({
     queue,
     getRegisteredGroups: () => registeredGroups,
+    sessions,
     getSessions: () => sessions,
     processGroupMessages,
     ensureTerminalContainerStarted,
