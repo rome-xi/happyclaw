@@ -168,22 +168,26 @@ export default defineConfig(({ command }) => {
                   },
                 },
               },
-              // ─── 消息历史（强一致敏感数据）───
-              // NetworkFirst 而非 SWR：消息可能被删除/撤回/流式补丁，第一帧
-              // 显示陈旧再被覆盖会"闪"。在线时优先网络保证一致性，2s 超时
-              // 才降级到 cache。`?after=` 增量轮询（每 2s）排除以免占用配额。
+              // ─── 消息历史（IM 体验：local-first + 实时推送对账）───
+              // SWR 而非 NetworkFirst：对齐 IM 应用切对话 0ms 出本地缓存的体验。
+              // 一致性靠以下机制保证：
+              //   1. WebSocket new_message / stream_event 实时推送
+              //   2. 2s 轮询拉增量（refreshMessages）
+              //   3. clearHistory / deleteMessage 后调用 invalidateGroupCache(jid)
+              //      主动清掉对应 SW cache 条目，杜绝"幽灵消息"
+              //   4. login/logout 调 clearApiCaches() 阻止跨用户串号
+              // `?after=` 增量轮询（每 2s）排除以免占用 maxEntries 配额。
               // agents 列表不在此处理：store 层已 memoize，SW 介入只会增加
-              // 协议复杂度（双层缓存的失效协调）。
+              // 双层缓存失效协调的复杂度。
               {
                 urlPattern: ({ url, request }) => {
                   if (request.method !== 'GET') return false;
                   if (url.searchParams.has('after')) return false; // 排除轮询
                   return /^\/api\/groups\/[^/]+\/messages$/.test(url.pathname);
                 },
-                handler: 'NetworkFirst',
+                handler: 'StaleWhileRevalidate',
                 options: {
                   cacheName: 'api-groups-cache',
-                  networkTimeoutSeconds: 2,
                   expiration: {
                     maxEntries: 50,
                     maxAgeSeconds: 60 * 60 * 24, // 1 day
