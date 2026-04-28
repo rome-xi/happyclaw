@@ -13,6 +13,7 @@ import crypto from 'crypto';
 import fs from 'node:fs/promises';
 import http from 'node:http';
 import https from 'node:https';
+import path from 'node:path';
 import {
   DWClient,
   TOPIC_ROBOT,
@@ -24,9 +25,15 @@ import { storeChatMetadata, storeMessageDirect, updateChatName } from './db.js';
 import { notifyNewImMessage } from './message-notifier.js';
 import { broadcastNewMessage } from './web.js';
 import { logger } from './logger.js';
+import { GROUPS_DIR } from './config.js';
 import { saveDownloadedFile, MAX_FILE_SIZE } from './im-downloader.js';
+import { extractFileText } from './file-text-extractor.js';
 import { detectImageMimeType } from './image-detector.js';
 import { markdownToPlainText, splitTextChunks } from './im-utils.js';
+import {
+  extractRepliedMsg,
+  type RepliedMsg,
+} from './dingtalk-reply-parser.js';
 
 // ─── Constants ──────────────────────────────────────────────────
 
@@ -130,7 +137,12 @@ interface DingTalkRobotMessage {
   sessionWebhook?: string;
   robotCode?: string;
   msgtype: string;
-  text?: { content: string };
+  originalMsgId?: string;
+  text?: {
+    content: string;
+    isReplyMsg?: boolean;
+    repliedMsg?: RepliedMsg;
+  };
   image?: { contentUrl: string };
   content?: {
     richText?: RichTextEntry[];
@@ -203,6 +215,37 @@ function parseDingTalkChatId(
     return { type: 'group', conversationId: chatId };
   }
 return null;
+}
+
+/**
+ * Build a prompt content block for an attached/quoted file. When possible we
+ * inline the extracted text so weaker models (e.g. MiniMax through Anthropic
+ * protocol) don't need to call Read — they often fail to, or hallucinate from
+ * session cache. On extraction miss the caller gets a path-only reference.
+ */
+async function buildFileContentBlock(params: {
+  fileName: string;
+  savedRelPath: string;
+  groupFolder: string;
+  prefixLabel: string; // e.g. "引用文件" or "文件"
+}): Promise<string> {
+  const { fileName, savedRelPath, groupFolder, prefixLabel } = params;
+  const absPath = path.join(GROUPS_DIR, groupFolder, savedRelPath);
+  const extracted = await extractFileText(absPath);
+
+  if (extracted) {
+    const truncNote = extracted.truncated ? '（已截断）' : '';
+    return [
+      `[${prefixLabel}: ${fileName}]`,
+      `原文件: ${savedRelPath}`,
+      `内容${truncNote}（已自动提取，请直接基于下面内容回答，忽略会话历史里的其它文件）:`,
+      '───',
+      extracted.text,
+      '───',
+    ].join('\n');
+  }
+
+  return `[${prefixLabel}: ${fileName} → ${savedRelPath}]`;
 }
 
 // ─── Factory Function ───────────────────────────────────────────
@@ -1388,7 +1431,106 @@ export function createDingTalkConnection(
       let attachmentsJson: string | undefined;
 
       if (data.msgtype === 'text' && 'text' in data) {
-        content = data.text?.content?.trim() || '';
+        const textBlock = (data as DingTalkRobotMessage).text;
+        const userText = textBlock?.content?.trim() || '';
+        const reply = textBlock?.isReplyMsg
+          ? extractRepliedMsg(
+              textBlock.repliedMsg,
+              (data as DingTalkRobotMessage).originalMsgId,
+            )
+          : null;
+
+        if (reply) {
+          const groupFolder = opts.resolveGroupFolder?.(jid);
+          logger.info(
+            {
+              msgId,
+              replyKind: reply.kind,
+              fileName: reply.fileName,
+              hasDownloadCode: !!(
+                reply.downloadCode || reply.pictureDownloadCode
+              ),
+            },
+            'DingTalk reply-to message detected',
+          );
+
+          if (reply.kind === 'file' && reply.downloadCode) {
+            const fileName = reply.fileName || 'file';
+            const fileBuffer = await downloadDingTalkFileByDownloadCode(
+              reply.downloadCode,
+              data.robotCode ?? '',
+            );
+            if (fileBuffer && groupFolder) {
+              try {
+                const ext = fileName.includes('.')
+                  ? fileName.split('.').pop()!
+                  : '';
+                const savedFilename = ext
+                  ? `file_${Date.now()}.${ext}`
+                  : `file_${Date.now()}`;
+                const savedPath = await saveDownloadedFile(
+                  groupFolder,
+                  'dingtalk',
+                  savedFilename,
+                  fileBuffer,
+                );
+                const fileBlock = await buildFileContentBlock({
+                  fileName,
+                  savedRelPath: savedPath,
+                  groupFolder,
+                  prefixLabel: '引用文件',
+                });
+                content = userText
+                  ? `${fileBlock}\n\n用户问: ${userText}`
+                  : fileBlock;
+              } catch (err) {
+                logger.warn(
+                  { err, msgId, fileName },
+                  'Failed to save DingTalk replied file',
+                );
+                content = userText
+                  ? `[引用文件: ${fileName}（保存失败）]\n${userText}`
+                  : `[引用文件: ${fileName}（保存失败）]`;
+              }
+            } else {
+              content = userText
+                ? `[引用文件: ${fileName}（下载失败）]\n${userText}`
+                : `[引用文件: ${fileName}（下载失败）]`;
+            }
+          } else if (reply.kind === 'picture') {
+            const code = reply.downloadCode || reply.pictureDownloadCode;
+            if (code) {
+              const normalized = await normalizeDingTalkImage(jid, opts, () =>
+                downloadDingTalkImageByDownloadCode(code, data.robotCode ?? ''),
+              );
+              if (normalized?.attachmentsJson) {
+                attachmentsJson = normalized.attachmentsJson;
+                content = userText
+                  ? `[引用图片]\n${userText}`
+                  : normalized.content;
+              } else {
+                content = userText
+                  ? `[引用图片（下载失败）]\n${userText}`
+                  : `[引用图片（下载失败）]`;
+              }
+            } else {
+              content = userText
+                ? `[引用图片（缺少 downloadCode）]\n${userText}`
+                : `[引用图片（缺少 downloadCode）]`;
+            }
+          } else {
+            // text / other — include replied body as context
+            const quoted = reply.textContent
+              ? reply.textContent
+                  .split('\n')
+                  .map((line) => `> ${line}`)
+                  .join('\n')
+              : '> [无法解析的引用内容]';
+            content = userText ? `${quoted}\n\n${userText}` : quoted;
+          }
+        } else {
+          content = userText;
+        }
       } else if (data.msgtype === 'richText' && data.content) {
         // richText: mixed content array with text segments and picture objects
         // e.g. [{text:"hi"},{type:"picture",downloadCode:"...",pictureDownloadCode:"..."}]
@@ -1538,7 +1680,12 @@ export function createDingTalkConnection(
                 savedFilename,
                 fileBuffer,
               );
-              content = `[文件: ${savedPath}]`;
+              content = await buildFileContentBlock({
+                fileName,
+                savedRelPath: savedPath,
+                groupFolder,
+                prefixLabel: '文件',
+              });
             } catch (err) {
               logger.warn({ err }, 'Failed to save DingTalk file to disk');
               content = `[文件: ${fileName}]`;
