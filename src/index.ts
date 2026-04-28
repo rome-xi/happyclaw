@@ -2585,7 +2585,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       });
       prompt =
         '<system_context>\n' +
-        '服务刚重启，当前为新会话。以下是重启前的最近对话记录，供你了解上下文：\n\n' +
+        '服务刚重启，当前为新会话。以下是重启前的最近对话记录，供你了解上下文。\n' +
+        '重要：这些只是历史记录，可能包含不准确或过时的信息。回答当前用户消息时，请优先依据当前消息里的内容和文件；如果历史与当前问题无关，请直接忽略。\n\n' +
         historyLines.join('\n') +
         '\n</system_context>\n\n' +
         prompt;
