@@ -169,13 +169,19 @@ export default defineConfig(({ command }) => {
                 },
               },
               // ─── 消息历史（IM 体验：local-first + 实时推送对账）───
-              // SWR 而非 NetworkFirst：对齐 IM 应用切对话 0ms 出本地缓存的体验。
-              // 一致性靠以下机制保证：
-              //   1. WebSocket new_message / stream_event 实时推送
+              // 使用 StaleWhileRevalidate：cache-first 即时渲染 + 后台 fetch 刷新。
+              //
+              // 已评估 NetworkFirst：实时性更好，但弱网下 200-500ms 等待会
+              // 破坏「切对话加速」这一核心目标（与 WeChat / Telegram / iMessage
+              // 0ms 出本地缓存的标杆体验背离）。权衡后选 SWR。
+              //
+              // 脏数据风险（SWR 第一帧可能渲染陈旧消息）通过下列机制消化：
+              //   1. WebSocket new_message / stream_event 实时推送对账
               //   2. 2s 轮询拉增量（refreshMessages）
               //   3. clearHistory / deleteMessage 后调用 invalidateGroupCache(jid)
               //      主动清掉对应 SW cache 条目，杜绝"幽灵消息"
               //   4. login/logout 调 clearApiCaches() 阻止跨用户串号
+              //   5. 服务端响应头 Cache-Control: private, no-store 兜底
               // `?after=` 增量轮询（每 2s）排除以免占用 maxEntries 配额。
               // agents 列表不在此处理：store 层已 memoize，SW 介入只会增加
               // 双层缓存失效协调的复杂度。
