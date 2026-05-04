@@ -2385,15 +2385,27 @@ export const useChatStore = create<ChatState>((set, get) => ({
   restoreActiveState: async () => {
     try {
       const data = await api.get<{ groups: Array<{ jid: string; active: boolean; pendingMessages?: boolean }> }>('/api/status');
+      const knownJids = new Set(data.groups.map((g) => g.jid));
+
+      // 关键：对 active 群组先 refreshMessages 同步本地与后端真相，再做推断。
+      // 否则 ws 断开期间漏接 agent 完成的 new_message 时，本地最新仍是用户消息，
+      // 下面的 inferredWaiting 会错把 waiting 设回 true，UI 永久卡"正在思考..."。
+      // refreshMessages 内部在拉到 agent 回复时会主动清除 waiting/streaming。
+      // 仅刷新本地已加载过 messages 的群组，避免为侧边栏未点开的群组浪费请求。
+      const currentMessages = get().messages;
+      const activeJidsToRefresh = data.groups
+        .filter((g) => g.active && currentMessages[g.jid])
+        .map((g) => g.jid);
+      await Promise.all(
+        activeJidsToRefresh.map((jid) => get().refreshMessages(jid)),
+      );
+
       set((s) => {
         const nextWaiting = { ...s.waiting };
         const nextStreaming = { ...s.streaming };
 
-        // 构建后端已知的群组集合；不在集合中的 JID 说明后端无活跃进程
-        // （pm2 restart 后 queue 为空，所有 JID 都不在集合中）。
-        const knownJids = new Set(data.groups.map((g) => g.jid));
-
         // 清除后端不可见的 JID 的 waiting/streaming（进程已死）
+        // （pm2 restart 后 queue 为空，所有 JID 都不在集合中）。
         for (const jid of Object.keys(nextWaiting)) {
           if (!knownJids.has(jid)) {
             delete nextWaiting[jid];
@@ -2415,6 +2427,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
             continue;
           }
           // active 可能仅表示 runner 空闲存活，这里回退到消息语义推断。
+          // 上面已 refreshMessages，s.messages 已与 DB 同步。
           const msgs = s.messages[g.jid] || [];
           const latest = msgs.length > 0 ? msgs[msgs.length - 1] : null;
           const inferredWaiting =
