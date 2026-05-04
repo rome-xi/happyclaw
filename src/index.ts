@@ -5118,7 +5118,6 @@ async function processTaskIpc(
         sourceGroup,
         sourceGroupEntry,
         isAdminHome,
-        isHome,
       );
       break;
 
@@ -5470,7 +5469,6 @@ async function handleDiscordIpcRequest(
   sourceGroup: string,
   sourceGroupEntry: RegisteredGroup | undefined,
   isAdminHome: boolean,
-  isHome: boolean,
 ): Promise<void> {
   const requestId = data.requestId;
   if (!requestId || !SAFE_REQUEST_ID_RE.test(requestId)) {

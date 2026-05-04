@@ -85,6 +85,10 @@ async function pollIpcResult(
   throw new Error(`Timeout waiting for IPC result (${timeoutMs / 1000}s)`);
 }
 
+function newRequestId(): string {
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
 // --- Memory helpers ---
 const MEMORY_EXTENSIONS = new Set(['.md', '.txt']);
 const MEMORY_SUBDIRS = new Set(['memory', 'conversations']);
@@ -628,7 +632,7 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
       "List all scheduled tasks. From admin home: shows all tasks. From other groups: shows only that group's tasks.",
       {},
       async () => {
-        const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const requestId = newRequestId();
         try {
           const result = await pollIpcResult(
             TASKS_DIR,
@@ -854,7 +858,7 @@ Returns up to 100 messages per call (default 50), ordered oldest-first. Use "bef
             isError: true,
           };
         }
-        const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const requestId = newRequestId();
         try {
           const result = await pollIpcResult(
             TASKS_DIR,
@@ -948,7 +952,7 @@ Only works when the current chat is a Discord channel.`,
             isError: true,
           };
         }
-        const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const requestId = newRequestId();
         try {
           const result = await pollIpcResult(
             TASKS_DIR,
@@ -1011,7 +1015,7 @@ Returns null if the current chat is a DM (DMs do not belong to a server). Only w
             isError: true,
           };
         }
-        const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const requestId = newRequestId();
         try {
           const result = await pollIpcResult(
             TASKS_DIR,
@@ -1099,7 +1103,7 @@ Example packages: "anthropic/memory", "anthropic/think", "owner/repo", "owner/re
             };
           }
 
-          const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+          const requestId = newRequestId();
           try {
             const result = await pollIpcResult(
               TASKS_DIR,
@@ -1175,7 +1179,7 @@ Use the skills panel in the UI to find the skill ID (directory name, e.g. "memor
             };
           }
 
-          const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+          const requestId = newRequestId();
           try {
             const result = await pollIpcResult(
               TASKS_DIR,

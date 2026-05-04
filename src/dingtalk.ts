@@ -1492,8 +1492,7 @@ export function createDingTalkConnection(
             );
             if (fileBuffer && groupFolder) {
               try {
-                const extWithDot = path.extname(fileName).toLowerCase();
-                const ext = extWithDot.replace(/^\./, '');
+                const ext = path.extname(fileName).slice(1).toLowerCase();
                 const savedFilename = ext
                   ? `file_${Date.now()}.${ext}`
                   : `file_${Date.now()}`;
@@ -1700,9 +1699,7 @@ export function createDingTalkConnection(
           const groupFolder = opts.resolveGroupFolder?.(jid);
           if (groupFolder) {
             try {
-              // Preserve original extension from filename
-              const extWithDot = path.extname(fileName).toLowerCase();
-              const ext = extWithDot.replace(/^\./, '');
+              const ext = path.extname(fileName).slice(1).toLowerCase();
               const savedFilename = ext
                 ? `file_${Date.now()}.${ext}`
                 : `file_${Date.now()}`;
