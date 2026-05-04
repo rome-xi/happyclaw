@@ -8775,9 +8775,14 @@ async function main(): Promise<void> {
 
   let anyFeishuConnected = false;
 
-  for (const user of allActiveUsers) {
+  // Connect each user's IM channels concurrently — startup latency was
+  // previously O(N_users) because the await was inside the for-loop. The
+  // per-user `connectUserIMChannels` already parallelizes within a user, so
+  // wrapping the outer loop in Promise.allSettled drops total cold-start to
+  // ~max(per-user latency).
+  await Promise.allSettled(allActiveUsers.map(async (user) => {
     const homeGroup = getUserHomeGroup(user.id);
-    if (!homeGroup) continue;
+    if (!homeGroup) return;
 
     // Per-user IM config takes precedence; fall back to global config for admin
     const userFeishu = getUserFeishuConfig(user.id);
@@ -8875,7 +8880,7 @@ async function main(): Promise<void> {
       !effectiveDingTalk &&
       !effectiveDiscord
     )
-      continue;
+      return;
 
     try {
       const result = await connectUserIMChannels(
@@ -8908,7 +8913,7 @@ async function main(): Promise<void> {
         'Failed to connect user IM channels',
       );
     }
-  }
+  }));
 
   // Start Feishu group sync if any connection is active
   if (anyFeishuConnected) {

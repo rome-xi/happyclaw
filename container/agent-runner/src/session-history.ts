@@ -76,12 +76,17 @@ export function extractSessionHistory(
   try {
     const transcriptPath = path.join(transcriptDir, `${sessionId}.jsonl`);
 
-    if (!fs.existsSync(transcriptPath)) {
-      log(`Session transcript not found at ${transcriptPath}`);
-      return null;
+    let content: string;
+    try {
+      content = fs.readFileSync(transcriptPath, 'utf-8');
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        log(`Session transcript not found at ${transcriptPath}`);
+        return null;
+      }
+      throw err;
     }
 
-    const content = fs.readFileSync(transcriptPath, 'utf-8');
     const messages = parseTranscript(content);
     if (messages.length === 0) return null;
 
