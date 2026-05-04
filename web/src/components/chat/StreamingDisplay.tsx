@@ -73,22 +73,29 @@ function TaskAgentBlock({ agent, groupJid }: { agent: AgentInfo; groupJid: strin
     if (isRunning) setExpanded(true);
   }, [isRunning]);
 
-  // Local elapsed timer for tools
+  // Local elapsed timer for tools. Depend on the joined tool-id signature
+  // (membership) rather than the array reference — every tool_progress event
+  // produces a fresh array but the same members, and re-creating the interval
+  // each time would prevent it from ever ticking.
+  const activeToolIdSignature = streaming?.activeTools
+    .map((t) => t.toolUseId)
+    .join('|') ?? '';
   useEffect(() => {
-    if (!streaming?.activeTools.length) {
+    if (!activeToolIdSignature) {
       setLocalElapsed({});
       return;
     }
     const interval = setInterval(() => {
       const now = Date.now();
+      const tools = useChatStore.getState().agentStreaming[agent.id]?.activeTools ?? [];
       const next: Record<string, number> = {};
-      for (const tool of streaming.activeTools) {
+      for (const tool of tools) {
         next[tool.toolUseId] = (now - tool.startTime) / 1000;
       }
       setLocalElapsed(next);
     }, 1000);
     return () => clearInterval(interval);
-  }, [streaming?.activeTools]);
+  }, [activeToolIdSignature, agent.id]);
 
   const borderColor = isRunning ? 'border-blue-200/60 dark:border-blue-700/40' : agent.status === 'error' ? 'border-red-200/60 dark:border-red-700/40' : 'border-emerald-200/60 dark:border-emerald-700/40';
   const bgColor = isRunning ? 'bg-blue-50/40 dark:bg-blue-950/30' : agent.status === 'error' ? 'bg-red-50/40 dark:bg-red-950/30' : 'bg-emerald-50/40 dark:bg-emerald-950/30';
@@ -452,24 +459,34 @@ export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNamePr
     prevIsThinkingRef.current = isThinking;
   }, [streaming?.isThinking, streaming?.thinkingText]);
 
-  // Local elapsed time for tools
+  // Local elapsed time for tools. Depend on the joined tool-id signature
+  // (membership) rather than the array reference; tool_progress events bump
+  // the array reference every ~200ms and would otherwise reset the timer
+  // before it ever ticks.
+  const mainActiveToolIdSignature = streaming?.activeTools
+    .map((t) => t.toolUseId)
+    .join('|') ?? '';
   useEffect(() => {
-    if (!streaming?.activeTools.length) {
+    if (!mainActiveToolIdSignature) {
       setLocalElapsed({});
       return;
     }
 
     const interval = setInterval(() => {
       const now = Date.now();
+      const state = useChatStore.getState();
+      const tools = (agentId
+        ? state.agentStreaming[agentId]?.activeTools
+        : state.streaming[groupJid]?.activeTools) ?? [];
       const next: Record<string, number> = {};
-      for (const tool of streaming.activeTools) {
+      for (const tool of tools) {
         next[tool.toolUseId] = (now - tool.startTime) / 1000;
       }
       setLocalElapsed(next);
     }, 1000);
 
     return () => clearInterval(interval);
-  }, [streaming?.activeTools]);
+  }, [mainActiveToolIdSignature, agentId, groupJid]);
 
   const handleThinkingScroll = () => {
     if (!thinkingRef.current) return;
