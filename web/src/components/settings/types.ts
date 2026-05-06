@@ -106,6 +106,7 @@ export interface SystemSettings {
   autoCompactWindow: number;
   disableMemoryLayerForAdminHost: boolean;
   pluginAutoScan: boolean;
+  taskBackfillGraceMs: number;
 }
 
 // ─── OAuth Usage ────────────────────────────────────────────

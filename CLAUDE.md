@@ -546,6 +546,7 @@ WebSocket：`/ws`（协议详见 §3.6）。
 | `MAX_LOGIN_ATTEMPTS` | `5` | 登录失败锁定阈值（可通过设置页覆盖） |
 | `LOGIN_LOCKOUT_MINUTES` | `15` | 锁定持续时间（分钟）（可通过设置页覆盖） |
 | `AUTO_COMPACT_WINDOW` | `0`（禁用，使用 SDK 默认 ~1M） | Claude Agent SDK 自动对话压缩触发点（tokens），0 = 关闭，>0 范围 [10000, 2000000]（可通过设置页覆盖） |
+| `TASK_BACKFILL_GRACE_MS` | `300000`（5min） | 定时任务逾期容忍窗口（毫秒）。停机重启后 `next_run` 距今超过该窗口的任务直接跳过本次（推到下一次触发），避免跨天积压任务集体 fire 刷屏。0 = 关闭旧行为（可通过设置页覆盖） |
 | `TRUST_PROXY` | `false` | 信任反向代理的 `X-Forwarded-For` 头（启用后从代理头获取客户端 IP） |
 | `TZ` | 系统时区 | 定时任务时区 |
 

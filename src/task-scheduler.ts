@@ -19,6 +19,7 @@ import {
 } from './container-runner.js';
 import {
   addGroupMember,
+  advanceSkippedTask,
   getAllTasks,
   cleanupOldTaskRunLogs,
   cleanupStaleRunningLogs,
@@ -852,6 +853,8 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
         logger.info({ count: dueTasks.length }, 'Found due tasks');
       }
 
+      const graceMs = getSystemSettings().taskBackfillGraceMs;
+
       for (const task of dueTasks) {
         // Re-check task status in case it was paused/cancelled
         const currentTask = getTaskById(task.id);
@@ -861,6 +864,37 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
 
         if (runningTaskIds.has(currentTask.id)) {
           continue;
+        }
+
+        // Backfill grace check: if the task is overdue beyond the configured
+        // window (e.g. machine was offline for days), skip this missed run and
+        // advance next_run to its next scheduled trigger. This prevents the
+        // "restart-storm" failure mode where multiple tasks on the same chat
+        // all fire concurrently in the same second after a long downtime.
+        if (graceMs > 0 && currentTask.next_run) {
+          const overdueMs = Date.now() - new Date(currentTask.next_run).getTime();
+          if (overdueMs > graceMs) {
+            const advancedNextRun = computeNextRun(currentTask);
+            advanceSkippedTask(currentTask.id, advancedNextRun);
+            logTaskRun({
+              task_id: currentTask.id,
+              run_at: new Date().toISOString(),
+              duration_ms: 0,
+              status: 'success',
+              result: `Skipped: overdue by ${Math.round(overdueMs / 1000)}s, exceeds backfill grace window (${Math.round(graceMs / 1000)}s)`,
+              error: null,
+            });
+            logger.info(
+              {
+                taskId: currentTask.id,
+                overdueMs,
+                graceMs,
+                nextRun: advancedNextRun,
+              },
+              'Skipping overdue task: exceeds backfill grace window',
+            );
+            continue;
+          }
         }
 
         const groups = deps.registeredGroups();

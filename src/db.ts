@@ -2116,6 +2116,19 @@ export function updateTaskAfterRun(
   ).run(nextRun, now, lastResult, nextRun, id);
 }
 
+// Advance next_run for a task we deliberately did NOT execute (e.g. overdue
+// beyond the backfill grace window). Does not touch last_run, so the task
+// detail view continues to reflect the last *actual* run.
+export function advanceSkippedTask(id: string, nextRun: string | null): void {
+  db.prepare(
+    `
+    UPDATE scheduled_tasks
+    SET next_run = ?, status = CASE WHEN ? IS NULL THEN 'completed' ELSE status END
+    WHERE id = ?
+  `,
+  ).run(nextRun, nextRun, id);
+}
+
 export function logTaskRun(log: TaskRunLog): void {
   db.prepare(
     `
