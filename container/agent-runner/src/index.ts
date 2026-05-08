@@ -1318,7 +1318,13 @@ async function runQuery(
               .join('')
           : '';
         if (topLevelText) {
-          canonicalAssistantText = topLevelText;
+          // Accumulate rather than overwrite. The SDK splits assistant output
+          // into multiple messages around each tool_use call (text → tool_use →
+          // text → tool_use → text...), so taking only the last message's text
+          // drops everything emitted before the first tool call. The canonical
+          // text must be the concatenation of all top-level text content blocks
+          // in this turn.
+          canonicalAssistantText = (canonicalAssistantText || '') + topLevelText;
           canonicalAssistantUuid = assistantMsg.uuid as string;
         }
       }
