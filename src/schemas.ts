@@ -246,6 +246,14 @@ export const SystemSettingsSchema = z.object({
     .optional(),
   disableMemoryLayerForAdminHost: z.boolean().optional(),
   pluginAutoScan: z.boolean().optional(),
+  taskBackfillGraceMs: z
+    .number()
+    .int()
+    .refine(
+      (v) => v === 0 || (v >= 1000 && v <= 86400000),
+      'taskBackfillGraceMs must be 0 (disabled) or between 1000 (1s) and 86400000 (24h)',
+    )
+    .optional(),
 });
 
 export const AppearanceConfigSchema = z.object({

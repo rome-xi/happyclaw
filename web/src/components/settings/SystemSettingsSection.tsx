@@ -140,6 +140,19 @@ const fields: FieldConfig[] = [
     max: 2000,
     step: 10,
   },
+  {
+    key: 'taskBackfillGraceMs',
+    label: '定时任务逾期容忍窗口',
+    description:
+      '停机/重启后，next_run 落在过去且距今超过该窗口的任务直接跳过本次（推到下一次触发），'
+      + '避免跨天积压的多个任务在重启那一秒集体并发刷屏。0 = 关闭（旧行为）。',
+    unit: '分钟',
+    toDisplay: (v) => Math.round(v / 60000),
+    toStored: (v) => v * 60000,
+    min: 0,
+    max: 1440,
+    step: 1,
+  },
 ];
 
 export function SystemSettingsSection() {
