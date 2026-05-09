@@ -59,6 +59,18 @@ export type MentionGateDecision =
 const ALLOW: MentionGateDecision = { allow: true };
 
 /**
+ * 判断飞书消息的 mention 列表是否包含 bot 自身。空 botOpenId 永远返回 false
+ * —— 调用方需自行决定无 botOpenId 时是 fail-closed 还是降级跳过。
+ */
+export function isBotMentioned(
+  botOpenId: string | undefined,
+  mentions: MentionGateMention[] | undefined,
+): boolean {
+  if (!botOpenId) return false;
+  return mentions?.some((m) => m.id?.open_id === botOpenId) ?? false;
+}
+
+/**
  * 评估单条群聊消息是否通过 mention 门控。
  *
  * 行为表（仅当 chatType==='group' 且传入了 shouldProcessGroupMessage 时启用门控；
@@ -89,9 +101,7 @@ export function evaluateMentionGate(input: MentionGateInput): MentionGateDecisio
     return { allow: false, reason: 'bot_open_id_missing' };
   }
 
-  const isBotMentioned =
-    input.mentions?.some((m) => m.id?.open_id === input.botOpenId) ?? false;
-  if (!isBotMentioned) {
+  if (!isBotMentioned(input.botOpenId, input.mentions)) {
     return { allow: false, reason: 'not_mentioned' };
   }
 

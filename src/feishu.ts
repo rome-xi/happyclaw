@@ -25,6 +25,7 @@ import { optimizeMarkdownStyle } from './feishu-markdown-style.js';
 import { buildAgentReplyCard } from './feishu-cards/builder.js';
 import {
   evaluateMentionGate,
+  isBotMentioned,
   type MentionGateMention,
 } from './feishu-mention-gate.js';
 import type { FeishuMessageMeta } from './types.js';
@@ -1145,11 +1146,10 @@ export function createFeishuConnection(
     if (chatType === 'group' && isSenderAllowedInGroup && !isSenderAllowedInGroup(chatJid, senderOpenId)) {
       // 被 @bot 时回 SILENT 表情表达「看到但故意不回复」，让发言者知道 bot 并非无响应而是被白名单挡掉；
       // 未 @bot 时静默丢弃，避免把群聊闲聊污染成一堆表情。
-      // 注意：botOpenId 缺失时退化为 false（不加 SILENT 反应）——消息已被 allowlist
-      // 决定丢弃，反应只是 courtesy；不能确认 @ 时宁可不加表情，避免对所有路过消息刷反应。
+      // botOpenId 缺失时 isBotMentioned() 返回 false → 不加 SILENT 反应。
+      // 反应只是 courtesy（消息已被 allowlist 决定丢弃），不能确认 @ 时宁可不加。
       // 与下方 mention gate 的 fail-closed 方向相反：那里是业务正确性边界，必须确认。
-      const isBotMentioned = !!botOpenId && (mentions?.some((m) => m.id?.open_id === botOpenId) ?? false);
-      if (isBotMentioned) {
+      if (isBotMentioned(botOpenId, mentions as MentionGateMention[] | undefined)) {
         addReaction(messageId, 'SILENT').catch(() => {});
         logger.debug(
           { chatJid, messageId, senderOpenId },
