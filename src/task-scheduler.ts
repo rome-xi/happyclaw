@@ -209,6 +209,22 @@ export function getRunningTaskIds(): string[] {
   return [...runningTaskIds];
 }
 
+/**
+ * Decide whether a due task is so overdue that we should skip this missed run
+ * and advance to the next scheduled trigger instead. Prevents the
+ * "restart-storm" failure mode where many tasks fire concurrently after a
+ * long downtime. Exported for direct test coverage of the policy.
+ */
+export function shouldSkipBackfill(
+  nextRunIso: string | null | undefined,
+  nowMs: number,
+  graceMs: number,
+): boolean {
+  if (graceMs <= 0 || !nextRunIso) return false;
+  const overdueMs = nowMs - new Date(nextRunIso).getTime();
+  return overdueMs > graceMs;
+}
+
 function computeNextRun(task: ScheduledTask): string | null {
   if (task.schedule_type === 'cron') {
     const interval = CronExpressionParser.parse(task.schedule_value, {
@@ -866,35 +882,23 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
           continue;
         }
 
-        // Backfill grace check: if the task is overdue beyond the configured
-        // window (e.g. machine was offline for days), skip this missed run and
-        // advance next_run to its next scheduled trigger. This prevents the
-        // "restart-storm" failure mode where multiple tasks on the same chat
-        // all fire concurrently in the same second after a long downtime.
-        if (graceMs > 0 && currentTask.next_run) {
-          const overdueMs = Date.now() - new Date(currentTask.next_run).getTime();
-          if (overdueMs > graceMs) {
-            const advancedNextRun = computeNextRun(currentTask);
-            advanceSkippedTask(currentTask.id, advancedNextRun);
-            logTaskRun({
-              task_id: currentTask.id,
-              run_at: new Date().toISOString(),
-              duration_ms: 0,
-              status: 'success',
-              result: `Skipped: overdue by ${Math.round(overdueMs / 1000)}s, exceeds backfill grace window (${Math.round(graceMs / 1000)}s)`,
-              error: null,
-            });
-            logger.info(
-              {
-                taskId: currentTask.id,
-                overdueMs,
-                graceMs,
-                nextRun: advancedNextRun,
-              },
-              'Skipping overdue task: exceeds backfill grace window',
-            );
-            continue;
-          }
+        if (shouldSkipBackfill(currentTask.next_run, Date.now(), graceMs)) {
+          const overdueMs = Date.now() - new Date(currentTask.next_run!).getTime();
+          const advancedNextRun = computeNextRun(currentTask);
+          advanceSkippedTask(currentTask.id, advancedNextRun);
+          logTaskRun({
+            task_id: currentTask.id,
+            run_at: new Date().toISOString(),
+            duration_ms: 0,
+            status: 'success',
+            result: `Skipped: overdue by ${Math.round(overdueMs / 1000)}s, exceeds backfill grace window (${Math.round(graceMs / 1000)}s)`,
+            error: null,
+          });
+          logger.info(
+            { taskId: currentTask.id, overdueMs, graceMs, nextRun: advancedNextRun },
+            'Skipping overdue task: exceeds backfill grace window',
+          );
+          continue;
         }
 
         const groups = deps.registeredGroups();

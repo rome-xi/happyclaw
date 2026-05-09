@@ -10,10 +10,15 @@ const tmpGroupsDir = path.join(tmpDir, 'groups');
 fs.mkdirSync(tmpStoreDir, { recursive: true });
 fs.mkdirSync(tmpGroupsDir, { recursive: true });
 
-vi.mock('../src/config.js', async () => ({
-  STORE_DIR: tmpStoreDir,
-  GROUPS_DIR: tmpGroupsDir,
-}));
+vi.mock(import('../src/config.js'), async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    DATA_DIR: tmpDir,
+    STORE_DIR: tmpStoreDir,
+    GROUPS_DIR: tmpGroupsDir,
+  };
+});
 
 const {
   initDatabase,
@@ -23,6 +28,8 @@ const {
   advanceSkippedTask,
   updateTaskAfterRun,
 } = await import('../src/db.js');
+
+const { shouldSkipBackfill } = await import('../src/task-scheduler.js');
 
 beforeAll(() => {
   initDatabase();
@@ -112,17 +119,8 @@ describe('task backfill grace — db helpers', () => {
 });
 
 describe('task backfill grace — decision predicate', () => {
-  // Mirrors the inline check in src/task-scheduler.ts. Kept here so the policy
-  // is independently testable without spinning up the scheduler loop.
-  function shouldSkipBackfill(
-    nextRunIso: string | null,
-    nowMs: number,
-    graceMs: number,
-  ): boolean {
-    if (graceMs <= 0 || !nextRunIso) return false;
-    const overdueMs = nowMs - new Date(nextRunIso).getTime();
-    return overdueMs > graceMs;
-  }
+  // Imported directly from production code so a future inline-only change
+  // breaks the test rather than silently drifting from a local mirror.
 
   test('graceMs=0 disables skipping (legacy behavior preserved)', () => {
     const tenDaysAgo = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString();
