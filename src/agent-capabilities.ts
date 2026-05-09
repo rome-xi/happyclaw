@@ -160,8 +160,26 @@ export interface CapabilityCheckResult {
   resolvedPaths: Record<string, string>;
 }
 
-/** Detect which agent capabilities are present on the host. */
-export async function checkHostCapabilities(): Promise<CapabilityCheckResult> {
+let cachedCheck: Promise<CapabilityCheckResult> | null = null;
+
+/** Test-only: drop the cached result so the next call re-probes the host. */
+export function resetHostCapabilitiesCache(): void {
+  cachedCheck = null;
+}
+
+/** Detect which agent capabilities are present on the host. Result is cached
+ * for the process lifetime — host tools don't appear/disappear at runtime. */
+export function checkHostCapabilities(): Promise<CapabilityCheckResult> {
+  if (!cachedCheck) {
+    cachedCheck = doCheckHostCapabilities().catch((err) => {
+      cachedCheck = null;
+      throw err;
+    });
+  }
+  return cachedCheck;
+}
+
+async function doCheckHostCapabilities(): Promise<CapabilityCheckResult> {
   const results = await Promise.all(
     AGENT_CAPABILITIES.map(async (cap) => ({
       cap,
@@ -181,7 +199,6 @@ export async function checkHostCapabilities(): Promise<CapabilityCheckResult> {
       const platformVars = cap.platformEnvVars?.[os.platform()];
       if (platformVars) Object.assign(envVars, platformVars);
 
-      // Resolve the actual path for claude specifically
       if (cap.binary === 'claude') {
         const resolvedPath = await resolveBinaryPath(cap.binary);
         if (resolvedPath) {
