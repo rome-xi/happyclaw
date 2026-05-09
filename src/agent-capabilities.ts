@@ -12,9 +12,14 @@ import { promisify } from 'util';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import { logger } from './logger.js';
 
 const execFileAsync = promisify(execFile);
+
+// Anchor on this source file rather than process.cwd() — pm2 / host mode may
+// launch from a different working directory.
+const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 export interface AgentCapability {
   /** Human-readable name */
@@ -105,7 +110,7 @@ function resolveSdkBundledClaude(): string | null {
   if (!plat || !arch) return null;
   const binName = process.platform === 'win32' ? 'claude.exe' : 'claude';
   const candidate = path.join(
-    process.cwd(),
+    PROJECT_ROOT,
     'container',
     'agent-runner',
     'node_modules',
