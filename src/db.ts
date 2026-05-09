@@ -1342,55 +1342,62 @@ export function setLastGroupSync(): void {
 }
 
 /**
- * Coerce a value bound to a TEXT column into a real JS string.
+ * Coerce a value flowing through a TEXT-affinity column into a JS string.
  *
- * SQLite has dynamic typing: a TEXT-affinity column will silently accept a
- * Buffer/Uint8Array binding and store it as BLOB. better-sqlite3 then reads
- * that cell back as a Buffer, which propagates through JSON.stringify as
+ * SQLite is dynamically typed: a TEXT column will silently accept a
+ * Buffer/Uint8Array binding and store it as BLOB. better-sqlite3 reads such
+ * cells back as Buffer, which propagates through JSON.stringify as
  * `{type:"Buffer",data:[…]}` and breaks any consumer expecting a string.
  *
- * Caller contracts are typed `string`, but TypeScript is erased at runtime —
- * so wrap every text-column binding with this guard. Buffers are decoded as
- * UTF-8 (the only encoding the codebase ever stores); other shapes are
- * coerced via String() and a warn-level log surfaces the offending caller.
+ * Wraps both write paths (where `warnField` surfaces the offending caller)
+ * and read paths (no `warnField`, silent normalization of legacy bad data).
  */
-function coerceTextField(
-  value: unknown,
-  field: string,
-): string {
+function toUtf8String(value: unknown, warnField?: string): string {
   if (typeof value === 'string') return value;
   if (value == null) return '';
   if (Buffer.isBuffer(value) || value instanceof Uint8Array) {
     const decoded = Buffer.from(value as Uint8Array).toString('utf8');
-    logger.warn(
-      { field, byteLen: (value as Uint8Array).byteLength, sample: decoded.slice(0, 80), stack: new Error().stack },
-      'coerceTextField: received Buffer/Uint8Array, decoded as UTF-8',
-    );
+    if (warnField) {
+      logger.warn(
+        { field: warnField, byteLen: (value as Uint8Array).byteLength, sample: decoded.slice(0, 80) },
+        'toUtf8String: Buffer on TEXT column, decoded as UTF-8',
+      );
+    }
     return decoded;
   }
   const coerced = String(value);
-  logger.warn(
-    { field, jsType: typeof value, sample: coerced.slice(0, 80), stack: new Error().stack },
-    'coerceTextField: received non-string, coerced via String()',
-  );
+  if (warnField) {
+    logger.warn(
+      { field: warnField, jsType: typeof value, sample: coerced.slice(0, 80) },
+      'toUtf8String: non-string on TEXT column, coerced via String()',
+    );
+  }
   return coerced;
 }
 
-/**
- * Read-side companion to coerceTextField: SQLite cells with BLOB affinity
- * (legacy bad data written before the write-side guard existed) are read
- * back by better-sqlite3 as Buffer. Decode them to UTF-8 so downstream
- * JSON serialization and React rendering do not choke.
- *
- * Fast path returns the input unchanged when it is already a string.
- */
-function normalizeTextCell(value: unknown): string | null {
-  if (value == null) return null;
-  if (typeof value === 'string') return value;
-  if (Buffer.isBuffer(value) || value instanceof Uint8Array) {
-    return Buffer.from(value as Uint8Array).toString('utf8');
+/** Variant that preserves null (vs the default '' fallback). */
+function toUtf8StringOrNull(value: unknown): string | null {
+  return value == null ? null : toUtf8String(value);
+}
+
+/** Normalize a raw message row from sqlite: decode content + boolify is_from_me.
+ *  The is_from_me overload must come first — TS overload resolution stops at
+ *  the first match and `NewMessage & { is_from_me: number }` is a subtype of
+ *  `NewMessage`. */
+function normalizeMessageRow(
+  row: NewMessage & { is_from_me: number },
+): NewMessage & { is_from_me: boolean };
+function normalizeMessageRow(row: NewMessage): NewMessage;
+function normalizeMessageRow(row: NewMessage & { is_from_me?: number }): NewMessage & { is_from_me?: boolean } {
+  const { is_from_me, content, ...rest } = row;
+  const out: NewMessage & { is_from_me?: boolean } = {
+    ...rest,
+    content: toUtf8String(content),
+  };
+  if (typeof is_from_me === 'number') {
+    out.is_from_me = is_from_me === 1;
   }
-  return String(value);
+  return out;
 }
 
 /**
@@ -1433,7 +1440,7 @@ export function storeMessageDirect(
     sourceJid ?? chatJid,
     sender,
     senderName,
-    coerceTextField(content, 'messages.content'),
+    toUtf8String(content, 'messages.content'),
     timestamp,
     isFromMe ? 1 : 0,
     attachments ?? null,
@@ -1940,7 +1947,7 @@ export function getNewMessages(
     cursor.id,
     ...jids,
   ) as NewMessage[];
-  const rows = rawRows.map((r) => ({ ...r, content: normalizeTextCell(r.content) ?? '' }));
+  const rows = rawRows.map((r) => normalizeMessageRow(r));
   const last = rows[rows.length - 1];
   return {
     messages: rows,
@@ -1958,7 +1965,7 @@ export function getMessagesSince(
     cursor.timestamp,
     cursor.id,
   ) as NewMessage[];
-  return rows.map((r) => ({ ...r, content: normalizeTextCell(r.content) ?? '' }));
+  return rows.map((row) => normalizeMessageRow(row));
 }
 
 export function createTask(
@@ -1973,14 +1980,14 @@ export function createTask(
     task.id,
     task.group_folder,
     task.chat_jid,
-    coerceTextField(task.prompt, 'scheduled_tasks.prompt'),
+    toUtf8String(task.prompt, 'scheduled_tasks.prompt'),
     task.schedule_type,
     task.schedule_value,
     task.context_mode || 'group',
     task.execution_type || 'agent',
     task.script_command == null
       ? null
-      : coerceTextField(task.script_command, 'scheduled_tasks.script_command'),
+      : toUtf8String(task.script_command, 'scheduled_tasks.script_command'),
     task.execution_mode ?? null,
     task.next_run,
     task.status,
@@ -2007,8 +2014,8 @@ function mapTaskRow(row: unknown): ScheduledTask {
   if (r.workspace_jid === undefined) r.workspace_jid = null;
   if (r.workspace_folder === undefined) r.workspace_folder = null;
   // Defensive: legacy BLOB cells in TEXT-affinity columns come back as Buffer.
-  r.prompt = normalizeTextCell(r.prompt) ?? '';
-  if (r.script_command !== undefined) r.script_command = normalizeTextCell(r.script_command);
+  r.prompt = toUtf8String(r.prompt);
+  if (r.script_command !== undefined) r.script_command = toUtf8StringOrNull(r.script_command);
   return r as ScheduledTask;
 }
 
@@ -2058,7 +2065,7 @@ export function updateTask(
 
   if (updates.prompt !== undefined) {
     fields.push('prompt = ?');
-    values.push(coerceTextField(updates.prompt, 'scheduled_tasks.prompt'));
+    values.push(toUtf8String(updates.prompt, 'scheduled_tasks.prompt'));
   }
   if (updates.schedule_type !== undefined) {
     fields.push('schedule_type = ?');
@@ -2085,7 +2092,7 @@ export function updateTask(
     values.push(
       updates.script_command == null
         ? null
-        : coerceTextField(updates.script_command, 'scheduled_tasks.script_command'),
+        : toUtf8String(updates.script_command, 'scheduled_tasks.script_command'),
     );
   }
   if (updates.next_run !== undefined) {
@@ -3002,11 +3009,7 @@ export function getMessagesPage(
     NewMessage & { is_from_me: number }
   >;
 
-  return rows.map((row) => ({
-    ...row,
-    content: normalizeTextCell(row.content) ?? '',
-    is_from_me: row.is_from_me === 1,
-  }));
+  return rows.map((row) => normalizeMessageRow(row));
 }
 
 /**
@@ -3029,11 +3032,7 @@ export function getMessagesAfter(
     )
     .all(chatJid, after, limit) as Array<NewMessage & { is_from_me: number }>;
 
-  return rows.map((row) => ({
-    ...row,
-    content: normalizeTextCell(row.content) ?? '',
-    is_from_me: row.is_from_me === 1,
-  }));
+  return rows.map((row) => normalizeMessageRow(row));
 }
 
 /**
@@ -3067,11 +3066,7 @@ export function getMessagesPageMulti(
     NewMessage & { is_from_me: number }
   >;
 
-  return rows.map((row) => ({
-    ...row,
-    content: normalizeTextCell(row.content) ?? '',
-    is_from_me: row.is_from_me === 1,
-  }));
+  return rows.map((row) => normalizeMessageRow(row));
 }
 
 /**
@@ -3099,11 +3094,7 @@ export function getMessagesAfterMulti(
     NewMessage & { is_from_me: number }
   >;
 
-  return rows.map((row) => ({
-    ...row,
-    content: normalizeTextCell(row.content) ?? '',
-    is_from_me: row.is_from_me === 1,
-  }));
+  return rows.map((row) => normalizeMessageRow(row));
 }
 
 /**
@@ -3149,11 +3140,7 @@ export function getMessagesByTimeRange(
     NewMessage & { is_from_me: number }
   >;
 
-  return rows.map((row) => ({
-    ...row,
-    content: normalizeTextCell(row.content) ?? '',
-    is_from_me: row.is_from_me === 1,
-  }));
+  return rows.map((row) => normalizeMessageRow(row));
 }
 
 /**
