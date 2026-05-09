@@ -762,7 +762,10 @@ DELETE /api/plugins/marketplaces/:name
 
 文件：
 
-- 新建 `src/plugin-command-expander.ts`
+- 新建 `src/plugin-expander-context.ts`
+- 新建 `src/plugin-expander-sentinel.ts`
+- 新建 `src/plugin-expander-store.ts`
+- 新建 `src/plugin-expander-core.ts`
 - 新建 `src/plugin-inline-bash.ts`
 - 修改消息处理入口
 - 新增 tests
