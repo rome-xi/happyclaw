@@ -121,6 +121,7 @@ import {
   resolveBroadcastFolder,
   resolveTaskRoutingDecision,
 } from './task-routing.js';
+import { resolveImGroupDefaults } from './im-group-defaults.js';
 import {
   applyAutoIsolateContextForGroups,
   getUserContextIsolationConfig,
@@ -7327,6 +7328,10 @@ function buildOnNewChat(
       return;
     }
     const ownerOpenId = getOwnerOpenId?.();
+    const ownerUser = getUserById(userId);
+    const groupDefaults = resolveImGroupDefaults({
+      ownerDefaultRequireMention: ownerUser?.default_require_mention,
+    });
     registerGroup(chatJid, {
       name: chatName,
       folder: homeFolder,
@@ -7338,9 +7343,16 @@ function buildOnNewChat(
       sender_allowlist: getOwnerOpenId
         ? (ownerOpenId ? [ownerOpenId] : [])
         : undefined,
+      require_mention: groupDefaults.requireMention,
     });
     logger.info(
-      { chatJid, chatName, userId, homeFolder },
+      {
+        chatJid,
+        chatName,
+        userId,
+        homeFolder,
+        requireMention: groupDefaults.requireMention,
+      },
       'Auto-registered IM chat',
     );
 
