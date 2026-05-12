@@ -16,6 +16,7 @@ import {
   getGroupMemberRole,
   getSessionWithUser,
 } from './db.js';
+import type { WhatsAppConnectionState } from './whatsapp.js';
 
 export interface WsClientInfo {
   sessionId: string;
@@ -84,7 +85,14 @@ export interface WebDeps {
   }) => Promise<boolean>;
   reloadUserIMConfig?: (
     userId: string,
-    channel: 'feishu' | 'telegram' | 'qq' | 'wechat' | 'dingtalk' | 'discord',
+    channel:
+      | 'feishu'
+      | 'telegram'
+      | 'qq'
+      | 'wechat'
+      | 'dingtalk'
+      | 'discord'
+      | 'whatsapp',
   ) => Promise<boolean>;
   isFeishuConnected?: () => boolean;
   isTelegramConnected?: () => boolean;
@@ -94,6 +102,10 @@ export interface WebDeps {
   isUserWeChatConnected?: (userId: string) => boolean;
   isUserDingTalkConnected?: (userId: string) => boolean;
   isUserDiscordConnected?: (userId: string) => boolean;
+  isUserWhatsAppConnected?: (userId: string) => boolean;
+  getUserWhatsAppState?: (userId: string) => WhatsAppConnectionState;
+  /** Hard logout: clears WhatsApp auth state on disk so next enable starts fresh. */
+  logoutUserWhatsApp?: (userId: string, accountId?: string) => Promise<void>;
   processAgentConversation?: (
     chatJid: string,
     agentId: string,
