@@ -133,6 +133,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
   const renameConversation = useChatStore(s => s.renameConversation);
   const reorderConversations = useChatStore(s => s.reorderConversations);
   const loadAgentMessages = useChatStore(s => s.loadAgentMessages);
+  const hydrateAgentMessages = useChatStore(s => s.hydrateAgentMessages);
   const refreshAgentMessages = useChatStore(s => s.refreshAgentMessages);
   const sendAgentMessage = useChatStore(s => s.sendAgentMessage);
   const agentMessages = useChatStore(s => s.agentMessages);
@@ -358,13 +359,19 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
 
   // Load messages for conversation agent tabs
   useEffect(() => {
+    let cancelled = false;
     if (activeAgentTab && isConversationTab) {
       const existing = agentMessages[activeAgentTab];
       if (!existing) {
-        loadAgentMessages(groupJid, activeAgentTab);
+        const agentId = activeAgentTab;
+        void (async () => {
+          await hydrateAgentMessages(groupJid, agentId);
+          if (!cancelled) await loadAgentMessages(groupJid, agentId);
+        })();
       }
     }
-  }, [activeAgentTab, isConversationTab, groupJid, loadAgentMessages, agentMessages]);
+    return () => { cancelled = true; };
+  }, [activeAgentTab, isConversationTab, groupJid, hydrateAgentMessages, loadAgentMessages, agentMessages]);
 
   // 监听 WebSocket 流式事件
   useEffect(() => {

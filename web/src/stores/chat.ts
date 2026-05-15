@@ -5,6 +5,12 @@ import { useFileStore } from './files';
 import { useAuthStore } from './auth';
 import { showToast, notifyIfHidden, shouldEmitBackgroundTaskNotice, showNotificationPromptToast } from '../utils/toast';
 import { invalidateGroupCache } from '../utils/pwaCache';
+import {
+  deleteAgentMessageSnapshot,
+  deleteGroupMessageSnapshots,
+  loadAgentMessageSnapshot,
+  saveAgentMessageSnapshot,
+} from '../utils/messageSnapshotCache';
 import type { GroupInfo, AgentInfo, AvailableImGroup } from '../types';
 
 export type { GroupInfo, AgentInfo };
@@ -237,6 +243,7 @@ interface ChatState {
   createConversation: (jid: string, name?: string, description?: string) => Promise<AgentInfo | null>;
   renameConversation: (jid: string, agentId: string, name: string) => Promise<boolean>;
   loadAgentMessages: (jid: string, agentId: string, loadMore?: boolean) => Promise<void>;
+  hydrateAgentMessages: (jid: string, agentId: string) => Promise<void>;
   sendAgentMessage: (jid: string, agentId: string, content: string, attachments?: Array<{ data: string; mimeType: string }>) => boolean;
   refreshAgentMessages: (jid: string, agentId: string) => Promise<void>;
   // Runner state sync
@@ -1195,6 +1202,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // Invalidate SW cache for this group so the next page load doesn't
       // serve a stale messages/agents response from before the clear (#467).
       void invalidateGroupCache(jid);
+      void deleteGroupMessageSnapshots(jid);
 
       set((s) => {
         // Delete the key entirely (not []==[]) so selectGroup/ChatView effect
@@ -1785,9 +1793,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
     // Route to agentMessages if this is a conversation agent message
     if (agentId) {
+      let snapshotMessages: Message[] | null = null;
+      let snapshotHasMore = false;
       set((s) => {
         const existing = s.agentMessages[agentId] || [];
         const updated = mergeMessagesChronologically(existing, [msg]);
+        snapshotMessages = updated;
+        snapshotHasMore = !!s.agentHasMore[agentId];
         const isAgentReply =
           msg.is_from_me &&
           msg.sender !== '__system__' &&
@@ -1818,6 +1830,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
           agentStreaming: nextAgentStreaming,
         };
       });
+      if (snapshotMessages) {
+        void saveAgentMessageSnapshot(
+          chatJid,
+          agentId,
+          snapshotMessages,
+          snapshotHasMore,
+        );
+      }
       return;
     }
 
@@ -2137,12 +2157,19 @@ export const useChatStore = create<ChatState>((set, get) => ({
   deleteAgentAction: async (jid, agentId) => {
     try {
       await api.delete(`/api/groups/${encodeURIComponent(jid)}/agents/${agentId}`);
+      void deleteAgentMessageSnapshot(jid, agentId);
       clearSdkTaskCleanupTimer(agentId);
       clearSdkTaskStaleTimer(agentId);
       set((s) => {
         const updated = (s.agents[jid] || []).filter((a) => a.id !== agentId);
+        const nextAgentMessages = { ...s.agentMessages };
+        delete nextAgentMessages[agentId];
         const nextAgentStreaming = { ...s.agentStreaming };
         delete nextAgentStreaming[agentId];
+        const nextAgentWaiting = { ...s.agentWaiting };
+        delete nextAgentWaiting[agentId];
+        const nextAgentHasMore = { ...s.agentHasMore };
+        delete nextAgentHasMore[agentId];
         const nextActiveTab = { ...s.activeAgentTab };
         if (nextActiveTab[jid] === agentId) nextActiveTab[jid] = null;
         const nextSdkTasks = { ...s.sdkTasks };
@@ -2150,7 +2177,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
         const nextSdkTaskAliases = removeSdkTaskAliases(s.sdkTaskAliases, agentId);
         return {
           agents: { ...s.agents, [jid]: updated },
+          agentMessages: nextAgentMessages,
           agentStreaming: nextAgentStreaming,
+          agentWaiting: nextAgentWaiting,
+          agentHasMore: nextAgentHasMore,
           activeAgentTab: nextActiveTab,
           sdkTasks: nextSdkTasks,
           sdkTaskAliases: nextSdkTaskAliases,
@@ -2233,19 +2263,40 @@ export const useChatStore = create<ChatState>((set, get) => ({
         `/api/groups/${encodeURIComponent(jid)}/messages?${params}`,
       );
       const sorted = [...data.messages].reverse();
+      let snapshotMessages: Message[] | null = null;
       set((s) => {
         const merged = mergeMessagesChronologically(
           s.agentMessages[agentId] || [],
           sorted,
         );
+        snapshotMessages = merged;
         return {
           agentMessages: { ...s.agentMessages, [agentId]: merged },
           agentHasMore: { ...s.agentHasMore, [agentId]: data.hasMore },
         };
       });
+      if (snapshotMessages) {
+        void saveAgentMessageSnapshot(jid, agentId, snapshotMessages, data.hasMore);
+      }
     } catch (err) {
       set({ error: err instanceof Error ? err.message : String(err) });
     }
+  },
+
+  hydrateAgentMessages: async (jid, agentId) => {
+    const snapshot = await loadAgentMessageSnapshot(jid, agentId);
+    if (!snapshot || snapshot.messages.length === 0) return;
+    set((s) => {
+      const existing = s.agentMessages[agentId] || [];
+      const merged = mergeMessagesChronologically(existing, snapshot.messages);
+      return {
+        agentMessages: { ...s.agentMessages, [agentId]: merged },
+        agentHasMore: {
+          ...s.agentHasMore,
+          [agentId]: s.agentHasMore[agentId] ?? snapshot.hasMore,
+        },
+      };
+    });
   },
 
   sendAgentMessage: (jid, agentId, content, attachments?) => {
@@ -2284,11 +2335,15 @@ export const useChatStore = create<ChatState>((set, get) => ({
       );
 
       if (data.messages.length > 0) {
+        let snapshotMessages: Message[] | null = null;
+        let snapshotHasMore = false;
         set((s) => {
           const merged = mergeMessagesChronologically(
             s.agentMessages[agentId] || [],
             data.messages,
           );
+          snapshotMessages = merged;
+          snapshotHasMore = !!s.agentHasMore[agentId];
           const agentReplied = data.messages.some(
             (m) =>
               m.is_from_me &&
@@ -2307,6 +2362,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
             agentStreaming: nextAgentStreaming,
           };
         });
+        if (snapshotMessages) {
+          void saveAgentMessageSnapshot(jid, agentId, snapshotMessages, snapshotHasMore);
+        }
       }
     } catch (err) {
       set({ error: err instanceof Error ? err.message : String(err) });
