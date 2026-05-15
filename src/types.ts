@@ -206,6 +206,14 @@ export interface User {
   ai_avatar_emoji: string | null;
   ai_avatar_color: string | null;
   ai_avatar_url: string | null;
+  /**
+   * Per-user default for require_mention on auto-registered IM group chats.
+   * When true, newly auto-registered Feishu/Telegram/etc groups start with
+   * require_mention=1 (only @bot triggers a response). false preserves the
+   * legacy default of responding to every owner-sent message in the group.
+   * Existing groups are not retroactively changed.
+   */
+  default_require_mention: boolean;
   created_at: string;
   updated_at: string;
   last_login_at: string | null;
@@ -229,6 +237,7 @@ export interface UserPublic {
   ai_avatar_emoji: string | null;
   ai_avatar_color: string | null;
   ai_avatar_url: string | null;
+  default_require_mention: boolean;
   created_at: string;
   last_login_at: string | null;
   last_active_at: string | null;
