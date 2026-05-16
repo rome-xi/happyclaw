@@ -15,6 +15,7 @@ import path from 'path';
 
 import { CONTAINER_IMAGE, DATA_DIR, GROUPS_DIR, TIMEZONE } from './config.js';
 import { logger } from './logger.js';
+import { resolveHostNodeBinary } from './node-resolver.js';
 import {
   loadMountAllowlist,
   validateAdditionalMounts,
@@ -1651,7 +1652,10 @@ export async function runHostAgent(
       };
 
       // 7. 启动进程
-      const proc = spawn('node', [agentRunnerDist], {
+      // Resolve absolute node path: bare 'node' fails with ENOENT under
+      // PM2 / launchd / GUI launchers where PATH lacks nvm/fnm dirs.
+      const hostNodeBinary = resolveHostNodeBinary(hostEnv);
+      const proc = spawn(hostNodeBinary, [agentRunnerDist], {
         stdio: ['pipe', 'pipe', 'pipe'],
         env: hostEnv,
         cwd: groupDir,
