@@ -27,7 +27,7 @@ function ctx(overrides: {
 }
 
 describe('buildNodeCandidates', () => {
-  test('process.execPath comes first when provided', () => {
+  test('process.execPath comes first when it has a Node basename', () => {
     const candidates = buildNodeCandidates(
       ctx({
         execPath: '/custom/node',
@@ -36,6 +36,30 @@ describe('buildNodeCandidates', () => {
       }),
     );
     expect(candidates[0]).toBe('/custom/node');
+  });
+
+  test('filters process execPath and argv0 to Node binary basenames', () => {
+    const accepted = buildNodeCandidates(
+      ctx({
+        execPath: '/usr/bin/nodejs',
+        argv0: 'C:\\Program Files\\nodejs\\node.exe',
+        env: {},
+        isExecutable: () => false,
+      }),
+    );
+    expect(accepted[0]).toBe('/usr/bin/nodejs');
+    expect(accepted[1]).toBe('C:\\Program Files\\nodejs\\node.exe');
+
+    const rejected = buildNodeCandidates(
+      ctx({
+        execPath: '/opt/homebrew/bin/bun',
+        argv0: '/tmp/node-wrapper',
+        env: {},
+        isExecutable: () => false,
+      }),
+    );
+    expect(rejected).not.toContain('/opt/homebrew/bin/bun');
+    expect(rejected).not.toContain('/tmp/node-wrapper');
   });
 
   test('NVM_BIN / FNM_MULTISHELL_PATH / VOLTA_HOME are joined with node', () => {
@@ -50,7 +74,7 @@ describe('buildNodeCandidates', () => {
       }),
     );
     expect(candidates).toContain('/nvm/bin/node');
-    expect(candidates).toContain('/fnm/shell/node');
+    expect(candidates).toContain('/fnm/shell/bin/node');
     expect(candidates).toContain(path.join('/volta', 'bin', 'node'));
   });
 
@@ -183,6 +207,19 @@ describe('resolveNodeBinary', () => {
       }),
     );
     expect(result).toBe('/argv0/node');
+  });
+
+  test('does not choose Bun-like execPath or argv0 even when executable', () => {
+    const exec = new Set(['/opt/homebrew/bin/bun', '/nvm/bin/node']);
+    const result = resolveNodeBinary(
+      ctx({
+        execPath: '/opt/homebrew/bin/bun',
+        argv0: '/opt/homebrew/bin/bun',
+        env: { NVM_BIN: '/nvm/bin' },
+        isExecutable: (p) => exec.has(p),
+      }),
+    );
+    expect(result).toBe('/nvm/bin/node');
   });
 
   test('falls back to NVM_BIN/node when execPath and argv0 are missing', () => {

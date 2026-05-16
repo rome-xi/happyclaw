@@ -45,18 +45,25 @@ export function resolveBinaryOnPath(
   return null;
 }
 
+function hasNodeBasename(filePath: string | undefined): filePath is string {
+  if (!filePath) return false;
+  const basename = path.basename(filePath.replace(/\\/g, '/')).toLowerCase();
+  return (
+    basename === 'node' || basename === 'nodejs' || basename === 'node.exe'
+  );
+}
+
 export function buildNodeCandidates(ctx: NodeResolverContext): string[] {
   const home = ctx.homeDir ?? '';
   const raw: (string | null | undefined)[] = [
-    // process.execPath is the absolute path of the current Node binary —
-    // since the parent process is already running on it, it's guaranteed
-    // to be executable. This is the highest-confidence candidate.
-    ctx.execPath,
-    ctx.argv0,
+    // process.execPath / argv0 can point at non-Node runtimes such as Bun,
+    // so only trust them when the executable basename is a Node binary name.
+    hasNodeBasename(ctx.execPath) ? ctx.execPath : null,
+    hasNodeBasename(ctx.argv0) ? ctx.argv0 : null,
     ctx.env.npm_node_execpath,
     ctx.env.NVM_BIN ? path.join(ctx.env.NVM_BIN, 'node') : null,
     ctx.env.FNM_MULTISHELL_PATH
-      ? path.join(ctx.env.FNM_MULTISHELL_PATH, 'node')
+      ? path.join(ctx.env.FNM_MULTISHELL_PATH, 'bin', 'node')
       : null,
     ctx.env.VOLTA_HOME ? path.join(ctx.env.VOLTA_HOME, 'bin', 'node') : null,
     resolveBinaryOnPath('node', ctx.env.PATH, ctx.isExecutable),
