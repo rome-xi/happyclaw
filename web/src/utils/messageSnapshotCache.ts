@@ -38,8 +38,18 @@ function openSnapshotDb(): Promise<IDBDatabase> {
       }
     };
     request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
-    request.onblocked = () => reject(new Error('IndexedDB upgrade blocked'));
+    // Reset the cached promise on failure so a later call can retry. Otherwise
+    // a single transient IDB error (Safari ITP eviction, private-mode quota
+    // refusal, ...) would poison every subsequent snapshot read/write until
+    // the page is reloaded.
+    request.onerror = () => {
+      dbPromise = null;
+      reject(request.error);
+    };
+    request.onblocked = () => {
+      dbPromise = null;
+      reject(new Error('IndexedDB upgrade blocked'));
+    };
   });
 
   return dbPromise;
@@ -55,6 +65,9 @@ function runAgentStore<T>(
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
     tx.onerror = () => reject(tx.error);
+    // Quota-exceeded triggers abort (not error). Without this, the
+    // returned promise hangs forever on storage pressure.
+    tx.onabort = () => reject(tx.error);
   }));
 }
 
@@ -148,6 +161,7 @@ export async function deleteGroupMessageSnapshots(jid: string): Promise<void> {
       request.onerror = () => reject(request.error);
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
     });
   } catch {
     /* best effort */

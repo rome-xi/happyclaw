@@ -1390,6 +1390,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
   deleteFlow: async (jid: string) => {
     try {
       await api.delete<{ success: boolean }>(`/api/groups/${encodeURIComponent(jid)}`);
+      // Workspace 已删除，连带把该 jid 下所有 conversation agent 的 IDB 快照
+      // 也清掉，避免 IDB 长期堆积孤儿条目。
+      void deleteGroupMessageSnapshots(jid);
       set((s) => {
         const nextGroups = { ...s.groups };
         const nextMessages = { ...s.messages };
@@ -2284,8 +2287,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   hydrateAgentMessages: async (jid, agentId) => {
+    // Honor clearHistory's in-flight lock — same contract as loadMessages /
+    // refreshMessages / handleWsNewMessage. Without this, snapshot hydrate can
+    // race with clearHistory and resurrect just-deleted messages into the
+    // agentMessages map.
+    if (get().clearing[jid]) return;
     const snapshot = await loadAgentMessageSnapshot(jid, agentId);
     if (!snapshot || snapshot.messages.length === 0) return;
+    // Re-check after the async IDB read: clearHistory may have started while
+    // we were awaiting.
+    if (get().clearing[jid]) return;
     set((s) => {
       const existing = s.agentMessages[agentId] || [];
       const merged = mergeMessagesChronologically(existing, snapshot.messages);
