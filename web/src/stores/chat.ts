@@ -2266,19 +2266,20 @@ export const useChatStore = create<ChatState>((set, get) => ({
         `/api/groups/${encodeURIComponent(jid)}/messages?${params}`,
       );
       const sorted = [...data.messages].reverse();
-      let snapshotMessages: Message[] | null = null;
+      let snapshotMessages = sorted;
       set((s) => {
-        const merged = mergeMessagesChronologically(
-          s.agentMessages[agentId] || [],
-          sorted,
-        );
-        snapshotMessages = merged;
+        const nextMessages = loadMore
+          ? mergeMessagesChronologically(s.agentMessages[agentId] || [], sorted)
+          : sorted;
+        snapshotMessages = nextMessages;
         return {
-          agentMessages: { ...s.agentMessages, [agentId]: merged },
+          agentMessages: { ...s.agentMessages, [agentId]: nextMessages },
           agentHasMore: { ...s.agentHasMore, [agentId]: data.hasMore },
         };
       });
-      if (snapshotMessages) {
+      if (!loadMore && snapshotMessages.length === 0) {
+        void deleteAgentMessageSnapshot(jid, agentId);
+      } else {
         void saveAgentMessageSnapshot(jid, agentId, snapshotMessages, data.hasMore);
       }
     } catch (err) {
