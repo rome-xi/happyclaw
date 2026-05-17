@@ -6254,6 +6254,9 @@ async function processAgentConversation(
           try {
             await agentStreamingSession.complete(text);
             streamingCardHandledIM = true;
+            if (replySourceImJid) {
+              imManager.clearAckReaction(replySourceImJid);
+            }
           } catch (err) {
             logger.warn(
               { err, chatJid, agentId },
@@ -6302,6 +6305,7 @@ async function processAgentConversation(
             localImagePaths,
           );
           if (imSent) {
+            imManager.clearAckReaction(replySourceImJid);
             logger.info(
               {
                 chatJid,
@@ -6627,6 +6631,9 @@ async function processAgentConversation(
             partialReply,
             localImagePaths,
           );
+          if (imSent) {
+            imManager.clearAckReaction(replySourceImJid);
+          }
           logger.info({ replySourceImJid, imSent }, 'agent IM reply sent');
         } else {
           logger.warn(
@@ -7678,7 +7685,7 @@ function resolveOrCreateThreadAgent(
   workspace: RegisteredGroup,
   group: RegisteredGroup,
   messageMeta: FeishuMessageMeta & { threadId: string },
-): { effectiveJid: string; agentId: string } {
+): { effectiveJid: string; agentId: string; sourceJid: string } {
   const now = new Date().toISOString();
   const threadId = messageMeta.threadId;
   const rootMessageId = messageMeta.rootId || threadId;
@@ -7768,6 +7775,7 @@ function resolveOrCreateThreadAgent(
   return {
     effectiveJid: `${workspaceJid}#agent:${binding.agent_id}`,
     agentId: binding.agent_id,
+    sourceJid: routeJid,
   };
 }
 
@@ -7780,7 +7788,7 @@ function resolveOrCreateThreadAgent(
 function buildResolveEffectiveChatJid(): (
   chatJid: string,
   messageMeta?: FeishuMessageMeta,
-) => { effectiveJid: string; agentId: string | null } | null {
+) => { effectiveJid: string; agentId: string | null; sourceJid?: string } | null {
   return (chatJid: string, messageMeta) => {
     const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
     if (!group) {
@@ -7806,8 +7814,12 @@ function buildResolveEffectiveChatJid(): (
       group.binding_mode === 'thread_map' &&
       group.target_main_jid &&
       getChannelType(chatJid) === 'feishu' &&
-      messageMeta?.threadId
+      messageMeta &&
+      (messageMeta?.threadId || messageMeta?.rootId || messageMeta?.messageId)
     ) {
+      const threadContextId =
+        messageMeta.threadId || messageMeta.rootId || messageMeta.messageId;
+      if (!threadContextId) return null;
       const workspaceJid = resolveWorkspaceJid(group.target_main_jid);
       if (!workspaceJid) {
         logger.warn(
@@ -7825,7 +7837,7 @@ function buildResolveEffectiveChatJid(): (
         workspaceJid,
         workspace,
         group,
-        { ...messageMeta, threadId: messageMeta.threadId },
+        { ...messageMeta, threadId: threadContextId },
       );
     }
 

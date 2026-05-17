@@ -43,6 +43,7 @@ export interface FeishuMessageMeta {
   threadId?: string;
   rootId?: string;
   parentId?: string;
+  messageId?: string;
   text?: string;
 }
 

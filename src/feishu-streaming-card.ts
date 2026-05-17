@@ -55,6 +55,8 @@ export interface StreamingCardOptions {
   chatId: string;
   /** Reply to this message ID (optional) */
   replyToMsgId?: string;
+  /** When replying to a Feishu topic/thread, keep the card inside that thread. */
+  replyInThread?: boolean;
   /** Called when the card is created or streaming fails */
   onFallback?: () => void;
   /** Called when the initial card is created and messageId is available */
@@ -791,7 +793,11 @@ class CardKitBackend {
    * Send the card as a message (referencing card_id).
    * Returns the message_id.
    */
-  async sendCard(chatId: string, replyToMsgId?: string): Promise<string> {
+  async sendCard(
+    chatId: string,
+    replyToMsgId?: string,
+    replyInThread = false,
+  ): Promise<string> {
     if (!this.cardId) {
       throw new Error('Cannot sendCard before createCard');
     }
@@ -805,7 +811,11 @@ class CardKitBackend {
     if (replyToMsgId) {
       resp = await this.client.im.message.reply({
         path: { message_id: replyToMsgId },
-        data: { content, msg_type: 'interactive' },
+        data: {
+          content,
+          msg_type: 'interactive',
+          ...(replyInThread ? { reply_in_thread: true } : {}),
+        },
       });
     } else {
       resp = await this.client.im.v1.message.create({
@@ -921,7 +931,11 @@ class StreamingModeBackend {
   /**
    * Send the card as a message. Returns message_id.
    */
-  async sendCard(chatId: string, replyToMsgId?: string): Promise<string> {
+  async sendCard(
+    chatId: string,
+    replyToMsgId?: string,
+    replyInThread = false,
+  ): Promise<string> {
     if (!this.cardId) throw new Error('Cannot sendCard before createCard');
 
     const content = JSON.stringify({
@@ -933,7 +947,11 @@ class StreamingModeBackend {
     if (replyToMsgId) {
       resp = await this.client.im.message.reply({
         path: { message_id: replyToMsgId },
-        data: { content, msg_type: 'interactive' },
+        data: {
+          content,
+          msg_type: 'interactive',
+          ...(replyInThread ? { reply_in_thread: true } : {}),
+        },
       });
     } else {
       resp = await this.client.im.v1.message.create({
@@ -1119,6 +1137,7 @@ class MultiCardManager {
   private readonly client: lark.Client;
   private readonly chatId: string;
   private readonly replyToMsgId?: string;
+  private readonly replyInThread: boolean;
   private readonly onCardCreated?: (messageId: string) => void;
   private cardIndex = 0;
   private readonly MAX_ELEMENTS = 45; // safety margin (Feishu limit ~50)
@@ -1127,11 +1146,13 @@ class MultiCardManager {
     client: lark.Client,
     chatId: string,
     replyToMsgId?: string,
+    replyInThread = false,
     onCardCreated?: (messageId: string) => void,
   ) {
     this.client = client;
     this.chatId = chatId;
     this.replyToMsgId = replyToMsgId;
+    this.replyInThread = replyInThread;
     this.onCardCreated = onCardCreated;
   }
 
@@ -1147,7 +1168,11 @@ class MultiCardManager {
     const card = new CardKitBackend(this.client);
     const cardJson = buildSchema2Card(initialText, 'streaming');
     await card.createCard(cardJson);
-    const messageId = await card.sendCard(this.chatId, this.replyToMsgId);
+    const messageId = await card.sendCard(
+      this.chatId,
+      this.replyToMsgId,
+      this.replyInThread,
+    );
     this.cards.push(card);
     this.cardIndex = 0;
     return messageId;
@@ -1258,7 +1283,11 @@ class MultiCardManager {
     );
     await newCard.createCard(newCardJson);
     // New card is sent as a fresh message (not reply)
-    const newMessageId = await newCard.sendCard(this.chatId);
+    const newMessageId = await newCard.sendCard(
+      this.chatId,
+      this.replyToMsgId,
+      this.replyInThread,
+    );
     this.cards.push(newCard);
 
     // Register the new card's messageId for interrupt button routing
@@ -1291,6 +1320,7 @@ export class StreamingCardController {
   private readonly client: lark.Client;
   private readonly chatId: string;
   private readonly replyToMsgId?: string;
+  private readonly replyInThread: boolean;
   private readonly onFallback?: () => void;
   private readonly onCardCreated?: (messageId: string) => void;
 
@@ -1322,6 +1352,7 @@ export class StreamingCardController {
     this.client = opts.client;
     this.chatId = opts.chatId;
     this.replyToMsgId = opts.replyToMsgId;
+    this.replyInThread = opts.replyInThread === true;
     this.onFallback = opts.onFallback;
     this.onCardCreated = opts.onCardCreated;
     this.flushCtrl = new FlushController();
@@ -1689,7 +1720,11 @@ export class StreamingCardController {
       const backend = new StreamingModeBackend(this.client);
       const cardJson = buildStreamingModeCard(initialText);
       await backend.createCard(cardJson);
-      const messageId = await backend.sendCard(this.chatId, this.replyToMsgId);
+      const messageId = await backend.sendCard(
+        this.chatId,
+        this.replyToMsgId,
+        this.replyInThread,
+      );
 
       this.streamingBackend = backend;
       this.messageId = messageId;
@@ -1722,6 +1757,7 @@ export class StreamingCardController {
         this.client,
         this.chatId,
         this.replyToMsgId,
+        this.replyInThread,
         this.onCardCreated,
       );
       const messageId = await this.multiCard.initialize(initialText);
@@ -1768,7 +1804,11 @@ export class StreamingCardController {
       if (this.replyToMsgId) {
         resp = await this.client.im.message.reply({
           path: { message_id: this.replyToMsgId },
-          data: { content, msg_type: 'interactive' },
+          data: {
+            content,
+            msg_type: 'interactive',
+            ...(this.replyInThread ? { reply_in_thread: true } : {}),
+          },
         });
       } else {
         resp = await this.client.im.v1.message.create({
@@ -2139,6 +2179,7 @@ export class StreamingCardController {
       this.client,
       this.chatId,
       this.replyToMsgId,
+      this.replyInThread,
       this.onCardCreated,
     );
     this.multiCard.adoptExistingCard(adoptedCard);
@@ -2267,7 +2308,11 @@ export class StreamingCardController {
       const contCard = new CardKitBackend(this.client);
       const contCardJson = buildSchema2Card(batchText, state, '(续) ', title);
       await contCard.createCard(contCardJson);
-      const newMsgId = await contCard.sendCard(this.chatId);
+      const newMsgId = await contCard.sendCard(
+        this.chatId,
+        this.replyToMsgId,
+        this.replyInThread,
+      );
       this.onCardCreated?.(newMsgId);
     }
   }
