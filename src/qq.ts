@@ -27,6 +27,7 @@ import { saveDownloadedFile, MAX_FILE_SIZE } from './im-downloader.js';
 import { detectImageMimeTypeStrict } from './image-detector.js';
 import path from 'node:path';
 import { markdownToPlainText, splitTextChunks } from './im-utils.js';
+import { ProcessingLock, isStale } from './im-safety/index.js';
 import {
   isTransientError,
   getReconnectDelay,
@@ -380,6 +381,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
 
   // Message deduplication
   const msgCache = new Map<string, number>();
+  const processingLock = new ProcessingLock();
 
   // Per-chat msg_seq counter for active messages
   const msgSeqCounters = new Map<string, number>();
@@ -1468,9 +1470,19 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
   ): Promise<void> {
     try {
       const msgId = data.id;
-      if (!msgId || isDuplicate(msgId)) return;
+      if (!msgId) return;
+      const msgTimeMs = data.timestamp ? new Date(data.timestamp).getTime() : 0;
+      if (isStale(msgTimeMs)) {
+        logger.debug({ msgId, msgTimeMs }, 'Stale QQ C2C message (>30min), dropping');
+        return;
+      }
+      if (isDuplicate(msgId)) return;
+      if (!processingLock.acquire(msgId)) {
+        logger.debug({ msgId }, 'QQ C2C message already in-flight, skipping');
+        return;
+      }
       markSeen(msgId);
-
+      try {
       // Skip stale messages from before connection (hot-reload scenario)
       if (opts.ignoreMessagesBefore && data.timestamp) {
         const msgTime = new Date(data.timestamp).getTime();
@@ -1627,6 +1639,9 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
           'QQ C2C message stored',
         );
       }
+      } finally {
+        processingLock.release(msgId);
+      }
     } catch (err) {
       logger.error({ err }, 'Error handling QQ C2C message');
     }
@@ -1638,9 +1653,19 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
   ): Promise<void> {
     try {
       const msgId = data.id;
-      if (!msgId || isDuplicate(msgId)) return;
+      if (!msgId) return;
+      const msgTimeMs = data.timestamp ? new Date(data.timestamp).getTime() : 0;
+      if (isStale(msgTimeMs)) {
+        logger.debug({ msgId, msgTimeMs }, 'Stale QQ group message (>30min), dropping');
+        return;
+      }
+      if (isDuplicate(msgId)) return;
+      if (!processingLock.acquire(msgId)) {
+        logger.debug({ msgId }, 'QQ group message already in-flight, skipping');
+        return;
+      }
       markSeen(msgId);
-
+      try {
       // Skip stale messages from before connection (hot-reload scenario)
       if (opts.ignoreMessagesBefore && data.timestamp) {
         const msgTime = new Date(data.timestamp).getTime();
@@ -1788,6 +1813,9 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
         { jid, sender: senderName, msgId },
         'QQ group message stored',
       );
+      } finally {
+        processingLock.release(msgId);
+      }
     } catch (err) {
       logger.error({ err }, 'Error handling QQ group message');
     }

@@ -28,6 +28,7 @@ import {
   isBotMentioned,
   type MentionGateMention,
 } from './feishu-mention-gate.js';
+import { ProcessingLock, isStale } from './im-safety/index.js';
 import type { FeishuMessageMeta } from './types.js';
 
 // ─── FeishuConnection Interface ────────────────────────────────
@@ -509,6 +510,7 @@ export function createFeishuConnection(
 
   // Per-instance state
   const msgCache = new Map<string, number>();
+  const processingLock = new ProcessingLock();
   const senderNameCache = new Map<string, string>();
   const lastMessageIdByChat = new Map<string, string>();
   const ackReactionByChat = new Map<string, string>();
@@ -918,8 +920,22 @@ export function createFeishuConnection(
     } = payload;
     if (!chatId || !messageId) return;
 
+    if (isStale(createTimeMs)) {
+      logger.debug(
+        { messageId, createTimeMs, age: Date.now() - createTimeMs },
+        'Stale Feishu message (>30min), dropping',
+      );
+      return;
+    }
     if (isDuplicate(messageId)) {
       logger.debug({ messageId }, 'Duplicate message, skipping');
+      return;
+    }
+    if (!processingLock.acquire(messageId)) {
+      logger.debug(
+        { messageId },
+        'Feishu message already in-flight, skipping duplicate dispatch',
+      );
       return;
     }
     markSeen(messageId);
@@ -927,6 +943,8 @@ export function createFeishuConnection(
       { messageId, messageType, chatId, source },
       'Feishu message received',
     );
+
+    try {
 
     if (
       ignoreMessagesBefore &&
@@ -1303,6 +1321,9 @@ export function createFeishuConnection(
         { chatJid, sender: resolvedSenderName, messageId, source },
         'Feishu message stored',
       );
+    }
+    } finally {
+      processingLock.release(messageId);
     }
   }
 
