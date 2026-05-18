@@ -1129,9 +1129,20 @@ async function runQuery(
   let queryRef: { interrupt(): Promise<void> } | null = null;
   let messageCount = 0;
   let resultCount = 0;
+  let postResultInterruptRequested = false;
   // SDK transport is not ready until system/init is received. Piping user messages
   // before init causes "ProcessTransport is not ready for writing" unhandled rejection.
   let sdkTransportReady = false;
+
+  const interruptQueryForShutdown = (reason: string) => {
+    if (!queryRef) return;
+    if (postResultInterruptRequested) return;
+    postResultInterruptRequested = true;
+    log(`${reason}, interrupting current query before closing stream`);
+    queryRef
+      .interrupt()
+      .catch((err: unknown) => log(`Post-result interrupt failed: ${err}`));
+  };
 
   const pollIpcDuringQuery = () => {
     if (!ipcPolling) return;
@@ -1139,6 +1150,7 @@ async function runQuery(
     if (shouldClose()) {
       log('Close sentinel detected during query, ending stream');
       closedDuringQuery = true;
+      interruptQueryForShutdown('Close sentinel detected during query');
       stream.end();
       ipcPolling = false;
       ipcQueryWatcher.close();
@@ -1164,6 +1176,7 @@ async function runQuery(
     if (resultCount > 0 && shouldDrain()) {
       log('Drain sentinel detected after query result, ending stream');
       closedDuringQuery = true;
+      interruptQueryForShutdown('Drain sentinel detected after query result');
       stream.end();
       ipcPolling = false;
       ipcQueryWatcher.close();
@@ -1175,6 +1188,7 @@ async function runQuery(
     // 这保证了终端预热等场景下容器不会在查询完成后立即退出。
     if (resultReceivedAt && Date.now() - resultReceivedAt > POST_RESULT_TIMEOUT_MS) {
       log(`Post-result timeout (${POST_RESULT_TIMEOUT_MS / 1000}s), closing stream`);
+      interruptQueryForShutdown('Post-result timeout');
       stream.end();
       ipcPolling = false;
       ipcQueryWatcher.close();

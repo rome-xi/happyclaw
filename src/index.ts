@@ -6114,6 +6114,16 @@ async function processAgentConversation(
   let currentAgentSessionId = sessionId;
 
   const wrappedOnOutput = async (output: ContainerOutput) => {
+    queue.markRunnerActivity(virtualJid);
+    if (
+      (output.status === 'success' && output.result !== null) ||
+      (output.status === 'stream' &&
+        output.streamEvent?.eventType === 'status' &&
+        output.streamEvent.statusText === 'interrupted')
+    ) {
+      queue.markRunnerQueryIdle(virtualJid);
+    }
+
     // Track session
     if (output.newSessionId && output.status !== 'error') {
       setSession(effectiveGroup.folder, output.newSessionId, agentId);
@@ -6428,19 +6438,21 @@ async function processAgentConversation(
         commitCursor();
         resetIdleTimer();
 
-        // Spawn agents are fire-and-forget: close after first reply to free process slot.
+        // Conversation agents also close after a final reply. Keeping the
+        // runner warm makes a hung post-reply tool call look like "no
+        // response" even though the reply was already persisted.
         // Skip for overflow_partial/compact_partial — those are intermediate context
         // compression outputs, not the final result; closing now would kill the agent
         // before it finishes the actual task.
         if (
-          agent.kind === 'spawn' &&
+          (agent.kind === 'spawn' || agent.kind === 'conversation') &&
           text &&
           output.sourceKind !== 'overflow_partial' &&
           output.sourceKind !== 'compact_partial'
         ) {
           logger.info(
             { agentId, chatJid },
-            'Spawn agent replied, sending close signal',
+            'Conversation agent replied, sending close signal',
           );
           queue.closeStdin(virtualChatJid);
         }
