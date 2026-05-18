@@ -282,6 +282,16 @@ interface ToolCallState {
   toolInput?: Record<string, unknown>;
 }
 
+interface TaskRunState {
+  id: string;
+  title: string;
+  status: 'running' | 'completed' | 'error' | 'backgrounded';
+  subagentType?: string;
+  lastToolName?: string;
+  summary?: string;
+  updatedAt: number;
+}
+
 /** Extra metadata a caller can attach to a running tool call. */
 export interface ToolCallMeta {
   skillName?: string;
@@ -299,8 +309,8 @@ function formatElapsed(ms: number): string {
 
 // ─── Auxiliary State & Builder ────────────────────────────────
 
-const MAX_THINKING_CHARS = 800;
-const MAX_RECENT_EVENTS = 5;
+const MAX_THINKING_CHARS = 2000;
+const MAX_RECENT_EVENTS = 20;
 const MAX_TOOL_DISPLAY = 5;
 const MAX_TODO_DISPLAY = 10;
 const MAX_TOOL_SUMMARY_CHARS = 60;
@@ -315,6 +325,7 @@ export interface AuxiliaryState {
   activeHook: { hookName: string; hookEvent: string } | null;
   todos: Array<{ id: string; content: string; status: string }> | null;
   recentEvents: Array<{ text: string }>;
+  tasks: Map<string, TaskRunState>;
 }
 
 /**
@@ -402,7 +413,27 @@ function buildAuxiliaryElements(aux: AuxiliaryState): {
     });
   }
 
-  // ④ Hook Status
+  // ④ Task / sub-agent status
+  if (aux.tasks.size > 0) {
+    const tasks = Array.from(aux.tasks.values())
+      .sort((a, b) => b.updatedAt - a.updatedAt)
+      .slice(0, 8);
+    const lines = tasks.map((task) => {
+      const icon =
+        task.status === 'running' ? '🔄' : task.status === 'completed' ? '✅' : task.status === 'backgrounded' ? '🌙' : '❌';
+      const type = task.subagentType ? ` <font color='grey'>${task.subagentType}</font>` : '';
+      const last = task.lastToolName ? ` [${task.lastToolName}]` : '';
+      const summary = task.summary ? `\n  <font color='grey'>${task.summary.slice(0, 160)}</font>` : '';
+      return `${icon} **${task.title.slice(0, 80)}**${type}${last}${summary}`;
+    });
+    before.push({
+      tag: 'markdown',
+      content: `🤖 **子 Agent / Task**\n${lines.join('\n')}`.slice(0, MAX_ELEMENT_CHARS),
+      text_size: 'notation',
+    });
+  }
+
+  // ⑤ Hook Status
   if (aux.activeHook) {
     before.push({
       tag: 'markdown',
@@ -411,7 +442,7 @@ function buildAuxiliaryElements(aux: AuxiliaryState): {
     });
   }
 
-  // ⑤ Todo Progress
+  // ⑥ Todo Progress
   if (aux.todos && aux.todos.length > 0) {
     const total = aux.todos.length;
     const done = aux.todos.filter((t) => t.status === 'completed').length;
@@ -1334,19 +1365,21 @@ export class StreamingCardController {
   private auxFlushCtrl: FlushController | null = null;
 
   // Streaming state
-  private thinking = false;
-  private thinkingText = '';
-  private toolCalls = new Map<string, ToolCallState>();
-  private startTime = 0;
+    private thinking = false;
+    private thinkingText = '';
+    private toolCalls = new Map<string, ToolCallState>();
+    private tasks = new Map<string, TaskRunState>();
+    private startTime = 0;
   private backendMode: 'streaming' | 'v1' | 'legacy' = 'v1';
 
   // Auxiliary display state
-  private systemStatus: string | null = null;
-  private activeHook: { hookName: string; hookEvent: string } | null = null;
-  private todos: Array<{ id: string; content: string; status: string }> | null =
-    null;
-  private recentEvents: Array<{ text: string }> = [];
-  private stateVersion = 0;
+    private systemStatus: string | null = null;
+    private activeHook: { hookName: string; hookEvent: string } | null = null;
+    private todos: Array<{ id: string; content: string; status: string }> | null =
+      null;
+    private recentEvents: Array<{ text: string }> = [];
+    private traceUrl: string | null = null;
+    private stateVersion = 0;
 
   constructor(opts: StreamingCardOptions) {
     this.client = opts.client;
@@ -1523,23 +1556,46 @@ export class StreamingCardController {
   /**
    * Set the todo list for progress panel display.
    */
-  setTodos(
-    todos: Array<{ id: string; content: string; status: string }>,
-  ): void {
-    this.todos = todos;
-    this.stateVersion++;
+    setTodos(
+      todos: Array<{ id: string; content: string; status: string }>,
+    ): void {
+      this.todos = todos;
+      this.stateVersion++;
     if (this.state === 'streaming') {
-      this.backendMode === 'streaming'
-        ? this.scheduleAuxFlush()
-        : this.schedulePatch();
+        this.backendMode === 'streaming'
+          ? this.scheduleAuxFlush()
+          : this.schedulePatch();
+      }
     }
-  }
+
+    updateTask(
+      taskId: string,
+      patch: Partial<Omit<TaskRunState, 'id' | 'updatedAt'>>,
+    ): void {
+      const existing = this.tasks.get(taskId);
+      const next: TaskRunState = {
+        id: taskId,
+        title: patch.title || existing?.title || 'Task',
+        status: patch.status || existing?.status || 'running',
+        subagentType: patch.subagentType ?? existing?.subagentType,
+        lastToolName: patch.lastToolName ?? existing?.lastToolName,
+        summary: patch.summary ?? existing?.summary,
+        updatedAt: Date.now(),
+      };
+      this.tasks.set(taskId, next);
+      this.stateVersion++;
+      if (this.state === 'streaming') {
+        this.backendMode === 'streaming'
+          ? this.scheduleAuxFlush()
+          : this.schedulePatch();
+      }
+    }
 
   /**
    * Push a recent event to the call trace log (FIFO, max MAX_RECENT_EVENTS).
    * Does NOT trigger schedulePatch — piggybacks on other events.
    */
-  pushRecentEvent(text: string): void {
+    pushRecentEvent(text: string): void {
     this.recentEvents.push({ text });
     if (this.recentEvents.length > MAX_RECENT_EVENTS) {
       this.recentEvents = this.recentEvents.slice(-MAX_RECENT_EVENTS);
@@ -1574,12 +1630,11 @@ export class StreamingCardController {
    * Append text to the streaming card.
    * Creates the card on first call, then patches on subsequent calls.
    */
-  append(text: string): void {
-    this.accumulatedText = text;
-    this.thinking = false; // Text arrived, no longer just thinking
-    this.thinkingText = ''; // Clear thinking text once real text arrives
+    append(text: string): void {
+      this.accumulatedText = text;
+      this.thinking = false; // Text arrived, no longer just thinking
 
-    if (this.state === 'idle') {
+      if (this.state === 'idle') {
       this.state = 'creating';
       this.createInitialCard().catch((err) => {
         logger.warn(
@@ -1614,11 +1669,11 @@ export class StreamingCardController {
     this.auxFlushCtrl?.dispose();
 
     try {
-      if (this.backendMode === 'streaming' && this.streamingBackend) {
-        await this.finalizeStreamingCard('completed');
-      } else if (this.messageId || this.multiCard) {
-        await this.patchCard('completed');
-      }
+        if (this.backendMode === 'streaming' && this.streamingBackend) {
+          await this.finalizeStreamingCard('completed');
+        } else if (this.messageId || this.multiCard) {
+          await this.patchCard('completed', this.traceFooterLink());
+        }
     } catch (err) {
       // Revert state so abort() doesn't bail on the 'completed' check
       this.state = prevState;
@@ -1651,7 +1706,7 @@ export class StreamingCardController {
       } else if (this.messageId || this.multiCard) {
         // For CardKit v1 / legacy: skip if multiCard has split content
         if (this.multiCard && this.multiCard.getCardCount() > 1) return;
-        const note = formatUsageNote(usage);
+        const note = this.mergeFooterNote(formatUsageNote(usage));
         if (!note) return;
         await this.patchCard('completed', note);
       }
@@ -1904,11 +1959,26 @@ export class StreamingCardController {
       isThinking: this.thinking,
       toolCalls: this.toolCalls,
       systemStatus: this.systemStatus,
-      activeHook: this.activeHook,
-      todos: this.todos,
-      recentEvents: this.recentEvents,
-    };
-  }
+        activeHook: this.activeHook,
+        todos: this.todos,
+        recentEvents: this.recentEvents,
+        tasks: this.tasks,
+      };
+    }
+
+    setTraceUrl(url: string | null): void {
+      this.traceUrl = url;
+    }
+
+    private traceFooterLink(): string | undefined {
+      return this.traceUrl ? `[查看完整运行轨迹](${this.traceUrl})` : undefined;
+    }
+
+    private mergeFooterNote(note?: string): string | undefined {
+      const trace = this.traceFooterLink();
+      if (note && trace) return `${note}\n${trace}`;
+      return note || trace;
+    }
 
   // ─── Streaming Mode Methods ──────────────────────────────
 
@@ -1996,8 +2066,9 @@ export class StreamingCardController {
 
   private buildRichPanelPatches(): {
     statusBanner: string;
-    progressContent?: string;
-    toolsContent: string;
+      progressContent?: string;
+      taskContent: string;
+      toolsContent: string;
     thinkingContent?: string;
     askContent?: string;
     timelineContent?: string;
@@ -2023,8 +2094,22 @@ export class StreamingCardController {
           )
         : undefined;
 
-    const now = Date.now();
-    // Filter out AskUserQuestion from the tools timeline — it gets its own panel.
+      const now = Date.now();
+      const taskViews = Array.from(this.tasks.values())
+        .sort((a, b) => b.updatedAt - a.updatedAt)
+        .slice(0, 10);
+      const taskContent = taskViews.length > 0
+        ? taskViews.map((task) => {
+            const tagColor = task.status === 'running' ? 'blue' : task.status === 'completed' ? 'green' : task.status === 'backgrounded' ? 'grey' : 'red';
+            const tagText = task.status === 'running' ? '运行' : task.status === 'completed' ? '完成' : task.status === 'backgrounded' ? '后台' : '失败';
+            const type = task.subagentType ? ` <font color='grey'>${task.subagentType}</font>` : '';
+            const last = task.lastToolName ? ` <font color='grey'>[${task.lastToolName}]</font>` : '';
+            const summary = task.summary ? `\n  <font color='grey'>${task.summary.slice(0, 180)}</font>` : '';
+            return `<text_tag color='${tagColor}'>${tagText}</text_tag> **${task.title.slice(0, 80)}**${type}${last}${summary}`;
+          }).join('\n')
+        : '<font color=\'grey\'>暂无子任务</font>';
+
+      // Filter out AskUserQuestion from the tools timeline — it gets its own panel.
     const toolViews: ToolCallView[] = Array.from(this.toolCalls.values())
       .filter((tc) => tc.name !== 'AskUserQuestion')
       .map((tc) => ({
@@ -2057,9 +2142,10 @@ export class StreamingCardController {
         : undefined;
 
     return {
-      statusBanner,
-      progressContent,
-      toolsContent,
+        statusBanner,
+        progressContent,
+        taskContent,
+        toolsContent,
       thinkingContent,
       askContent,
       timelineContent,
@@ -2098,6 +2184,10 @@ export class StreamingCardController {
             patches.progressContent,
           );
         }
+        await this.streamingBackend!.updateMarkdownContent(
+          CARD_ELEMENT_IDS.TASK_CONTENT,
+          patches.taskContent,
+        );
         await this.streamingBackend!.updateMarkdownContent(
           CARD_ELEMENT_IDS.TOOLS_CONTENT,
           patches.toolsContent,
@@ -2213,11 +2303,12 @@ export class StreamingCardController {
       ([name, count]) => ({ name, count }),
     );
     const thinking = this.thinkingText.trim() || undefined;
-    return buildAgentReplyCard({
-      status,
-      text: this.accumulatedText || '...',
-      thinking,
-      meta: {
+      return buildAgentReplyCard({
+        status,
+        text: this.accumulatedText || '...',
+        thinking,
+        footer: this.traceFooterLink(),
+        meta: {
         toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
         durationMs: usage?.durationMs,
         inputTokens: usage?.inputTokens,

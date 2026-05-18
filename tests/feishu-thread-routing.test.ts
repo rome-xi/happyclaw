@@ -56,4 +56,45 @@ describe('StreamingCardController Feishu thread reply', () => {
       reply_in_thread: true,
     });
   });
+
+  test('preserves trace link when usage patch updates a legacy completed card', async () => {
+    const patch = vi.fn().mockResolvedValue({});
+    const create = vi.fn().mockResolvedValue({ data: { message_id: 'om_card' } });
+    const client = {
+      cardkit: {
+        v1: {
+          card: {
+            create: vi.fn().mockRejectedValue(new Error('streaming unavailable')),
+          },
+          cardElement: {},
+        },
+      },
+      im: {
+        message: { reply: vi.fn() },
+        v1: { message: { create, patch } },
+      },
+    };
+
+    const controller = new StreamingCardController({
+      client: client as any,
+      chatId: 'oc_123',
+    });
+    controller.setTraceUrl('https://happy.example/chat/main?trace=1');
+    controller.append('hello');
+
+    await vi.waitFor(() => expect(create).toHaveBeenCalledTimes(1));
+    await controller.complete('hello');
+    await controller.patchUsageNote({
+      inputTokens: 10,
+      outputTokens: 5,
+      costUSD: 0.01,
+      durationMs: 1000,
+      numTurns: 1,
+    });
+
+    const finalContent = patch.mock.calls.at(-1)?.[0]?.data?.content;
+    expect(finalContent).toContain('查看完整运行轨迹');
+    expect(finalContent).toContain('happy.example/chat/main');
+    expect(finalContent).toContain('10 / 5 tokens');
+  });
 });

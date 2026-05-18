@@ -41,12 +41,41 @@ export interface StreamingTimelineEvent {
   id: string;
   timestamp: number;
   text: string;
-  kind: 'tool' | 'skill' | 'hook' | 'status';
+  kind: 'tool' | 'skill' | 'hook' | 'status' | 'task' | 'memory' | 'debug' | 'context';
+}
+
+export interface StreamingTraceEvent {
+  id: string;
+  timestamp: number;
+  kind: StreamingTimelineEvent['kind'];
+  scope?: StreamEvent['agentScope'];
+  title: string;
+  summary?: string;
+  detail?: string;
+  taskId?: string;
+  toolUseId?: string;
+  parentToolUseId?: string | null;
+  displayLevel?: StreamEvent['displayLevel'];
+}
+
+export interface StreamingTaskRuntimeState {
+  id: string;
+  title: string;
+  status: 'running' | 'completed' | 'error' | 'backgrounded';
+  subagentType?: string;
+  latestSummary?: string;
+  lastToolName?: string;
+  thinkingTail: string;
+  textTail: string;
+  activeTools: StreamingState['activeTools'];
+  recentTools: StreamingTimelineEvent[];
+  updatedAt: number;
 }
 
 /** Shape of the snapshot payload pushed from the backend on WS reconnect (stream_snapshot). */
 export interface StreamSnapshotData {
   partialText: string;
+  thinkingText?: string;
   activeTools: Array<{
     toolName: string;
     toolUseId: string;
@@ -58,8 +87,11 @@ export interface StreamSnapshotData {
     id: string;
     timestamp: number;
     text: string;
-    kind: 'tool' | 'skill' | 'hook' | 'status';
+    kind: StreamingTimelineEvent['kind'];
   }>;
+  traceEvents?: StreamingTraceEvent[];
+  taskStates?: Record<string, StreamingTaskRuntimeState>;
+  contextAudit?: StreamEvent['contextAudit'];
   todos?: Array<{ id: string; content: string; status: string }>;
   systemStatus: string | null;
   turnId?: string;
@@ -89,6 +121,9 @@ export interface StreamingState {
   activeHook: { hookName: string; hookEvent: string } | null;
   systemStatus: string | null;
   recentEvents: StreamingTimelineEvent[];
+  traceEvents: StreamingTraceEvent[];
+  taskStates: Record<string, StreamingTaskRuntimeState>;
+  contextAudit?: StreamEvent['contextAudit'];
   todos?: Array<{ id: string; content: string; status: string }>;
   interrupted?: boolean;
 }
@@ -268,6 +303,7 @@ const DEFAULT_STREAMING_STATE: StreamingState = {
   sessionId: undefined,
   partialText: '', thinkingText: '', isThinking: false,
   activeTools: [], activeHook: null, systemStatus: null, recentEvents: [],
+  traceEvents: [], taskStates: {},
 };
 
 /**
@@ -292,11 +328,13 @@ function freezeStreamingState(state: StreamingState | undefined): StreamingState
   const hasData =
     state.partialText ||
     state.thinkingText ||
-    state.activeTools.length > 0 ||
-    state.activeHook ||
-    state.systemStatus ||
-    state.recentEvents.length > 0 ||
-    (state.todos && state.todos.length > 0);
+      state.activeTools.length > 0 ||
+      state.activeHook ||
+      state.systemStatus ||
+      state.recentEvents.length > 0 ||
+      state.traceEvents.length > 0 ||
+      Object.keys(state.taskStates).length > 0 ||
+      (state.todos && state.todos.length > 0);
   if (!hasData) return null;
   // Preserve any in-flight thinking duration so the interrupted card still shows "已思考 Xs".
   const thinkingDurationMs = state.thinkingDurationMs ?? (
@@ -326,8 +364,11 @@ function resolveStreamingPrev(current: StreamingState | undefined, event: Stream
   return current || { ...DEFAULT_STREAMING_STATE };
 }
 
-const MAX_STREAMING_TEXT = 8000;
+const MAX_STREAMING_TEXT = 16000;
+const MAX_THINKING_TEXT = 8000;
 const MAX_EVENT_LOG = 30;
+const MAX_TRACE_EVENTS = 200;
+const MAX_TASK_TAIL = 4000;
 const SDK_TASK_AUTO_CLOSE_MS = 3000;
 const SDK_TASK_TOOL_END_FALLBACK_CLOSE_MS = 1200;
 const SDK_TASK_STALE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes stale timeout for non-teammate tasks
@@ -355,13 +396,16 @@ function saveStreamingToSession(chatJid: string, state: StreamingState | undefin
     streamingSaveTimers.delete(chatJid);
     try {
       const stored = JSON.parse(sessionStorage.getItem(STREAMING_STORAGE_KEY) || '{}');
-      if (state && (state.partialText || state.activeTools.length > 0 || state.recentEvents.length > 0)) {
+      if (state && (state.partialText || state.thinkingText || state.activeTools.length > 0 || state.recentEvents.length > 0 || state.traceEvents.length > 0 || Object.keys(state.taskStates).length > 0 || state.contextAudit)) {
         stored[chatJid] = {
           partialText: state.partialText.slice(-4000), // cap size
-          thinkingText: '',  // don't persist thinking
-          isThinking: false,
+          thinkingText: state.thinkingText.slice(-MAX_THINKING_TEXT),
+          isThinking: state.isThinking,
           activeTools: state.activeTools,
           recentEvents: state.recentEvents.slice(-10),
+          traceEvents: state.traceEvents.slice(-50),
+          taskStates: state.taskStates,
+          contextAudit: state.contextAudit,
           todos: state.todos,
           systemStatus: state.systemStatus,
           turnId: state.turnId,
@@ -401,8 +445,13 @@ function restoreStreamingFromSession(chatJid: string): StreamingState | null {
     return {
       ...DEFAULT_STREAMING_STATE,
       partialText: entry.partialText || '',
+      thinkingText: entry.thinkingText || '',
+      isThinking: entry.isThinking || false,
       activeTools: entry.activeTools || [],
       recentEvents: entry.recentEvents || [],
+      traceEvents: entry.traceEvents || [],
+      taskStates: entry.taskStates || {},
+      contextAudit: entry.contextAudit,
       todos: entry.todos,
       systemStatus: entry.systemStatus || null,
       turnId: entry.turnId,
@@ -449,7 +498,7 @@ function flushPendingDelta(
       }
       if (mergedThinking) {
         const combined = prev.thinkingText + mergedThinking;
-        next.thinkingText = combined.length > MAX_STREAMING_TEXT ? combined.slice(-MAX_STREAMING_TEXT) : combined;
+        next.thinkingText = combined.length > MAX_THINKING_TEXT ? combined.slice(-MAX_THINKING_TEXT) : combined;
         next.isThinking = true;
         markThinkingStarted(prev, next);
       }
@@ -469,7 +518,7 @@ function flushPendingDelta(
       }
       if (mergedThinking) {
         const combined = prev.thinkingText + mergedThinking;
-        next.thinkingText = combined.length > MAX_STREAMING_TEXT ? combined.slice(-MAX_STREAMING_TEXT) : combined;
+        next.thinkingText = combined.length > MAX_THINKING_TEXT ? combined.slice(-MAX_THINKING_TEXT) : combined;
         next.isThinking = true;
         markThinkingStarted(prev, next);
       }
@@ -663,6 +712,142 @@ function pushEvent(
   return [...events, item].slice(-MAX_EVENT_LOG);
 }
 
+function tail(text: string, max: number): string {
+  return text.length > max ? text.slice(-max) : text;
+}
+
+function traceKind(event: StreamEvent): StreamingTraceEvent['kind'] {
+  if (event.eventType.startsWith('tool_')) return event.skillName ? 'skill' : 'tool';
+  if (event.eventType.startsWith('hook_')) return 'hook';
+  if (event.eventType.startsWith('task_')) return 'task';
+  if (event.eventType === 'context_audit') return 'context';
+  if (event.eventType === 'memory_recall' || event.eventType === 'compact_boundary') return 'memory';
+  if (event.eventType === 'raw_sdk_event') return 'debug';
+  return 'status';
+}
+
+function traceTitle(event: StreamEvent): string {
+  if (event.title) return event.title;
+  switch (event.eventType) {
+    case 'tool_use_start': return event.skillName ? `技能 ${event.skillName}` : `工具 ${event.toolName || 'unknown'}`;
+    case 'tool_use_end': return `工具完成 ${event.toolName || event.toolUseId || ''}`.trim();
+    case 'tool_progress': return `工具进度 ${event.toolName || event.toolUseId || ''}`.trim();
+    case 'task_start': return `Task 启动`;
+    case 'task_progress': return `Task 进度`;
+    case 'task_updated': return `Task 更新`;
+    case 'task_notification': return `Task ${event.taskStatus || '完成'}`;
+    case 'context_audit': return 'Agent Context';
+    case 'status': return event.statusText || '状态更新';
+    case 'permission_denied': return `权限拒绝 ${event.toolName || ''}`.trim();
+    case 'memory_recall': return '记忆召回';
+    case 'compact_boundary': return '上下文压缩';
+    case 'notification': return '通知';
+    case 'prompt_suggestion': return '建议';
+    default: return event.rawType || event.eventType;
+  }
+}
+
+function pushTrace(events: StreamingTraceEvent[], event: StreamEvent): StreamingTraceEvent[] {
+  if (event.eventType === 'text_delta' || event.eventType === 'thinking_delta' || event.eventType === 'usage' || event.eventType === 'init') {
+    return events;
+  }
+  const item: StreamingTraceEvent = {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    timestamp: Date.now(),
+    kind: traceKind(event),
+    scope: event.agentScope,
+    title: traceTitle(event),
+    summary: event.summary || event.taskSummary || event.statusText || event.toolInputSummary,
+    detail: event.detail,
+    taskId: event.taskId,
+    toolUseId: event.toolUseId,
+    parentToolUseId: event.parentToolUseId,
+    displayLevel: event.displayLevel,
+  };
+  return [...events, item].slice(-MAX_TRACE_EVENTS);
+}
+
+function taskIdFromEvent(event: StreamEvent): string | null {
+  return event.parentToolUseId || event.taskId || (
+    (event.eventType === 'task_start' || event.eventType === 'task_progress' || event.eventType === 'task_updated' || event.eventType === 'task_notification')
+      ? event.toolUseId || null
+      : null
+  );
+}
+
+function ensureTaskRuntime(
+  taskStates: Record<string, StreamingTaskRuntimeState>,
+  taskId: string,
+  event: StreamEvent,
+): StreamingTaskRuntimeState {
+  return taskStates[taskId] || {
+    id: taskId,
+    title: event.taskDescription || event.toolInputSummary || event.summary || 'Task',
+    status: 'running',
+    subagentType: event.subagentType,
+    thinkingTail: '',
+    textTail: '',
+    activeTools: [],
+    recentTools: [],
+    updatedAt: Date.now(),
+  };
+}
+
+function updateTaskRuntime(prev: StreamingState, next: StreamingState, event: StreamEvent): boolean {
+  const taskId = taskIdFromEvent(event);
+  if (!taskId) return false;
+  const taskStates = { ...prev.taskStates };
+  const task = { ...ensureTaskRuntime(taskStates, taskId, event) };
+  task.updatedAt = Date.now();
+  if (event.taskDescription && (!task.title || task.title === 'Task')) task.title = event.taskDescription;
+  if (event.subagentType) task.subagentType = event.subagentType;
+
+  if (event.eventType === 'text_delta') {
+    task.textTail = tail(task.textTail + (event.text || ''), MAX_TASK_TAIL);
+  } else if (event.eventType === 'thinking_delta') {
+    task.thinkingTail = tail(task.thinkingTail + (event.text || ''), MAX_TASK_TAIL);
+  } else if (event.eventType === 'task_progress') {
+    task.status = 'running';
+    task.latestSummary = event.summary || event.taskSummary || event.taskDescription || task.latestSummary;
+    task.lastToolName = event.lastToolName || task.lastToolName;
+  } else if (event.eventType === 'task_updated') {
+    const patch = event.taskPatch;
+    if (patch?.status === 'completed') task.status = 'completed';
+    else if (patch?.status === 'failed' || patch?.status === 'killed') task.status = 'error';
+    else if (patch?.is_backgrounded) task.status = 'backgrounded';
+    else if (patch?.status === 'running' || patch?.status === 'pending') task.status = 'running';
+    task.latestSummary = event.summary || patch?.description || patch?.error || task.latestSummary;
+  } else if (event.eventType === 'task_notification') {
+    task.status = event.taskStatus === 'completed' ? 'completed' : 'error';
+    task.latestSummary = event.taskSummary || event.summary || task.latestSummary;
+  } else if (event.eventType === 'tool_use_start' && event.parentToolUseId) {
+    const tool = {
+      toolName: event.toolName || 'unknown',
+      toolUseId: event.toolUseId || '',
+      startTime: Date.now(),
+      parentToolUseId: event.parentToolUseId,
+      isNested: event.isNested,
+      skillName: event.skillName,
+      toolInputSummary: event.toolInputSummary,
+      toolInput: event.toolInput,
+    };
+    task.activeTools = task.activeTools.some(t => t.toolUseId === tool.toolUseId && tool.toolUseId)
+      ? task.activeTools.map(t => (t.toolUseId === tool.toolUseId ? { ...t, ...tool } : t))
+      : [...task.activeTools, tool];
+    task.recentTools = pushEvent(task.recentTools, event.skillName ? 'skill' : 'tool', `${event.skillName ? `技能 ${event.skillName}` : `工具 ${event.toolName || 'unknown'}`}${event.toolInputSummary ? ` (${event.toolInputSummary})` : ''}`);
+  } else if (event.eventType === 'tool_use_end' && event.parentToolUseId) {
+    task.activeTools = task.activeTools.filter(t => t.toolUseId !== event.toolUseId);
+    task.recentTools = pushEvent(task.recentTools, 'tool', `✓ ${event.toolName || event.toolUseId || '工具'}`);
+  } else if (event.eventType === 'tool_progress' && event.parentToolUseId) {
+    task.activeTools = task.activeTools.map(t => t.toolUseId === event.toolUseId
+      ? { ...t, elapsedSeconds: event.elapsedSeconds, toolInputSummary: event.toolInputSummary || t.toolInputSummary }
+      : t);
+  }
+  taskStates[taskId] = task;
+  next.taskStates = taskStates;
+  return true;
+}
+
 /**
  * Apply a single StreamEvent to a StreamingState object.
  * Shared by main conversation and SDK subagent streaming.
@@ -675,8 +860,13 @@ function applyStreamEvent(
 ): void {
   if (event.turnId) next.turnId = event.turnId;
   if (event.sessionId) next.sessionId = event.sessionId;
+  next.traceEvents = pushTrace(prev.traceEvents || [], event);
   switch (event.eventType) {
     case 'text_delta': {
+      if (event.parentToolUseId) {
+        updateTaskRuntime(prev, next, event);
+        break;
+      }
       const combined = prev.partialText + (event.text || '');
       next.partialText = combined.length > maxText ? combined.slice(-maxText) : combined;
       next.isThinking = false;
@@ -684,8 +874,12 @@ function applyStreamEvent(
       break;
     }
     case 'thinking_delta': {
+      if (event.parentToolUseId) {
+        updateTaskRuntime(prev, next, event);
+        break;
+      }
       const combined = prev.thinkingText + (event.text || '');
-      next.thinkingText = combined.length > maxText ? combined.slice(-maxText) : combined;
+      next.thinkingText = combined.length > MAX_THINKING_TEXT ? combined.slice(-MAX_THINKING_TEXT) : combined;
       next.isThinking = true;
       markThinkingStarted(prev, next);
       break;
@@ -707,6 +901,9 @@ function applyStreamEvent(
       next.activeTools = existing
         ? prev.activeTools.map(t => (t.toolUseId === toolUseId ? { ...t, ...tool } : t))
         : [...prev.activeTools, tool];
+      if (event.parentToolUseId) {
+        updateTaskRuntime(prev, next, event);
+      }
 
       const isSkill = tool.toolName === 'Skill';
       const label = isSkill
@@ -716,8 +913,8 @@ function applyStreamEvent(
       next.recentEvents = pushEvent(prev.recentEvents, isSkill ? 'skill' : 'tool', `${label}${detail}`);
       break;
     }
-    case 'tool_use_end':
-      if (event.toolUseId) {
+      case 'tool_use_end':
+        if (event.toolUseId) {
         const ended = prev.activeTools.find(t => t.toolUseId === event.toolUseId);
         next.activeTools = prev.activeTools.filter(t => t.toolUseId !== event.toolUseId);
         if (ended) {
@@ -727,15 +924,18 @@ function applyStreamEvent(
           const label = isSkill
             ? `技能 ${ended.skillName || 'unknown'}`
             : `工具 ${ended.toolName}`;
-          next.recentEvents = pushEvent(prev.recentEvents, isSkill ? 'skill' : 'tool', `✓ ${label} (${elapsedSec}s)`);
+            next.recentEvents = pushEvent(prev.recentEvents, isSkill ? 'skill' : 'tool', `✓ ${label} (${elapsedSec}s)`);
+          }
+        } else {
+          next.activeTools = [];
         }
-      } else {
-        next.activeTools = [];
-      }
-      break;
+        if (event.parentToolUseId) {
+          updateTaskRuntime(prev, next, event);
+        }
+        break;
     case 'tool_progress': {
       const existing = prev.activeTools.find(t => t.toolUseId === event.toolUseId);
-      if (existing) {
+        if (existing) {
         const skillNameResolved = event.skillName && !existing.skillName;
         next.activeTools = prev.activeTools.map(t =>
           t.toolUseId === event.toolUseId
@@ -756,7 +956,7 @@ function applyStreamEvent(
               : e
           );
         }
-      } else {
+        } else {
         next.activeTools = [...prev.activeTools, {
           toolName: event.toolName || 'unknown',
           toolUseId: event.toolUseId || '',
@@ -765,7 +965,32 @@ function applyStreamEvent(
           isNested: event.isNested,
           elapsedSeconds: event.elapsedSeconds,
         }];
+        }
+        if (event.parentToolUseId) {
+          updateTaskRuntime(prev, next, event);
+        }
+        break;
       }
+    case 'task_start': {
+      updateTaskRuntime(prev, next, event);
+      const desc = event.taskDescription || event.toolInputSummary || event.summary || 'Task';
+      next.recentEvents = pushEvent(prev.recentEvents, 'task', `Task 启动: ${desc}`);
+      break;
+    }
+    case 'task_progress': {
+      updateTaskRuntime(prev, next, event);
+      const label = event.lastToolName ? `Task 进度 [${event.lastToolName}]` : 'Task 进度';
+      next.recentEvents = pushEvent(prev.recentEvents, 'task', `${label}: ${event.summary || event.taskDescription || ''}`);
+      break;
+    }
+    case 'task_updated': {
+      updateTaskRuntime(prev, next, event);
+      next.recentEvents = pushEvent(prev.recentEvents, 'task', `Task 更新: ${event.summary || event.taskPatch?.status || ''}`);
+      break;
+    }
+    case 'task_notification': {
+      updateTaskRuntime(prev, next, event);
+      next.recentEvents = pushEvent(prev.recentEvents, 'task', `Task ${event.taskStatus === 'completed' ? '完成' : '结束'}: ${event.taskSummary || event.summary || ''}`);
       break;
     }
     case 'hook_started':
@@ -792,13 +1017,35 @@ function applyStreamEvent(
         next.todos = event.todos;
       }
       break;
-    case 'status': {
-      next.systemStatus = event.statusText || null;
+      case 'status': {
+        next.systemStatus = event.statusText || null;
       if (event.statusText) {
         next.recentEvents = pushEvent(prev.recentEvents, 'status', `状态: ${event.statusText}`);
       }
-      break;
-    }
+        break;
+      }
+      case 'permission_denied':
+        next.recentEvents = pushEvent(prev.recentEvents, 'status', event.summary || event.detail || '权限被拒绝');
+        break;
+      case 'memory_recall':
+      case 'compact_boundary':
+        next.recentEvents = pushEvent(prev.recentEvents, 'memory', event.summary || traceTitle(event));
+        break;
+      case 'notification':
+      case 'prompt_suggestion':
+        next.recentEvents = pushEvent(prev.recentEvents, 'status', event.summary || traceTitle(event));
+        break;
+      case 'raw_sdk_event':
+        if (event.displayLevel === 'primary') {
+          next.recentEvents = pushEvent(prev.recentEvents, 'debug', event.summary || traceTitle(event));
+        }
+        break;
+      case 'context_audit':
+        next.contextAudit = event.contextAudit;
+        if (event.contextAudit?.warnings?.length) {
+          next.recentEvents = pushEvent(prev.recentEvents, 'context', `Agent Context: ${event.contextAudit.warnings[0]}`);
+        }
+        break;
     case 'usage':
       // Token usage is handled at handleStreamEvent level (direct message table update).
       // No streaming state mutation needed.
@@ -1451,7 +1698,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     if (get().clearing[chatJid]) return;
 
     // ⓪ text_delta / thinking_delta — rAF batch for both agent and main conversation
-    if (event.eventType === 'text_delta' || event.eventType === 'thinking_delta') {
+    if ((event.eventType === 'text_delta' || event.eventType === 'thinking_delta') && (agentId || !event.parentToolUseId)) {
       const key = agentId ? `agent:${agentId}` : `main:${chatJid}`;
       let entry = pendingDeltas.get(key);
       if (entry) {
@@ -1516,7 +1763,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         }
         const prev = resolveStreamingPrev(s.agentStreaming[agentId], event);
         const next = { ...prev };
-        applyStreamEvent(event, prev, next, 8000);
+        applyStreamEvent(event, prev, next, MAX_STREAMING_TEXT);
         return { agentStreaming: { ...s.agentStreaming, [agentId]: next } };
       });
       return;
@@ -1592,10 +1839,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
       }
     };
 
-    // ② task_start / Task tool start → 创建/更新虚拟 Agent（SDK Task）
-    if (
-      (event.eventType === 'task_start' && event.toolUseId)
-      || (event.eventType === 'tool_use_start' && event.toolName === 'Task' && event.toolUseId)
+      // ② task_start / Task tool start → 创建/更新虚拟 Agent（SDK Task）
+      if (
+        (event.eventType === 'task_start' && event.toolUseId)
+        || (event.eventType === 'tool_use_start' && event.toolName === 'Task' && event.toolUseId)
     ) {
       ensureSdkTask(
         event.toolUseId!,
@@ -1603,6 +1850,36 @@ export const useChatStore = create<ChatState>((set, get) => ({
         event.isTeammate,
       );
       // 不 return — 让 task_start 同时落入主对话 streaming（显示 Task 工具卡片）
+    }
+
+    if (event.eventType === 'task_progress' && (event.toolUseId || event.taskId)) {
+      const resolvedTaskId = resolveOrBindTaskId(event.toolUseId || event.taskId!);
+      set((s) => {
+        const existing = s.sdkTasks[resolvedTaskId];
+        if (!existing) return {};
+        return {
+          sdkTasks: {
+            ...s.sdkTasks,
+            [resolvedTaskId]: {
+              ...existing,
+              description: event.taskDescription || existing.description,
+              summary: event.summary || event.taskSummary || existing.summary,
+            },
+          },
+        };
+      });
+    }
+
+    if (event.eventType === 'task_updated' && (event.toolUseId || event.taskId)) {
+      const resolvedTaskId = resolveOrBindTaskId(event.toolUseId || event.taskId!);
+      const patchStatus = event.taskPatch?.status;
+      if (patchStatus === 'completed' || patchStatus === 'failed' || patchStatus === 'killed') {
+        finalizeSdkTask(
+          resolvedTaskId,
+          patchStatus === 'completed' ? 'completed' : 'error',
+          event.summary || event.taskPatch?.error,
+        );
+      }
     }
 
     // ③ task_notification → 标记完成/失败并自动关闭标签页
@@ -1626,6 +1903,18 @@ export const useChatStore = create<ChatState>((set, get) => ({
         }
         notifyIfHidden(`HappyClaw: ${desc} ${status}`, event.taskSummary);
       }
+
+      set((s) => {
+        const current = s.streaming[chatJid];
+        if (!current || current.interrupted) return s;
+        const prev = resolveStreamingPrev(current, event);
+        const next = { ...prev };
+        applyStreamEvent(event, prev, next, MAX_STREAMING_TEXT);
+        saveStreamingToSession(chatJid, next);
+        return {
+          streaming: { ...s.streaming, [chatJid]: next },
+        };
+      });
 
       // 不落入主对话 streaming
       return;
@@ -1759,7 +2048,6 @@ export const useChatStore = create<ChatState>((set, get) => ({
       if (s.streaming[chatJid]?.interrupted) {
         return s;
       }
-      const MAX_STREAMING_TEXT = 8000;
       const prev = resolveStreamingPrev(s.streaming[chatJid], event);
       const next = { ...prev };
       applyStreamEvent(event, prev, next, MAX_STREAMING_TEXT);
@@ -2530,6 +2818,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const restored: StreamingState = {
       ...DEFAULT_STREAMING_STATE,
       partialText: snapshot.partialText || '',
+      thinkingText: snapshot.thinkingText || '',
       activeTools: (snapshot.activeTools || []).map((t) => ({
         toolName: t.toolName,
         toolUseId: t.toolUseId,
@@ -2538,6 +2827,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
         parentToolUseId: t.parentToolUseId,
       })),
       recentEvents: (snapshot.recentEvents || []) as StreamingTimelineEvent[],
+      traceEvents: snapshot.traceEvents || [],
+      taskStates: snapshot.taskStates || {},
+      contextAudit: snapshot.contextAudit,
       todos: snapshot.todos,
       systemStatus: snapshot.systemStatus || null,
       turnId: snapshot.turnId,

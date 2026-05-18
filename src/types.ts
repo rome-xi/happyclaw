@@ -440,6 +440,7 @@ export type WsMessageOut =
       chatJid: string;
       snapshot: {
         partialText: string;
+        thinkingText?: string;
         activeTools: Array<{
           toolName: string;
           toolUseId: string;
@@ -451,8 +452,23 @@ export type WsMessageOut =
           id: string;
           timestamp: number;
           text: string;
-          kind: 'tool' | 'skill' | 'hook' | 'status';
+          kind: 'tool' | 'skill' | 'hook' | 'status' | 'task' | 'memory' | 'debug' | 'context';
         }>;
+        traceEvents?: Array<{
+          id: string;
+          timestamp: number;
+          kind: 'tool' | 'skill' | 'hook' | 'status' | 'task' | 'memory' | 'debug' | 'context';
+          scope?: StreamEvent['agentScope'];
+          title: string;
+          summary?: string;
+          detail?: string;
+          taskId?: string;
+          toolUseId?: string;
+          parentToolUseId?: string | null;
+          displayLevel?: StreamEvent['displayLevel'];
+        }>;
+        taskStates?: Record<string, unknown>;
+        contextAudit?: StreamEvent['contextAudit'];
         todos?: Array<{ id: string; content: string; status: string }>;
         systemStatus: string | null;
         turnId?: string;
