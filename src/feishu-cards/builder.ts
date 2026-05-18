@@ -2,9 +2,9 @@
  * Top-level Feishu v2 Agent reply card builders.
  *
  *   buildAgentReplyCard(input)
- *       Terminal (static) card. Structured body: title + body with collapsible
- *       overflow sections + metadata row (2×2) + optional thinking/tool panels
- *       + footer. Suitable for finalized Agent replies and error cards.
+ *       Terminal (static) card. Structured body with optional explicit header,
+ *       body chunks + metadata row (2×2) + optional thinking/tool panels +
+ *       footer. Suitable for finalized Agent replies and error cards.
  *
  *   buildStreamingAgentCard(opts)
  *       Initial streaming skeleton. Preserves the 5 slot element_ids that
@@ -25,7 +25,6 @@ import {
   buildStreamingPanels,
   buildStatusBannerText,
   extractTitle,
-  stripTitleFromBody,
   CARD_ELEMENT_IDS,
   type StreamingPanelsInit,
 } from './sections.js';
@@ -44,20 +43,23 @@ export function buildAgentReplyCard(input: AgentCardInput): FeishuCardV2 {
     ? optimizeMarkdownStyle(input.thinking, 2)
     : undefined;
 
-  const { title: autoTitle, bodyStartIndex } = extractTitle(optimizedText);
-  const displayTitle = input.title ?? autoTitle;
-  const body = stripTitleFromBody(optimizedText, bodyStartIndex);
+  const explicitTitle = input.title?.trim();
+  const body = optimizedText.trim();
+  const summaryTitle = explicitTitle
+    ? input.titlePrefix
+      ? `${input.titlePrefix}${explicitTitle}`
+      : explicitTitle
+    : undefined;
 
   const normalizedInput: AgentCardInput = {
     ...input,
     text: optimizedText,
+    title: explicitTitle,
     thinking: optimizedThinking,
   };
 
-  const header = buildHeader(normalizedInput);
+  const header = explicitTitle ? buildHeader(normalizedInput) : undefined;
   const elements: Array<Record<string, unknown>> = [];
-  // When the title was auto-extracted from the first line, body may be empty.
-  // Hiding the body area avoids the header/first-line duplication (issue #488).
   if (body) {
     elements.push(...buildBodyChunks(body));
   }
@@ -81,21 +83,28 @@ export function buildAgentReplyCard(input: AgentCardInput): FeishuCardV2 {
   elements.push(...toolsPanel);
   elements.push(...footer);
 
-  return {
+  const config: Record<string, unknown> = {
+    update_multi: true,
+    enable_forward: true,
+    width_mode: 'fill',
+  };
+  if (summaryTitle) {
+    config.summary = { content: summaryTitle };
+  }
+
+  const card: FeishuCardV2 = {
     schema: '2.0',
-    config: {
-      update_multi: true,
-      enable_forward: true,
-      width_mode: 'fill',
-      summary: { content: displayTitle },
-    },
-    header,
+    config,
     body: {
       direction: 'vertical',
       vertical_spacing: 'medium',
       elements,
     },
   };
+  if (header) {
+    card.header = header;
+  }
+  return card;
 }
 
 export interface StreamingCardBuildOptions {
