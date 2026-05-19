@@ -20,6 +20,7 @@ import type {
   AuthEventType,
 } from '../types.js';
 import { lastActiveCache, invalidateUserSessions } from '../web-context.js';
+import { imManager } from '../im-manager.js';
 import {
   listUsers,
   getUserById,
@@ -314,6 +315,12 @@ adminRoutes.patch(
     if (validation.data.status !== undefined) {
       if (validation.data.status === 'deleted') {
         deleteUser(id);
+        // Tear down all IM connections so feishu/telegram/qq/wechat/etc bots
+        // stop responding immediately. Without this the bots would keep firing
+        // until the next service restart (loadState filters non-active users).
+        void imManager
+          .disconnectAllUserChannels(id)
+          .catch(() => undefined);
         logAuthEvent({
           event_type: 'user_deleted',
           username: target.username,
@@ -329,6 +336,10 @@ adminRoutes.patch(
         // Revoke all sessions when disabling + clean caches
         invalidateUserSessions(id);
         deleteUserSessionsByUserId(id);
+        // Tear down all IM connections — see note above on the 'deleted' branch.
+        void imManager
+          .disconnectAllUserChannels(id)
+          .catch(() => undefined);
         updates.disable_reason =
           validation.data.disable_reason ?? 'disabled_by_admin';
         logAuthEvent({

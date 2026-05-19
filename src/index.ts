@@ -179,6 +179,7 @@ import {
 import { logger } from './logger.js';
 import { resolveTaskOwner } from './task-utils.js';
 import { resolvePerMessageRuntimeOwner } from './runtime-owner.js';
+import { checkOwnerActive } from './owner-gate.js';
 import {
   ensureAgentDirectories,
   isSystemMaintenanceNoise,
@@ -3057,6 +3058,22 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   if (effectiveGroup.created_by) {
     const owner = getUserById(effectiveGroup.created_by);
+    // Defense-in-depth: drop messages whose owner is no longer active
+    // (disabled or deleted). See `src/owner-gate.ts` for rationale.
+    const ownerGate = checkOwnerActive(owner);
+    if (!ownerGate.allowed) {
+      commitCursor();
+      await setTyping(chatJid, false);
+      logger.info(
+        {
+          chatJid,
+          userId: effectiveGroup.created_by,
+          ownerStatus: ownerGate.status,
+        },
+        'Dropping message: group owner is not active',
+      );
+      return true;
+    }
     if (owner && owner.role !== 'admin') {
       const accessResult = checkBillingAccessFresh(
         effectiveGroup.created_by,
@@ -6844,6 +6861,29 @@ async function startMessageLoop(): Promise<void> {
           // Skip groups with target_agent_id — their messages are routed
           // to conversation agents at IM ingestion time (feishu.ts/telegram.ts)
           if (group.target_agent_id) continue;
+
+          // Owner status check: drop messages from groups whose owner is
+          // disabled/deleted. See `src/owner-gate.ts` for rationale.
+          if (group.created_by) {
+            const owner = getUserById(group.created_by);
+            const ownerGate = checkOwnerActive(owner);
+            if (!ownerGate.allowed) {
+              const lastMsg = groupMessages[groupMessages.length - 1];
+              setCursors(chatJid, {
+                timestamp: lastMsg.timestamp,
+                id: lastMsg.id,
+              });
+              logger.info(
+                {
+                  chatJid,
+                  userId: group.created_by,
+                  ownerStatus: ownerGate.status,
+                },
+                'Dropping message: group owner is not active',
+              );
+              continue;
+            }
+          }
 
           // Billing quota check before processing
           if (group.created_by) {
