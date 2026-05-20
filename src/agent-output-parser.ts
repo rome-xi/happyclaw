@@ -25,6 +25,8 @@ export interface StdoutParserState {
   hasSuccessOutput: boolean;
   /** True when agent emitted a { status: 'closed' } marker (exit due to _close sentinel). */
   hasClosedOutput: boolean;
+  /** True when SDK returned an API/provider failure as a successful final text. */
+  hasProviderFailureOutput: boolean;
   /** True when agent emitted a stream event with statusText='interrupted'. */
   hasInterruptedOutput: boolean;
 }
@@ -46,6 +48,7 @@ export function createStdoutParserState(): StdoutParserState {
     outputChain: Promise.resolve(),
     hasSuccessOutput: false,
     hasClosedOutput: false,
+    hasProviderFailureOutput: false,
     hasInterruptedOutput: false,
   };
 }
@@ -111,6 +114,10 @@ export function attachStdoutHandler(
           }
           if (parsed.status === 'success') {
             state.hasSuccessOutput = true;
+            if (isProviderFailureResult(parsed.result)) {
+              state.hasProviderFailureOutput = true;
+              parsed.providerFailure = true;
+            }
           }
           if (parsed.status === 'closed') {
             state.hasClosedOutput = true;
@@ -499,7 +506,7 @@ export function handleSuccessClose(
 
   // Streaming mode: wait for output chain to settle
   if (ctx.onOutput) {
-    const { hasClosedOutput } = ctx.stdoutState;
+    const { hasClosedOutput, hasProviderFailureOutput } = ctx.stdoutState;
     waitForOutputChain(
       outputChain,
       ctx.groupName,
@@ -518,6 +525,7 @@ export function handleSuccessClose(
           status: finalStatus,
           result: null,
           newSessionId,
+          providerFailure: hasProviderFailureOutput,
         });
       },
     );
@@ -597,8 +605,18 @@ const API_ERROR_PATTERNS = [
   /\binvalid[_ ]?api\b/i,
   /\bbilling\s+(error|issue|limit)\b/i,
   /\bcredit(s)?\s+(exhausted|insufficient)\b/i,
+  /\bout of extra usage\b/i,
+  /\byou(?:'ve|'re| are)\s+(?:hit|out of)\s+(?:your\s+)?(?:limit|extra usage)\b/i,
+  /\bresets?\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\s*\([^)]*\)/i,
   /connection\s*(refused|reset|timed?\s*out)/i,
   /ECONNREFUSED|ECONNRESET|ETIMEDOUT/,
+];
+
+const PROVIDER_FAILURE_RESULT_PATTERNS = [
+  /\bout of extra usage\b/i,
+  /\byou(?:'ve|'re| are)\s+(?:hit|out of)\s+(?:your\s+)?(?:limit|extra usage)\b/i,
+  /\brate[_ ]?limit(?:ed)?\b/i,
+  /\bquota\s+(?:exceeded|exhausted)\b/i,
 ];
 
 /**
@@ -611,4 +629,11 @@ const API_ERROR_PATTERNS = [
 export function isApiError(stderr: string): boolean {
   if (!stderr) return false;
   return API_ERROR_PATTERNS.some((pattern) => pattern.test(stderr));
+}
+
+export function isProviderFailureResult(result: string | null): boolean {
+  if (!result) return false;
+  return PROVIDER_FAILURE_RESULT_PATTERNS.some((pattern) =>
+    pattern.test(result),
+  );
 }
