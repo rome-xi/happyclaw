@@ -6438,21 +6438,23 @@ async function processAgentConversation(
         commitCursor();
         resetIdleTimer();
 
-        // Conversation agents also close after a final reply. Keeping the
-        // runner warm makes a hung post-reply tool call look like "no
-        // response" even though the reply was already persisted.
+        // Spawn agents are fire-and-forget: close after first reply to free process slot.
+        // Conversation agents stay warm and are reclaimed by IDLE_TIMEOUT — closing them
+        // after every reply would cold-start the runner each turn (seconds in container mode).
+        // A post-reply tool call that hangs is handled runner-side by the post-result
+        // interrupt fallback, not by tearing down a warm conversation runner here.
         // Skip for overflow_partial/compact_partial — those are intermediate context
         // compression outputs, not the final result; closing now would kill the agent
         // before it finishes the actual task.
         if (
-          (agent.kind === 'spawn' || agent.kind === 'conversation') &&
+          agent.kind === 'spawn' &&
           text &&
           output.sourceKind !== 'overflow_partial' &&
           output.sourceKind !== 'compact_partial'
         ) {
           logger.info(
             { agentId, chatJid },
-            'Conversation agent replied, sending close signal',
+            'Spawn agent replied, sending close signal',
           );
           queue.closeStdin(virtualChatJid);
         }
