@@ -45,6 +45,7 @@ import { hasScriptCapacity, runScript } from './script-runner.js';
 import type { StreamEvent } from './stream-event.types.js';
 import { ExecutionMode, RegisteredGroup, ScheduledTask } from './types.js';
 import { checkBillingAccessFresh, isBillingEnabled } from './billing.js';
+import { checkOwnerActive } from './owner-gate.js';
 import { stripAgentInternalTags } from './utils.js';
 
 /**
@@ -310,6 +311,33 @@ async function runTask(
     { taskId: task.id, group: workspace.folder },
     'Running scheduled task',
   );
+
+  // Owner gate before running task: a disabled/deleted owner's scheduled
+  // tasks must stop firing (billing only checks balance, not status, and is
+  // skipped for admins — so it can't cover this). See `src/owner-gate.ts`.
+  if (workspaceGroup.created_by) {
+    const ownerGate = checkOwnerActive(getUserById(workspaceGroup.created_by));
+    if (!ownerGate.allowed) {
+      logger.info(
+        {
+          taskId: task.id,
+          userId: workspaceGroup.created_by,
+          ownerStatus: ownerGate.status,
+        },
+        'Owner not active, blocking scheduled task',
+      );
+      updateTaskRunLog(runLogId, {
+        duration_ms: Date.now() - startTime,
+        status: 'error',
+        result: null,
+        error: '账户已禁用',
+      });
+      runningTaskIds.delete(task.id);
+      const nextRun = options?.manualRun ? task.next_run : computeNextRun(task);
+      updateTaskAfterRun(task.id, nextRun, 'Error: 账户已禁用');
+      return;
+    }
+  }
 
   // Billing quota check before running task
   if (isBillingEnabled() && workspaceGroup.created_by) {
@@ -588,6 +616,32 @@ async function runScriptTask(
     { taskId: task.id, group: task.group_folder, executionType: 'script' },
     'Running script task',
   );
+
+  // Owner gate before running script task: same as the Agent-task path, a
+  // disabled/deleted owner's scheduled scripts must stop firing regardless of
+  // billing toggle or role. See `src/owner-gate.ts`.
+  {
+    const ownerId = deps.registeredGroups()[groupJid]?.created_by;
+    if (ownerId) {
+      const ownerGate = checkOwnerActive(getUserById(ownerId));
+      if (!ownerGate.allowed) {
+        logger.info(
+          { taskId: task.id, userId: ownerId, ownerStatus: ownerGate.status },
+          'Owner not active, blocking script task',
+        );
+        updateTaskRunLog(runLogId, {
+          duration_ms: Date.now() - startTime,
+          status: 'error',
+          result: null,
+          error: '账户已禁用',
+        });
+        runningTaskIds.delete(task.id);
+        const nextRun = manualRun ? task.next_run : computeNextRun(task);
+        updateTaskAfterRun(task.id, nextRun, 'Error: 账户已禁用');
+        return;
+      }
+    }
+  }
 
   // Billing quota check before running script task
   if (isBillingEnabled() && task.group_folder) {

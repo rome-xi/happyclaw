@@ -94,6 +94,14 @@ export interface WebDeps {
       | 'discord'
       | 'whatsapp',
   ) => Promise<boolean>;
+  /**
+   * Reconnect all of a user's IM channels from their persisted config.
+   * Symmetric counterpart to `imManager.disconnectAllUserChannels` — called
+   * when admin re-enables (or restores) a previously disabled/deleted user so
+   * their bots come back without a service restart. Only enabled channels
+   * with valid credentials actually connect.
+   */
+  reconnectUserIMChannels?: (userId: string) => Promise<void>;
   isFeishuConnected?: () => boolean;
   isTelegramConnected?: () => boolean;
   isUserFeishuConnected?: (userId: string) => boolean;

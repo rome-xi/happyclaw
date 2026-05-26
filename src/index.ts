@@ -179,6 +179,7 @@ import {
 import { logger } from './logger.js';
 import { resolveTaskOwner } from './task-utils.js';
 import { resolvePerMessageRuntimeOwner } from './runtime-owner.js';
+import { checkOwnerActive } from './owner-gate.js';
 import {
   ensureAgentDirectories,
   isSystemMaintenanceNoise,
@@ -3057,6 +3058,22 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   if (effectiveGroup.created_by) {
     const owner = getUserById(effectiveGroup.created_by);
+    // Defense-in-depth: drop messages whose owner is no longer active
+    // (disabled or deleted). See `src/owner-gate.ts` for rationale.
+    const ownerGate = checkOwnerActive(owner);
+    if (!ownerGate.allowed) {
+      commitCursor();
+      await setTyping(chatJid, false);
+      logger.info(
+        {
+          chatJid,
+          userId: effectiveGroup.created_by,
+          ownerStatus: ownerGate.status,
+        },
+        'Dropping message: group owner is not active',
+      );
+      return true;
+    }
     if (owner && owner.role !== 'admin') {
       const accessResult = checkBillingAccessFresh(
         effectiveGroup.created_by,
@@ -5895,6 +5912,35 @@ async function processAgentConversation(
   // Get pending messages
   const sinceCursor = lastAgentTimestamp[virtualChatJid] || EMPTY_CURSOR;
   let missedMessages = getMessagesSince(virtualChatJid, sinceCursor);
+
+  // Owner gate (single chokepoint for all 5 call sites: normal dispatch,
+  // IM-restart recovery, unconsumed-IPC recovery, /spawn). The main message
+  // loop's owner gate is bypassed for target_agent_id groups (they `continue`
+  // before it), so conversation-agent traffic only reaches this gate. When the
+  // owner is disabled/deleted, advance the cursor past the pending messages so
+  // they aren't replayed, then drop. See `src/owner-gate.ts` for rationale.
+  if (effectiveGroup.created_by) {
+    const ownerGate = checkOwnerActive(getUserById(effectiveGroup.created_by));
+    if (!ownerGate.allowed) {
+      const lastMsg = missedMessages[missedMessages.length - 1];
+      if (lastMsg) {
+        setCursors(virtualChatJid, {
+          timestamp: lastMsg.timestamp,
+          id: lastMsg.id,
+        });
+      }
+      logger.info(
+        {
+          chatJid,
+          agentId,
+          userId: effectiveGroup.created_by,
+          ownerStatus: ownerGate.status,
+        },
+        'Dropping agent conversation: owner is not active',
+      );
+      return;
+    }
+  }
   if (missedMessages.length === 0) {
     // Spawn agents are fire-and-forget: if no messages are found (race condition
     // or cursor already advanced), mark as error so they don't stay idle forever.
@@ -6845,9 +6891,31 @@ async function startMessageLoop(): Promise<void> {
           // to conversation agents at IM ingestion time (feishu.ts/telegram.ts)
           if (group.target_agent_id) continue;
 
-          // Billing quota check before processing
+          // Owner gate + billing share a single owner lookup. Owner status
+          // check first: drop messages from groups whose owner is
+          // disabled/deleted (see `src/owner-gate.ts`); billing quota check
+          // second.
           if (group.created_by) {
             const owner = getUserById(group.created_by);
+            const ownerGate = checkOwnerActive(owner);
+            if (!ownerGate.allowed) {
+              const lastMsg = groupMessages[groupMessages.length - 1];
+              setCursors(chatJid, {
+                timestamp: lastMsg.timestamp,
+                id: lastMsg.id,
+              });
+              logger.info(
+                {
+                  chatJid,
+                  userId: group.created_by,
+                  ownerStatus: ownerGate.status,
+                },
+                'Dropping message: group owner is not active',
+              );
+              continue;
+            }
+
+            // Billing quota check before processing
             if (owner && owner.role !== 'admin') {
               const accessResult = checkBillingAccessFresh(
                 group.created_by,
@@ -9019,6 +9087,27 @@ async function main(): Promise<void> {
     }
   };
 
+  // Reconnect all of a user's IM channels from persisted config — symmetric
+  // counterpart to disconnectAllUserChannels (called on admin re-enable/
+  // restore). Reuses reloadUserIMConfig per channel: it reads each channel's
+  // saved config and only connects the enabled ones, so disabled channels stay
+  // down without extra branching here.
+  const reconnectUserIMChannels = async (userId: string): Promise<void> => {
+    const channels: Array<
+      | 'feishu'
+      | 'telegram'
+      | 'qq'
+      | 'wechat'
+      | 'dingtalk'
+      | 'discord'
+      | 'whatsapp'
+    > = ['feishu', 'telegram', 'qq', 'wechat', 'dingtalk', 'discord', 'whatsapp'];
+    await Promise.allSettled(
+      channels.map((channel) => reloadUserIMConfig(userId, channel)),
+    );
+    logger.info({ userId }, 'Reconnected user IM channels after re-enable');
+  };
+
   // Start Web server early so frontend auth/API isn't blocked by Feishu readiness.
   startWebServer({
     queue,
@@ -9056,6 +9145,7 @@ async function main(): Promise<void> {
     reloadFeishuConnection,
     reloadTelegramConnection,
     reloadUserIMConfig,
+    reconnectUserIMChannels,
     isFeishuConnected: () => imManager.isAnyFeishuConnected(),
     isTelegramConnected: () => imManager.isAnyTelegramConnected(),
     isUserFeishuConnected: (userId: string) =>

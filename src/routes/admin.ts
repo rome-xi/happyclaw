@@ -19,7 +19,12 @@ import type {
   PermissionTemplateKey,
   AuthEventType,
 } from '../types.js';
-import { lastActiveCache, invalidateUserSessions } from '../web-context.js';
+import {
+  lastActiveCache,
+  invalidateUserSessions,
+  getWebDeps,
+} from '../web-context.js';
+import { imManager } from '../im-manager.js';
 import {
   listUsers,
   getUserById,
@@ -314,6 +319,12 @@ adminRoutes.patch(
     if (validation.data.status !== undefined) {
       if (validation.data.status === 'deleted') {
         deleteUser(id);
+        // Tear down all IM connections so feishu/telegram/qq/wechat/etc bots
+        // stop responding immediately. Without this the bots would keep firing
+        // until the next service restart (loadState filters non-active users).
+        void imManager
+          .disconnectAllUserChannels(id)
+          .catch(() => undefined);
         logAuthEvent({
           event_type: 'user_deleted',
           username: target.username,
@@ -329,6 +340,10 @@ adminRoutes.patch(
         // Revoke all sessions when disabling + clean caches
         invalidateUserSessions(id);
         deleteUserSessionsByUserId(id);
+        // Tear down all IM connections — see note above on the 'deleted' branch.
+        void imManager
+          .disconnectAllUserChannels(id)
+          .catch(() => undefined);
         updates.disable_reason =
           validation.data.disable_reason ?? 'disabled_by_admin';
         logAuthEvent({
@@ -405,6 +420,19 @@ adminRoutes.patch(
 
     updateUserFields(id, updates);
     const updated = getUserById(id)!;
+
+    // Symmetric to the disconnect-on-disable/delete above: when a user is
+    // re-enabled or restored (was disabled/deleted, now active), bring their
+    // IM channels back without a service restart. Fire-and-forget; only
+    // enabled channels with valid credentials actually reconnect.
+    if (
+      validation.data.status === 'active' &&
+      (target.status === 'disabled' || target.status === 'deleted')
+    ) {
+      void getWebDeps()
+        ?.reconnectUserIMChannels?.(id)
+        .catch(() => undefined);
+    }
 
     // When admin resets their own password, recreate session to avoid logout
     if (isSelfPasswordReset) {

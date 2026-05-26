@@ -1044,6 +1044,32 @@ class IMConnectionManager {
   }
 
   /**
+   * Disconnect all IM channels owned by a single user (feishu / telegram /
+   * qq / wechat / dingtalk / discord / whatsapp). Used when admin disables
+   * or deletes a user — without this, an active feishu bot would keep
+   * responding to that user's group messages until the next service restart
+   * (loadState filters out non-active users at startup).
+   */
+  async disconnectAllUserChannels(userId: string): Promise<void> {
+    const conn = this.connections.get(userId);
+    if (!conn) return;
+    const promises: Promise<void>[] = [];
+    for (const [channelType, channel] of conn.channels.entries()) {
+      promises.push(
+        channel.disconnect().catch((err) => {
+          logger.warn(
+            { userId, channelType, err },
+            'Error disconnecting user IM channel',
+          );
+        }),
+      );
+    }
+    await Promise.allSettled(promises);
+    this.connections.delete(userId);
+    logger.info({ userId }, 'All IM channels for user disconnected');
+  }
+
+  /**
    * Disconnect all IM connections for all users.
    * Called during graceful shutdown.
    */
