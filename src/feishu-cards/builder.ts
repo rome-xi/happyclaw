@@ -2,9 +2,12 @@
  * Top-level Feishu v2 Agent reply card builders.
  *
  *   buildAgentReplyCard(input)
- *       Terminal (static) card. Structured body: title + body with collapsible
- *       overflow sections + metadata row (2×2) + optional thinking/tool panels
- *       + footer. Suitable for finalized Agent replies and error cards.
+ *       Terminal (static) card. Header is status-driven: a successful `done`
+ *       reply drops the header (unless an explicit title is passed) so short
+ *       status messages aren't reduced to a truncated header, while
+ *       running/warning/error keep a status-coloured header. Followed by body
+ *       chunks + metadata row (2×2) + optional thinking/tool panels + footer.
+ *       Suitable for finalized Agent replies and error cards.
  *
  *   buildStreamingAgentCard(opts)
  *       Initial streaming skeleton. Preserves the 5 slot element_ids that
@@ -24,8 +27,7 @@ import {
   buildFooter,
   buildStreamingPanels,
   buildStatusBannerText,
-  extractTitle,
-  stripTitleFromBody,
+  statusHeadline,
   CARD_ELEMENT_IDS,
   type StreamingPanelsInit,
 } from './sections.js';
@@ -44,20 +46,36 @@ export function buildAgentReplyCard(input: AgentCardInput): FeishuCardV2 {
     ? optimizeMarkdownStyle(input.thinking, 2)
     : undefined;
 
-  const { title: autoTitle, bodyStartIndex } = extractTitle(optimizedText);
-  const displayTitle = input.title ?? autoTitle;
-  const body = stripTitleFromBody(optimizedText, bodyStartIndex);
+  const explicitTitle = input.title?.trim();
+  const body = optimizedText.trim();
+
+  // Header policy is driven by status, not by whether a title was passed:
+  //   - done  → drop the header unless an explicit title is given, so short
+  //             status replies don't promote their first line into a truncated
+  //             header (issue #488).
+  //   - running / warning / error → always render a status-coloured header so
+  //             the orange/red/blue state semantics survive into the terminal
+  //             card and the streaming→terminal transition stays visually
+  //             consistent (no header that suddenly disappears).
+  // The header title text comes from the explicit title when present, otherwise
+  // a minimal status word — never the body's first line.
+  const renderHeader = input.status !== 'done' || !!explicitTitle;
+  const headlineTitle = explicitTitle ?? statusHeadline(input.status);
+  const summaryTitle = renderHeader
+    ? input.titlePrefix
+      ? `${input.titlePrefix}${headlineTitle}`
+      : headlineTitle
+    : undefined;
 
   const normalizedInput: AgentCardInput = {
     ...input,
     text: optimizedText,
+    title: explicitTitle,
     thinking: optimizedThinking,
   };
 
-  const header = buildHeader(normalizedInput);
+  const header = renderHeader ? buildHeader(normalizedInput) : undefined;
   const elements: Array<Record<string, unknown>> = [];
-  // When the title was auto-extracted from the first line, body may be empty.
-  // Hiding the body area avoids the header/first-line duplication (issue #488).
   if (body) {
     elements.push(...buildBodyChunks(body));
   }
@@ -81,21 +99,28 @@ export function buildAgentReplyCard(input: AgentCardInput): FeishuCardV2 {
   elements.push(...toolsPanel);
   elements.push(...footer);
 
-  return {
+  const config: Record<string, unknown> = {
+    update_multi: true,
+    enable_forward: true,
+    width_mode: 'fill',
+  };
+  if (summaryTitle) {
+    config.summary = { content: summaryTitle };
+  }
+
+  const card: FeishuCardV2 = {
     schema: '2.0',
-    config: {
-      update_multi: true,
-      enable_forward: true,
-      width_mode: 'fill',
-      summary: { content: displayTitle },
-    },
-    header,
+    config,
     body: {
       direction: 'vertical',
       vertical_spacing: 'medium',
       elements,
     },
   };
+  if (header) {
+    card.header = header;
+  }
+  return card;
 }
 
 export interface StreamingCardBuildOptions {
@@ -123,8 +148,11 @@ export function buildStreamingAgentCard(
   opts: StreamingCardBuildOptions = {},
 ): FeishuCardV2 {
   const initialText = opts.initialText ?? '';
-  const { title: autoTitle } = extractTitle(initialText);
-  const displayTitle = opts.title ?? autoTitle ?? '...';
+  // Header/summary title follows the same status-driven policy as the terminal
+  // card: an explicit title wins, otherwise a minimal status word ("生成中") —
+  // never the reply's first line. This keeps the streaming→terminal transition
+  // consistent instead of moving the first line between header and body.
+  const displayTitle = opts.title?.trim() || statusHeadline('running');
   const useRich = opts.rich !== false;
 
   const header = buildHeader({

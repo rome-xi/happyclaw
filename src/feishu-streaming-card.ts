@@ -26,6 +26,7 @@ import {
 import type { CardStatus, ToolCallStat } from './feishu-cards/types.js';
 import {
   CARD_ELEMENT_IDS,
+  statusHeadline,
   buildStatusBannerText,
   buildProgressListText,
   buildToolsTimelineText,
@@ -499,9 +500,11 @@ function buildStreamingCard(
   state: 'streaming' | 'completed' | 'aborted',
   footerNote?: string,
 ): object {
-  // Terminal states delegate to the structured v2 builder so the final card
-  // matches every other reply (themed header + metadata slot + collapsible
-  // continuation sections + grey-notation footer).
+  // Terminal states delegate to the structured v2 builder, which drives the
+  // header off status: `done` drops the header so short replies aren't reduced
+  // to a truncated title (issue #488), while `aborted`→warning keeps an orange
+  // status header. Body, metadata slot and grey-notation footer match every
+  // other reply.
   if (state === 'completed') {
     return buildAgentReplyCard({
       status: 'done',
@@ -517,17 +520,16 @@ function buildStreamingCard(
     });
   }
 
-  // Streaming state — flat v2 layout for cheap full-card patches.
+  // Streaming state — flat v2 layout for cheap full-card patches. The header is
+  // a fixed status word ("生成中"), never the reply's first line: keeping the
+  // body intact (first line stays in MAIN_CONTENT) means the streaming→terminal
+  // transition no longer shuffles the first line between header and body.
   const optimized = optimizeMarkdownStyle(text || '...', 2);
-  const { title, body } = extractTitleAndBody(optimized);
-  const displayTitle = title || '...';
-  // When the title was extracted from the first line, body is empty — keep the
-  // MAIN_CONTENT slot so streaming patches still target it, but avoid echoing
-  // the title back into the body (issue #488).
+  const streamingTitle = statusHeadline('running');
   const elements: Array<Record<string, unknown>> = [
     {
       tag: 'markdown',
-      content: body,
+      content: optimized,
       element_id: CARD_ELEMENT_IDS.MAIN_CONTENT,
     },
     { ...INTERRUPT_BUTTON_V2, element_id: CARD_ELEMENT_IDS.INTERRUPT_BTN },
@@ -550,10 +552,10 @@ function buildStreamingCard(
     schema: '2.0',
     config: {
       width_mode: 'fill',
-      summary: { content: displayTitle },
+      summary: { content: streamingTitle },
     },
     header: {
-      title: { tag: 'plain_text', content: displayTitle },
+      title: { tag: 'plain_text', content: streamingTitle },
       template: 'blue',
     },
     body: { elements },
@@ -2281,7 +2283,9 @@ export class StreamingCardController {
   /**
    * Build a structured terminal card from the controller's accumulated state.
    * Reuses the shared v2 builder so the visual surface matches non-streaming
-   * replies (metadata row, collapsible overflow, themed header).
+   * replies (metadata row, collapsible thinking/tool panels, grey footer). The
+   * builder decides the header off status: `done` has none, `aborted`→warning
+   * keeps an orange status header.
    */
   private buildStructuredFinalCard(
     finalState: 'completed' | 'aborted',
