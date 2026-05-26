@@ -6160,6 +6160,16 @@ async function processAgentConversation(
   let currentAgentSessionId = sessionId;
 
   const wrappedOnOutput = async (output: ContainerOutput) => {
+    queue.markRunnerActivity(virtualJid);
+    if (
+      (output.status === 'success' && output.result !== null) ||
+      (output.status === 'stream' &&
+        output.streamEvent?.eventType === 'status' &&
+        output.streamEvent.statusText === 'interrupted')
+    ) {
+      queue.markRunnerQueryIdle(virtualJid);
+    }
+
     // Track session
     if (output.newSessionId && output.status !== 'error') {
       setSession(effectiveGroup.folder, output.newSessionId, agentId);
@@ -6475,6 +6485,10 @@ async function processAgentConversation(
         resetIdleTimer();
 
         // Spawn agents are fire-and-forget: close after first reply to free process slot.
+        // Conversation agents stay warm and are reclaimed by IDLE_TIMEOUT — closing them
+        // after every reply would cold-start the runner each turn (seconds in container mode).
+        // A post-reply tool call that hangs is handled runner-side by the post-result
+        // interrupt fallback, not by tearing down a warm conversation runner here.
         // Skip for overflow_partial/compact_partial — those are intermediate context
         // compression outputs, not the final result; closing now would kill the agent
         // before it finishes the actual task.

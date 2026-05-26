@@ -620,7 +620,7 @@ export class GroupQueue {
       : agentId
         ? path.join(DATA_DIR, 'ipc', groupFolder, 'agents', agentId, 'input')
         : path.join(DATA_DIR, 'ipc', groupFolder, 'input');
-    for (const name of ['_drain', '_close']) {
+    for (const name of ['_drain', '_close', '_interrupt']) {
       try {
         fs.unlinkSync(path.join(inputDir, name));
       } catch {

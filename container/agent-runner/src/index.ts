@@ -1129,9 +1129,25 @@ async function runQuery(
   let queryRef: { interrupt(): Promise<void> } | null = null;
   let messageCount = 0;
   let resultCount = 0;
+  let postResultInterruptRequested = false;
   // SDK transport is not ready until system/init is received. Piping user messages
   // before init causes "ProcessTransport is not ready for writing" unhandled rejection.
   let sdkTransportReady = false;
+
+  // 收尾阶段中止挂起的工具调用：当 stream 准备关闭（_close/_drain/post-result-timeout）时，
+  // SDK 可能仍卡在最终回复之后的某个工具调用上，光 stream.end() 不会让它退出。
+  // 这里主动 query.interrupt() 中止那个卡住的工具调用，让 for-await 自然结束、runner 回到
+  // waitForIpcMessage() 保持 warm——不杀整个 runner。interrupt 引发的 SDK 错误由 catch 分支
+  // 通过 postResultInterruptRequested 归类为 non-fatal（不退避、不上报为失败）。
+  const interruptQueryForShutdown = (reason: string) => {
+    if (!queryRef) return;
+    if (postResultInterruptRequested) return;
+    postResultInterruptRequested = true;
+    log(`${reason}, interrupting current query before closing stream`);
+    queryRef
+      .interrupt()
+      .catch((err: unknown) => log(`Shutdown interrupt failed: ${err}`));
+  };
 
   const pollIpcDuringQuery = () => {
     if (!ipcPolling) return;
@@ -1139,6 +1155,7 @@ async function runQuery(
     if (shouldClose()) {
       log('Close sentinel detected during query, ending stream');
       closedDuringQuery = true;
+      interruptQueryForShutdown('Close sentinel detected during query');
       stream.end();
       ipcPolling = false;
       ipcQueryWatcher.close();
@@ -1164,6 +1181,7 @@ async function runQuery(
     if (resultCount > 0 && shouldDrain()) {
       log('Drain sentinel detected after query result, ending stream');
       closedDuringQuery = true;
+      interruptQueryForShutdown('Drain sentinel detected after query result');
       stream.end();
       ipcPolling = false;
       ipcQueryWatcher.close();
@@ -1175,6 +1193,7 @@ async function runQuery(
     // 这保证了终端预热等场景下容器不会在查询完成后立即退出。
     if (resultReceivedAt && Date.now() - resultReceivedAt > POST_RESULT_TIMEOUT_MS) {
       log(`Post-result timeout (${POST_RESULT_TIMEOUT_MS / 1000}s), closing stream`);
+      interruptQueryForShutdown('Post-result timeout');
       stream.end();
       ipcPolling = false;
       ipcQueryWatcher.close();
@@ -1684,6 +1703,16 @@ async function runQuery(
     // 中断导致的 SDK 错误（error_during_execution 等）：正常返回，不抛出
     if (interruptedDuringQuery) {
       log(`runQuery error during interrupt (non-fatal): ${errorMessage}`);
+      return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery, pipedMessagesDuringQuery };
+    }
+
+    // Shutdown 触发的 interrupt（_close/_drain/post-result-timeout）：interruptQueryForShutdown()
+    // 调用 query.interrupt() 中止挂起的工具调用，SDK 随后可能抛出 error_during_execution。
+    // 这与 _interrupt sentinel 是同一类"主动中止"，不是真正的执行失败——必须按 interrupted
+    // 同级处理为 non-fatal。否则在 result 尚未发射（resultCount===0，如 _close 在 query 刚起步就到）
+    // 时会落到下方 re-throw，被外层当 error 退避，把一次干净的 shutdown 误报成失败。
+    if (postResultInterruptRequested) {
+      log(`runQuery error after shutdown interrupt (non-fatal): ${errorMessage}`);
       return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery, pipedMessagesDuringQuery };
     }
 
