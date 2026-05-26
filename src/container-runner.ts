@@ -282,6 +282,66 @@ export function setProviderOverride(groupFolder: string, providerId: string): vo
 }
 
 /**
+ * Read-only prediction of whether the next provider selection will *clear* the
+ * resumable Claude session because it has to switch away from the bound
+ * provider (the binding is unhealthy or no longer enabled, or a one-time
+ * override targets a different provider). Mirrors the `resetSession` conditions
+ * in trySelectPoolProvider without mutating sticky bindings.
+ *
+ * The orchestration layer calls this *before* building the prompt so a
+ * proactive provider switch injects recent conversation history into the fresh
+ * session — matching the reactive (mid-stream provider-failure) path. Without
+ * this, the first turn under the new provider would see an empty conversation.
+ *
+ * Conservative by design: a false positive only injects redundant history
+ * (harmless), never the reverse.
+ */
+export function willClearSessionOnProviderSwitch(
+  groupFolder: string,
+  agentId?: string | null,
+): boolean {
+  // Env-level provider override means the pool is bypassed entirely — no
+  // pool-driven switch, so the session is never cleared on this account.
+  const override = getContainerEnvConfig(groupFolder);
+  if (
+    override.anthropicApiKey ||
+    override.anthropicAuthToken ||
+    override.anthropicBaseUrl
+  ) {
+    return false;
+  }
+
+  const boundId = getSessionProviderId(groupFolder, agentId);
+  if (!boundId) return false;
+
+  // One-time override (from switchProvider) targeting a different provider will
+  // reset. Peek without consuming — trySelectPoolProvider consumes it later.
+  const overrideProviderId = providerOverrides.get(groupFolder);
+  if (overrideProviderId) {
+    return overrideProviderId !== boundId;
+  }
+
+  const enabledProviders = getEnabledProviders();
+  if (enabledProviders.length === 0) return false;
+
+  // Bound provider removed/disabled → a fresh one gets picked → reset.
+  const stillEnabled = enabledProviders.some((p) => p.id === boundId);
+  if (!stillEnabled) return true;
+
+  // Single enabled provider equal to the binding → sticky, no reset.
+  if (enabledProviders.length === 1) {
+    return enabledProviders[0].id !== boundId;
+  }
+
+  // Multiple providers: sticky reuse only when the binding is still healthy.
+  // Unhealthy binding falls through to pool selection, which prefers a
+  // different healthy provider → reset.
+  const balancing = getBalancingConfig();
+  providerPool.refreshFromConfig(enabledProviders, balancing);
+  return !providerPool.getHealthStatus(boundId).healthy;
+}
+
+/**
  * Try to select a provider from the pool. Returns profileId + resolved config,
  * or null if no providers are enabled / group has env-level provider override / selection fails.
  * For single-provider setups, returns the provider for display without pool balancing.
@@ -861,7 +921,14 @@ export async function runContainerAgent(
       },
       'Clearing Claude session after switching providers',
     );
+    // deleteSession removes the whole sessions row, including the provider_id
+    // binding trySelectPoolProvider just wrote. Re-bind the freshly-selected
+    // provider so the next turn stays sticky to it instead of degrading to a
+    // fresh pool pick.
     deleteSession(group.folder, input.agentId);
+    if (selectedProfileId) {
+      setSessionProviderId(group.folder, input.agentId, selectedProfileId);
+    }
     input = { ...input, sessionId: undefined };
   }
 
@@ -1398,7 +1465,13 @@ export async function runHostAgent(
       },
       'Clearing Claude session after switching providers',
     );
+    // deleteSession removes the whole sessions row, including the provider_id
+    // binding trySelectPoolProvider just wrote. Re-bind so the next turn stays
+    // sticky to the freshly-selected provider (mirrors the container path).
     deleteSession(group.folder, input.agentId);
+    if (hostSelectedProfileId) {
+      setSessionProviderId(group.folder, input.agentId, hostSelectedProfileId);
+    }
     input = { ...input, sessionId: undefined };
   }
 
