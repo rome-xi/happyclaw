@@ -26,6 +26,7 @@ import {
   ContainerOutput,
   runContainerAgent,
   runHostAgent,
+  willClearSessionOnProviderSwitch,
   writeGroupsSnapshot,
   writeTasksSnapshot,
 } from './container-runner.js';
@@ -211,6 +212,7 @@ import {
 import { verifyPairingCode } from './telegram-pairing.js';
 import { sdkQuery } from './sdk-query.js';
 import { executeSessionReset } from './commands.js';
+import { buildRecentConversationHistoryContext } from './conversation-history.js';
 import { scanHostMarketplaces } from './plugin-importer.js';
 import { expandMessagesIfNeeded } from './plugin-expander-core.js';
 import { makeExpandContext } from './plugin-expander-context.js';
@@ -2675,47 +2677,6 @@ export function formatMessages(
   return `<messages>\n${lines.join('\n')}\n</messages>`;
 }
 
-function buildRecentConversationHistoryContext(
-  chatJid: string,
-  pendingMessageIds: Set<string>,
-  opts: {
-    limit?: number;
-    maxMessageLength?: number;
-    intro: string;
-  },
-): { context: string; count: number } | null {
-  const recentHistory = getMessagesPage(chatJid, undefined, opts.limit ?? 30);
-  const historyMsgs = recentHistory
-    .reverse()
-    .filter((m) => !pendingMessageIds.has(m.id))
-    .filter((m) => m.content.trim().length > 0);
-
-  if (historyMsgs.length === 0) return null;
-
-  const maxLen = opts.maxMessageLength ?? 700;
-  const historyLines = historyMsgs.map((m) => {
-    const role = m.is_from_me ? 'assistant' : m.sender_name;
-    const truncated =
-      m.content.length > maxLen ? m.content.slice(0, maxLen) + '…' : m.content;
-    let cleaned = truncated.replace(
-      /(?:[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF])/g,
-      '',
-    );
-    cleaned = cleaned.replace(/<\/system_context>/gi, '</system_context_>');
-    return `[${role}] ${cleaned}`;
-  });
-
-  return {
-    count: historyMsgs.length,
-    context:
-      '<system_context>\n' +
-      opts.intro +
-      '\n重要：这些只是 HappyClaw 持久化的历史聊天记录，用来在新模型/新 session 中恢复上下文。回答当前用户消息时，请优先依据当前消息和当前文件状态；如果历史与当前问题无关，请直接忽略。\n\n' +
-      historyLines.join('\n') +
-      '\n</system_context>\n\n',
-  };
-}
-
 export function collectMessageImages(
   chatJid: string,
   messages: NewMessage[],
@@ -2919,6 +2880,27 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       logger.info(
         { group: group.name, historyCount: historyContext.count },
         'Recovery: injected recent conversation history into prompt',
+      );
+    }
+  } else if (willClearSessionOnProviderSwitch(effectiveGroup.folder)) {
+    // Proactive provider switch (sticky binding unhealthy/disabled) will clear
+    // the SDK session inside the runner. Inject history so the new provider's
+    // first turn keeps context, matching the recovery + reactive-failure paths.
+    const historyContext = buildRecentConversationHistoryContext(
+      chatJid,
+      new Set(missedMessages.map((m) => m.id)),
+      {
+        limit: 30,
+        maxMessageLength: 700,
+        intro:
+          '检测到本次因切换 provider 需要使用新的底层模型 session。以下是 HappyClaw 保存的最近对话记录，供你延续上下文。',
+      },
+    );
+    if (historyContext) {
+      prompt = historyContext.context + prompt;
+      logger.info(
+        { group: group.name, historyCount: historyContext.count },
+        'Provider switch: injected recent conversation history into prompt',
       );
     }
   }
@@ -3457,6 +3439,26 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             // Reset idle timer on stream events so long-running tool calls
             // (e.g. MCP batch writes) don't get killed while the agent is
             // actively working. Previously only final results triggered a reset.
+            resetIdleTimer();
+            return;
+          }
+
+          // Provider quota/limit notice surfaced as a "successful" result.
+          // The switch is silent to the user (decided in #549): never deliver
+          // the English limit text to IM/web — only log for admin/monitoring.
+          // The runner already stops the container and re-routes to another
+          // provider on the next turn.
+          if (result.providerFailure) {
+            logger.warn(
+              {
+                group: group.name,
+                result:
+                  typeof result.result === 'string'
+                    ? result.result.slice(0, 200)
+                    : result.result,
+              },
+              'Provider failure result suppressed from user (silent switch)',
+            );
             resetIdleTimer();
             return;
           }
@@ -6082,7 +6084,10 @@ async function processAgentConversation(
   const sessionId = getSession(effectiveGroup.folder, agentId) || undefined;
   let currentAgentSessionId = sessionId;
   let prompt = formatMessages(missedMessages, false);
-  if (!sessionId) {
+  // Inject history when the SDK session is fresh, or when a proactive provider
+  // switch (sticky binding unhealthy/disabled) will clear the existing session
+  // inside the runner — otherwise the new provider's first turn loses context.
+  if (!sessionId || willClearSessionOnProviderSwitch(effectiveGroup.folder, agentId)) {
     const historyContext = buildRecentConversationHistoryContext(
       virtualChatJid,
       new Set(missedMessages.map((m) => m.id)),
@@ -6359,6 +6364,25 @@ async function processAgentConversation(
 
       // Reset idle timer on stream events so long-running tool calls
       // don't get killed while the agent is actively working.
+      resetIdleTimer();
+      return;
+    }
+
+    // Provider quota/limit notice surfaced as a "successful" result — silent
+    // switch (#549): suppress the English limit text from the user, log only.
+    // Session was already cleared at the top of this callback.
+    if (output.providerFailure) {
+      logger.warn(
+        {
+          chatJid,
+          agentId,
+          result:
+            typeof output.result === 'string'
+              ? output.result.slice(0, 200)
+              : output.result,
+        },
+        'Provider failure result suppressed from user (silent switch)',
+      );
       resetIdleTimer();
       return;
     }
