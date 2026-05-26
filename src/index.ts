@@ -26,6 +26,7 @@ import {
   ContainerOutput,
   runContainerAgent,
   runHostAgent,
+  willClearSessionOnProviderSwitch,
   writeGroupsSnapshot,
   writeTasksSnapshot,
 } from './container-runner.js';
@@ -211,6 +212,7 @@ import {
 import { verifyPairingCode } from './telegram-pairing.js';
 import { sdkQuery } from './sdk-query.js';
 import { executeSessionReset } from './commands.js';
+import { buildRecentConversationHistoryContext } from './conversation-history.js';
 import { scanHostMarketplaces } from './plugin-importer.js';
 import { expandMessagesIfNeeded } from './plugin-expander-core.js';
 import { makeExpandContext } from './plugin-expander-context.js';
@@ -2863,46 +2865,42 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // recent conversation history to give the fresh session context.
   const isRecovery = recoveryGroups.delete(chatJid);
   if (isRecovery) {
-    const RECOVERY_HISTORY_LIMIT = 20;
-    const recentHistory = getMessagesPage(
+    const historyContext = buildRecentConversationHistoryContext(
       chatJid,
-      undefined,
-      RECOVERY_HISTORY_LIMIT,
+      new Set(missedMessages.map((m) => m.id)),
+      {
+        limit: 20,
+        maxMessageLength: 500,
+        intro:
+          '检测到上次有未完成消息，当前使用新会话恢复处理。以下是恢复前的最近对话记录，供你了解上下文。',
+      },
     );
-    // getMessagesPage returns DESC order; reverse to chronological, exclude
-    // the pending messages themselves (already in prompt).
-    const pendingIds = new Set(missedMessages.map((m) => m.id));
-    const historyMsgs = recentHistory
-      .reverse()
-      .filter((m) => !pendingIds.has(m.id));
-    if (historyMsgs.length > 0) {
-      const historyLines = historyMsgs.map((m) => {
-        const role = m.is_from_me ? 'assistant' : m.sender_name;
-        const truncated =
-          m.content.length > 500 ? m.content.slice(0, 500) + '…' : m.content;
-        // Strip lone (unpaired) surrogates while preserving valid surrogate pairs
-        // such as emoji. Must stay byte-for-byte aligned with the matching regex
-        // in container/agent-runner/src/index.ts:extractSessionHistory — both
-        // sides feed the same Anthropic API and must produce identical strings.
-        let cleaned = truncated.replace(
-          /(?:[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF])/g,
-          '',
-        );
-        // Defense in depth: strip the closing tag we use to fence this block
-        // so a user message containing "</system_context>" can't escape early.
-        cleaned = cleaned.replace(/<\/system_context>/gi, '</system_context_>');
-        return `[${role}] ${cleaned}`;
-      });
-      prompt =
-        '<system_context>\n' +
-        '检测到上次有未完成消息，当前使用新会话恢复处理。以下是恢复前的最近对话记录，供你了解上下文。\n' +
-        '重要：这些只是历史记录，可能包含不准确或过时的信息。回答当前用户消息时，请优先依据当前消息里的内容和文件；如果历史与当前问题无关，请直接忽略。\n\n' +
-        historyLines.join('\n') +
-        '\n</system_context>\n\n' +
-        prompt;
+    if (historyContext) {
+      prompt = historyContext.context + prompt;
       logger.info(
-        { group: group.name, historyCount: historyMsgs.length },
+        { group: group.name, historyCount: historyContext.count },
         'Recovery: injected recent conversation history into prompt',
+      );
+    }
+  } else if (willClearSessionOnProviderSwitch(effectiveGroup.folder)) {
+    // Proactive provider switch (sticky binding unhealthy/disabled) will clear
+    // the SDK session inside the runner. Inject history so the new provider's
+    // first turn keeps context, matching the recovery + reactive-failure paths.
+    const historyContext = buildRecentConversationHistoryContext(
+      chatJid,
+      new Set(missedMessages.map((m) => m.id)),
+      {
+        limit: 30,
+        maxMessageLength: 700,
+        intro:
+          '检测到本次因切换 provider 需要使用新的底层模型 session。以下是 HappyClaw 保存的最近对话记录，供你延续上下文。',
+      },
+    );
+    if (historyContext) {
+      prompt = historyContext.context + prompt;
+      logger.info(
+        { group: group.name, historyCount: historyContext.count },
+        'Provider switch: injected recent conversation history into prompt',
       );
     }
   }
@@ -3441,6 +3439,26 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             // Reset idle timer on stream events so long-running tool calls
             // (e.g. MCP batch writes) don't get killed while the agent is
             // actively working. Previously only final results triggered a reset.
+            resetIdleTimer();
+            return;
+          }
+
+          // Provider quota/limit notice surfaced as a "successful" result.
+          // The switch is silent to the user (decided in #549): never deliver
+          // the English limit text to IM/web — only log for admin/monitoring.
+          // The runner already stops the container and re-routes to another
+          // provider on the next turn.
+          if (result.providerFailure) {
+            logger.warn(
+              {
+                group: group.name,
+                result:
+                  typeof result.result === 'string'
+                    ? result.result.slice(0, 200)
+                    : result.result,
+              },
+              'Provider failure result suppressed from user (silent switch)',
+            );
             resetIdleTimer();
             return;
           }
@@ -4141,7 +4159,11 @@ async function runAgent(
         }
         // 仅从成功的输出中更新 session ID；
         // error 输出可能携带 stale ID，会覆盖流式传递的有效 session
-        if (output.newSessionId && output.status !== 'error') {
+        if (
+          output.newSessionId &&
+          output.status !== 'error' &&
+          !output.providerFailure
+        ) {
           sessions[group.folder] = output.newSessionId;
           setSession(group.folder, output.newSessionId);
         }
@@ -4216,7 +4238,11 @@ async function runAgent(
 
     // 仅从成功的最终输出中更新 session ID；
     // error 状态的输出可能携带 stale ID，覆盖流式阶段已写入的有效 session
-    if (output.newSessionId && output.status !== 'error') {
+    if (
+      output.newSessionId &&
+      output.status !== 'error' &&
+      !output.providerFailure
+    ) {
       sessions[group.folder] = output.newSessionId;
       setSession(group.folder, output.newSessionId);
     }
@@ -6051,7 +6077,35 @@ async function processAgentConversation(
   updateAgentStatus(agentId, 'running');
   broadcastAgentStatus(chatJid, agentId, 'running', agent.name, agent.prompt);
 
-  const prompt = formatMessages(missedMessages, false);
+  // Get or use agent-specific session before building the prompt. If the
+  // session was cleared by provider/model switching, inject persisted HappyClaw
+  // chat history so the new model does not mistake the fresh SDK session for
+  // an empty conversation.
+  const sessionId = getSession(effectiveGroup.folder, agentId) || undefined;
+  let currentAgentSessionId = sessionId;
+  let prompt = formatMessages(missedMessages, false);
+  // Inject history when the SDK session is fresh, or when a proactive provider
+  // switch (sticky binding unhealthy/disabled) will clear the existing session
+  // inside the runner — otherwise the new provider's first turn loses context.
+  if (!sessionId || willClearSessionOnProviderSwitch(effectiveGroup.folder, agentId)) {
+    const historyContext = buildRecentConversationHistoryContext(
+      virtualChatJid,
+      new Set(missedMessages.map((m) => m.id)),
+      {
+        limit: 30,
+        maxMessageLength: 700,
+        intro:
+          '检测到当前 agent 的底层模型 session 是新的（可能因为切换 provider/model 或恢复失败）。以下是 HappyClaw 保存的最近对话记录，供你延续上下文。',
+      },
+    );
+    if (historyContext) {
+      prompt = historyContext.context + prompt;
+      logger.info(
+        { chatJid, agentId, historyCount: historyContext.count },
+        'Agent fresh session: injected recent conversation history into prompt',
+      );
+    }
+  }
   const images = collectMessageImages(virtualChatJid, missedMessages);
   const imagesForAgent = images.length > 0 ? images : undefined;
   // For agent conversations, route reply to IM based on the most recent
@@ -6155,11 +6209,9 @@ async function processAgentConversation(
     cursorCommitted = true;
   };
 
-  // Get or use agent-specific session
-  const sessionId = getSession(effectiveGroup.folder, agentId) || undefined;
-  let currentAgentSessionId = sessionId;
-
   const wrappedOnOutput = async (output: ContainerOutput) => {
+    // #547: warm-lifecycle bookkeeping — mark activity, and flag query-idle on
+    // a substantive result / interruption so the runner can be kept warm.
     queue.markRunnerActivity(virtualJid);
     if (
       (output.status === 'success' && output.result !== null) ||
@@ -6170,8 +6222,26 @@ async function processAgentConversation(
       queue.markRunnerQueryIdle(virtualJid);
     }
 
+    // #549: a provider switch surfaced as a failure clears the agent session so
+    // the next turn starts fresh on the newly-selected provider.
+    if (output.providerFailure) {
+      try {
+        deleteSession(effectiveGroup.folder, agentId);
+        currentAgentSessionId = undefined;
+      } catch (err) {
+        logger.warn(
+          { err, chatJid, agentId, folder: effectiveGroup.folder },
+          'Failed to clear agent session after provider failure',
+        );
+      }
+    }
+
     // Track session
-    if (output.newSessionId && output.status !== 'error') {
+    if (
+      output.newSessionId &&
+      output.status !== 'error' &&
+      !output.providerFailure
+    ) {
       setSession(effectiveGroup.folder, output.newSessionId, agentId);
       currentAgentSessionId = output.newSessionId;
     }
@@ -6294,6 +6364,25 @@ async function processAgentConversation(
 
       // Reset idle timer on stream events so long-running tool calls
       // don't get killed while the agent is actively working.
+      resetIdleTimer();
+      return;
+    }
+
+    // Provider quota/limit notice surfaced as a "successful" result — silent
+    // switch (#549): suppress the English limit text from the user, log only.
+    // Session was already cleared at the top of this callback.
+    if (output.providerFailure) {
+      logger.warn(
+        {
+          chatJid,
+          agentId,
+          result:
+            typeof output.result === 'string'
+              ? output.result.slice(0, 200)
+              : output.result,
+        },
+        'Provider failure result suppressed from user (silent switch)',
+      );
       resetIdleTimer();
       return;
     }
@@ -6590,7 +6679,11 @@ async function processAgentConversation(
     }
 
     // Finalize session
-    if (output.newSessionId && output.status !== 'error') {
+    if (
+      output.newSessionId &&
+      output.status !== 'error' &&
+      !output.providerFailure
+    ) {
       setSession(effectiveGroup.folder, output.newSessionId, agentId);
     }
 

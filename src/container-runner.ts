@@ -34,7 +34,11 @@ import {
   writeCredentialsFile,
 } from './runtime-config.js';
 import { providerPool } from './provider-pool.js';
-import { getSessionProviderId, setSessionProviderId } from './db.js';
+import {
+  deleteSession,
+  getSessionProviderId,
+  setSessionProviderId,
+} from './db.js';
 import { isApiError } from './agent-output-parser.js';
 import type { ClaudeProviderConfig } from './runtime-config.js';
 import { loadUserMcpServers } from './mcp-utils.js';
@@ -233,6 +237,7 @@ export interface ContainerOutput {
   result: string | null;
   newSessionId?: string;
   error?: string;
+  providerFailure?: boolean;
   streamEvent?: StreamEvent;
   turnId?: string;
   sessionId?: string;
@@ -277,6 +282,66 @@ export function setProviderOverride(groupFolder: string, providerId: string): vo
 }
 
 /**
+ * Read-only prediction of whether the next provider selection will *clear* the
+ * resumable Claude session because it has to switch away from the bound
+ * provider (the binding is unhealthy or no longer enabled, or a one-time
+ * override targets a different provider). Mirrors the `resetSession` conditions
+ * in trySelectPoolProvider without mutating sticky bindings.
+ *
+ * The orchestration layer calls this *before* building the prompt so a
+ * proactive provider switch injects recent conversation history into the fresh
+ * session — matching the reactive (mid-stream provider-failure) path. Without
+ * this, the first turn under the new provider would see an empty conversation.
+ *
+ * Conservative by design: a false positive only injects redundant history
+ * (harmless), never the reverse.
+ */
+export function willClearSessionOnProviderSwitch(
+  groupFolder: string,
+  agentId?: string | null,
+): boolean {
+  // Env-level provider override means the pool is bypassed entirely — no
+  // pool-driven switch, so the session is never cleared on this account.
+  const override = getContainerEnvConfig(groupFolder);
+  if (
+    override.anthropicApiKey ||
+    override.anthropicAuthToken ||
+    override.anthropicBaseUrl
+  ) {
+    return false;
+  }
+
+  const boundId = getSessionProviderId(groupFolder, agentId);
+  if (!boundId) return false;
+
+  // One-time override (from switchProvider) targeting a different provider will
+  // reset. Peek without consuming — trySelectPoolProvider consumes it later.
+  const overrideProviderId = providerOverrides.get(groupFolder);
+  if (overrideProviderId) {
+    return overrideProviderId !== boundId;
+  }
+
+  const enabledProviders = getEnabledProviders();
+  if (enabledProviders.length === 0) return false;
+
+  // Bound provider removed/disabled → a fresh one gets picked → reset.
+  const stillEnabled = enabledProviders.some((p) => p.id === boundId);
+  if (!stillEnabled) return true;
+
+  // Single enabled provider equal to the binding → sticky, no reset.
+  if (enabledProviders.length === 1) {
+    return enabledProviders[0].id !== boundId;
+  }
+
+  // Multiple providers: sticky reuse only when the binding is still healthy.
+  // Unhealthy binding falls through to pool selection, which prefers a
+  // different healthy provider → reset.
+  const balancing = getBalancingConfig();
+  providerPool.refreshFromConfig(enabledProviders, balancing);
+  return !providerPool.getHealthStatus(boundId).healthy;
+}
+
+/**
  * Try to select a provider from the pool. Returns profileId + resolved config,
  * or null if no providers are enabled / group has env-level provider override / selection fails.
  * For single-provider setups, returns the provider for display without pool balancing.
@@ -293,7 +358,12 @@ export function setProviderOverride(groupFolder: string, providerId: string): vo
 function trySelectPoolProvider(
   groupFolder: string,
   agentId?: string | null,
-): { profileId: string; resolved: ResolvedProvider } | null {
+): {
+  profileId: string;
+  resolved: ResolvedProvider;
+  previousProviderId?: string;
+  resetSession?: boolean;
+} | null {
   const override = getContainerEnvConfig(groupFolder);
   const hasOverride = !!(
     override.anthropicApiKey ||
@@ -301,6 +371,8 @@ function trySelectPoolProvider(
     override.anthropicBaseUrl
   );
   if (hasOverride) return null;
+
+  const existingBoundId = getSessionProviderId(groupFolder, agentId);
 
   // Check one-time override (consumed on use)
   const overrideProviderId = providerOverrides.get(groupFolder);
@@ -318,38 +390,57 @@ function trySelectPoolProvider(
       return {
         profileId: overrideProviderId,
         resolved: { config: resolved.config, customEnv: resolved.customEnv },
+        previousProviderId: existingBoundId,
+        resetSession:
+          !!existingBoundId && existingBoundId !== overrideProviderId,
       };
     } catch (err) {
-      logger.warn({ err, providerId: overrideProviderId }, 'Provider override failed, falling back to pool');
+      logger.warn(
+        { err, providerId: overrideProviderId },
+        'Provider override failed, falling back to pool',
+      );
     }
   }
 
   // Refresh pool state from V4 config
   const enabledProviders = getEnabledProviders();
   if (enabledProviders.length === 0) return null;
+  const balancing = getBalancingConfig();
+  providerPool.refreshFromConfig(enabledProviders, balancing);
+  const boundId = existingBoundId;
 
   // Sticky path: respect previous session→provider binding when the bound
   // provider is still enabled. Skip when only one provider exists (single
   // provider already gives stickiness implicitly).
   if (enabledProviders.length > 1) {
-    const boundId = getSessionProviderId(groupFolder, agentId);
     if (boundId && enabledProviders.some((p) => p.id === boundId)) {
-      try {
-        const resolved = resolveProviderById(boundId);
-        providerPool.acquireSession(boundId);
-        logger.debug(
+      const boundHealth = providerPool.getHealthStatus(boundId);
+      if (!boundHealth.healthy) {
+        logger.info(
           { groupFolder, agentId: agentId || null, providerId: boundId },
-          'Reusing sticky provider binding for resumed session',
+          'Sticky provider is unhealthy, falling back to pool selection',
         );
-        return {
-          profileId: boundId,
-          resolved: { config: resolved.config, customEnv: resolved.customEnv },
-        };
-      } catch (err) {
-        logger.warn(
-          { err, providerId: boundId },
-          'Sticky provider resolution failed, falling back to pool selection',
-        );
+      } else {
+        try {
+          const resolved = resolveProviderById(boundId);
+          providerPool.acquireSession(boundId);
+          logger.debug(
+            { groupFolder, agentId: agentId || null, providerId: boundId },
+            'Reusing sticky provider binding for resumed session',
+          );
+          return {
+            profileId: boundId,
+            resolved: {
+              config: resolved.config,
+              customEnv: resolved.customEnv,
+            },
+          };
+        } catch (err) {
+          logger.warn(
+            { err, providerId: boundId },
+            'Sticky provider resolution failed, falling back to pool selection',
+          );
+        }
       }
     } else if (boundId) {
       // Bound provider was disabled or removed — fall through and pick a fresh one.
@@ -369,14 +460,13 @@ function trySelectPoolProvider(
       return {
         profileId: enabledProviders[0].id,
         resolved: { config: resolved.config, customEnv: resolved.customEnv },
+        previousProviderId: boundId,
+        resetSession: !!boundId && boundId !== enabledProviders[0].id,
       };
     } catch {
       return null;
     }
   }
-
-  const balancing = getBalancingConfig();
-  providerPool.refreshFromConfig(enabledProviders, balancing);
 
   try {
     const profileId = providerPool.selectProvider();
@@ -386,9 +476,14 @@ function trySelectPoolProvider(
     return {
       profileId,
       resolved: { config: resolved.config, customEnv: resolved.customEnv },
+      previousProviderId: boundId,
+      resetSession: !!boundId && boundId !== profileId,
     };
   } catch (err) {
-    logger.warn({ err }, 'Provider pool selection failed, falling back to active profile');
+    logger.warn(
+      { err },
+      'Provider pool selection failed, falling back to active profile',
+    );
     return null;
   }
 }
@@ -815,6 +910,27 @@ export async function runContainerAgent(
   const poolResult = trySelectPoolProvider(group.folder, input.agentId);
   const selectedProfileId = poolResult?.profileId ?? null;
   const resolvedProvider = poolResult?.resolved;
+  let providerFailureReported = false;
+  if (poolResult?.resetSession && input.sessionId) {
+    logger.info(
+      {
+        groupFolder: group.folder,
+        agentId: input.agentId || null,
+        previousProviderId: poolResult.previousProviderId,
+        providerId: selectedProfileId,
+      },
+      'Clearing Claude session after switching providers',
+    );
+    // deleteSession removes the whole sessions row, including the provider_id
+    // binding trySelectPoolProvider just wrote. Re-bind the freshly-selected
+    // provider so the next turn stays sticky to it instead of degrading to a
+    // fresh pool pick.
+    deleteSession(group.folder, input.agentId);
+    if (selectedProfileId) {
+      setSessionProviderId(group.folder, input.agentId, selectedProfileId);
+    }
+    input = { ...input, sessionId: undefined };
+  }
 
   try {
     // Determine if this is an admin home container (full privileges)
@@ -936,12 +1052,41 @@ export async function runContainerAgent(
         clearTimeout(timeout);
         timeout = setTimeout(killOnTimeout, timeoutMs);
       };
+      const handleOutput = onOutput
+        ? async (output: ContainerOutput): Promise<void> => {
+            await onOutput(output);
+            if (output.providerFailure && selectedProfileId) {
+              if (!providerFailureReported) {
+                providerFailureReported = true;
+                providerPool.reportFailure(selectedProfileId, true);
+                logger.warn(
+                  {
+                    group: group.name,
+                    containerName,
+                    providerId: selectedProfileId,
+                    result: output.result,
+                  },
+                  'Provider failure detected from streamed output, stopping container',
+                );
+              }
+              exec(`docker stop ${containerName}`, (err) => {
+                if (err) {
+                  logger.warn(
+                    { group: group.name, containerName, err },
+                    'Failed to stop container after provider failure',
+                  );
+                  container.kill('SIGTERM');
+                }
+              });
+            }
+          }
+        : undefined;
 
       // Attach stdout/stderr handlers using shared parser
       attachStdoutHandler(container.stdout, stdoutState, {
         groupName: group.name,
         label: 'Container',
-        onOutput,
+        onOutput: handleOutput,
         resetTimeout,
       });
       attachStderrHandler(container.stderr, stderrState, group.name, {
@@ -1009,7 +1154,11 @@ export async function runContainerAgent(
 
     // ─── Provider Pool health reporting ───
     if (selectedProfileId) {
-      if (result.status === 'success' || result.status === 'closed') {
+      if (result.providerFailure) {
+        if (!providerFailureReported) {
+          providerPool.reportFailure(selectedProfileId, true);
+        }
+      } else if (result.status === 'success' || result.status === 'closed') {
         providerPool.reportSuccess(selectedProfileId);
       } else if (result.status === 'error' && isApiError(result.error || '')) {
         providerPool.reportFailure(selectedProfileId);
@@ -1305,6 +1454,26 @@ export async function runHostAgent(
   const hostPoolResult = trySelectPoolProvider(group.folder, input.agentId);
   const hostSelectedProfileId = hostPoolResult?.profileId ?? null;
   const globalConfig = hostPoolResult?.resolved.config ?? getClaudeProviderConfig();
+  let hostProviderFailureReported = false;
+  if (hostPoolResult?.resetSession && input.sessionId) {
+    logger.info(
+      {
+        groupFolder: group.folder,
+        agentId: input.agentId || null,
+        previousProviderId: hostPoolResult.previousProviderId,
+        providerId: hostSelectedProfileId,
+      },
+      'Clearing Claude session after switching providers',
+    );
+    // deleteSession removes the whole sessions row, including the provider_id
+    // binding trySelectPoolProvider just wrote. Re-bind so the next turn stays
+    // sticky to the freshly-selected provider (mirrors the container path).
+    deleteSession(group.folder, input.agentId);
+    if (hostSelectedProfileId) {
+      setSessionProviderId(group.folder, input.agentId, hostSelectedProfileId);
+    }
+    input = { ...input, sessionId: undefined };
+  }
 
   try {
     // 配置层环境变量
@@ -1618,12 +1787,33 @@ export async function runHostAgent(
         clearTimeout(timeout);
         timeout = setTimeout(killOnTimeout, timeoutMs);
       };
+      const handleOutput = onOutput
+        ? async (output: ContainerOutput): Promise<void> => {
+            await onOutput(output);
+            if (output.providerFailure && hostSelectedProfileId) {
+              if (!hostProviderFailureReported) {
+                hostProviderFailureReported = true;
+                providerPool.reportFailure(hostSelectedProfileId, true);
+                logger.warn(
+                  {
+                    group: group.name,
+                    processId,
+                    providerId: hostSelectedProfileId,
+                    result: output.result,
+                  },
+                  'Provider failure detected from streamed output, stopping host agent',
+                );
+              }
+              killProcessTree(proc, 'SIGTERM');
+            }
+          }
+        : undefined;
 
       // 10. stdout/stderr 解析
       attachStdoutHandler(proc.stdout, stdoutState, {
         groupName: group.name,
         label: 'Host agent',
-        onOutput,
+        onOutput: handleOutput,
         resetTimeout,
       });
       attachStderrHandler(proc.stderr, stderrState, group.name, {
@@ -1687,7 +1877,14 @@ export async function runHostAgent(
 
     // ─── Provider Pool health reporting (host mode) ───
     if (hostSelectedProfileId) {
-      if (hostResult.status === 'success' || hostResult.status === 'closed') {
+      if (hostResult.providerFailure) {
+        if (!hostProviderFailureReported) {
+          providerPool.reportFailure(hostSelectedProfileId, true);
+        }
+      } else if (
+        hostResult.status === 'success' ||
+        hostResult.status === 'closed'
+      ) {
         providerPool.reportSuccess(hostSelectedProfileId);
       } else if (
         hostResult.status === 'error' &&
