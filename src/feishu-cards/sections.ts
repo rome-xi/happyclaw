@@ -119,15 +119,30 @@ export function extractTitle(text: string): TitleExtractResult {
   return { title: 'Reply', bodyStartIndex: 0 };
 }
 
-export function stripTitleFromBody(text: string, bodyStartIndex: number): string {
-  if (bodyStartIndex <= 0) return text.trim();
-  return text.split('\n').slice(bodyStartIndex).join('\n').trim();
+/**
+ * Minimal status word shown as the header title when no explicit title is
+ * provided. Never derive the title from the body's first line — that was the
+ * root cause of the header/first-line duplication (issue #488). For terminal
+ * states we want a short, unambiguous status word instead.
+ */
+export function statusHeadline(status: AgentCardInput['status']): string {
+  switch (status) {
+    case 'running':
+      return '生成中';
+    case 'warning':
+      return '已中断';
+    case 'error':
+      return '出错';
+    case 'done':
+    default:
+      return '已完成';
+  }
 }
 
 export function buildHeader(input: AgentCardInput): El {
   const theme = resolveStatusTheme(input.status);
-  const { title: autoTitle } = extractTitle(input.text);
-  const baseTitle = input.title ?? autoTitle;
+  const explicitTitle = input.title?.trim();
+  const baseTitle = explicitTitle || statusHeadline(input.status);
   const displayTitle = input.titlePrefix
     ? `${input.titlePrefix}${baseTitle}`
     : baseTitle;

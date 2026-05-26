@@ -334,6 +334,69 @@ describe('buildAgentReplyCard', () => {
     }
   });
 
+  test('warning terminal state keeps an orange status header even without a title', () => {
+    const text = '部分文件写入失败，已回滚。';
+    const card = buildAgentReplyCard({ status: 'warning', text });
+    const header = card.header as Record<string, unknown> | undefined;
+    expect(header).toBeDefined();
+    expect(header!.template).toBe('orange');
+    const title = (header!.title as Record<string, unknown>).content as string;
+    expect(title).toBe('已中断');
+    const config = card.config as Record<string, unknown>;
+    expect(config.summary).toEqual({ content: '已中断' });
+    // Body must still carry the full reply text (never promoted into the header).
+    const body = card.body as { elements: Array<Record<string, unknown>> };
+    const main = body.elements.find(
+      (e) => e.element_id === CARD_ELEMENT_IDS.MAIN_CONTENT,
+    );
+    expect(main?.content).toBe(text);
+  });
+
+  test('error terminal state keeps a red status header even without a title', () => {
+    const text = '执行 Bash 命令时崩溃。';
+    const card = buildAgentReplyCard({ status: 'error', text });
+    const header = card.header as Record<string, unknown> | undefined;
+    expect(header).toBeDefined();
+    expect(header!.template).toBe('red');
+    const title = (header!.title as Record<string, unknown>).content as string;
+    expect(title).toBe('出错');
+    const config = card.config as Record<string, unknown>;
+    expect(config.summary).toEqual({ content: '出错' });
+    const body = card.body as { elements: Array<Record<string, unknown>> };
+    const main = body.elements.find(
+      (e) => e.element_id === CARD_ELEMENT_IDS.MAIN_CONTENT,
+    );
+    expect(main?.content).toBe(text);
+  });
+
+  test('status header never derives its title from the body first line', () => {
+    // The first line is a long heading-ish sentence; it must stay in the body
+    // and never be lifted into the header (issue #488 regression guard).
+    const text = '# 这是一段很长的标题文本，超过四十个字符，绝不能被提升到卡片 header 上当作标题展示\n正文细节';
+    const card = buildAgentReplyCard({ status: 'warning', text });
+    const header = card.header as Record<string, unknown>;
+    const title = (header.title as Record<string, unknown>).content as string;
+    expect(title).toBe('已中断');
+    const body = card.body as { elements: Array<Record<string, unknown>> };
+    const main = body.elements.find(
+      (e) => e.element_id === CARD_ELEMENT_IDS.MAIN_CONTENT,
+    );
+    expect(main?.content).toContain('这是一段很长的标题文本');
+    expect(main?.content).toContain('正文细节');
+  });
+
+  test('explicit title on a warning state uses the title, not the status word', () => {
+    const card = buildAgentReplyCard({
+      status: 'warning',
+      title: '部分成功',
+      text: 'detail',
+    });
+    const header = card.header as Record<string, unknown>;
+    expect(header.template).toBe('orange');
+    const title = (header.title as Record<string, unknown>).content as string;
+    expect(title).toBe('部分成功');
+  });
+
   test('short multi-line reply without explicit title → no header and keeps full text in body', () => {
     const text = 'Summary line\nDetail body text';
     const card = buildAgentReplyCard({
