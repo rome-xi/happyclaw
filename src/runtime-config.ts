@@ -2739,8 +2739,16 @@ export function buildContainerEnvLines(
         );
         continue;
       }
-      // Strip control characters to prevent env injection
-      const sanitized = value.replace(/[\r\n\0]/g, '');
+      // Strip control characters to prevent env injection. ANTHROPIC_CUSTOM_HEADERS
+      // is the one legitimate exception: Claude Code parses it as a newline-delimited
+      // list of HTTP headers (e.g. "x-relay-passthrough: anthropic\nx-relay-api-key: ..."),
+      // so newlines must survive. It stays injection-safe because shellQuoteEnvLines
+      // single-quotes the value (file path) and host mode sets it via an env dict
+      // (no shell parsing); only \r and \0 are stripped here.
+      const sanitized =
+        key === 'ANTHROPIC_CUSTOM_HEADERS'
+          ? value.replace(/[\r\0]/g, '')
+          : value.replace(/[\r\n\0]/g, '');
       lines.push(`${key}=${sanitized}`);
     }
   }

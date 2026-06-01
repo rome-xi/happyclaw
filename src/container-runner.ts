@@ -15,6 +15,7 @@ import path from 'path';
 
 import { CONTAINER_IMAGE, DATA_DIR, GROUPS_DIR, TIMEZONE } from './config.js';
 import { logger } from './logger.js';
+import { getArkMashupEnv } from './ark-mashup.js';
 import { resolveHostNodeBinary } from './node-resolver.js';
 import {
   loadMountAllowlist,
@@ -1489,11 +1490,42 @@ export async function runHostAgent(
       }
     }
 
+    // ark-mashup (路线 A, host-only): 若存在 super-relay 配置，且本工作区没有被显式
+    // 钉到第三方 provider（无 base_url / 无 API key），就注入 relay 环境——opus 经透传
+    // 走官方 Claude 当 manager，sonnet/haiku 档工人落字节豆包。必须在下面的
+    // isRelayPassthrough 判定【之前】注入，这样透传 header 在场 → OAuth 被保留不删。
+    // 不覆盖已有第三方 provider 的工作区；豆包工人走 relay key、不碰 OAuth。
+    if (!hostEnv['ANTHROPIC_BASE_URL'] && !hostEnv['ANTHROPIC_API_KEY']) {
+      const mashup = getArkMashupEnv();
+      if (mashup) {
+        for (const [k, v] of Object.entries(mashup)) {
+          hostEnv[k] = v;
+        }
+        logger.info(
+          { folder: group.folder },
+          'ark-mashup: injected relay env (opus passthrough manager + doubao workers)',
+        );
+      }
+    }
+
+    // Relay passthrough mode: ANTHROPIC_BASE_URL points at a relay that forwards
+    // bare Claude model names (e.g. claude-opus-4-8) to the real Anthropic API
+    // using the process's OWN OAuth Bearer (signalled via the x-relay-passthrough
+    // custom header), while provider-prefixed names (ark/*) route to in-house
+    // models authed by the relay key. In this mode OAuth MUST be preserved —
+    // stripping it breaks opus passthrough. We detect it by the passthrough
+    // header plus the absence of an injected API key (genuine third-party
+    // providers always carry an API key and still need the strip below).
+    const isRelayPassthrough =
+      (hostEnv['ANTHROPIC_CUSTOM_HEADERS'] || '').includes(
+        'x-relay-passthrough',
+      ) && !hostEnv['ANTHROPIC_API_KEY'];
+
     // Third-party provider: ANTHROPIC_AUTH_TOKEN inherited from the host
     // (~/.claude/settings.json) forces the SDK down the OAuth code path,
     // which skips the standard Bearer header and causes 404 on non-Anthropic
     // endpoints. Unset it so the injected ANTHROPIC_API_KEY takes effect.
-    if (hostEnv['ANTHROPIC_BASE_URL']) {
+    if (hostEnv['ANTHROPIC_BASE_URL'] && !isRelayPassthrough) {
       delete hostEnv['ANTHROPIC_AUTH_TOKEN'];
 
       // Also strip oauthAccount from session .claude.json: the SDK detects
