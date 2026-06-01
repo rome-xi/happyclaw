@@ -100,6 +100,7 @@ import {
   extractChatId,
   type StreamingSession,
 } from './im-channel.js';
+import { getParentGroupJid, buildTelegramJid } from './telegram.js';
 import {
   registerStreamingSession,
   unregisterStreamingSession,
@@ -752,7 +753,16 @@ export function removeImGroupRecord(jid: string, reason: string): void {
  * execution context. Bound targets take precedence over the source IM folder.
  */
 function resolveEffectiveFolder(chatJid: string): string | undefined {
-  const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
+  let group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
+
+  // Telegram topic JIDs not yet registered fall back to their parent group's
+  // execution context (file downloads, folder resolution).
+  if (!group) {
+    const parentJid = getParentGroupJid(chatJid);
+    if (parentJid !== chatJid) {
+      group = registeredGroups[parentJid] ?? getRegisteredGroup(parentJid);
+    }
+  }
   if (!group) return undefined;
 
   if (group.target_agent_id) {
@@ -1631,7 +1641,26 @@ async function handleNewCommand(
   if (!name) return '用法: /new <工作区名称>';
   if (name.length > 50) return '名称过长（最多 50 字符）';
 
-  // Create a new workspace (same pattern as routes/groups.ts POST)
+  // Telegram forum supergroups: create a real sub-topic and bind it to a fresh
+  // workspace, so each /new lives in its own thread. The actual topic creation
+  // + binding runs asynchronously (network call) and replies into the new topic.
+  if (chatJid.startsWith('telegram:')) {
+    void handleNewCommandWithTopic(chatJid, name, userId, group);
+    return `正在创建话题「${name}」…`;
+  }
+
+  // Non-Telegram channels: create the workspace and bind the current chat to it.
+  return await createWorkspaceAndBind(chatJid, name, userId, group);
+}
+
+/**
+ * Create a new isolated workspace (web JID + folder) owned by the user.
+ * Returns the new web JID and folder; does not bind any IM chat to it.
+ */
+async function createBoundWorkspace(
+  name: string,
+  userId: string,
+): Promise<{ newJid: string; folder: string }> {
   const newJid = `web:${crypto.randomUUID()}`;
   const folder = `flow-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
   const now = new Date().toISOString();
@@ -1644,11 +1673,25 @@ async function handleNewCommand(
     created_by: userId,
   };
 
-  // Register the workspace
   registerGroup(newJid, newGroup);
   ensureChatExists(newJid);
   updateChatName(newJid, name);
   addGroupMember(folder, userId, 'owner', userId);
+
+  return { newJid, folder };
+}
+
+/**
+ * Create a new workspace and bind the given IM chat to it (the original /new
+ * behavior, used for non-Telegram channels and as a Telegram fallback).
+ */
+async function createWorkspaceAndBind(
+  chatJid: string,
+  name: string,
+  userId: string,
+  group: RegisteredGroup,
+): Promise<string> {
+  const { newJid, folder } = await createBoundWorkspace(name, userId);
 
   // Bind the current IM group to the new workspace's main conversation
   const updated: RegisteredGroup = {
@@ -1663,6 +1706,66 @@ async function handleNewCommand(
   imHealthCheckFailCounts.delete(chatJid);
 
   return `工作区「${name}」已创建并绑定\n📁 ${folder}\n🔁 回复策略: source_only\n\n发送 /unbind 可解绑回默认工作区`;
+}
+
+/**
+ * Telegram /new: create a forum sub-topic under the parent supergroup, then
+ * register the new topic JID bound to a fresh workspace so messages posted in
+ * that topic route to (and replies land back in) the topic.
+ *
+ * Falls back to plain workspace-bind on the current chat when the chat is not a
+ * forum / the bot lacks "Manage Topics" permission / the API call fails.
+ */
+async function handleNewCommandWithTopic(
+  chatJid: string,
+  name: string,
+  userId: string,
+  group: RegisteredGroup,
+): Promise<void> {
+  try {
+    const parentJid = getParentGroupJid(chatJid);
+    const parentChatId = extractChatId(parentJid);
+
+    const threadId = await imManager.createForumTopic(parentJid, name);
+    if (threadId == null) {
+      // Not a forum group / no admin perm / API failed — fall back to binding
+      // the current chat to a new workspace (original /new behavior).
+      const result = await createWorkspaceAndBind(chatJid, name, userId, group);
+      await imManager.sendMessage(chatJid, result);
+      return;
+    }
+
+    // Topic created — wire the topic JID to a fresh isolated workspace.
+    const topicJid = buildTelegramJid(parentChatId, threadId);
+    const { newJid, folder } = await createBoundWorkspace(name, userId);
+
+    const topicGroup: RegisteredGroup = {
+      name,
+      folder: group.folder, // base folder inherited from the parent group
+      added_at: new Date().toISOString(),
+      created_by: userId,
+      target_main_jid: newJid,
+      reply_policy: 'source_only',
+    };
+    registerGroup(topicJid, topicGroup);
+    registeredGroups[topicJid] = topicGroup;
+    imSendFailCounts.delete(topicJid);
+    imHealthCheckFailCounts.delete(topicJid);
+
+    await imManager.sendMessage(
+      topicJid,
+      `工作区「${name}」已创建并绑定到此话题\n📁 ${folder}\n\n直接在这里发消息即可`,
+    );
+  } catch (err) {
+    logger.error(
+      { err, chatJid, name },
+      'Failed to create Telegram forum topic workspace',
+    );
+    await imManager.sendMessage(
+      chatJid,
+      '创建话题失败，请确认该群已开启「话题(Topics)」功能，且 bot 拥有「管理话题」管理员权限',
+    );
+  }
 }
 
 function handleRequireMentionCommand(chatJid: string, rawArgs: string, senderImId?: string): string {
@@ -2442,7 +2545,7 @@ function loadState(): void {
 
   // Ensure every active user has a home group (is_home=true).
   // Admin → folder='main', executionMode='host'
-  // Member → folder='home-{userId}', executionMode='container'
+  // Member → folder='home-{userId}', executionMode='host'
   try {
     // Paginate through all active users
     const activeUsers: Array<{ id: string; role: string; username: string }> =
@@ -7874,7 +7977,16 @@ function buildFeishuBotAddedHandler(
 function buildIsChatAuthorized(userId: string): (jid: string) => boolean {
   return (jid) => {
     const group = registeredGroups[jid];
-    return !!group && group.created_by === userId;
+    if (group && group.created_by === userId) return true;
+    // Telegram topic JIDs inherit authorization from their parent group, so a
+    // message in a not-yet-registered topic (or a /new sent inside a topic) is
+    // accepted as long as the parent supergroup is owned by this user.
+    const parentJid = getParentGroupJid(jid);
+    if (parentJid !== jid) {
+      const parentGroup = registeredGroups[parentJid];
+      return !!parentGroup && parentGroup.created_by === userId;
+    }
+    return false;
   };
 }
 

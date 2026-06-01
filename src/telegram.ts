@@ -76,7 +76,43 @@ export interface TelegramConnection {
     fileName: string,
   ): Promise<void>;
   sendChatAction(chatId: string, action: 'typing'): Promise<void>;
+  /**
+   * Create a forum topic (sub-topic) in a Telegram forum supergroup.
+   * Returns the new topic's message_thread_id, or null if the chat is not a
+   * forum / the bot lacks "Manage Topics" admin permission / the API failed.
+   */
+  createForumTopic(chatId: string, name: string): Promise<number | null>;
   isConnected(): boolean;
+}
+
+// ─── Topic JID Helpers ───────────────────────────────────────────
+// A Telegram forum topic is routed as `telegram:{chatId}:topic:{threadId}`.
+// These mirror the inner topicRouteJid/parseTopicTarget routing helpers but
+// are exported for use by index.ts (e.g. the /new command and auth fallback).
+
+const TOPIC_SEPARATOR = ':topic:';
+
+/**
+ * Build a topic-aware JID from a numeric chat id and optional thread id.
+ * `buildTelegramJid('-100x', 5)` → `telegram:-100x:topic:5`
+ * `buildTelegramJid('-100x')`    → `telegram:-100x`
+ */
+export function buildTelegramJid(chatId: string, threadId?: number): string {
+  if (threadId != null) {
+    return `telegram:${chatId}${TOPIC_SEPARATOR}${threadId}`;
+  }
+  return `telegram:${chatId}`;
+}
+
+/**
+ * Strip the topic suffix from a JID to get the parent group JID.
+ * `telegram:-100x:topic:5` → `telegram:-100x`
+ * `telegram:-100x`          → `telegram:-100x` (unchanged)
+ * Non-topic JIDs are returned as-is.
+ */
+export function getParentGroupJid(jid: string): string {
+  const idx = jid.indexOf(TOPIC_SEPARATOR);
+  return idx >= 0 ? jid.slice(0, idx) : jid;
 }
 
 // ─── Shared Helpers (pure functions, no instance state) ────────
@@ -366,6 +402,41 @@ export function createTelegramConnection(
   const rejectTimestamps = new Map<string, number>();
   const REJECT_COOLDOWN_MS = 5 * 60 * 1000;
 
+  // Forum topic routing (stateless): encode the source topic
+  // (message_thread_id) into the chat JID as `<groupJid>:topic:<threadId>` so
+  // each forum topic routes to its own bound workspace and replies land back in
+  // the same topic. General-topic / non-forum messages keep the bare group JID.
+  // Reply thread is parsed back out of the JID at send time (parseTopicTarget),
+  // so routing survives restarts and never cross-talks between topics.
+  function topicRouteJid(
+    groupJid: string,
+    msg: { is_topic_message?: boolean; message_thread_id?: number },
+  ): string {
+    if (msg.is_topic_message && msg.message_thread_id) {
+      return `${groupJid}:topic:${msg.message_thread_id}`;
+    }
+    return groupJid;
+  }
+
+  // Split a send-target chatId that may carry a `<id>:topic:<threadId>` suffix
+  // into the numeric chat id and an optional message_thread_id send option.
+  function parseTopicTarget(chatId: string): {
+    chatIdNum: number;
+    threadOpt: { message_thread_id?: number };
+  } {
+    const marker = ':topic:';
+    const idx = chatId.indexOf(marker);
+    if (idx === -1) return { chatIdNum: Number(chatId), threadOpt: {} };
+    const threadId = Number(chatId.slice(idx + marker.length));
+    return {
+      chatIdNum: Number(chatId.slice(0, idx)),
+      threadOpt:
+        Number.isFinite(threadId) && threadId > 0
+          ? { message_thread_id: threadId }
+          : {},
+    };
+  }
+
   function isExpectedStopError(err: unknown): boolean {
     const msg = err instanceof Error ? err.message : String(err ?? '');
     return msg.includes('Aborted delay') || msg.includes('AbortError');
@@ -438,7 +509,9 @@ export function createTelegramConnection(
           if (isStaleMessage(ctx.message.date, opts.ignoreMessagesBefore)) return;
 
           const chatId = String(ctx.chat.id);
-          const jid = `telegram:${chatId}`;
+          // Group-level JID for auth/pairing; topic-aware JID for routing/storage.
+          const groupJid = `telegram:${chatId}`;
+          const jid = topicRouteJid(groupJid, ctx.message);
           const chatName =
             ctx.chat.title ||
             [ctx.chat.first_name, ctx.chat.last_name]
@@ -456,7 +529,7 @@ export function createTelegramConnection(
           if (pairMatch && opts.onPairAttempt) {
             const code = pairMatch[1];
             try {
-              const success = await opts.onPairAttempt(jid, chatName, code);
+              const success = await opts.onPairAttempt(groupJid, chatName, code);
               if (success) {
                 await ctx.reply(
                   'Pairing successful! This chat is now connected.',
@@ -477,7 +550,7 @@ export function createTelegramConnection(
 
           // ── /start command ──
           if (text.trim() === '/start') {
-            if (opts.isChatAuthorized(jid)) {
+            if (opts.isChatAuthorized(groupJid)) {
               await ctx.reply(
                 'This chat is already connected. You can send messages normally.',
               );
@@ -493,11 +566,11 @@ export function createTelegramConnection(
           }
 
           // ── Authorization check ──
-          if (!opts.isChatAuthorized(jid)) {
+          if (!opts.isChatAuthorized(groupJid)) {
             const now = Date.now();
-            const lastReject = rejectTimestamps.get(jid) ?? 0;
+            const lastReject = rejectTimestamps.get(groupJid) ?? 0;
             if (now - lastReject >= REJECT_COOLDOWN_MS) {
-              rejectTimestamps.set(jid, now);
+              rejectTimestamps.set(groupJid, now);
               await ctx.reply(
                 'This chat is not yet paired. Please send /pair <code> to connect.\n' +
                   'You can generate a pairing code from the web settings page.',
@@ -637,7 +710,8 @@ export function createTelegramConnection(
           if (isStaleMessage(ctx.message.date, opts.ignoreMessagesBefore)) return;
 
           const chatId = String(ctx.chat.id);
-          const jid = `telegram:${chatId}`;
+          const groupJid = `telegram:${chatId}`;
+          const jid = topicRouteJid(groupJid, ctx.message);
           const chatName =
             ctx.chat.title ||
             [ctx.chat.first_name, ctx.chat.last_name]
@@ -649,7 +723,7 @@ export function createTelegramConnection(
               .filter(Boolean)
               .join(' ') || 'Unknown';
 
-          if (!opts.isChatAuthorized(jid)) {
+          if (!opts.isChatAuthorized(groupJid)) {
             logger.debug(
               { jid },
               'Unauthorized Telegram chat (photo), ignoring',
@@ -786,7 +860,8 @@ export function createTelegramConnection(
           if (isStaleMessage(ctx.message.date, opts.ignoreMessagesBefore)) return;
 
           const chatId = String(ctx.chat.id);
-          const jid = `telegram:${chatId}`;
+          const groupJid = `telegram:${chatId}`;
+          const jid = topicRouteJid(groupJid, ctx.message);
           const chatName =
             ctx.chat.title ||
             [ctx.chat.first_name, ctx.chat.last_name]
@@ -798,7 +873,7 @@ export function createTelegramConnection(
               .filter(Boolean)
               .join(' ') || 'Unknown';
 
-          if (!opts.isChatAuthorized(jid)) {
+          if (!opts.isChatAuthorized(groupJid)) {
             logger.debug(
               { jid },
               'Unauthorized Telegram chat (document), ignoring',
@@ -1045,7 +1120,7 @@ export function createTelegramConnection(
         return;
       }
 
-      const chatIdNum = Number(chatId);
+      const { chatIdNum, threadOpt } = parseTopicTarget(chatId);
       if (isNaN(chatIdNum)) {
         logger.error({ chatId }, 'Invalid Telegram chat ID');
         return;
@@ -1058,20 +1133,25 @@ export function createTelegramConnection(
         for (const mdChunk of mdChunks) {
           const html = markdownToTelegramHtml(mdChunk);
           try {
-            await bot.api.sendMessage(chatIdNum, html, { parse_mode: 'HTML' });
+            await bot.api.sendMessage(chatIdNum, html, {
+              parse_mode: 'HTML',
+              ...threadOpt,
+            });
           } catch (err) {
             // HTML parse failed (e.g. unclosed tags), fallback to plain text
             logger.debug(
               { err, chatId },
               'HTML parse failed, fallback to plain',
             );
-            await bot.api.sendMessage(chatIdNum, mdChunk);
+            await bot.api.sendMessage(chatIdNum, mdChunk, { ...threadOpt });
           }
         }
 
         for (const localImagePath of localImagePaths || []) {
           try {
-            await bot.api.sendPhoto(chatIdNum, new InputFile(localImagePath));
+            await bot.api.sendPhoto(chatIdNum, new InputFile(localImagePath), {
+              ...threadOpt,
+            });
           } catch (imageErr) {
             logger.warn(
               { chatId, localImagePath, err: imageErr },
@@ -1102,7 +1182,7 @@ export function createTelegramConnection(
         return;
       }
 
-      const chatIdNum = Number(chatId);
+      const { chatIdNum, threadOpt } = parseTopicTarget(chatId);
       if (isNaN(chatIdNum)) {
         logger.error({ chatId }, 'Invalid Telegram chat ID for image');
         return;
@@ -1139,14 +1219,17 @@ export function createTelegramConnection(
         if (isGif) {
           await bot.api.sendAnimation(chatIdNum, inputFile, {
             caption: safeCaption,
+            ...threadOpt,
           });
         } else if (isPhoto) {
           await bot.api.sendPhoto(chatIdNum, inputFile, {
             caption: safeCaption,
+            ...threadOpt,
           });
         } else {
           await bot.api.sendDocument(chatIdNum, inputFile, {
             caption: safeCaption,
+            ...threadOpt,
           });
         }
 
@@ -1181,7 +1264,7 @@ export function createTelegramConnection(
         return;
       }
 
-      const chatIdNum = Number(chatId);
+      const { chatIdNum, threadOpt } = parseTopicTarget(chatId);
       if (isNaN(chatIdNum)) {
         logger.error({ chatId }, 'Invalid Telegram chat ID for file');
         return;
@@ -1200,6 +1283,7 @@ export function createTelegramConnection(
         await bot.api.sendDocument(
           chatIdNum,
           new InputFile(filePath, fileName),
+          threadOpt,
         );
 
         logger.info(
@@ -1217,12 +1301,35 @@ export function createTelegramConnection(
 
     async sendChatAction(chatId: string, action: 'typing'): Promise<void> {
       if (!bot) return;
-      const chatIdNum = Number(chatId);
+      const { chatIdNum, threadOpt } = parseTopicTarget(chatId);
       if (isNaN(chatIdNum)) return;
       try {
-        await bot.api.sendChatAction(chatIdNum, action);
+        await bot.api.sendChatAction(chatIdNum, action, threadOpt);
       } catch (err) {
         logger.debug({ err, chatId }, 'Failed to send Telegram chat action');
+      }
+    },
+
+    async createForumTopic(
+      chatId: string,
+      name: string,
+    ): Promise<number | null> {
+      if (!bot) return null;
+      // Topic creation always targets the supergroup itself, never a thread.
+      const { chatIdNum } = parseTopicTarget(chatId);
+      if (isNaN(chatIdNum)) {
+        logger.error({ chatId }, 'Invalid Telegram chat ID for forum topic');
+        return null;
+      }
+      try {
+        const result = await bot.api.createForumTopic(chatIdNum, name);
+        return result.message_thread_id;
+      } catch (err) {
+        logger.error(
+          { err, chatId, name },
+          'Failed to create Telegram forum topic',
+        );
+        return null;
       }
     },
 

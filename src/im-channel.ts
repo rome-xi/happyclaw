@@ -147,6 +147,8 @@ export interface IMChannel {
     chat_mode?: string;
     group_message_type?: string;
   } | null>;
+  /** Create a forum topic in a Telegram supergroup (Telegram only). */
+  createForumTopic?(chatId: string, name: string): Promise<number | null>;
 }
 
 // ─── Channel Registry ───────────────────────────────────────────
@@ -426,6 +428,14 @@ export function createTelegramChannel(
       typingTimer = setInterval(() => {
         void sendAction();
       }, 4000);
+    },
+
+    async createForumTopic(
+      chatId: string,
+      name: string,
+    ): Promise<number | null> {
+      if (!inner) return null;
+      return inner.createForumTopic(chatId, name);
     },
 
     isConnected(): boolean {

@@ -231,6 +231,26 @@ class IMConnectionManager {
   }
 
   /**
+   * Create a forum topic (sub-topic) in a Telegram supergroup, auto-routing via
+   * JID prefix. Returns the new topic's message_thread_id, or null if the
+   * channel doesn't support topics / isn't connected / the API failed.
+   */
+  async createForumTopic(jid: string, name: string): Promise<number | null> {
+    const channelType = getChannelType(jid);
+    if (!channelType) {
+      logger.debug({ jid }, 'Unknown channel type for JID, skip createForumTopic');
+      return null;
+    }
+    const chatId = extractChatId(jid);
+    const channel = this.findChannelForJid(jid, channelType);
+    if (channel?.createForumTopic) {
+      return channel.createForumTopic(chatId, name);
+    }
+    logger.debug({ jid, channelType }, 'Channel does not support forum topics');
+    return null;
+  }
+
+  /**
    * Send a file to an IM chat, auto-routing via JID prefix.
    * @throws Error if the channel doesn't support file sending
    */
