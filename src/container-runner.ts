@@ -758,9 +758,14 @@ export function buildVolumeMounts(
     resolvedProvider?.customEnv,
   );
   // SystemSettings.autoCompactWindow > 0 时注入到容器，让 agent-runner 通过 query() settings 传给 SDK
-  const sysAutoCompact = getSystemSettings().autoCompactWindow;
-  if (sysAutoCompact > 0) {
-    envLines.push(`AUTO_COMPACT_WINDOW=${sysAutoCompact}`);
+  const sysSettings = getSystemSettings();
+  if (sysSettings.autoCompactWindow > 0) {
+    envLines.push(`AUTO_COMPACT_WINDOW=${sysSettings.autoCompactWindow}`);
+  }
+  // SubAgent 模型：仅在显式配置了非默认值时注入。默认 'inherit' 与省略 model 等价，
+  // 此时不注入，避免覆盖用户可能在 provider customEnv 里设的 SUBAGENT_MODEL（与 autoCompact 对称）。
+  if (sysSettings.subagentModel && sysSettings.subagentModel !== 'inherit') {
+    envLines.push(`SUBAGENT_MODEL=${sysSettings.subagentModel}`);
   }
   if (envLines.length > 0) {
     const envFilePath = path.join(envDir, 'env');
@@ -1544,9 +1549,13 @@ export async function runHostAgent(
     }
 
     // SystemSettings.autoCompactWindow > 0 时注入到 host 进程，agent-runner 通过 query() settings 传给 SDK
-    const hostAutoCompact = getSystemSettings().autoCompactWindow;
-    if (hostAutoCompact > 0) {
-      hostEnv['AUTO_COMPACT_WINDOW'] = String(hostAutoCompact);
+    const hostSysSettings = getSystemSettings();
+    if (hostSysSettings.autoCompactWindow > 0) {
+      hostEnv['AUTO_COMPACT_WINDOW'] = String(hostSysSettings.autoCompactWindow);
+    }
+    // SubAgent 模型：仅非默认 'inherit' 时注入，避免覆盖 customEnv 同名值。
+    if (hostSysSettings.subagentModel && hostSysSettings.subagentModel !== 'inherit') {
+      hostEnv['SUBAGENT_MODEL'] = hostSysSettings.subagentModel;
     }
 
     // admin 主容器 + 系统设置 disableMemoryLayerForAdminHost 时禁用 HappyClaw 记忆层：

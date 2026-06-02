@@ -3606,6 +3606,9 @@ export interface SystemSettings {
   externalClaudeDir: string;
   // Claude Agent SDK 自动对话压缩触发点（tokens）。0 = 保留 SDK 默认（约 1M）
   autoCompactWindow: number;
+  // 预定义 SubAgent（code-reviewer / web-researcher）使用的模型别名或完整 ID。
+  // 经 SUBAGENT_MODEL 注入容器；默认 inherit（继承主会话模型，不擅自改变），可在设置页改。
+  subagentModel: string;
   // 关闭 admin host 模式下 HappyClaw 自带的 memory 注入层（MCP 工具、模板 CLAUDE.md、WORKSPACE_GLOBAL/MEMORY env）
   // 启用后 admin 可以在 host 模式下完全按原生 Claude Code 的 Playbook 使用 ~/.claude/ 下的 memory/skills/rules
   disableMemoryLayerForAdminHost: boolean;
@@ -3637,6 +3640,7 @@ const DEFAULT_SYSTEM_SETTINGS: SystemSettings = {
   billingCurrencyRate: 1,
   externalClaudeDir: '',
   autoCompactWindow: 0,
+  subagentModel: 'inherit',
   disableMemoryLayerForAdminHost: false,
   pluginAutoScan: true,
   taskBackfillGraceMs: 300000,
@@ -3646,6 +3650,17 @@ function parseIntEnv(envVar: string | undefined, fallback: number): number {
   if (!envVar) return fallback;
   const parsed = parseInt(envVar, 10);
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+/**
+ * autoCompactWindow 区间收紧：0 = 禁用（用 SDK 默认 ~1M）；>0 收紧到 [100000, 1000000]。
+ * SDK 侧 schema 为 assistant.mjs 的 `.min(1e5).max(1e6).catch(void 0)`——越界值会被静默剥离
+ * 回退默认。在读（file/env）与写（save）两端统一调用，避免存量/手填的越界值在下游静默失效。
+ */
+function clampAutoCompactWindow(v: unknown): number {
+  const n = typeof v === 'number' ? v : NaN;
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.min(1_000_000, Math.max(100_000, Math.floor(n)));
 }
 
 function parseFloatEnv(envVar: string | undefined, fallback: number): number {
@@ -3726,10 +3741,11 @@ function readSystemSettingsFromFile(): SystemSettings | null {
       typeof raw.externalClaudeDir === 'string'
         ? raw.externalClaudeDir.trim()
         : DEFAULT_SYSTEM_SETTINGS.externalClaudeDir,
-    autoCompactWindow:
-      typeof raw.autoCompactWindow === 'number' && raw.autoCompactWindow >= 0
-        ? raw.autoCompactWindow
-        : DEFAULT_SYSTEM_SETTINGS.autoCompactWindow,
+    autoCompactWindow: clampAutoCompactWindow(raw.autoCompactWindow),
+    subagentModel:
+      typeof raw.subagentModel === 'string' && raw.subagentModel.trim()
+        ? raw.subagentModel.trim()
+        : DEFAULT_SYSTEM_SETTINGS.subagentModel,
     disableMemoryLayerForAdminHost:
       typeof raw.disableMemoryLayerForAdminHost === 'boolean'
         ? raw.disableMemoryLayerForAdminHost
@@ -3800,10 +3816,11 @@ function buildEnvFallbackSettings(): SystemSettings {
     ),
     externalClaudeDir:
       process.env.EXTERNAL_CLAUDE_DIR || DEFAULT_SYSTEM_SETTINGS.externalClaudeDir,
-    autoCompactWindow: parseIntEnv(
-      process.env.AUTO_COMPACT_WINDOW,
-      DEFAULT_SYSTEM_SETTINGS.autoCompactWindow,
+    autoCompactWindow: clampAutoCompactWindow(
+      parseIntEnv(process.env.AUTO_COMPACT_WINDOW, DEFAULT_SYSTEM_SETTINGS.autoCompactWindow),
     ),
+    subagentModel:
+      process.env.SUBAGENT_MODEL || DEFAULT_SYSTEM_SETTINGS.subagentModel,
     disableMemoryLayerForAdminHost:
       process.env.DISABLE_MEMORY_LAYER_FOR_ADMIN_HOST === 'true' ||
       DEFAULT_SYSTEM_SETTINGS.disableMemoryLayerForAdminHost,
@@ -3900,15 +3917,14 @@ export function saveSystemSettings(
   if (merged.billingMinStartBalanceUsd > 1000000)
     merged.billingMinStartBalanceUsd = 1000000;
 
-  // autoCompactWindow: 0 表示禁用（使用 SDK 默认），>0 必须在 [10000, 2000000] 范围
-  if (
-    merged.autoCompactWindow < 0 ||
-    !Number.isFinite(merged.autoCompactWindow)
-  ) {
-    merged.autoCompactWindow = 0;
-  } else if (merged.autoCompactWindow > 0) {
-    if (merged.autoCompactWindow < 10000) merged.autoCompactWindow = 10000;
-    if (merged.autoCompactWindow > 2000000) merged.autoCompactWindow = 2000000;
+  // autoCompactWindow 在读/写两端统一用 clampAutoCompactWindow 收紧（见函数注释）。
+  merged.autoCompactWindow = clampAutoCompactWindow(merged.autoCompactWindow);
+
+  // subagentModel: 非空字符串（别名或完整 model ID），去空白并限长；空则回退默认。
+  if (typeof merged.subagentModel !== 'string' || !merged.subagentModel.trim()) {
+    merged.subagentModel = DEFAULT_SYSTEM_SETTINGS.subagentModel;
+  } else {
+    merged.subagentModel = merged.subagentModel.trim().slice(0, 64);
   }
 
   // taskBackfillGraceMs: 0 = 关闭（旧行为：无视逾期全 backfill）；

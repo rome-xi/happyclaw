@@ -240,10 +240,11 @@ export const SystemSettingsSchema = z.object({
     .number()
     .int()
     .refine(
-      (v) => v === 0 || (v >= 10000 && v <= 2000000),
-      'autoCompactWindow must be 0 (disabled) or between 10000 and 2000000',
+      (v) => v === 0 || (v >= 100000 && v <= 1000000),
+      'autoCompactWindow must be 0 (disabled) or between 100000 and 1000000',
     )
     .optional(),
+  subagentModel: z.string().min(1).max(64).optional(),
   disableMemoryLayerForAdminHost: z.boolean().optional(),
   pluginAutoScan: z.boolean().optional(),
   taskBackfillGraceMs: z
