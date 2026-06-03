@@ -687,12 +687,16 @@ export class StreamEventProcessor {
       return false;
     }
     if (message.subtype === 'status') {
-      const statusText = message.status?.type || null;
+      // SDKStatus 是字符串字面量（'compacting' | 'requesting' | null），不是带 .type 的对象。
+      // 旧代码读 message.status?.type 恒为 undefined，导致前端永远收不到"压缩中"状态。
+      // 注：compact_result / compact_error 确实存在于 SDKStatusMessage（仅在 status=null 的压缩
+      // 完成/失败消息上携带）；此处移除 detail 仅因当前前端 status 分支只消费 statusText，
+      // 不渲染 detail——若日后要向用户暴露压缩成败，可在 compact_error 存在时另发一条事件。
+      const statusText = message.status || null;
       this.emitStreamEvent({
         eventType: 'status',
         agentScope: 'system',
         statusText,
-        detail: message.compact_error || message.compact_result,
         displayLevel: 'primary',
       });
       return true;
