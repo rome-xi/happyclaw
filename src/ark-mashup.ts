@@ -21,8 +21,11 @@ import { logger } from './logger.js';
  * 没有该配置的部署自然不启用，对其他人/其他部署零影响。
  */
 
-/** 豆包工人模型（sonnet/haiku 档映射到它，opus 档保留官方透传走硬活）。 */
-const WORKER_MODEL = process.env.ARK_WORKER_MODEL || 'ark/seed-code-0530';
+/**
+ * 豆包工人模型的兜底默认值（sonnet/haiku 档映射到它，opus 档保留官方透传走硬活）。
+ * 实际取值优先级见 getArkMashupEnv：env 覆盖 > config.worker_model（运行时旋钮）> 此默认。
+ */
+const DEFAULT_WORKER_MODEL = 'ark/seed-code-0530';
 
 export interface ArkMashupEnv {
   ANTHROPIC_BASE_URL: string;
@@ -52,15 +55,23 @@ export function getArkMashupEnv(): ArkMashupEnv | null {
     const cfg = JSON.parse(fs.readFileSync(p, 'utf-8')) as {
       base_url?: string;
       api_key?: string;
+      worker_model?: string;
     };
     const baseUrl = (cfg.base_url || '').trim();
     const key = (cfg.api_key || '').trim();
     if (!baseUrl || !key) return null;
+    // 工人模型优先级：env 覆盖 > config 的 worker_model（运行时旋钮——改 JSON 即换模型，
+    // 无需重编/重启，下次 agent spawn 现读生效）> 兜底默认。
+    // 注意：不回退到 cfg.model——那是另一个豆包模型（extended-thinking），语义不同。
+    const workerModel =
+      process.env.ARK_WORKER_MODEL ||
+      (cfg.worker_model || '').trim() ||
+      DEFAULT_WORKER_MODEL;
     return {
       ANTHROPIC_BASE_URL: baseUrl,
       ANTHROPIC_CUSTOM_HEADERS: `x-relay-passthrough: anthropic\nx-relay-api-key: ${key}`,
-      ANTHROPIC_DEFAULT_SONNET_MODEL: WORKER_MODEL,
-      ANTHROPIC_DEFAULT_HAIKU_MODEL: WORKER_MODEL,
+      ANTHROPIC_DEFAULT_SONNET_MODEL: workerModel,
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: workerModel,
     };
   } catch (err) {
     logger.warn({ err }, 'ark-mashup: failed to read super-relay config');
