@@ -76,7 +76,7 @@ import { promisify } from 'node:util';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
-import net from 'node:net';
+// SSRF helpers 抽到 ../url-safety.ts；本文件 re-export isPrivateHostname 以保留旧导入路径。
 import { z } from 'zod';
 import { broadcastNewMessage, invalidateAllowedUserCache } from '../web.js';
 import { getStreamingSession } from '../feishu-streaming-card.js';
@@ -86,52 +86,11 @@ const execFileAsync = promisify(execFile);
 /**
  * 检查 hostname 是否为内网地址（SSRF 防护）。
  * 拒绝 127.x, 10.x, 172.16-31.x, 192.168.x, 169.254.x, ::1, fd00::, fe80:: 等。
+ *
+ * Re-export 自 ../url-safety.ts 以兼容已有调用方；新代码应直接 import 那里的版本。
  */
-function isPrivateHostname(hostname: string): boolean {
-  // localhost 变体
-  if (hostname === 'localhost' || hostname.endsWith('.localhost')) return true;
-
-  // IPv6: 移除方括号
-  const cleaned = hostname.replace(/^\[|\]$/g, '');
-
-  if (net.isIPv6(cleaned)) {
-    const lower = cleaned.toLowerCase();
-    if (lower === '::1' || lower === '::') return true;
-    // fd00::/8 (unique local) 和 fe80::/10 (link-local)
-    if (lower.startsWith('fd') || lower.startsWith('fe80')) return true;
-    // ::ffff:127.0.0.1 等 IPv4-mapped IPv6
-    if (lower.startsWith('::ffff:')) {
-      const ipv4Part = lower.slice(7);
-      return isPrivateIPv4(ipv4Part);
-    }
-    return false;
-  }
-
-  if (net.isIPv4(cleaned)) {
-    return isPrivateIPv4(cleaned);
-  }
-
-  return false;
-}
-
-function isPrivateIPv4(ip: string): boolean {
-  const parts = ip.split('.').map(Number);
-  if (parts.length !== 4 || parts.some((p) => isNaN(p))) return false;
-  const [a, b] = parts;
-  // 127.0.0.0/8
-  if (a === 127) return true;
-  // 10.0.0.0/8
-  if (a === 10) return true;
-  // 172.16.0.0/12
-  if (a === 172 && b >= 16 && b <= 31) return true;
-  // 192.168.0.0/16
-  if (a === 192 && b === 168) return true;
-  // 169.254.0.0/16 (link-local)
-  if (a === 169 && b === 254) return true;
-  // 0.0.0.0
-  if (a === 0) return true;
-  return false;
-}
+import { isPrivateHostname } from '../url-safety.js';
+export { isPrivateHostname };
 
 const groupRoutes = new Hono<{ Variables: Variables }>();
 
@@ -1486,7 +1445,16 @@ groupRoutes.get('/:jid/env', authMiddleware, (c) => {
     );
   }
 
-  // Check permissions
+  // Check permissions: 与 PUT 对称收紧为 owner-only。`customEnv` 含
+  // 第三方 token（GitHub / 自定义 API key 等），即使 toPublicContainerEnvForUser
+  // 把 anthropic/openai 字段做了 mask，customEnv 仍是明文返回；shared
+  // workspace 中持有 manage_group_env 的非 owner 不应能读 owner 的私密 env。
+  if (
+    user.role !== 'admin' &&
+    !canModifyGroup({ id: user.id, role: user.role }, { ...group, jid })
+  ) {
+    return c.json({ error: 'Forbidden: only the workspace owner can read env' }, 403);
+  }
   if (
     user.role !== 'admin' &&
     (!user.permissions || !user.permissions.includes('manage_group_env'))
@@ -1515,7 +1483,15 @@ groupRoutes.put('/:jid/env', authMiddleware, async (c) => {
     );
   }
 
-  // Check permissions
+  // Check permissions：owner-only。`manage_group_env` 是系统级权限但 envvar
+  // 包含 anthropicAuthToken 等会让 agent 全部流量被劫持的字段，跨用户共享
+  // 工作区里持有该权限的非 owner 不能改 owner 的 token。Admin 例外。
+  if (
+    envUser.role !== 'admin' &&
+    !canModifyGroup({ id: envUser.id, role: envUser.role }, { ...group, jid })
+  ) {
+    return c.json({ error: 'Forbidden: only the workspace owner can modify env' }, 403);
+  }
   if (
     envUser.role !== 'admin' &&
     (!envUser.permissions || !envUser.permissions.includes('manage_group_env'))

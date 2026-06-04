@@ -1012,7 +1012,11 @@ export function isMentioningBot(
   content: proto.IMessage,
   selfJid: string | null | undefined,
 ): boolean {
-  if (!selfJid) return true; // Safety degrade: no self-id known → don't gate
+  // Fail closed: 当 selfJid 暂时不可用（reconnect 间隙、auth 状态未就绪），
+  // 从前的 fail-open 让 require_mention 模式短暂被绕过——攻击者可在 socket
+  // 启动毫秒级窗口中把所有群消息都被处理。一致性优先：没法确认时按"未被
+  // mention"处理，主消息处理流会丢弃。和 feishu 实现的语义对齐。
+  if (!selfJid) return false;
   const selfNorm = jidNormalizedUser(selfJid);
   const ctx =
     content.extendedTextMessage?.contextInfo ||

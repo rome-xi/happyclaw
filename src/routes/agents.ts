@@ -600,7 +600,7 @@ router.put('/:jid/agents/:agentId/im-binding', authMiddleware, async (c) => {
   if (!imGroup) {
     return c.json({ error: 'IM group not found' }, 404);
   }
-  if (!canAccessGroup(user, { ...imGroup, jid: imJid })) {
+  if (!canModifyGroup(user, { ...imGroup, jid: imJid })) {
     return c.json({ error: 'Forbidden' }, 403);
   }
   const { threadCapable } = await checkFeishuThreadCapable(user.id, imJid, imGroup);
@@ -674,7 +674,7 @@ router.delete(
     if (!imGroup) {
       return c.json({ error: 'IM group not found' }, 404);
     }
-    if (!canAccessGroup(user, { ...imGroup, jid: imJid })) {
+    if (!canModifyGroup(user, { ...imGroup, jid: imJid })) {
       return c.json({ error: 'Forbidden' }, 403);
     }
     if (imGroup.target_agent_id !== agentId) {
@@ -738,7 +738,7 @@ router.put('/:jid/im-binding', authMiddleware, async (c) => {
   if (!imGroup) {
     return c.json({ error: 'IM group not found' }, 404);
   }
-  if (!canAccessGroup(user, { ...imGroup, jid: imJid })) {
+  if (!canModifyGroup(user, { ...imGroup, jid: imJid })) {
     return c.json({ error: 'Forbidden' }, 403);
   }
   const { threadCapable, feishuInfo } = await checkFeishuThreadCapable(user.id, imJid, imGroup);
@@ -874,7 +874,7 @@ router.delete('/:jid/im-binding/:imJid', authMiddleware, async (c) => {
   if (!imGroup) {
     return c.json({ error: 'IM group not found' }, 404);
   }
-  if (!canAccessGroup(user, { ...imGroup, jid: imJid })) {
+  if (!canModifyGroup(user, { ...imGroup, jid: imJid })) {
     return c.json({ error: 'Forbidden' }, 403);
   }
   const targetMainJid = jid; // Use actual registered JID (not folder-based)

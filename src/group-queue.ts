@@ -68,6 +68,13 @@ export class GroupQueue {
   private activeHostProcessCount = 0;
   private waitingGroups = new Set<string>();
   private contextOverflowGroups = new Set<string>(); // 跟踪发生上下文溢出的 group
+  // 记录最近一次 stopGroup 的时间戳（毫秒）。runForGroup finally 块会用它来
+  // 决定是否跳过自动 drainGroup —— stopGroup 中清空 pendingMessages 之后，
+  // hasIpcInjectedMessages 重新置 pendingMessages=true，会让用户的 'stop' 之后
+  // 容器立即又被拉起来。同时让主消息循环在 OOM 计数前看一眼这个标志，避免
+  // 把 user-stopped (SIGKILL → 137) 误判为真实 OOM 触发会话重置。
+  private recentlyStoppedFolders = new Map<string, number>();
+  private static RECENTLY_STOPPED_WINDOW_MS = 30_000;
   private processMessagesFn: ((groupJid: string) => Promise<boolean>) | null =
     null;
   private shuttingDown = false;
@@ -169,12 +176,51 @@ export class GroupQueue {
     );
   }
 
+  /**
+   * 公开 shutdown 状态供 scheduler 等子系统避免在关停过程中再启动新工作。
+   * 调度器主循环 tick 期间若已 shutdown，应直接 skip 这次 tick，避免在
+   * grace 窗口内 spawn 新脚本子进程导致孤儿。
+   */
+  isShuttingDown(): boolean {
+    return this.shuttingDown;
+  }
+
   private clearRetryTimer(state: GroupState): void {
     if (state.retryTimer !== null) {
       clearTimeout(state.retryTimer);
       state.retryTimer = null;
     }
     state.retryCount = 0;
+  }
+
+  /**
+   * 仅取消正在排队的 retry 定时器，不重置 retryCount。
+   * interruptQuery 用这个：用户中断当前查询不应抹掉之前的 backoff 进度，
+   * 否则 N 次失败后正在退避的 runner 一被 interrupt 就回到 retry=0，
+   * 死循环重试同一个失败请求。
+   */
+  private cancelRetryTimer(state: GroupState): void {
+    if (state.retryTimer !== null) {
+      clearTimeout(state.retryTimer);
+      state.retryTimer = null;
+    }
+  }
+
+  /**
+   * Whether stopGroup was issued for this folder in the recent window.
+   * Used by:
+   *   1. runForGroup finally — skip pendingMessages re-arm + drainGroup
+   *   2. main loop OOM handler — don't count user-stopped 137 as OOM
+   *   3. anything else that needs to suppress auto-restart shortly after a stop
+   */
+  isRecentlyStopped(folder: string): boolean {
+    const ts = this.recentlyStoppedFolders.get(folder);
+    if (!ts) return false;
+    if (Date.now() - ts > GroupQueue.RECENTLY_STOPPED_WINDOW_MS) {
+      this.recentlyStoppedFolders.delete(folder);
+      return false;
+    }
+    return true;
   }
 
   private isHostMode(groupJid: string): boolean {
@@ -635,7 +681,14 @@ export class GroupQueue {
       state.queryInFlight = true;
       onInjected?.();
       return 'sent';
-    } catch {
+    } catch (err) {
+      // 不静默：磁盘满 / 权限错 / inode 耗尽这些根因不应该被伪装成
+      // 'no_active'。下游会重新 enqueueMessageCheck 走 fallback 路径，
+      // 但运维需要看到根因日志。
+      logger.warn(
+        { groupJid, inputDir, err },
+        'GroupQueue.sendMessage: failed to write IPC input file, falling back to no_active',
+      );
       return 'no_active';
     }
   }
@@ -698,6 +751,12 @@ export class GroupQueue {
     context: string,
   ): void {
     if (!state.groupFolder) return;
+    // 与 runForGroup finally 的逻辑保持一致：刚被 stopGroup 标记的 folder 不
+    // 应该在这里重新点亮 pendingMessages，否则 stopGroup 之后的 drainGroup 路径
+    // 会拉起一个新 runner。
+    if (this.isRecentlyStopped(state.groupFolder)) {
+      return;
+    }
     try {
       if (!this.hasRemainingIpcMessages(state.groupFolder, state.agentId, state.taskRunId)) return;
 
@@ -819,7 +878,9 @@ export class GroupQueue {
     const state = this.resolveActiveState(groupJid);
     if (!state) return false;
 
-    this.clearRetryTimer(state);
+    // 只取消等待中的 retry 定时器（如果有），不重置 retryCount —— 不让用户
+    // 中断把已积累的 backoff 进度归零。
+    this.cancelRetryTimer(state);
 
     const inputDir = this.resolveIpcInputDir(state);
     try {
@@ -856,6 +917,11 @@ export class GroupQueue {
     requestedState.pendingMessages = false;
     requestedState.pendingTasks = [];
     this.clearRetryTimer(requestedState);
+    // 标记 stop 时间：runForGroup finally + index.ts OOM 计数 + 主消息循环
+    // 都用这个时间窗判断 user-stopped vs 真 OOM / IPC-injected drain。
+    if (requestedState.groupFolder) {
+      this.recentlyStoppedFolders.set(requestedState.groupFolder, Date.now());
+    }
 
     const activeRunner = this.findActiveRunnerFor(groupJid);
     const targetJid = activeRunner || groupJid;
@@ -864,6 +930,9 @@ export class GroupQueue {
       state.pendingMessages = false;
       state.pendingTasks = [];
       this.clearRetryTimer(state);
+    }
+    if (state.groupFolder) {
+      this.recentlyStoppedFolders.set(state.groupFolder, Date.now());
     }
     this.waitingGroups.delete(groupJid);
     this.waitingGroups.delete(targetJid);
@@ -1094,6 +1163,10 @@ export class GroupQueue {
       this.scheduleRetry(groupJid, state);
     } finally {
       // Clean up stale sentinel files before clearing groupFolder/agentId
+      const exitFolder = state.groupFolder;
+      const isStopRequested = exitFolder
+        ? this.isRecentlyStopped(exitFolder)
+        : false;
       if (state.groupFolder) {
         try {
           this.cleanupIpcSentinels(state.groupFolder, state.agentId, state.taskRunId);
@@ -1107,11 +1180,21 @@ export class GroupQueue {
       // already replied to them, processGroupMessages will find 0 new messages
       // (cursor was committed) and return immediately — harmless.  If the
       // agent crashed, this ensures the messages are re-read from DB.
-      if (state.hasIpcInjectedMessages) {
+      //
+      // BUT: when the user just clicked Stop, this re-armed pendingMessages
+      // was racing stopGroup's clear → the agent restarted itself instantly.
+      // Honor stopGroup's intent by skipping this re-arm if a stop was issued
+      // for this folder in the last RECENTLY_STOPPED_WINDOW_MS.
+      if (state.hasIpcInjectedMessages && !isStopRequested) {
         state.pendingMessages = true;
         logger.debug(
           { groupJid },
           'IPC-injected messages detected, marking pending for safety re-check',
+        );
+      } else if (state.hasIpcInjectedMessages && isStopRequested) {
+        logger.info(
+          { groupJid, folder: exitFolder },
+          'Stop requested recently, skipping pendingMessages re-arm',
         );
       }
       state.active = false;
@@ -1142,10 +1225,19 @@ export class GroupQueue {
       } catch (err) {
         logger.error({ groupJid, err }, 'onContainerExit callback failed');
       }
-      try {
-        this.drainGroup(groupJid);
-      } catch (err) {
-        logger.error({ groupJid, err }, 'drainGroup failed');
+      // Skip auto-drain when a stop was just requested — drainGroup would
+      // start a fresh runForGroup if any pending* slipped through.
+      if (!isStopRequested) {
+        try {
+          this.drainGroup(groupJid);
+        } catch (err) {
+          logger.error({ groupJid, err }, 'drainGroup failed');
+        }
+      } else {
+        logger.info(
+          { groupJid, folder: exitFolder },
+          'Stop requested recently, skipping drainGroup',
+        );
       }
     }
   }
@@ -1438,6 +1530,25 @@ export class GroupQueue {
       },
       'GroupQueue shutting down, waiting for containers',
     );
+
+    // 主动写 _close sentinel：runForGroup 的 query() loop 一直在等 IPC 输入，
+    // 没有 sentinel 就需要等到 grace 用完再被 SIGTERM/docker stop 强制结束。
+    // 写入后 agent 看到 sentinel 自然 break loop、走 finally 清理、conversation
+    // archive 完成。和 closeAllActiveForCredentialRefresh 的策略一致。
+    for (const [, state] of this.groups) {
+      if (!state.active || !state.groupFolder) continue;
+      const inputDir = state.taskRunId
+        ? path.join(DATA_DIR, 'ipc', state.groupFolder, 'tasks-run', state.taskRunId, 'input')
+        : state.agentId
+          ? path.join(DATA_DIR, 'ipc', state.groupFolder, 'agents', state.agentId, 'input')
+          : path.join(DATA_DIR, 'ipc', state.groupFolder, 'input');
+      try {
+        fs.mkdirSync(inputDir, { recursive: true });
+        fs.writeFileSync(path.join(inputDir, '_close'), '');
+      } catch {
+        // best effort — fall back to SIGTERM/docker stop later
+      }
+    }
 
     // Wait for activeCount to reach zero or timeout
     const startTime = Date.now();

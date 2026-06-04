@@ -113,6 +113,9 @@ async function runScan(opts: ScanOptions): Promise<ImportReport> {
 
   // Ensure catalog root exists so writes don't have to mkdir each time.
   fs.mkdirSync(getCatalogRoot(), { recursive: true });
+  // Sweep stale .tmp-* directories left behind by SIGKILLed importers.
+  // Cheap one-shot per scan; runtime sweep happens in plugin-utils.materialize.
+  sweepStaleTmpDirs(getCatalogRoot(), report);
 
   const marketplaces = resolveMarketplaceDirs(opts, report);
 
@@ -402,6 +405,11 @@ async function importPluginSnapshot(args: ImportPluginArgs): Promise<void> {
   const { marketplace, plugin, pluginDir, manifest, idx, report } = args;
 
   const contentHash = await hashDirectoryContents(pluginDir);
+  // 32 hex chars (128-bit prefix) — 维持向后兼容：现有部署的 catalog 都是
+  // 32 字符目录名，切到 64 字符会让所有现有 snapshot 重复一份。128 位
+  // collision 抵抗在 per-(marketplace,plugin) scope 下已足够（攻击者还
+  // 需要同时控制 marketplace+plugin 名才能尝试碰撞），且 fs.existsSync
+  // idempotency 检查走的是 dir-name 不是哈希值。
   const snapshotId = `sha256-${contentHash.slice(0, 32)}`;
   const targetDir = getCatalogSnapshotDir(marketplace, plugin, snapshotId);
   const fullId = buildFullId(plugin, marketplace);
@@ -587,6 +595,68 @@ function verifyManifestPresent(dir: string): void {
     throw new Error(
       `Imported snapshot at ${dir} missing .claude-plugin/plugin.json`,
     );
+  }
+}
+
+/**
+ * 删除 catalog 下因 importer 被 SIGKILL 留下的 `.tmp-` 临时目录。
+ *
+ * **不是**全树扫描：那会误伤 plugin 内部含 `.tmp-`/`.legacy-bak@` 子串的
+ * 文件名（README.tmp-2025.md / scripts/build.tmp-stage.sh / archive.legacy-bak@v1
+ * 等）。importer 实际只在 `versions/` 这一级创建临时目录，命名形如
+ * `sha256-<hash>.tmp-<pid>-<ms>`，所以扫描限定在 `marketplaces/<mp>/plugins/<plugin>/versions/`
+ * 这一级，且仅匹配 importer 真实使用的命名。一次性、廉价。
+ */
+function sweepStaleTmpDirs(catalogRoot: string, report?: ImportReport): void {
+  // importer 命名形态：sha256-<hex>.tmp-<pid>-<ms>
+  const TMP_RE = /^sha256-[0-9a-f]+\.tmp-/;
+  let removed = 0;
+  const marketplacesRoot = path.join(catalogRoot, 'marketplaces');
+  let mpEntries: fs.Dirent[];
+  try {
+    mpEntries = fs.readdirSync(marketplacesRoot, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const mpEntry of mpEntries) {
+    if (!mpEntry.isDirectory()) continue;
+    const pluginsRoot = path.join(marketplacesRoot, mpEntry.name, 'plugins');
+    let pluginEntries: fs.Dirent[];
+    try {
+      pluginEntries = fs.readdirSync(pluginsRoot, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const pluginEntry of pluginEntries) {
+      if (!pluginEntry.isDirectory()) continue;
+      const versionsRoot = path.join(
+        pluginsRoot,
+        pluginEntry.name,
+        'versions',
+      );
+      let versionEntries: fs.Dirent[];
+      try {
+        versionEntries = fs.readdirSync(versionsRoot, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const v of versionEntries) {
+        if (!v.isDirectory()) continue;
+        if (!TMP_RE.test(v.name)) continue;
+        try {
+          fs.rmSync(path.join(versionsRoot, v.name), {
+            recursive: true,
+            force: true,
+          });
+          removed++;
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+  }
+  if (removed > 0 && report) {
+    report.warnings.push(`Swept ${removed} stale .tmp- snapshot dirs`);
   }
 }
 

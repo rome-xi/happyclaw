@@ -26,7 +26,7 @@ import { logger } from './logger.js';
 import { saveDownloadedFile, MAX_FILE_SIZE } from './im-downloader.js';
 import { detectImageMimeTypeStrict } from './image-detector.js';
 import path from 'node:path';
-import { markdownToPlainText, splitTextChunks } from './im-utils.js';
+import { markdownToPlainText, splitTextChunks, createDedupCache } from './im-utils.js';
 import { ProcessingLock, isStale } from './im-safety/index.js';
 import {
   isTransientError,
@@ -38,8 +38,6 @@ import {
 const QQ_TOKEN_URL = 'https://bots.qq.com/app/getAppAccessToken';
 const QQ_API_BASE = 'https://api.sgroup.qq.com';
 const TOKEN_REFRESH_BUFFER_MS = 300_000; // refresh 5min before expiry
-const MSG_DEDUP_MAX = 1000;
-const MSG_DEDUP_TTL = 30 * 60 * 1000; // 30min
 const MSG_SPLIT_LIMIT = 5000;
 const MAX_RECONNECT_ATTEMPTS = 100;
 const RATE_LIMIT_DELAY_MS = 60_000;
@@ -386,7 +384,8 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
   let lastErrorIsTransient = false;
 
   // Message deduplication
-  const msgCache = new Map<string, number>();
+  // LRU deduplication cache（共享 helper）
+  const dedup = createDedupCache({ ttlMs: 30 * 60 * 1000, max: 1000 });
   const processingLock = new ProcessingLock();
 
   // Per-chat msg_seq counter for active messages
@@ -470,28 +469,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
     );
   }
 
-  function isDuplicate(msgId: string): boolean {
-    const now = Date.now();
-    // Map preserves insertion order; stop at first non-expired entry
-    for (const [id, ts] of msgCache.entries()) {
-      if (now - ts > MSG_DEDUP_TTL) {
-        msgCache.delete(id);
-      } else {
-        break;
-      }
-    }
-    if (msgCache.size >= MSG_DEDUP_MAX) {
-      const firstKey = msgCache.keys().next().value;
-      if (firstKey) msgCache.delete(firstKey);
-    }
-    return msgCache.has(msgId);
-  }
 
-  function markSeen(msgId: string): void {
-    // delete + set to refresh insertion order (move to end)
-    msgCache.delete(msgId);
-    msgCache.set(msgId, Date.now());
-  }
 
   function getNextMsgSeq(chatId: string): number {
     const current = msgSeqCounters.get(chatId) ?? 0;
@@ -1482,12 +1460,12 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
         logger.debug({ msgId, msgTimeMs }, 'Stale QQ C2C message (>30min), dropping');
         return;
       }
-      if (isDuplicate(msgId)) return;
+      if (dedup.isDuplicate(msgId)) return;
       if (!processingLock.acquire(msgId)) {
         logger.debug({ msgId }, 'QQ C2C message already in-flight, skipping');
         return;
       }
-      markSeen(msgId);
+      dedup.markSeen(msgId);
       try {
       // Skip stale messages from before connection (hot-reload scenario)
       if (opts.ignoreMessagesBefore && data.timestamp) {
@@ -1670,12 +1648,12 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
         logger.debug({ msgId, msgTimeMs }, 'Stale QQ group message (>30min), dropping');
         return;
       }
-      if (isDuplicate(msgId)) return;
+      if (dedup.isDuplicate(msgId)) return;
       if (!processingLock.acquire(msgId)) {
         logger.debug({ msgId }, 'QQ group message already in-flight, skipping');
         return;
       }
-      markSeen(msgId);
+      dedup.markSeen(msgId);
       try {
       // Skip stale messages from before connection (hot-reload scenario)
       if (opts.ignoreMessagesBefore && data.timestamp) {
@@ -1896,7 +1874,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
       lastConnectTime = 0;
       keepaliveMode = false;
       lastErrorIsTransient = false;
-      msgCache.clear();
+      dedup.clear();
       msgSeqCounters.clear();
       rejectTimestamps.clear();
       logger.info('QQ bot disconnected');

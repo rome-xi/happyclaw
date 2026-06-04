@@ -945,7 +945,11 @@ app.use(
 // --- WebSocket ---
 
 function setupWebSocket(server: any): WebSocketServer {
-  const wss = new WebSocketServer({ noServer: true });
+  // 8 MiB 上限：覆盖单条消息含 10 张 5MB base64 image 的合法上限（~70MB 是
+  // attachments 上限里的极端情形——通过 schema 上的 attachments.max(10) 控制
+  // 而不是把 ws frame 单帧打到 100MB），也防止认证用户用单帧 OOM 服务器
+  // （ws 库默认 100 MiB；详见 node_modules/ws/lib/websocket-server.js）。
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 8 * 1024 * 1024 });
 
   server.on('upgrade', (request: any, socket: any, head: any) => {
     const { pathname } = new URL(request.url, `http://${request.headers.host}`);
@@ -953,6 +957,21 @@ function setupWebSocket(server: any): WebSocketServer {
     if (pathname !== '/ws') {
       socket.destroy();
       return;
+    }
+
+    // Origin 校验：CORS 中间件不覆盖 WebSocket，浏览器对 WebSocket 也不发
+    // CORS preflight。SameSite=Strict cookie 是当前的主防御，origin 检查
+    // 是纵深防御 —— SameSite 实现不严的 UA / future SameSite=Lax 回退会
+    // 直接暴露 CSWSH（跨站 WebSocket 劫持）。Origin 缺失（同源、无浏览器
+    // origin）放行；存在但不在白名单则拒绝。
+    const origin = request.headers.origin as string | undefined;
+    if (origin) {
+      const allowed = isAllowedOrigin(origin);
+      if (!allowed) {
+        socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+        socket.destroy();
+        return;
+      }
     }
 
     // Verify session cookie (HMAC signature + DB lookup).
@@ -992,6 +1011,15 @@ function setupWebSocket(server: any): WebSocketServer {
     }
     if (session.status !== 'active') {
       socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+    // 强制改密码用户不能通过 WebSocket 发指令 / 操作终端，否则 HTTP 中
+    // PASSWORD_CHANGE_REQUIRED 形同虚设——admin 重置密码后用户仍能继续与
+    // agent 交互、开容器终端。HTTP 仍允许 /api/auth/me / /password / /sessions
+    // 完成强制改密流程。
+    if (session.must_change_password) {
+      socket.write('HTTP/1.1 403 Password Change Required\r\n\r\n');
       socket.destroy();
       return;
     }
@@ -1101,6 +1129,12 @@ function setupWebSocket(server: any): WebSocketServer {
           }
           invalidateSessionCache(sessionId);
           ws.close(1008, 'Unauthorized');
+          return;
+        }
+        // 与 upgrade 处一致：管理员重置密码后被强制改密的 session 不能继续
+        // 操作 agent / 终端；ws.close(1008) 让前端收到关闭再走改密流程。
+        if (session.must_change_password) {
+          ws.close(1008, 'Password change required');
           return;
         }
 
@@ -1591,8 +1625,11 @@ function setupWebSocket(server: any): WebSocketServer {
  * @param adminOnly - If true, only admin users receive the message
  * @param allowedUserIds - Group access filtering:
  *   - undefined: no user-level filtering (e.g. system-wide admin broadcasts)
- *   - null: ownership unresolvable → default-deny, only admin can see
- *   - Set<string>: only these users + admin can see
+ *   - null: ownership unresolvable → default-deny (drop for ALL recipients,
+ *     including admin). 这是有意的硬拒绝，不区分角色，避免 ACL 解析失败时
+ *     管理员意外看到本不该看的群组事件。注意先前文档说"only admin can see"
+ *     与代码不一致，代码 default-deny 更安全所以保留代码、对齐注释。
+ *   - Set<string>: only these users (admin must be an explicit member to see)
  */
 function safeBroadcast(
   msg: WsMessageOut,
@@ -1640,8 +1677,9 @@ function safeBroadcast(
       continue;
     }
 
-    // Group isolation: only allowed users (owner + shared members) can see this group's events
-    // allowedUserIds === null means ownership unresolvable → default-deny (admin-only)
+    // Group isolation: only allowed users (owner + shared members) can see this group's events.
+    // allowedUserIds === null means ownership unresolvable → default-deny EVERYONE
+    // (including admin). 故意这样：解析失败时宁可不广播也不要意外泄漏。
     if (allowedUserIds !== undefined) {
       if (allowedUserIds === null || !allowedUserIds.has(session.user_id)) {
         continue;

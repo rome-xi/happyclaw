@@ -2620,6 +2620,13 @@ function saveState(): void {
 }
 
 function registerGroup(jid: string, group: RegisteredGroup): void {
+  // 严格校验 folder 名：注册路径来自 IPC（agent register_group 工具）和直接调用，
+  // folder 会直接拼到 path.join(GROUPS_DIR, ...) 上。任何含 `..`、绝对路径或
+  // 路径分隔符的 folder 都会让 mkdir/写入跑出 GROUPS_DIR 之外（agent
+  // bypass-permissions 模式下完全可达）。规则与典型 unix 目录命名一致。
+  if (!group.folder || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(group.folder)) {
+    throw new Error(`registerGroup: invalid folder name: ${group.folder}`);
+  }
   registeredGroups[jid] = group;
   setRegisteredGroup(jid, group);
 
@@ -3983,7 +3990,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     // which is ambiguous for host processes (could be user stop, process tree
     // kill, or actual OOM).  exitLabel is either `code N` or `signal X` —
     // never both — so this only triggers on Docker container OOM exits.
-    const isOom = OOM_EXIT_RE.test(errorDetail);
+    //
+    // Additional guard: stopGroup → SIGTERM → grace timeout → docker kill 也会
+    // 让容器以 137 退出。如果用户刚点过 stop（GroupQueue.isRecentlyStopped），
+    // 不要把这次退出计入 OOM 计数 —— 否则连续两次手动 stop 就会触发会话重置
+    // 并显示『内存溢出』提示，混淆运维。
+    const isUserStopped = queue.isRecentlyStopped(effectiveGroup.folder);
+    const isOom = !isUserStopped && OOM_EXIT_RE.test(errorDetail);
     if (isOom) {
       const folder = effectiveGroup.folder;
       consecutiveOomExits[folder] = (consecutiveOomExits[folder] || 0) + 1;
@@ -5566,14 +5579,23 @@ async function processTaskIpc(
           data.executionMode === 'host' || data.executionMode === 'container'
             ? data.executionMode
             : undefined;
-        registerGroup(data.jid, {
-          name: data.name,
-          folder: data.folder,
-          added_at: new Date().toISOString(),
-          containerConfig: data.containerConfig,
-          created_by: sourceEntry?.created_by,
-          executionMode: execMode,
-        });
+        try {
+          registerGroup(data.jid, {
+            name: data.name,
+            folder: data.folder,
+            added_at: new Date().toISOString(),
+            containerConfig: data.containerConfig,
+            created_by: sourceEntry?.created_by,
+            executionMode: execMode,
+          });
+        } catch (err) {
+          // registerGroup 校验 folder 名时会抛错。IPC 来源不可信（agent 进程
+          // 可能被 prompt 注入），不要把异常冒泡到主消息循环。
+          logger.warn(
+            { jid: data.jid, folder: data.folder, err },
+            'register_group rejected by validation',
+          );
+        }
       } else {
         logger.warn(
           { data },
@@ -9281,6 +9303,9 @@ async function main(): Promise<void> {
   // saved config and only connects the enabled ones, so disabled channels stay
   // down without extra branching here.
   const reconnectUserIMChannels = async (userId: string): Promise<void> => {
+    // 解封：disconnectAllUserChannels 把 user 标 sealed 后，所有 connectChannel
+    // 都被拒。re-enable / restore 用户时必须先解封否则 reload 全部失败。
+    imManager.markUserReconnectable(userId);
     const channels: Array<
       | 'feishu'
       | 'telegram'
