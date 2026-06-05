@@ -305,6 +305,16 @@ export function feedStreamEventToCard(
       if (se.toolUseId && se.toolInputSummary) {
         session.updateToolSummary(se.toolUseId, se.toolInputSummary);
       }
+      // AskUserQuestion 等工具的结构化输入（questions/options）经 tool_progress
+      // 的 toolInput 字段下发（非 toolInputSummary，因流式 tool_use_start 时 input 恒空）。
+      // 写入 tc.toolInput 以驱动飞书 ASK 面板渲染，与 Web 端 applyStreamEvent 对齐。
+      if (
+        se.toolUseId &&
+        se.toolInput &&
+        session instanceof StreamingCardController
+      ) {
+        session.setToolMeta(se.toolUseId, { toolInput: se.toolInput });
+      }
       break;
     case 'status':
       if (se.statusText && se.statusText !== 'interrupted') {
@@ -3186,15 +3196,20 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             broadcastStreamEvent(chatJid, result.streamEvent);
 
             // ── 累积 text_delta / thinking_delta 文本（中断时用于保存已输出内容）──
+            // 仅累积主 Agent 文本（无 parentToolUseId）。子 Agent（SDK Task）的
+            // 中间文本带 parentToolUseId，混入会污染飞书主卡片正文与 interrupt_partial。
+            // 与 Web 端 chat.ts 对带 parentToolUseId 的 text_delta 隔离到 Task 块的逻辑对齐。
             if (
               result.streamEvent.eventType === 'text_delta' &&
-              result.streamEvent.text
+              result.streamEvent.text &&
+              !result.streamEvent.parentToolUseId
             ) {
               streamingAccumulatedText += result.streamEvent.text;
             }
             if (
               result.streamEvent.eventType === 'thinking_delta' &&
-              result.streamEvent.text
+              result.streamEvent.text &&
+              !result.streamEvent.parentToolUseId
             ) {
               streamingAccumulatedThinking += result.streamEvent.text;
             }
@@ -3765,11 +3780,37 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     // ── Streaming card cleanup ──
     if (streamingSession) {
       if (streamingSession.isActive()) {
+        // isActive() 仍为 true ⟹ 卡片从未被 complete()（result.result 非空路径会
+        // 在 3594 complete 后令 isActive 转 false）。这里覆盖所有"卡片建了但没收口"的
+        // 收尾场景，避免卡片永久停在「生成中」（僵尸卡片）。
         if (hadError || !output || output.status === 'error') {
           await streamingSession.abort('处理出错').catch(() => {});
         } else if (wasInterrupted) {
           await streamingSession.abort('已中断').catch(() => {});
+        } else if (output.status === 'closed') {
+          // closed：容器 drain/_close 中断了 in-flight query（agent-runner 发
+          // status:'closed' 而非 interrupt 流事件，streamInterrupted 仍为 false）。
+          // 该消息会重试（3904 保留 cursor），此处仅收口卡片避免僵尸卡 + 重试叠卡。
+          // 文案区别于"已中断"：closed 是系统侧打断并自动重试，非用户主动中断。
+          await streamingSession.abort('连接已切换，正在重试').catch(() => {});
+        } else if (!sentReply) {
+          // 真 silent-success：本轮从未发过可见回复（agent 仅用 send_message 旁路
+          // 回复、最终 result 为空，3546 if(result.result) 门控跳过了 complete()）。
+          // complete() 把卡片从 streaming 收口到 completed（空正文由 buildStructuredFinalCard
+          // 兜底为 "..."，并保留 thinking/工具统计），而非裸 dispose() 留下「生成中」僵尸卡。
+          try {
+            await streamingSession.complete(streamingAccumulatedText);
+          } catch (err) {
+            logger.warn(
+              { err, chatJid },
+              'Streaming card silent-success finalize failed, disposing',
+            );
+            streamingSession.dispose();
+          }
         } else {
+          // sentReply 已为 true：卡片是正常回复 complete 后由 3651 为"下一条消息"预建的
+          // 空白 active 卡，本轮无后续 result。dispose() 丢弃，不可 complete()（否则会
+          // 凭空渲染一张正文为 "..." 的完成卡）。
           streamingSession.dispose();
         }
       }
@@ -4069,6 +4110,20 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   }
 
   // Final fallback for silent-success paths (no visible reply).
+  // silent-success：agent 仅用 send_message 旁路回复或最终 result 为空，未发
+  // sdk_final new_message。前端的 waiting/streaming 被 thinking/tool 流事件设为 true 后
+  // 没有任何终态信号可清，会永久停在「正在思考...」。广播一个 idle status 事件让前端
+  // 收口；broadcastStreamEvent→updateStreamingSnapshot 会据 idle 删除后端快照，
+  // 避免 WS 重连恢复到「生成中」僵尸快照。
+  // （飞书等 IM 卡片已在 finally 的 complete()/abort() 收口，此处仅补 Web 通路。）
+  if (!sentReply) {
+    broadcastStreamEvent(chatJid, {
+      eventType: 'status',
+      statusText: 'idle',
+      turnId: lastProcessed.id,
+      sessionId: activeSessionId,
+    });
+  }
   commitCursor();
 
   return true;

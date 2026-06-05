@@ -1737,6 +1737,10 @@ async function runQuery(
     // 中断导致的 SDK 错误（error_during_execution 等）：正常返回，不抛出
     if (interruptedDuringQuery) {
       log(`runQuery error during interrupt (non-fatal): ${errorMessage}`);
+      // 收尾：catch 路径跳过了正常出口的 processor.cleanup()，残留 <200 字符的
+      // 缓冲尾巴（未达 flush 阈值、定时器未触发）会永久丢失，导致 interrupt_partial 缺尾。
+      // cleanup() 幂等安全（seenTextualResult 时丢尾避重复，否则 flushBuffers）。
+      processor.cleanup();
       return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery, pipedMessagesDuringQuery };
     }
 
@@ -1747,6 +1751,9 @@ async function runQuery(
     // 时会落到下方 re-throw，被外层当 error 退避，把一次干净的 shutdown 误报成失败。
     if (postResultInterruptRequested) {
       log(`runQuery error after shutdown interrupt (non-fatal): ${errorMessage}`);
+      // 同 interruptedDuringQuery：补 cleanup() 刷新残留缓冲尾巴，避免 shutdown
+      // 中断时未达阈值的最后一小段文本丢失。
+      processor.cleanup();
       return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery, pipedMessagesDuringQuery };
     }
 

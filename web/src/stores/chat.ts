@@ -944,6 +944,7 @@ function applyStreamEvent(
                 elapsedSeconds: event.elapsedSeconds,
                 ...(event.skillName ? { skillName: event.skillName } : {}),
                 ...(event.toolInput ? { toolInput: event.toolInput } : {}),
+                ...(event.toolInputSummary ? { toolInputSummary: event.toolInputSummary } : {}),
               }
             : t
         );
@@ -964,6 +965,7 @@ function applyStreamEvent(
           parentToolUseId: event.parentToolUseId,
           isNested: event.isNested,
           elapsedSeconds: event.elapsedSeconds,
+          ...(event.toolInputSummary ? { toolInputSummary: event.toolInputSummary } : {}),
         }];
         }
         if (event.parentToolUseId) {
@@ -1945,6 +1947,32 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // fall-through 到主对话处理，移除 activeTools 中的 Task 条目
     }
 
+    // turn 干净结束信号（silent-success：agent 仅用 send_message 旁路回复或最终
+    // result 为空，后端不会发 sdk_final new_message 来清 waiting）。直接清除 streaming
+    // 与 waiting，避免 spinner/思考动画永久残留。那些 send_message 已作为独立 new_message
+    // 在消息列表中，无需保留 streaming 富内容。
+    if (event.eventType === 'status' && event.statusText === 'idle') {
+      const mainKey = `main:${chatJid}`;
+      const pendingEntry = pendingDeltas.get(mainKey);
+      if (pendingEntry) {
+        cancelAnimationFrame(pendingEntry.raf);
+        pendingDeltas.delete(mainKey);
+      }
+      set((s) => {
+        if (!s.streaming[chatJid] && s.waiting[chatJid] === false) return s;
+        const nextStreaming = { ...s.streaming };
+        delete nextStreaming[chatJid];
+        const nextPendingThinking = { ...s.pendingThinking };
+        delete nextPendingThinking[chatJid];
+        return {
+          waiting: { ...s.waiting, [chatJid]: false },
+          streaming: nextStreaming,
+          pendingThinking: nextPendingThinking,
+        };
+      });
+      return;
+    }
+
     // 中断事件：冻结流式 UI（保留已输出文本），等待 new_message 完成最终转换。
     if (event.eventType === 'status' && event.statusText === 'interrupted') {
       // 强制 flush rAF 缓冲：thinking_delta/text_delta 通过 requestAnimationFrame 批处理，
@@ -2134,6 +2162,19 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
     // 闭包外标志：set() 内部计算后传出，用于驱动通知逻辑（避免重复判断条件）
     let didFinalizeAssistant = false;
+
+    // 强制 flush rAF 缓冲：finalize 会 delete streaming 并把 thinkingText 转存
+    // thinkingCache。若某轮最后一帧 thinking_delta/text_delta 仍卡在 pendingDeltas
+    // （页面隐藏时 rAF 被节流），不先 flush 会随 streaming 删除而丢失。
+    // 与中断路径（status:interrupted）和 agent-status 路径对称。
+    {
+      const mainKey = `main:${chatJid}`;
+      const pendingEntry = pendingDeltas.get(mainKey);
+      if (pendingEntry) {
+        cancelAnimationFrame(pendingEntry.raf);
+        flushPendingDelta(mainKey, chatJid, undefined, set);
+      }
+    }
 
     set((s) => {
       const existing = s.messages[chatJid] || [];

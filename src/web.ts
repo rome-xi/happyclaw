@@ -2016,6 +2016,14 @@ function updateSnapshotTask(snap: StreamingSnapshotEntry, event: StreamEvent): v
 }
 
 function updateStreamingSnapshot(normalizedJid: string, event: StreamEvent): void {
+  // turn 干净结束（silent-success）：删除快照而非累积，避免 WS 重连恢复到
+  // 「生成中」僵尸快照。前端收到同一 idle 事件后清 waiting/streaming。
+  if (event.eventType === 'status' && event.statusText === 'idle') {
+    streamingSnapshots.delete(normalizedJid);
+    streamingFullTexts.delete(normalizedJid);
+    return;
+  }
+
   let snap = streamingSnapshots.get(normalizedJid);
 
   // Reset on new turn
