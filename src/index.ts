@@ -301,6 +301,18 @@ export function feedStreamEventToCard(
         if (info) session.pushRecentEvent(`✅ ${info.name}`);
       }
       break;
+    case 'tool_result': {
+      // Surface the (truncated + sanitized) tool output in the timeline so the
+      // card shows *what* a tool returned, aligning with Claude Code's trace.
+      if (se.toolResult) {
+        const resultInfo = se.toolUseId ? session.getToolInfo(se.toolUseId) : undefined;
+        const toolLabel = resultInfo?.name ? `\`${resultInfo.name}\` ` : '';
+        session.pushRecentEvent(
+          `↳ <font color='grey'>结果</font> ${toolLabel}${se.toolResult.slice(0, 120)}`,
+        );
+      }
+      break;
+    }
     case 'tool_progress':
       if (se.toolUseId && se.toolInputSummary) {
         session.updateToolSummary(se.toolUseId, se.toolInputSummary);
@@ -410,13 +422,35 @@ export function feedStreamEventToCard(
     case 'usage':
       if (se.usage) session.patchUsageNote(se.usage);
       break;
-    case 'permission_denied':
+    case 'permission_denied': {
+      // A denied tool call is a real signal (the agent wanted to do something
+      // it wasn't allowed to) — render it in red so it stands out from the
+      // grey routine-event stream instead of being buried as plain text.
+      const pd = se.permissionDenied;
+      const toolName = pd?.toolName || se.toolName || '';
+      const reason = pd?.reason || pd?.message || se.summary || '';
+      const toolPart = toolName ? ` \`${toolName}\`` : '';
+      const reasonPart = reason
+        ? ` <font color='grey'>${reason.slice(0, 80)}</font>`
+        : '';
+      session.pushRecentEvent(
+        `🚫 <text_tag color='red'>权限拒绝</text_tag>${toolPart}${reasonPart}`,
+      );
+      break;
+    }
     case 'memory_recall':
     case 'compact_boundary':
     case 'notification':
     case 'prompt_suggestion':
       if (se.summary || se.title) {
-        session.pushRecentEvent(`${se.title || se.eventType}: ${(se.summary || '').slice(0, 80)}`);
+        // memory_recall / compact_boundary carry the matched memory or the
+        // pre-compaction summary in `detail`; surface it (clamped) after the
+        // headline so the runtime trace shows *what* was recalled/compacted,
+        // not just that it happened.
+        const detail = se.detail ? ` <font color='grey'>${se.detail.slice(0, 120)}</font>` : '';
+        session.pushRecentEvent(
+          `${se.title || se.eventType}: ${(se.summary || '').slice(0, 80)}${detail}`,
+        );
       }
       if (se.eventType === 'compact_boundary') {
         session.setSystemStatus(se.summary || '上下文已压缩');
@@ -6307,6 +6341,10 @@ async function processAgentConversation(
     : undefined;
   let agentStreamingAccText = '';
   let agentStreamInterrupted = false;
+  // Mirrors the main session's `output.status === 'closed'` handling: set when
+  // the container drained mid-query so the finally block finalizes the card as
+  // "reconnecting" instead of leaving a zombie 生成中 card.
+  let agentClosed = false;
   if (agentStreamingSession && streamingSessionJid) {
     registerStreamingSession(streamingSessionJid, agentStreamingSession);
     logger.debug(
@@ -6369,6 +6407,11 @@ async function processAgentConversation(
         );
       }
     }
+
+    // Container drained/_closed the in-flight query — remember it so the finally
+    // block finalizes the card (the message will be retried) instead of leaving
+    // a zombie 生成中 card.
+    if (output.status === 'closed') agentClosed = true;
 
     // Track session
     if (
@@ -6871,10 +6914,31 @@ async function processAgentConversation(
     // ── Streaming card cleanup ──
     if (agentStreamingSession) {
       if (agentStreamingSession.isActive()) {
+        // Symmetric with the main session's five-way finalize (index.ts ~3804):
+        // every "card built but never completed" path must finalize so the card
+        // can't get stuck at 生成中 (zombie card).
         if (hadError) {
           await agentStreamingSession.abort('处理出错').catch(() => {});
         } else if (wasInterrupted) {
           await agentStreamingSession.abort('已中断').catch(() => {});
+        } else if (agentClosed) {
+          // Container drained/_closed the in-flight query; the message will be
+          // retried, so just finalize the card (区别于"已中断"：系统侧打断重试).
+          await agentStreamingSession.abort('连接已切换，正在重试').catch(() => {});
+        } else if (!cursorCommitted) {
+          // Silent-success: the agent replied only via the send_message
+          // side-channel or produced an empty result, so the card was never
+          // completed. complete() 收口 (空正文由 buildStructuredFinalCard 兜底)
+          // 而非裸 dispose 留下「生成中」僵尸卡。
+          try {
+            await agentStreamingSession.complete(agentStreamingAccText);
+          } catch (err) {
+            logger.warn(
+              { err, chatJid, agentId },
+              'Agent streaming card silent-success finalize failed, disposing',
+            );
+            agentStreamingSession.dispose();
+          }
         } else {
           agentStreamingSession.dispose();
         }

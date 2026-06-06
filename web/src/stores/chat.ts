@@ -41,7 +41,7 @@ export interface StreamingTimelineEvent {
   id: string;
   timestamp: number;
   text: string;
-  kind: 'tool' | 'skill' | 'hook' | 'status' | 'task' | 'memory' | 'debug' | 'context';
+  kind: 'tool' | 'skill' | 'hook' | 'status' | 'task' | 'memory' | 'debug' | 'context' | 'permission';
 }
 
 export interface StreamingTraceEvent {
@@ -94,6 +94,8 @@ export interface StreamSnapshotData {
   contextAudit?: StreamEvent['contextAudit'];
   todos?: Array<{ id: string; content: string; status: string }>;
   systemStatus: string | null;
+  isThinking?: boolean;
+  activeHook?: { hookName: string; hookEvent: string } | null;
   turnId?: string;
 }
 
@@ -722,6 +724,7 @@ function traceKind(event: StreamEvent): StreamingTraceEvent['kind'] {
   if (event.eventType.startsWith('task_')) return 'task';
   if (event.eventType === 'context_audit') return 'context';
   if (event.eventType === 'memory_recall' || event.eventType === 'compact_boundary') return 'memory';
+  if (event.eventType === 'permission_denied') return 'permission';
   if (event.eventType === 'raw_sdk_event') return 'debug';
   return 'status';
 }
@@ -731,6 +734,7 @@ function traceTitle(event: StreamEvent): string {
   switch (event.eventType) {
     case 'tool_use_start': return event.skillName ? `技能 ${event.skillName}` : `工具 ${event.toolName || 'unknown'}`;
     case 'tool_use_end': return `工具完成 ${event.toolName || event.toolUseId || ''}`.trim();
+    case 'tool_result': return '工具结果';
     case 'tool_progress': return `工具进度 ${event.toolName || event.toolUseId || ''}`.trim();
     case 'task_start': return `Task 启动`;
     case 'task_progress': return `Task 进度`;
@@ -926,9 +930,11 @@ function applyStreamEvent(
             : `工具 ${ended.toolName}`;
             next.recentEvents = pushEvent(prev.recentEvents, isSkill ? 'skill' : 'tool', `✓ ${label} (${elapsedSec}s)`);
           }
-        } else {
-          next.activeTools = [];
         }
+        // An end event without a toolUseId is malformed — ignore it instead of
+        // clearing ALL active tools, which would make genuinely-running tools
+        // suddenly vanish from the UI. Matches the feishu card + WS snapshot
+        // behaviour (both key off toolUseId and skip idless ends).
         if (event.parentToolUseId) {
           updateTaskRuntime(prev, next, event);
         }
@@ -1026,9 +1032,17 @@ function applyStreamEvent(
       }
         break;
       }
-      case 'permission_denied':
-        next.recentEvents = pushEvent(prev.recentEvents, 'status', event.summary || event.detail || '权限被拒绝');
+      case 'permission_denied': {
+        const pd = event.permissionDenied;
+        const tool = pd?.toolName || event.toolName || '';
+        const why = pd?.reason || pd?.message || event.summary || event.detail || '权限被拒绝';
+        next.recentEvents = pushEvent(
+          prev.recentEvents,
+          'permission',
+          `🚫 ${tool ? `${tool}: ` : ''}${why}`.trim(),
+        );
         break;
+      }
       case 'memory_recall':
       case 'compact_boundary':
         next.recentEvents = pushEvent(prev.recentEvents, 'memory', event.summary || traceTitle(event));
@@ -2373,11 +2387,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // Skip for title-only broadcasts (titleGenerating set) — those carry the
       // persistent running status but shouldn't re-open the "waiting" window
       // after the reply has already finalized.
+      // running → open the waiting window so stream events are accepted; any
+      // terminal status (idle/completed/error) → close it, otherwise a
+      // silent-success / closed finalize would leave agentWaiting stuck true and
+      // the UI spinning forever (mirrors the main conversation's handleRunnerState).
       const nextAgentWaiting =
         (resolvedKind === 'conversation' || resolvedKind === 'spawn') &&
-        status === 'running' &&
         typeof titleGenerating !== 'boolean'
-          ? { ...s.agentWaiting, [agentId]: true }
+          ? status === 'running'
+            ? { ...s.agentWaiting, [agentId]: true }
+            : { ...s.agentWaiting, [agentId]: false }
           : s.agentWaiting;
 
       return {
@@ -2873,6 +2892,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
       contextAudit: snapshot.contextAudit,
       todos: snapshot.todos,
       systemStatus: snapshot.systemStatus || null,
+      isThinking: snapshot.isThinking ?? false,
+      activeHook: snapshot.activeHook ?? null,
       turnId: snapshot.turnId,
     };
 

@@ -1073,6 +1073,8 @@ function setupWebSocket(server: any): WebSocketServer {
               contextAudit: snap.contextAudit,
               todos: snap.todos,
               systemStatus: snap.systemStatus,
+              isThinking: snap.isThinking,
+              activeHook: snap.activeHook,
               turnId: snap.turnId,
             },
           } satisfies WsMessageOut));
@@ -1867,12 +1869,12 @@ interface StreamingSnapshotEntry {
     id: string;
     timestamp: number;
     text: string;
-    kind: 'tool' | 'skill' | 'hook' | 'status' | 'task' | 'memory' | 'context' | 'debug';
+    kind: 'tool' | 'skill' | 'hook' | 'status' | 'task' | 'memory' | 'context' | 'debug' | 'permission';
   }>;
   traceEvents: Array<{
     id: string;
     timestamp: number;
-    kind: 'tool' | 'skill' | 'hook' | 'status' | 'task' | 'memory' | 'context' | 'debug';
+    kind: 'tool' | 'skill' | 'hook' | 'status' | 'task' | 'memory' | 'context' | 'debug' | 'permission';
     scope?: StreamEvent['agentScope'];
     title: string;
     summary?: string;
@@ -1898,6 +1900,13 @@ interface StreamingSnapshotEntry {
   }>;
   todos?: Array<{ id: string; content: string; status: string }>;
   systemStatus: string | null;
+  /** Whether the agent is mid-thinking (no text emitted yet) — kept in the
+   *  snapshot so a WS reconnect restores the "思考中" indicator instead of a
+   *  blank pause. */
+  isThinking?: boolean;
+  /** Currently-running hook, if any — restored on reconnect so the hook spinner
+   *  survives the reconnect instead of silently disappearing. */
+  activeHook?: { hookName: string; hookEvent: string } | null;
   turnId?: string;
   updatedAt: number;
 }
@@ -1912,7 +1921,7 @@ const MAX_SNAPSHOT_TRACE_EVENTS = 200;
 const MAX_SNAPSHOT_TASK_TAIL = 4000;
 
 /** Push a recent event entry and truncate to MAX_SNAPSHOT_EVENTS. */
-function pushRecentEvent(snap: StreamingSnapshotEntry, event: { id: string; timestamp: number; text: string; kind: 'tool' | 'skill' | 'hook' | 'status' | 'task' | 'memory' | 'context' | 'debug' }): void {
+function pushRecentEvent(snap: StreamingSnapshotEntry, event: { id: string; timestamp: number; text: string; kind: 'tool' | 'skill' | 'hook' | 'status' | 'task' | 'memory' | 'context' | 'debug' | 'permission' }): void {
   snap.recentEvents.push(event);
   if (snap.recentEvents.length > MAX_SNAPSHOT_EVENTS) {
     snap.recentEvents = snap.recentEvents.slice(-MAX_SNAPSHOT_EVENTS);
@@ -1927,6 +1936,7 @@ function pushTraceEvent(snap: StreamingSnapshotEntry, event: StreamEvent): void 
     event.eventType.startsWith('task_') ? 'task' :
     event.eventType === 'memory_recall' || event.eventType === 'compact_boundary' ? 'memory' :
     event.eventType === 'context_audit' ? 'context' :
+    event.eventType === 'permission_denied' ? 'permission' :
     event.eventType === 'raw_sdk_event' ? 'debug' :
     'status';
   const title = event.title
@@ -2054,6 +2064,8 @@ function updateStreamingSnapshot(normalizedJid: string, event: StreamEvent): voi
   switch (event.eventType) {
     case 'text_delta':
       if (event.text && !event.parentToolUseId) {
+        // Real assistant text means the current thinking burst is over.
+        snap.isThinking = false;
         snap.partialText += event.text;
         if (snap.partialText.length > MAX_SNAPSHOT_TEXT) {
           snap.partialText = snap.partialText.slice(-MAX_SNAPSHOT_TEXT);
@@ -2065,6 +2077,7 @@ function updateStreamingSnapshot(normalizedJid: string, event: StreamEvent): voi
 
     case 'thinking_delta':
       if (event.text && !event.parentToolUseId) {
+        snap.isThinking = true;
         snap.thinkingText += event.text;
         if (snap.thinkingText.length > MAX_SNAPSHOT_THINKING) {
           snap.thinkingText = snap.thinkingText.slice(-MAX_SNAPSHOT_THINKING);
@@ -2074,6 +2087,8 @@ function updateStreamingSnapshot(normalizedJid: string, event: StreamEvent): voi
 
     case 'tool_use_start':
       if (event.toolUseId && event.toolName) {
+        // A tool call ends the current thinking burst.
+        snap.isThinking = false;
         snap.activeTools.push({
           toolName: event.toolName,
           toolUseId: event.toolUseId,
@@ -2145,6 +2160,7 @@ function updateStreamingSnapshot(normalizedJid: string, event: StreamEvent): voi
       break;
 
     case 'hook_started':
+      snap.activeHook = { hookName: event.hookName || '', hookEvent: event.hookEvent || '' };
       if (event.hookName) {
         pushRecentEvent(snap, {
           id: `hook-${Date.now()}`,
@@ -2153,6 +2169,14 @@ function updateStreamingSnapshot(normalizedJid: string, event: StreamEvent): voi
           kind: 'hook',
         });
       }
+      break;
+
+    case 'hook_progress':
+      snap.activeHook = { hookName: event.hookName || '', hookEvent: event.hookEvent || '' };
+      break;
+
+    case 'hook_response':
+      snap.activeHook = null;
       break;
 
     case 'memory_recall':

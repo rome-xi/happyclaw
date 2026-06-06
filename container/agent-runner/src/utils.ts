@@ -133,6 +133,37 @@ export function summarizeToolInput(input: unknown): string | undefined {
 }
 
 /**
+ * Summarize a tool_result block's content for streaming display.
+ *
+ * The SDK delivers tool results as either a plain string or an array of content
+ * blocks ({type:'text'|'image'|...}). We flatten the text, redact inline secrets,
+ * and clamp the length so the trace stays readable without dumping a 10K-line
+ * bash output into the card. Returns undefined for empty / non-textual results.
+ */
+export function summarizeToolResult(content: unknown, maxLen = 400): string | undefined {
+  let text: string | undefined;
+  if (typeof content === 'string') {
+    text = content;
+  } else if (Array.isArray(content)) {
+    text = content
+      .map((b) => {
+        if (typeof b === 'string') return b;
+        if (b && typeof b === 'object') {
+          const block = b as { type?: string; text?: string };
+          if (block.type === 'text') return block.text ?? '';
+          if (block.type === 'image') return '[image]';
+        }
+        return '';
+      })
+      .filter(Boolean)
+      .join('\n');
+  }
+  const trimmed = text?.trim();
+  if (!trimmed) return undefined;
+  return shorten(redactInlineSecrets(trimmed), maxLen);
+}
+
+/**
  * Extract a skill name from Skill tool input.
  * Tries skillName, skill, name, command fields, then regex-matches leading slashes.
  */

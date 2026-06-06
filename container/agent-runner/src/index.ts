@@ -71,7 +71,10 @@ const DEFAULT_ALLOWED_TOOLS = [
   'WebSearch', 'WebFetch',
   'Task', 'TaskOutput', 'TaskStop',
   'TeamCreate', 'TeamDelete', 'SendMessage',
-  'TodoWrite', 'ToolSearch', 'Skill',
+  // 'Skill' removed: since SDK 0.3.x skills are enabled via the `skills` option
+  // (skills: 'all' below), not by listing a 'Skill' tool here. Keeping the dead
+  // entry just invited confusion.
+  'TodoWrite', 'ToolSearch',
   'NotebookEdit',
   'mcp__happyclaw__*'
 ];
@@ -1393,6 +1396,12 @@ async function runQuery(
         // 显式声明比依赖 CLI 隐式默认更可靠，确保全局/项目/用户技能完整挂载生效。
         skills: 'all',
         includePartialMessages: true,
+        // Forward sub-agent (Task) text/thinking as stream events so the card's
+        // sub-agent transcript lights up live instead of only filling in when the
+        // Task completes. The stream-processor already renders these
+        // (agentScope:'subagent' deltas, stream-processor.ts ~979); this flag is
+        // what actually makes the SDK emit them.
+        forwardSubagentText: true,
         ...(Object.keys(flagSettings).length > 0 ? { settings: flagSettings as any } : {}),
         ...(userPlugins && { plugins: userPlugins }),
         mcpServers: {
@@ -1508,6 +1517,12 @@ async function runQuery(
     // ── 子 Agent 消息转 StreamEvent ──
     if (processor.processSubAgentMessage(message as any)) {
       continue;
+    }
+
+    // ── Main-agent tool results → tool_result stream events ──
+    // (sub-agent results are handled inside processSubAgentMessage above)
+    if (message.type === 'user') {
+      processor.processMainToolResults(message as any);
     }
 
     if (message.type === 'assistant' && 'uuid' in message) {

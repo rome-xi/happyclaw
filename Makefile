@@ -237,22 +237,33 @@ sync-types: ## 同步 shared/ 下的类型定义到各子项目
 
 # ─── SDK ─────────────────────────────────────────────────────
 
-update-sdk: ## 更新 agent-runner 的 Claude Agent SDK 到最新版本
+update-sdk: ## 更新 agent-runner + 主服务的 Claude Agent SDK 到最新版本
 	cd container/agent-runner && $(PKG) update @anthropic-ai/claude-agent-sdk && $(PKG) run build
-	@# npm/bun update 会将 "*" 回写为具体版本，还原它
+	$(PKG) update @anthropic-ai/claude-agent-sdk
+	@# npm/bun update 会将 "*" 回写为具体版本，还原它（agent-runner + 主服务）
 	@sed -i '' 's/"@anthropic-ai\/claude-agent-sdk": "[^"]*"/"@anthropic-ai\/claude-agent-sdk": "*"/' container/agent-runner/package.json
+	@sed -i '' 's/"@anthropic-ai\/claude-agent-sdk": "[^"]*"/"@anthropic-ai\/claude-agent-sdk": "*"/' package.json
 	@echo "SDK updated. Run 'make typecheck' to verify."
 
-ensure-latest-sdk: ## 启动前自动检测并更新 SDK（有新版才更新）
+ensure-latest-sdk: ## 启动前自动检测并更新 SDK（agent-runner + 主服务，有新版才更新）
 	@LOCAL=$$(node -p "require('./container/agent-runner/node_modules/@anthropic-ai/claude-agent-sdk/package.json').version" 2>/dev/null || echo "0.0.0"); \
+	ROOT_LOCAL=$$(node -p "require('./node_modules/@anthropic-ai/claude-agent-sdk/package.json').version" 2>/dev/null || echo "0.0.0"); \
 	LATEST=$$(npm view @anthropic-ai/claude-agent-sdk version --fetch-timeout=5000 2>/dev/null || echo "$$LOCAL"); \
 	if [ "$$LOCAL" != "$$LATEST" ]; then \
-		echo "🔄 Claude Agent SDK 有新版本: $$LOCAL → $$LATEST，正在更新..."; \
+		echo "🔄 [agent-runner] Claude Agent SDK 有新版本: $$LOCAL → $$LATEST，正在更新..."; \
 		(cd container/agent-runner && $(PKG) update @anthropic-ai/claude-agent-sdk && $(PKG) run build); \
 		sed -i '' 's/"@anthropic-ai\/claude-agent-sdk": "[^"]*"/"@anthropic-ai\/claude-agent-sdk": "*"/' container/agent-runner/package.json; \
-		echo "✅ SDK 更新完成（内置 Claude Code 版本随之更新）"; \
+		echo "✅ [agent-runner] SDK 更新完成（内置 Claude Code 版本随之更新）"; \
 	else \
-		echo "✅ Claude Agent SDK 已是最新 ($$LOCAL)"; \
+		echo "✅ [agent-runner] Claude Agent SDK 已是最新 ($$LOCAL)"; \
+	fi; \
+	if [ "$$ROOT_LOCAL" != "$$LATEST" ]; then \
+		echo "🔄 [主服务] Claude Agent SDK 有新版本: $$ROOT_LOCAL → $$LATEST，正在更新..."; \
+		$(PKG) update @anthropic-ai/claude-agent-sdk; \
+		sed -i '' 's/"@anthropic-ai\/claude-agent-sdk": "[^"]*"/"@anthropic-ai\/claude-agent-sdk": "*"/' package.json; \
+		echo "✅ [主服务] SDK 更新完成"; \
+	else \
+		echo "✅ [主服务] Claude Agent SDK 已是最新 ($$ROOT_LOCAL)"; \
 	fi
 
 # ─── Setup ───────────────────────────────────────────────────

@@ -10,7 +10,7 @@
  */
 
 import type { ContainerOutput, StreamEvent } from './types.js';
-import { extractSkillName, summarizeToolInput } from './utils.js';
+import { extractSkillName, summarizeToolInput, summarizeToolResult } from './utils.js';
 
 /** Tools with specialized input_json_delta handling — generic accumulation is skipped for these. */
 const SPECIAL_TOOLS = ['Skill', 'Task', 'Agent', 'AskUserQuestion', 'TodoWrite'];
@@ -1069,6 +1069,22 @@ export class StreamEventProcessor {
             this.emit({ status: 'stream', result: null,
               streamEvent: { eventType: 'tool_use_end', toolUseId: block.tool_use_id, parentToolUseId: msgParentToolUseId },
             });
+            const rb = block as { content?: unknown; is_error?: boolean };
+            const resultText = summarizeToolResult(rb.content);
+            if (resultText) {
+              // ToolResultBlockParam.is_error marks a failed tool call — prefix
+              // so the trace distinguishes failures from normal output.
+              const shown = rb.is_error ? `⚠️ ${resultText}` : resultText;
+              this.emit({ status: 'stream', result: null,
+                streamEvent: {
+                  eventType: 'tool_result',
+                  toolUseId: block.tool_use_id,
+                  toolResult: shown,
+                  detail: shown,
+                  parentToolUseId: msgParentToolUseId,
+                },
+              });
+            }
             activeSub?.delete(block.tool_use_id);
           }
         }
@@ -1076,6 +1092,44 @@ export class StreamEventProcessor {
     }
 
     return true;
+  }
+
+  /**
+   * Surface tool results for the MAIN agent (parent_tool_use_id == null).
+   * The sub-agent path emits its own tool_result events; the main path's
+   * tool_use_end is inferred from the partial stream and the result block was
+   * previously dropped entirely, so we extract it here (truncated + sanitized)
+   * and emit a `tool_result` event so the trace shows what a tool returned.
+   */
+  processMainToolResults(message: any): void {
+    if (message.type !== 'user') return;
+    if ((message.parent_tool_use_id ?? null) !== null) return;
+    const content = message.message?.content;
+    if (!Array.isArray(content)) return;
+    for (const block of content as Array<{
+      type?: string;
+      tool_use_id?: string;
+      content?: unknown;
+      is_error?: boolean;
+    }>) {
+      if (block.type === 'tool_result' && block.tool_use_id) {
+        const resultText = summarizeToolResult(block.content);
+        if (resultText) {
+          // is_error marks a failed tool call — prefix so failures stand out.
+          const shown = block.is_error ? `⚠️ ${resultText}` : resultText;
+          this.emit({
+            status: 'stream',
+            result: null,
+            streamEvent: {
+              eventType: 'tool_result',
+              toolUseId: block.tool_use_id,
+              toolResult: shown,
+              detail: shown,
+            },
+          });
+        }
+      }
+    }
   }
 
   /** Check if a tool_use was already resolved by the streaming accumulator. */
