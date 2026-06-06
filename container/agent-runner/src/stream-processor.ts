@@ -894,6 +894,19 @@ export class StreamEventProcessor {
       this.emitRawSdkEvent(message, this.rawType(message), message.subtype === 'mirror_error' ? 'primary' : 'debug');
       return true;
     }
+    // `thinking_tokens` is a high-frequency progress counter the CLI (>=2.1.x)
+    // emits once per thinking chunk — ~33 for a trivial reply, thousands for a
+    // reasoning-heavy multi-agent turn. It carries no user-facing content, but
+    // the catch-all below would turn each one into a broadcast raw_sdk_event,
+    // flooding the WS. On the Web client each raw_sdk_event is NOT rAF-batched
+    // (only text/thinking deltas are), so every one triggers a synchronous
+    // Zustand set + saveStreamingToSession (JSON.stringify + sessionStorage) +
+    // StreamingDisplay re-render — starving the batched text/thinking flush so
+    // the streaming card never paints and the UI freezes on "正在思考" until the
+    // flood ends. Drop it at the source.
+    if (message.subtype === 'thinking_tokens') {
+      return true;
+    }
     this.emitRawSdkEvent(message);
     return true;
   }
