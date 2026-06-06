@@ -65,6 +65,19 @@ const PANEL_ICON = {
   token: 'down-small-ccm_outlined',
 } as const;
 
+/**
+ * Per-panel header tints. Feishu's saturated colour TOKENS (wathet/turquoise/
+ * orange) render as DARK fills on a collapsible_panel header, which buried the
+ * dark title text (unreadable). Use very light rgba fills instead — near-white
+ * Material-50 shades that keep the title legible while still differentiating the
+ * panels. (background_color accepts rgba; it rejects hex.)
+ */
+const PANEL_TINT = {
+  thinking: 'rgba(227, 242, 253, 1)', // light blue  (#e3f2fd)
+  tools: 'rgba(224, 247, 250, 1)', // light cyan  (#e0f7fa)
+  ask: 'rgba(255, 243, 224, 1)', // light amber (#fff3e0)
+} as const;
+
 type El = Record<string, unknown>;
 
 export function formatDuration(ms: number | undefined): string {
@@ -239,7 +252,7 @@ export function buildThinkingPanel(thinking: string | undefined): El[] {
       title: '**💭 思考过程**',
       expanded: false,
       elementId: CARD_ELEMENT_IDS.THINKING_PANEL_FINAL,
-      backgroundColor: 'wathet',
+      backgroundColor: PANEL_TINT.thinking,
       elements: [
         {
           tag: 'markdown',
@@ -274,7 +287,7 @@ export function buildToolsPanel(toolCalls: ToolCallStat[] | undefined): El[] {
       title: `**🛠 工具调用** ${totalBadge}`,
       expanded: false,
       elementId: CARD_ELEMENT_IDS.TOOLS_PANEL_FINAL,
-      backgroundColor: 'turquoise',
+      backgroundColor: PANEL_TINT.tools,
       elements: [{ tag: 'markdown', content: lines.join('\n') }],
     }),
   ];
@@ -601,7 +614,7 @@ export function buildStreamingPanels(init: StreamingPanelsInit): El[] {
       contentElementId: CARD_ELEMENT_IDS.ASK_CONTENT,
       title: '**❓ 等待你的回复**',
       expanded: init.expandAsk ?? true,
-      backgroundColor: 'orange',
+      backgroundColor: PANEL_TINT.ask,
       content:
         init.askContent ?? "<font color='grey'>暂无提问</font>",
     }),
@@ -624,7 +637,7 @@ export function buildStreamingPanels(init: StreamingPanelsInit): El[] {
       contentElementId: CARD_ELEMENT_IDS.TOOLS_CONTENT,
       title: '**🛠 工具时间轴**',
       expanded: init.expandTools ?? false,
-      backgroundColor: 'turquoise',
+      backgroundColor: PANEL_TINT.tools,
       content: init.toolsContent ?? '<font color=\'grey\'>尚未调用工具…</font>',
     }),
     buildRuntimePanel({
@@ -632,7 +645,7 @@ export function buildStreamingPanels(init: StreamingPanelsInit): El[] {
       contentElementId: CARD_ELEMENT_IDS.THINKING_CONTENT,
       title: '**💭 思考过程**',
       expanded: init.expandThinking ?? false,
-      backgroundColor: 'wathet',
+      backgroundColor: PANEL_TINT.thinking,
       content: init.thinkingContent ?? '<font color=\'grey\'>尚未开始思考…</font>',
     }),
     buildRuntimePanel({
