@@ -154,10 +154,15 @@ RUN chmod +x /app/entrypoint.sh
 # Set ownership to node user (non-root) for writable directories
 RUN chown -R node:node /workspace
 
-# Install oh-my-zsh for node user (ys theme)
-RUN su - node -c 'sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended' \
+# Install oh-my-zsh for node user (ys theme).
+# Best-effort: the installer pulls from raw.githubusercontent.com, which is flaky
+# behind some networks (notably CN, where it gets connection-reset). It's a
+# cosmetic shell theme, NOT required by the agent runtime, so a download failure
+# must not abort the whole image build — fall back to the default shell.
+RUN (su - node -c 'sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended' \
     && sed -i 's/ZSH_THEME="robbyrussell"/ZSH_THEME="ys"/' /home/node/.zshrc \
-    && chsh -s /bin/zsh node
+    && chsh -s /bin/zsh node) \
+    || echo "⚠️ oh-my-zsh setup skipped (network unavailable); container keeps default shell"
 
 # Entrypoint runs as root to fix volume permissions, then drops to node user.
 # Do NOT add USER node here — entrypoint handles the privilege drop.
