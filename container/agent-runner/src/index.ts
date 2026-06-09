@@ -71,7 +71,10 @@ const DEFAULT_ALLOWED_TOOLS = [
   'WebSearch', 'WebFetch',
   'Task', 'TaskOutput', 'TaskStop',
   'TeamCreate', 'TeamDelete', 'SendMessage',
-  'TodoWrite', 'ToolSearch', 'Skill',
+  // 'Skill' removed: since SDK 0.3.x skills are enabled via the `skills` option
+  // (skills: 'all' below), not by listing a 'Skill' tool here. Keeping the dead
+  // entry just invited confusion.
+  'TodoWrite', 'ToolSearch',
   'NotebookEdit',
   'mcp__happyclaw__*'
 ];
@@ -1393,6 +1396,12 @@ async function runQuery(
         // 显式声明比依赖 CLI 隐式默认更可靠，确保全局/项目/用户技能完整挂载生效。
         skills: 'all',
         includePartialMessages: true,
+        // Forward sub-agent (Task) text/thinking as stream events so the card's
+        // sub-agent transcript lights up live instead of only filling in when the
+        // Task completes. The stream-processor already renders these
+        // (agentScope:'subagent' deltas, stream-processor.ts ~979); this flag is
+        // what actually makes the SDK emit them.
+        forwardSubagentText: true,
         ...(Object.keys(flagSettings).length > 0 ? { settings: flagSettings as any } : {}),
         ...(userPlugins && { plugins: userPlugins }),
         mcpServers: {
@@ -1508,6 +1517,12 @@ async function runQuery(
     // ── 子 Agent 消息转 StreamEvent ──
     if (processor.processSubAgentMessage(message as any)) {
       continue;
+    }
+
+    // ── Main-agent tool results → tool_result stream events ──
+    // (sub-agent results are handled inside processSubAgentMessage above)
+    if (message.type === 'user') {
+      processor.processMainToolResults(message as any);
     }
 
     if (message.type === 'assistant' && 'uuid' in message) {
@@ -1737,6 +1752,10 @@ async function runQuery(
     // 中断导致的 SDK 错误（error_during_execution 等）：正常返回，不抛出
     if (interruptedDuringQuery) {
       log(`runQuery error during interrupt (non-fatal): ${errorMessage}`);
+      // 收尾：catch 路径跳过了正常出口的 processor.cleanup()，残留 <200 字符的
+      // 缓冲尾巴（未达 flush 阈值、定时器未触发）会永久丢失，导致 interrupt_partial 缺尾。
+      // cleanup() 幂等安全（seenTextualResult 时丢尾避重复，否则 flushBuffers）。
+      processor.cleanup();
       return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery, pipedMessagesDuringQuery };
     }
 
@@ -1747,6 +1766,9 @@ async function runQuery(
     // 时会落到下方 re-throw，被外层当 error 退避，把一次干净的 shutdown 误报成失败。
     if (postResultInterruptRequested) {
       log(`runQuery error after shutdown interrupt (non-fatal): ${errorMessage}`);
+      // 同 interruptedDuringQuery：补 cleanup() 刷新残留缓冲尾巴，避免 shutdown
+      // 中断时未达阈值的最后一小段文本丢失。
+      processor.cleanup();
       return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery, pipedMessagesDuringQuery };
     }
 
