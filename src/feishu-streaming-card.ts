@@ -222,8 +222,12 @@ function buildCardContent(
   const { title: extractedTitle, body } = extractTitleAndBody(text);
   const title = overrideTitle || extractedTitle;
   // When the auto-extracted title is the first line, body excludes that line so
-  // we don't echo it back into the content area (issue #488).
-  const contentToRender = body ? optimizeMarkdownStyle(body, 2) : '';
+  // we don't echo it back into the content area (issue #488). With an
+  // overrideTitle the first line is ordinary content (e.g. mid-stream text on a
+  // continuation card, possibly a ``` fence line) — dropping it would silently
+  // lose content, so render the full text instead.
+  const rendered = overrideTitle ? text : body;
+  const contentToRender = rendered ? optimizeMarkdownStyle(rendered, 2) : '';
   const elements: Array<Record<string, unknown>> = [];
 
   if (contentToRender.length > CARD_MD_LIMIT) {
@@ -1441,11 +1445,13 @@ class MultiCardManager {
         reopener = '```' + last.lang + '\n';
       }
 
+      // Card 0 keeps the strip-first-line-as-title behavior (#488); continuation
+      // cards get the override title so their first line stays in the body.
       const frozenCard = buildSchema2Card(
         frozenText,
         'frozen',
         this.cardIndex > 0 ? '(续) ' : '',
-        title,
+        this.cardIndex > 0 ? title : undefined,
       );
       const currentCard = this.cards[this.cards.length - 1];
       if (currentCard) {
@@ -2581,10 +2587,12 @@ export class StreamingCardController {
     const firstChunks = chunks.slice(0, maxChunksFirst);
     const firstText = firstChunks.join('\n\n');
 
-    // Use finalState if all content fits in the first card, otherwise freeze
+    // Use finalState if all content fits in the first card, otherwise freeze.
+    // First card extracts its own title (strip-first-line, #488); only
+    // continuation cards get the override title.
     const firstCardState =
       chunks.length <= maxChunksFirst ? finalState : 'frozen';
-    const frozenCard = buildSchema2Card(firstText, firstCardState, '', title);
+    const frozenCard = buildSchema2Card(firstText, firstCardState, '');
     await backend.updateCardFull(frozenCard);
 
     // Create continuation cards
