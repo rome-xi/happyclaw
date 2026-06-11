@@ -73,9 +73,9 @@ const PANEL_ICON = {
  * panels. (background_color accepts rgba; it rejects hex.)
  */
 const PANEL_TINT = {
-  thinking: 'rgba(227, 242, 253, 1)', // light blue  (#e3f2fd)
-  tools: 'rgba(224, 247, 250, 1)', // light cyan  (#e0f7fa)
-  ask: 'rgba(255, 243, 224, 1)', // light amber (#fff3e0)
+  thinking: 'rgba(227,242,253,1)', // light blue  (#e3f2fd)
+  tools: 'rgba(224,247,250,1)', // light cyan  (#e0f7fa)
+  ask: 'rgba(255,243,224,1)', // light amber (#fff3e0)
 } as const;
 
 type El = Record<string, unknown>;

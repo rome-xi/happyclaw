@@ -3093,7 +3093,36 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     // in the streaming session rebuild (which also fires on SDK Task
     // completion and would cause multi-result IM spam).
     sentReply = false;
-    if (newImJid === replySourceImJid) return; // no change
+    if (newImJid === replySourceImJid) {
+      // 同一路由下，若上一轮卡片因连续更新失败进入 error 态被冻结（防同轮刷屏，
+      // 见下方 stream 事件处理的 sessionErrored 分支），在新用户消息开启新一轮时
+      // 重建一张干净卡片，恢复流式展示能力。
+      if (
+        streamingSession &&
+        (streamingSession as { currentState?: string }).currentState === 'error'
+      ) {
+        unregisterStreamingSession(streamingSessionJid);
+        streamingAccumulatedText = '';
+        streamingAccumulatedThinking = '';
+        streamInterrupted = false;
+        try {
+          streamingSession = await imManager.createStreamingSession(
+            streamingSessionJid,
+            makeOnCardCreated(streamingSessionJid),
+          );
+        } catch (err: any) {
+          logger.warn(
+            { err: err?.message, streamingSessionJid },
+            'Failed to rebuild streaming session after card error',
+          );
+          streamingSession = undefined;
+        }
+        if (streamingSession) {
+          registerStreamingSession(streamingSessionJid, streamingSession);
+        }
+      }
+      return; // no route change
+    }
     logger.debug(
       { chatJid, oldRoute: replySourceImJid, newRoute: newImJid },
       'Reply route updated via IPC injection',
@@ -3252,7 +3281,20 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             // ── Feed stream events into Feishu streaming card ──
             // IPC 注入的新 query 开始时，旧卡片已 complete()/abort()，
             // 需要为新 query 重建流式卡片并重置会话级状态。
-            if (streamingSession && !streamingSession.isActive()) {
+            // 例外：卡片因连续更新失败进入 error 态时绝不在本轮重建——每次重建
+            // 都会向群里再发一张新卡片（失败持续时演变成每隔几秒一条的刷屏），
+            // 且清空 streamingAccumulatedText 会丢失已生成的内容。error 态保持
+            // 冻结，让最终 result 走静态 sendMessage 兜底；下一条用户消息到达时
+            // 由 route updater 重建干净卡片。
+            const sessionErrored =
+              streamingSession &&
+              (streamingSession as { currentState?: string }).currentState ===
+                'error';
+            if (
+              streamingSession &&
+              !streamingSession.isActive() &&
+              !sessionErrored
+            ) {
               unregisterStreamingSession(streamingSessionJid);
               streamingAccumulatedText = '';
               streamingAccumulatedThinking = '';

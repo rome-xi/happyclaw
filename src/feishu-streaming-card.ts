@@ -821,9 +821,25 @@ class CardKitBackend {
   private sequence = 0;
   private lastContentHash = '';
   private readonly client: lark.Client;
+  /**
+   * Serializes update requests for this card. Flush controllers can overlap
+   * (a slow request still in flight when the next flush fires); without
+   * serialization the later sequence can land first and Feishu rejects the
+   * stale one, inflating patch failure counts with phantom errors.
+   */
+  private chain: Promise<unknown> = Promise.resolve();
 
   constructor(client: lark.Client) {
     this.client = client;
+  }
+
+  private enqueue<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.chain.then(fn, fn);
+    this.chain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
   }
 
   get messageId(): string | null {
@@ -914,19 +930,21 @@ class CardKitBackend {
     if (!this.cardId) return;
 
     const dataStr = JSON.stringify(cardJson);
-    const hash = quickHash(dataStr);
-    if (hash === this.lastContentHash) return; // no change
+    return this.enqueue(async () => {
+      const hash = quickHash(dataStr);
+      if (hash === this.lastContentHash) return; // no change
 
-    this.sequence++;
-    await this.client.cardkit.v1.card.update({
-      path: { card_id: this.cardId },
-      data: {
-        card: { type: 'card_json', data: dataStr },
-        sequence: this.sequence,
-      },
+      this.sequence++;
+      await this.client.cardkit.v1.card.update({
+        path: { card_id: this.cardId! },
+        data: {
+          card: { type: 'card_json', data: dataStr },
+          sequence: this.sequence,
+        },
+      });
+
+      this.lastContentHash = hash;
     });
-
-    this.lastContentHash = hash;
   }
 
   /**
@@ -950,9 +968,26 @@ class StreamingModeBackend {
   private lastAuxAfterHash = '';
   private readonly richSlotHashes = new Map<string, string>();
   private readonly client: lark.Client;
+  /**
+   * Serializes all CardKit calls for this card. The text flush (300-600ms) and
+   * aux flush (800-1500ms) controllers fire independently; without a single
+   * in-flight chain their requests can reach Feishu out of sequence order and
+   * the stale sequence gets rejected — phantom failures that push
+   * patchFailCount toward degradation even though nothing is wrong.
+   */
+  private chain: Promise<unknown> = Promise.resolve();
 
   constructor(client: lark.Client) {
     this.client = client;
+  }
+
+  private enqueue<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.chain.then(fn, fn);
+    this.chain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
   }
 
   get messageId(): string | null {
@@ -1052,34 +1087,41 @@ class StreamingModeBackend {
         ? text.slice(0, MAX_STREAMING_CONTENT - truncHint.length) + truncHint
         : text;
 
-    const hash = quickHash(content);
-    if (hash === this.lastMainHash) return;
+    return this.enqueue(async () => {
+      const hash = quickHash(content);
+      if (hash === this.lastMainHash) return;
 
-    try {
-      await this.client.cardkit.v1.cardElement.content({
-        path: { card_id: this.cardId, element_id: ELEMENT_IDS.MAIN_CONTENT },
-        data: { content, sequence: this.nextSequence() },
-      });
-      this.lastMainHash = hash;
-    } catch (err: any) {
-      const code = err?.code ?? err?.response?.data?.code;
-      // 200850 = streaming timeout, 300309 = streaming closed
-      if (code === 200850 || code === 300309) {
-        logger.info(
-          { code, cardId: this.cardId },
-          'Streaming mode expired, re-enabling',
-        );
-        await this.enableStreamingMode();
-        // Retry once
+      try {
         await this.client.cardkit.v1.cardElement.content({
-          path: { card_id: this.cardId, element_id: ELEMENT_IDS.MAIN_CONTENT },
+          path: { card_id: this.cardId!, element_id: ELEMENT_IDS.MAIN_CONTENT },
           data: { content, sequence: this.nextSequence() },
         });
         this.lastMainHash = hash;
-      } else {
-        throw err;
+      } catch (err: any) {
+        const code = err?.code ?? err?.response?.data?.code;
+        // 200850 = streaming timeout, 300309 = streaming closed
+        if (code === 200850 || code === 300309) {
+          logger.info(
+            { code, cardId: this.cardId },
+            'Streaming mode expired, re-enabling',
+          );
+          // Raw call (not the public wrapper) — we're already inside the chain;
+          // enqueueing here would deadlock on ourselves.
+          await this.enableStreamingModeRaw();
+          // Retry once
+          await this.client.cardkit.v1.cardElement.content({
+            path: {
+              card_id: this.cardId!,
+              element_id: ELEMENT_IDS.MAIN_CONTENT,
+            },
+            data: { content, sequence: this.nextSequence() },
+          });
+          this.lastMainHash = hash;
+        } else {
+          throw err;
+        }
       }
-    }
+    });
   }
 
   /**
@@ -1091,25 +1133,27 @@ class StreamingModeBackend {
   ): Promise<void> {
     if (!this.cardId) return;
 
-    const hash = quickHash(content);
-    const hashField =
-      elementId === ELEMENT_IDS.AUX_BEFORE
-        ? 'lastAuxBeforeHash'
-        : 'lastAuxAfterHash';
-    if (hash === this[hashField]) return;
+    return this.enqueue(async () => {
+      const hash = quickHash(content);
+      const hashField =
+        elementId === ELEMENT_IDS.AUX_BEFORE
+          ? 'lastAuxBeforeHash'
+          : 'lastAuxAfterHash';
+      if (hash === this[hashField]) return;
 
-    const element = JSON.stringify({
-      tag: 'markdown',
-      content,
-      element_id: elementId,
-      text_size: 'notation',
-    });
+      const element = JSON.stringify({
+        tag: 'markdown',
+        content,
+        element_id: elementId,
+        text_size: 'notation',
+      });
 
-    await this.client.cardkit.v1.cardElement.update({
-      path: { card_id: this.cardId, element_id: elementId },
-      data: { element, sequence: this.nextSequence() },
+      await this.client.cardkit.v1.cardElement.update({
+        path: { card_id: this.cardId!, element_id: elementId },
+        data: { element, sequence: this.nextSequence() },
+      });
+      this[hashField] = hash;
     });
-    this[hashField] = hash;
   }
 
   /**
@@ -1122,13 +1166,15 @@ class StreamingModeBackend {
     content: string,
   ): Promise<void> {
     if (!this.cardId) return;
-    const hash = quickHash(content);
-    if (this.richSlotHashes.get(elementId) === hash) return;
-    await this.client.cardkit.v1.cardElement.content({
-      path: { card_id: this.cardId, element_id: elementId },
-      data: { content, sequence: this.nextSequence() },
+    return this.enqueue(async () => {
+      const hash = quickHash(content);
+      if (this.richSlotHashes.get(elementId) === hash) return;
+      await this.client.cardkit.v1.cardElement.content({
+        path: { card_id: this.cardId!, element_id: elementId },
+        data: { content, sequence: this.nextSequence() },
+      });
+      this.richSlotHashes.set(elementId, hash);
     });
-    this.richSlotHashes.set(elementId, hash);
   }
 
   /**
@@ -1140,19 +1186,19 @@ class StreamingModeBackend {
     elementJson: object,
   ): Promise<void> {
     if (!this.cardId) return;
-    await this.client.cardkit.v1.cardElement.update({
-      path: { card_id: this.cardId, element_id: elementId },
-      data: {
-        element: JSON.stringify(elementJson),
-        sequence: this.nextSequence(),
-      },
+    return this.enqueue(async () => {
+      await this.client.cardkit.v1.cardElement.update({
+        path: { card_id: this.cardId!, element_id: elementId },
+        data: {
+          element: JSON.stringify(elementJson),
+          sequence: this.nextSequence(),
+        },
+      });
     });
   }
 
-  /**
-   * Enable streaming mode via card.settings().
-   */
-  async enableStreamingMode(): Promise<void> {
+  /** Enable streaming mode via card.settings() — chain-internal raw call. */
+  private async enableStreamingModeRaw(): Promise<void> {
     if (!this.cardId) return;
     await this.client.cardkit.v1.card.settings({
       path: { card_id: this.cardId },
@@ -1169,18 +1215,28 @@ class StreamingModeBackend {
   }
 
   /**
+   * Enable streaming mode via card.settings().
+   */
+  async enableStreamingMode(): Promise<void> {
+    if (!this.cardId) return;
+    return this.enqueue(() => this.enableStreamingModeRaw());
+  }
+
+  /**
    * Disable streaming mode via card.settings().
    */
   async disableStreamingMode(): Promise<void> {
     if (!this.cardId) return;
-    await this.client.cardkit.v1.card.settings({
-      path: { card_id: this.cardId },
-      data: {
-        settings: JSON.stringify({
-          config: { streaming_mode: false },
-        }),
-        sequence: this.nextSequence(),
-      },
+    return this.enqueue(async () => {
+      await this.client.cardkit.v1.card.settings({
+        path: { card_id: this.cardId! },
+        data: {
+          settings: JSON.stringify({
+            config: { streaming_mode: false },
+          }),
+          sequence: this.nextSequence(),
+        },
+      });
     });
   }
 
@@ -1189,17 +1245,22 @@ class StreamingModeBackend {
    */
   async updateCardFull(cardJson: object): Promise<void> {
     if (!this.cardId) return;
-    await this.client.cardkit.v1.card.update({
-      path: { card_id: this.cardId },
-      data: {
-        card: { type: 'card_json', data: JSON.stringify(cardJson) },
-        sequence: this.nextSequence(),
-      },
+    return this.enqueue(async () => {
+      await this.client.cardkit.v1.card.update({
+        path: { card_id: this.cardId! },
+        data: {
+          card: { type: 'card_json', data: JSON.stringify(cardJson) },
+          sequence: this.nextSequence(),
+        },
+      });
     });
   }
 }
 
 // ─── Multi-Card Manager ───────────────────────────────────────
+
+/** Max chars frozen into a single card during rollover (~25KB JSON budget). */
+const FREEZE_SLICE_CHARS = 18000;
 
 class MultiCardManager {
   private cards: CardKitBackend[] = [];
@@ -1210,6 +1271,17 @@ class MultiCardManager {
   private readonly onCardCreated?: (messageId: string) => void;
   private cardIndex = 0;
   private readonly MAX_ELEMENTS = 45; // safety margin (Feishu limit ~50)
+  /**
+   * Chars of the full accumulated text already frozen into previous cards.
+   * commitContent() always receives the FULL text (the controller re-renders
+   * the whole state on every flush); after a split, only the unfrozen tail
+   * belongs to the current card. Without this offset every post-split flush
+   * would re-exceed the size limit and split again — one duplicate card per
+   * flush, i.e. a message flood.
+   */
+  private frozenPrefixChars = 0;
+  /** Fence reopener when a freeze boundary fell inside a ``` code block. */
+  private continuationPrefix = '';
 
   constructor(
     client: lark.Client,
@@ -1227,6 +1299,13 @@ class MultiCardManager {
 
   getCardCount(): number {
     return this.cards.length;
+  }
+
+  /** The slice of the full text still owned by the current (last) card. */
+  private activeView(fullText: string): string {
+    return this.frozenPrefixChars > 0
+      ? this.continuationPrefix + fullText.slice(this.frozenPrefixChars)
+      : fullText;
   }
 
   /**
@@ -1264,103 +1343,148 @@ class MultiCardManager {
     auxiliaryState?: AuxiliaryState,
     footerNote?: string,
   ): Promise<void> {
-    const titlePrefix = this.cardIndex > 0 ? '(续) ' : '';
+    if (state === 'streaming' && this.needsRollover(text, auxiliaryState, footerNote)) {
+      await this.rollover(text);
+    }
 
-    // Estimate element count: content + auxiliary + fixed elements
-    const { contentElements } = buildCardContent(text, splitCodeBlockSafe);
+    const currentCard = this.cards[this.cards.length - 1];
+    if (!currentCard) return;
+
+    const activeText = this.activeView(text);
+    const titlePrefix = this.cardIndex > 0 ? '(续) ' : '';
+    // Continuation cards keep the title extracted from the FULL text so all
+    // cards of one reply share a consistent header.
+    const overrideTitle =
+      this.cardIndex > 0 ? extractTitleAndBody(text).title : undefined;
+
+    const cardJson = buildSchema2Card(
+      activeText,
+      state,
+      titlePrefix,
+      overrideTitle,
+      auxiliaryState,
+      footerNote,
+    );
+    await currentCard.updateCard(cardJson);
+  }
+
+  /** Whether the current card would exceed element-count or byte limits. */
+  private needsRollover(
+    fullText: string,
+    auxiliaryState?: AuxiliaryState,
+    footerNote?: string,
+  ): boolean {
+    const activeText = this.activeView(fullText);
+    const { contentElements } = buildCardContent(activeText, splitCodeBlockSafe);
     const auxCount = auxiliaryState
       ? (() => {
           const { before, after } = buildAuxiliaryElements(auxiliaryState);
           return before.length + after.length;
         })()
       : 0;
-    const fixedCount =
-      (state === 'streaming' ? 1 : 0) + // button
-      (SCHEMA2_NOTE_MAP[state] ? 1 : 0) + // note
-      (footerNote ? 1 : 0); // footer
-    const totalElements = contentElements.length + auxCount + fixedCount;
-
-    if (totalElements > this.MAX_ELEMENTS && state === 'streaming') {
-      // Need to split: freeze current card and create a new one
-      await this.splitToNewCard(text);
-      return;
+    // button + note + optional footer
+    const fixedCount = 2 + (footerNote ? 1 : 0);
+    if (contentElements.length + auxCount + fixedCount > this.MAX_ELEMENTS) {
+      return true;
     }
-
-    // Normal update on current card
-    const currentCard = this.cards[this.cards.length - 1];
-    if (!currentCard) return;
-
     const cardJson = buildSchema2Card(
-      text,
-      state,
-      titlePrefix,
+      activeText,
+      'streaming',
+      this.cardIndex > 0 ? '(续) ' : '',
       undefined,
       auxiliaryState,
       footerNote,
     );
+    return (
+      Buffer.byteLength(JSON.stringify(cardJson), 'utf-8') > CARD_SIZE_LIMIT
+    );
+  }
 
-    // Byte size check (Feishu limit ~30KB, use 25KB safety margin)
-    const cardSize = Buffer.byteLength(JSON.stringify(cardJson), 'utf-8');
-    if (cardSize > CARD_SIZE_LIMIT && state === 'streaming') {
-      await this.splitToNewCard(text);
-      return;
+  /** Pick a freeze boundary near FREEZE_SLICE_CHARS on a paragraph/line break. */
+  private pickSliceEnd(active: string): number {
+    if (active.length <= FREEZE_SLICE_CHARS) return active.length;
+    let idx = active.lastIndexOf('\n\n', FREEZE_SLICE_CHARS);
+    if (idx < FREEZE_SLICE_CHARS * 0.3) {
+      idx = active.lastIndexOf('\n', FREEZE_SLICE_CHARS);
     }
-
-    await currentCard.updateCard(cardJson);
+    if (idx < FREEZE_SLICE_CHARS * 0.3) idx = FREEZE_SLICE_CHARS;
+    return idx;
   }
 
   /**
-   * Split content across cards when element limit is reached.
+   * Freeze the current card's pending text and open a fresh card for the
+   * remainder. Advances frozenPrefixChars so subsequent commits only render
+   * the unfrozen tail — each split happens exactly once per ~18K chars of NEW
+   * text, never repeatedly for the same content.
    */
-  private async splitToNewCard(text: string): Promise<void> {
-    const currentCard = this.cards[this.cards.length - 1];
-    if (!currentCard) return;
+  private async rollover(fullText: string): Promise<void> {
+    const { title } = extractTitleAndBody(fullText);
+    // A degradation handover can dump a large backlog in one commit; freeze it
+    // across multiple cards. Guard caps pathological loops.
+    let guard = 0;
+    do {
+      const active = this.activeView(fullText);
+      const sliceEnd = this.pickSliceEnd(active);
+      let frozenText = active.slice(0, sliceEnd);
 
-    // Extract title once so all sub-cards share the same title
-    const { title: consistentTitle } = extractTitleAndBody(text);
+      // Freeze boundary inside a fenced code block → close the fence here and
+      // reopen it on the next card.
+      let reopener = '';
+      const ranges = findCodeBlockRanges(frozenText);
+      const last = ranges[ranges.length - 1];
+      if (
+        last &&
+        last.close === frozenText.length &&
+        !/```\s*$/.test(frozenText)
+      ) {
+        frozenText += '\n```';
+        reopener = '```' + last.lang + '\n';
+      }
 
-    // Determine how much content the current card can hold
-    const maxChunksPerCard = this.MAX_ELEMENTS - 3; // reserve for fixed elements
-    const chunks = splitCodeBlockSafe(text, CARD_MD_LIMIT);
+      const frozenCard = buildSchema2Card(
+        frozenText,
+        'frozen',
+        this.cardIndex > 0 ? '(续) ' : '',
+        title,
+      );
+      const currentCard = this.cards[this.cards.length - 1];
+      if (currentCard) {
+        try {
+          await currentCard.updateCard(frozenCard);
+        } catch (err) {
+          logger.debug(
+            { err, chatId: this.chatId },
+            'MultiCard freeze update failed (non-fatal, continuing rollover)',
+          );
+        }
+      }
 
-    // Content for the current (frozen) card
-    const frozenChunks = chunks.slice(0, maxChunksPerCard);
-    const frozenText = frozenChunks.join('\n\n');
-    const titlePrefix = this.cardIndex > 0 ? '(续) ' : '';
+      // Advance the frozen offset by the chars consumed from the full text
+      // (sliceEnd is measured on `active`, which starts with the reopener
+      // prefix from the previous split).
+      this.frozenPrefixChars += Math.max(
+        0,
+        sliceEnd - this.continuationPrefix.length,
+      );
+      this.continuationPrefix = reopener;
 
-    // Freeze current card with consistent title
-    const frozenCard = buildSchema2Card(
-      frozenText,
-      'frozen',
-      titlePrefix,
-      consistentTitle,
+      // Open a fresh card for the remainder.
+      this.cardIndex++;
+      const newCard = new CardKitBackend(this.client);
+      const newCardJson = buildSchema2Card('...', 'streaming', '(续) ', title);
+      await newCard.createCard(newCardJson);
+      const newMessageId = await newCard.sendCard(
+        this.chatId,
+        this.replyToMsgId,
+        this.replyInThread,
+      );
+      this.cards.push(newCard);
+      // Register the new card's messageId for interrupt button routing
+      this.onCardCreated?.(newMessageId);
+    } while (
+      this.activeView(fullText).length > FREEZE_SLICE_CHARS &&
+      ++guard < 8
     );
-    await currentCard.updateCard(frozenCard);
-
-    // Create new card for remaining content
-    this.cardIndex++;
-    const newTitlePrefix = '(续) ';
-    const remainingChunks = chunks.slice(maxChunksPerCard);
-    const remainingText = remainingChunks.join('\n\n');
-
-    const newCard = new CardKitBackend(this.client);
-    const newCardJson = buildSchema2Card(
-      remainingText || '...',
-      'streaming',
-      newTitlePrefix,
-      consistentTitle,
-    );
-    await newCard.createCard(newCardJson);
-    // New card is sent as a fresh message (not reply)
-    const newMessageId = await newCard.sendCard(
-      this.chatId,
-      this.replyToMsgId,
-      this.replyInThread,
-    );
-    this.cards.push(newCard);
-
-    // Register the new card's messageId for interrupt button routing
-    this.onCardCreated?.(newMessageId);
   }
 
   getAllMessageIds(): string[] {
@@ -1827,9 +1951,13 @@ export class StreamingCardController {
       this.backendMode = 'streaming';
       this.useCardKit = true;
       this.startTime = Date.now();
-      // Streaming mode: 300ms text flush, 800ms aux flush
-      this.textFlushCtrl = new FlushController(300, 30);
-      this.auxFlushCtrl = new FlushController(800, 0);
+      // Streaming mode: 600ms text flush, 1500ms aux flush.
+      // Feishu caps card updates at ~5 QPS per card; text (1.7/s) + aux
+      // (banner/footer/panels, ≤2-3 calls per flush after hash dedup) must
+      // stay under that together, or pushes start failing and the controller
+      // wrongly degrades. The native typewriter effect keeps 600ms smooth.
+      this.textFlushCtrl = new FlushController(600, 30);
+      this.auxFlushCtrl = new FlushController(1500, 0);
       this.maxPatchFailures = 3;
 
       logger.debug(
@@ -1981,6 +2109,13 @@ export class StreamingCardController {
       );
       this.state = 'error';
       this.flushCtrl.dispose();
+      // Best-effort terminal patch — without it the card stays frozen on
+      // 「生成中...」forever (zombie card). Updates have been failing, so this
+      // may fail too; that's fine, it's the last attempt before giving up.
+      this.patchCard(
+        'aborted',
+        '<font color="grey">⚠️ 流式更新中断，完整回复将以普通消息发送</font>',
+      ).catch(() => {});
       this.onFallback?.();
       return;
     }
@@ -2116,7 +2251,13 @@ export class StreamingCardController {
     footerNote: string;
   } {
     const phase = this.derivePhase();
-    const elapsedMs = this.startTime > 0 ? Date.now() - this.startTime : 0;
+    // Bucket elapsed to 5s so the banner text doesn't change on every single
+    // aux flush — sub-second precision would defeat the hash dedup and turn
+    // each flush into 2 guaranteed API calls (banner + footer echo).
+    const elapsedMs =
+      this.startTime > 0
+        ? Math.floor((Date.now() - this.startTime) / 5000) * 5000
+        : 0;
     const statusBanner = buildStatusBannerText({
       phase,
       detail: this.deriveBannerDetail(phase),
@@ -2278,14 +2419,17 @@ export class StreamingCardController {
    * Degrade from streaming mode to v1 full-update mode.
    */
   private degradeToV1(): void {
+    // Re-entrancy guard: two failed flushes can both reach the degradation
+    // threshold; the second call would null-deref streamingBackend.
+    if (!this.streamingBackend) return;
     logger.warn(
       { chatId: this.chatId },
       'Streaming mode: degrading to v1 full-update',
     );
 
     // Save card_id and sequence from streaming backend before clearing
-    const existingCardId = this.streamingBackend!.getCardId();
-    const existingSeq = this.streamingBackend!.getSequence();
+    const existingCardId = this.streamingBackend.getCardId();
+    const existingSeq = this.streamingBackend.getSequence();
 
     // Try to disable streaming mode gracefully (fire and forget)
     this.streamingBackend?.disableStreamingMode().catch(() => {});
@@ -2582,9 +2726,16 @@ export function registerStreamingSession(
   session: IStreamingSession,
 ): void {
   const existing = activeSessions.get(chatJid);
-  if (existing && existing.isActive()) {
-    // Abort (not just dispose) so the old card shows "已中断" instead of stuck "生成中..."
-    existing.abort('新的回复已开始').catch(() => {});
+  if (existing && existing !== session) {
+    if (existing.isActive()) {
+      // Abort (not just dispose) so the old card shows "已中断" instead of stuck "生成中..."
+      existing.abort('新的回复已开始').catch(() => {});
+    }
+    // Drop the replaced card's messageId routing entries — its interrupt
+    // button is gone after abort, so keeping them only leaks the Map.
+    for (const msgId of existing.getAllMessageIds()) {
+      unregisterMessageId(msgId);
+    }
   }
   activeSessions.set(chatJid, session);
 }
