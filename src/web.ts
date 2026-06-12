@@ -1912,6 +1912,11 @@ interface StreamingSnapshotEntry {
 }
 
 const streamingSnapshots = new Map<string, StreamingSnapshotEntry>();
+/** runner idle 后的墓碑标记：阻止迟到 stream 事件重建已清理的快照。
+ * key 为完整 normalizedJid（主 jid 或 `web:folder#agent:id` 虚拟 jid），
+ * 与 runner/快照同粒度；下一个 run 的 'running' 状态清除。 */
+const snapshotTombstones = new Map<string, number>();
+const MAX_SNAPSHOT_TOMBSTONES = 500;
 /** Accumulates full (non-truncated) text per group for shutdown persistence & disk buffer. */
 const streamingFullTexts = new Map<string, string>();
 const MAX_SNAPSHOT_TEXT = 4000;
@@ -2033,6 +2038,17 @@ function updateStreamingSnapshot(normalizedJid: string, event: StreamEvent): voi
     streamingFullTexts.delete(normalizedJid);
     return;
   }
+
+  // 终态守卫：runner 已 idle（run 结束）后 outputChain 的迟到事件不得重建
+  // 快照——重建出的「生成中」快照永远等不到清理，WS 重连/刷新会恢复出僵尸
+  // 转圈。下一个 run 启动时 runner_state 'running' 会清掉 tombstone。
+  // Web 客户端侧有对称的迟到守卫（chat.ts），此处补齐服务端快照的一侧。
+  //
+  // 键必须用完整 normalizedJid（含 #agent: 后缀），与 runner/快照同粒度：
+  // 主 runner idle 只 tombstone `web:folder`，不会误杀并发 sub-agent /
+  // 定时任务（虚拟 jid）的快照；agent runner idle tombstone 自己的
+  // `web:folder#agent:id`，其迟到事件才能被自己的 tombstone 拦住。
+  if (snapshotTombstones.has(normalizedJid)) return;
 
   let snap = streamingSnapshots.get(normalizedJid);
 
@@ -2379,6 +2395,19 @@ export function broadcastRunnerState(
     const fullTextKeysToDelete = [...streamingFullTexts.keys()].filter(k => k.startsWith(agentPrefix));
     for (const key of snapshotKeysToDelete) streamingSnapshots.delete(key);
     for (const key of fullTextKeysToDelete) streamingFullTexts.delete(key);
+    // 墓碑：拦截本 run 残留 outputChain 回调对快照的迟到重建。同粒度落键——
+    // 主 runner idle 落 `web:folder`，agent/task runner idle 落各自虚拟 jid，
+    // 互不误伤。容量上限防 Map 无界增长（长期运行会累积大量短命虚拟 jid）。
+    snapshotTombstones.set(jid, Date.now());
+    if (snapshotTombstones.size > MAX_SNAPSHOT_TOMBSTONES) {
+      for (const k of snapshotTombstones.keys()) {
+        if (snapshotTombstones.size <= MAX_SNAPSHOT_TOMBSTONES) break;
+        snapshotTombstones.delete(k);
+      }
+    }
+  } else {
+    // 新 run 启动，恢复快照写入
+    snapshotTombstones.delete(jid);
   }
 }
 
