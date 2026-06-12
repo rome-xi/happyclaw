@@ -122,6 +122,17 @@ export class GroupQueue {
     return state;
   }
 
+  /** 当前重试轮次（0 = 首次尝试）。供 processMessages 侧识别静默重试轮。 */
+  getRetryCount(groupJid: string): number {
+    return this.groups.get(groupJid)?.retryCount ?? 0;
+  }
+
+  /** 本轮失败后队列是否还会再次重试（决定错误提示发本轮还是等最终失败）。 */
+  willRetryAfterFailure(groupJid: string): boolean {
+    if (this.contextOverflowGroups.has(groupJid)) return false;
+    return (this.groups.get(groupJid)?.retryCount ?? 0) < MAX_RETRIES;
+  }
+
   setProcessMessagesFn(fn: (groupJid: string) => Promise<boolean>): void {
     this.processMessagesFn = fn;
   }

@@ -1912,6 +1912,9 @@ interface StreamingSnapshotEntry {
 }
 
 const streamingSnapshots = new Map<string, StreamingSnapshotEntry>();
+/** runner idle 后的墓碑标记：阻止迟到 stream 事件重建已清理的快照。
+ * key 为主 jid（不含 #agent: 后缀），下一个 run 的 'running' 状态清除。 */
+const snapshotTombstones = new Map<string, number>();
 /** Accumulates full (non-truncated) text per group for shutdown persistence & disk buffer. */
 const streamingFullTexts = new Map<string, string>();
 const MAX_SNAPSHOT_TEXT = 4000;
@@ -2033,6 +2036,13 @@ function updateStreamingSnapshot(normalizedJid: string, event: StreamEvent): voi
     streamingFullTexts.delete(normalizedJid);
     return;
   }
+
+  // 终态守卫：runner 已 idle（run 结束）后 outputChain 的迟到事件不得重建
+  // 快照——重建出的「生成中」快照永远等不到清理，WS 重连/刷新会恢复出僵尸
+  // 转圈。下一个 run 启动时 runner_state 'running' 会清掉 tombstone。
+  // Web 客户端侧有对称的迟到守卫（chat.ts），此处补齐服务端快照的一侧。
+  const baseJid = normalizedJid.split('#agent:')[0];
+  if (snapshotTombstones.has(baseJid)) return;
 
   let snap = streamingSnapshots.get(normalizedJid);
 
@@ -2379,6 +2389,11 @@ export function broadcastRunnerState(
     const fullTextKeysToDelete = [...streamingFullTexts.keys()].filter(k => k.startsWith(agentPrefix));
     for (const key of snapshotKeysToDelete) streamingSnapshots.delete(key);
     for (const key of fullTextKeysToDelete) streamingFullTexts.delete(key);
+    // 墓碑：拦截本 run 残留 outputChain 回调对快照的迟到重建
+    snapshotTombstones.set(jid, Date.now());
+  } else {
+    // 新 run 启动，恢复快照写入
+    snapshotTombstones.delete(jid);
   }
 }
 

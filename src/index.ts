@@ -709,6 +709,34 @@ const activeRouteUpdaters = new Map<string, ReplyRouteUpdater>();
 // outputs to the correct IM channel (the running session holds the truth).
 const activeImReplyRoutes = new Map<string, string | null>();
 
+// ── IPC send_message 跨重试去重 ──
+// 错误退避重试会把整个 prompt 从头重跑，agent 在失败前已执行的 send_message
+// 会被原样再执行一遍，经 IPC watcher 即时送达用户（重复刷消息）。10 分钟窗口
+// 内相同 (源 group, 目标 chat, 内容 hash) 只投递一次。
+const IPC_SEND_DEDUP_TTL_MS = 10 * 60_000;
+const IPC_SEND_DEDUP_MAX = 500;
+const recentIpcSends = new Map<string, number>(); // key → expireAt
+function isDuplicateIpcSend(
+  sourceGroup: string,
+  chatJid: string,
+  text: string,
+): boolean {
+  const key = `${sourceGroup}|${chatJid}|${crypto
+    .createHash('md5')
+    .update(text)
+    .digest('hex')}`;
+  const now = Date.now();
+  const exp = recentIpcSends.get(key);
+  if (exp && exp > now) return true;
+  recentIpcSends.set(key, now + IPC_SEND_DEDUP_TTL_MS);
+  // 容量控制：Map 迭代为插入序，先进先出淘汰
+  for (const k of recentIpcSends.keys()) {
+    if (recentIpcSends.size <= IPC_SEND_DEDUP_MAX) break;
+    recentIpcSends.delete(k);
+  }
+  return false;
+}
+
 // Track consecutive IM send failures per JID for auto-unbind
 const imSendFailCounts = new Map<string, number>();
 const IM_SEND_FAIL_THRESHOLD = 3;
@@ -3065,13 +3093,24 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let streamingSessionJid = replySourceImJid ?? chatJid;
   const makeOnCardCreated = (jid: string) => (messageId: string) =>
     registerMessageIdMapping(messageId, jid);
-  let streamingSession = await imManager.createStreamingSession(
-    streamingSessionJid,
-    makeOnCardCreated(streamingSessionJid),
-  );
+  // 重试轮（指数退避后的重跑）静默执行，不新建流式卡片：否则一条持续失败的
+  // 消息每轮都会在飞书发一张「生成中→处理出错」卡，最多刷 6 张（消息洪流）。
+  // 重试成功时最终回复仍经静态 sendMessage 送达。
+  const retryAttempt = queue.getRetryCount(chatJid);
+  let streamingSession =
+    retryAttempt > 0
+      ? undefined
+      : await imManager.createStreamingSession(
+          streamingSessionJid,
+          makeOnCardCreated(streamingSessionJid),
+        );
   let streamingAccumulatedText = '';
   let streamingAccumulatedThinking = '';
   let streamInterrupted = false;
+  // 本 run 是否已进入 finally 收尾。outputChain 的迟到回调可能在 run resolve
+  // 之后才执行（waitForOutputChain 30s 兜底只放行不取消）；此时绝不能再重建
+  // 流式卡片——重建出的卡片永远无人 complete，成为僵尸「生成中」卡。
+  let runEnded = false;
   logger.info(
     { chatJid, streamingSessionJid, hasSession: !!streamingSession },
     'Streaming session creation result',
@@ -3293,7 +3332,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             if (
               streamingSession &&
               !streamingSession.isActive() &&
-              !sessionErrored
+              !sessionErrored &&
+              !runEnded
             ) {
               unregisterStreamingSession(streamingSessionJid);
               streamingAccumulatedText = '';
@@ -3840,6 +3880,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       currentSourceJid,
     );
   } finally {
+    runEnded = true;
     await setTyping(chatJid, false);
     // Always clear ack reaction in finally — covers error/interrupt/abort paths
     // where the normal sendMessage (which clears it) is never called.
@@ -3880,8 +3921,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           } catch (err) {
             logger.warn(
               { err, chatJid },
-              'Streaming card silent-success finalize failed, disposing',
+              'Streaming card silent-success finalize failed, aborting card',
             );
+            // dispose() 只清定时器不碰卡面，会留下永久「生成中」僵尸卡；
+            // abort() 内部自带 catch，会尽力把卡面切到「已中断」终态。
+            await streamingSession.abort('').catch(() => {});
             streamingSession.dispose();
           }
         } else {
@@ -4172,11 +4216,29 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       deleteRouterState(`oom_exits:${effectiveGroup.folder}`);
     }
 
-    sendSystemMessage(chatJid, 'agent_error', errorDetail);
-    logger.warn(
-      { group: group.name, error: errorDetail },
-      'Agent error (no reply sent), keeping cursor at previous position for retry',
-    );
+    // 还会重试的中间轮次不向用户广播 agent_error：每轮一条错误消息叠加每轮
+    // 一张中断卡就是「消息洪流」。最终失败由 onMaxRetriesExceeded 的
+    // agent_max_retries 系统消息统一告知。
+    if (queue.willRetryAfterFailure(chatJid)) {
+      logger.warn(
+        { group: group.name, error: errorDetail, retry: queue.getRetryCount(chatJid) },
+        'Agent error (no reply sent), will retry silently with backoff',
+      );
+      // agent_error 同时承担清除 Web 端 waiting/streaming 的职责；抑制它后
+      // 必须补一个 status:idle 终态事件，否则重试退避期间 Web 一直转圈。
+      broadcastStreamEvent(chatJid, {
+        eventType: 'status',
+        statusText: 'idle',
+        turnId: lastProcessed.id,
+        sessionId: activeSessionId,
+      });
+    } else {
+      sendSystemMessage(chatJid, 'agent_error', errorDetail);
+      logger.warn(
+        { group: group.name, error: errorDetail },
+        'Agent error (no reply sent), keeping cursor at previous position for retry',
+      );
+    }
     return false;
   }
 
@@ -4927,7 +4989,12 @@ function startIpcWatcher(): void {
             const data = JSON.parse(raw);
             if (data.type === 'message' && data.chatJid && data.text) {
               const targetGroup = registeredGroups[data.chatJid];
-              if (
+              if (isDuplicateIpcSend(sourceGroup, data.chatJid, data.text)) {
+                logger.info(
+                  { sourceGroup, chatJid: data.chatJid },
+                  'Duplicate IPC send_message suppressed (retry replay window)',
+                );
+              } else if (
                 canSendCrossGroupMessage(
                   isAdminHome,
                   isHome,

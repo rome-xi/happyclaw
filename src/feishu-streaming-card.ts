@@ -173,6 +173,14 @@ function splitCodeBlockSafe(text: string, maxLen: number): string[] {
 
 const CARD_MD_LIMIT = 4000;
 const CARD_SIZE_LIMIT = 25 * 1024; // Feishu limit ~30KB, 5KB safety margin
+/**
+ * Raw-char threshold above which the finalize path must split into multiple
+ * cards. buildAgentReplyCard truncates the body to ~16K chars (4 sections ×
+ * 4000); judging "fits in one card" by the byte size of the ALREADY-truncated
+ * JSON can never trigger the split for ASCII/code replies — the tail would
+ * silently vanish at completion.
+ */
+const MAX_FINAL_SINGLE_CARD_CHARS = 15000;
 
 export function extractTitleAndBody(text: string): {
   title: string;
@@ -1531,6 +1539,9 @@ export class StreamingCardController {
   private streamingBackend: StreamingModeBackend | null = null;
   private textFlushCtrl: FlushController | null = null;
   private auxFlushCtrl: FlushController | null = null;
+  /** True when finalize split content across multiple cards — patchUsageNote
+   * must not rebuild a single card or it would overwrite the first card. */
+  private finalizedAsSplit = false;
 
   // Streaming state
     private thinking = false;
@@ -1867,10 +1878,12 @@ export class StreamingCardController {
 
     try {
       if (this.backendMode === 'streaming' && this.streamingBackend) {
-        // Rebuild the structured final card with usage metadata attached.
-        const cardJson = this.buildStructuredFinalCard('completed', usage);
         // Skip if card was split during finalization — rebuilding a single card
-        // would overwrite the first card with full text while continuation cards remain.
+        // would overwrite the first card with full text while continuation
+        // cards remain. The explicit flag matters: for ASCII long replies the
+        // truncated JSON is small, so a byte-size check alone never trips.
+        if (this.finalizedAsSplit) return;
+        const cardJson = this.buildStructuredFinalCard('completed', usage);
         const cardSize = Buffer.byteLength(JSON.stringify(cardJson), 'utf-8');
         if (cardSize > CARD_SIZE_LIMIT) return;
         await this.streamingBackend.updateCardFull(cardJson);
@@ -2108,6 +2121,10 @@ export class StreamingCardController {
   }
 
   private schedulePatch(): void {
+    // Terminal guard: a late/in-flight flush failure after complete()/abort()
+    // must never re-render the finalized card back to「生成中」(the patchCard
+    // callback below hardcodes 'streaming').
+    if (this.state === 'completed' || this.state === 'aborted') return;
     if (this.patchFailCount >= this.maxPatchFailures) {
       logger.info(
         { chatId: this.chatId, useCardKit: this.useCardKit },
@@ -2175,11 +2192,16 @@ export class StreamingCardController {
     }
 
     this.textFlushCtrl.schedule(this.accumulatedText.length, async () => {
+      // Terminal guard: the controller may have completed/aborted between
+      // scheduling and execution — don't push stale streaming content, and
+      // never let a post-finalize failure count toward degradation.
+      if (this.state !== 'streaming' || !this.streamingBackend) return;
       try {
-        await this.streamingBackend!.streamContent(this.accumulatedText);
+        await this.streamingBackend.streamContent(this.accumulatedText);
         this.textFlushCtrl!.markFlushed(this.accumulatedText.length);
         this.patchFailCount = 0;
       } catch (err) {
+        if (this.state !== 'streaming') return;
         this.patchFailCount++;
         logger.debug(
           {
@@ -2348,6 +2370,8 @@ export class StreamingCardController {
     }
 
     this.auxFlushCtrl.schedule(this.stateVersion * 1000, async () => {
+      // Terminal guard — mirror of scheduleTextFlush.
+      if (this.state !== 'streaming' || !this.streamingBackend) return;
       const patches = this.buildRichPanelPatches();
 
       // Every flush goes through cardElement.content() to update the inner
@@ -2428,6 +2452,11 @@ export class StreamingCardController {
     // Re-entrancy guard: two failed flushes can both reach the degradation
     // threshold; the second call would null-deref streamingBackend.
     if (!this.streamingBackend) return;
+    // Terminal guard: degrading AFTER complete()/abort() would build a fresh
+    // MultiCardManager (frozenPrefixChars=0) over the full final text and
+    // schedule a 'streaming' patch — overwriting the finalized card back to
+    // 「生成中」and, for long replies, spraying (续) cards post-completion.
+    if (this.state !== 'streaming' && this.state !== 'creating') return;
     logger.warn(
       { chatId: this.chatId },
       'Streaming mode: degrading to v1 full-update',
@@ -2539,12 +2568,17 @@ export class StreamingCardController {
       const cardJson = this.buildStructuredFinalCard(finalState);
       const cardSize = Buffer.byteLength(JSON.stringify(cardJson), 'utf-8');
 
-      if (cardSize <= CARD_SIZE_LIMIT) {
-        // 3a. Single card fits
+      if (
+        cardSize <= CARD_SIZE_LIMIT &&
+        this.accumulatedText.length <= MAX_FINAL_SINGLE_CARD_CHARS
+      ) {
+        // 3a. Single card fits (both built JSON and RAW text length — the
+        // latter catches ASCII replies whose truncated JSON looks small)
         await backend.updateCardFull(cardJson);
       } else {
-        // 3b. Too large for single card — split on finalize
+        // 3b. Too large for single card — split on finalize (full content)
         await this.splitOnFinalize(finalState);
+        this.finalizedAsSplit = true;
       }
     } catch (err) {
       logger.debug(
@@ -2560,10 +2594,15 @@ export class StreamingCardController {
         );
         await backend.updateCardFull(fallbackCard);
       } catch (fallbackErr) {
-        logger.debug(
+        logger.warn(
           { err: fallbackErr, chatId: this.chatId },
           'Streaming finalize truncated fallback also failed',
         );
+        // Both attempts failed — the card face is still stuck on「生成中」.
+        // Rethrow so complete() reverts state and the caller falls back to a
+        // static IM message; swallowing here would silently lose the reply
+        // AND leave a zombie card.
+        throw fallbackErr;
       }
     }
   }
@@ -2579,38 +2618,48 @@ export class StreamingCardController {
     const { title } = extractTitleAndBody(this.accumulatedText);
     const chunks = splitCodeBlockSafe(this.accumulatedText, CARD_MD_LIMIT);
 
-    // How many chunks fit in the first card?
-    const MAX_ELEMENTS_PER_CARD = 45;
-    const fixedElements = 2; // note + margin
-    const maxChunksFirst = MAX_ELEMENTS_PER_CARD - fixedElements;
+    // Group chunks into cards bounded by BOTH element count and char budget —
+    // a 43-chunk card could be ~170KB of JSON, far over the ~30KB API limit.
+    const MAX_ELEMENTS_PER_CARD = 43;
+    const groups: string[][] = [];
+    let current: string[] = [];
+    let currentChars = 0;
+    for (const chunk of chunks) {
+      if (
+        current.length > 0 &&
+        (current.length >= MAX_ELEMENTS_PER_CARD ||
+          currentChars + chunk.length > FREEZE_SLICE_CHARS)
+      ) {
+        groups.push(current);
+        current = [];
+        currentChars = 0;
+      }
+      current.push(chunk);
+      currentChars += chunk.length;
+    }
+    if (current.length > 0) groups.push(current);
 
-    const firstChunks = chunks.slice(0, maxChunksFirst);
-    const firstText = firstChunks.join('\n\n');
-
-    // Use finalState if all content fits in the first card, otherwise freeze.
-    // First card extracts its own title (strip-first-line, #488); only
-    // continuation cards get the override title.
-    const firstCardState =
-      chunks.length <= maxChunksFirst ? finalState : 'frozen';
-    const frozenCard = buildSchema2Card(firstText, firstCardState, '');
-    await backend.updateCardFull(frozenCard);
-
-    // Create continuation cards
-    let remaining = chunks.slice(maxChunksFirst);
-    while (remaining.length > 0) {
-      const batch = remaining.slice(0, maxChunksFirst);
-      remaining = remaining.slice(maxChunksFirst);
-      const batchText = batch.join('\n\n');
-      const state = remaining.length === 0 ? finalState : 'frozen';
-      const contCard = new CardKitBackend(this.client);
-      const contCardJson = buildSchema2Card(batchText, state, '(续) ', title);
-      await contCard.createCard(contCardJson);
-      const newMsgId = await contCard.sendCard(
-        this.chatId,
-        this.replyToMsgId,
-        this.replyInThread,
-      );
-      this.onCardCreated?.(newMsgId);
+    for (let i = 0; i < groups.length; i++) {
+      const text = groups[i].join('\n\n');
+      const isLast = i === groups.length - 1;
+      const state = isLast ? finalState : ('frozen' as const);
+      if (i === 0) {
+        // First card reuses the existing streaming card. It extracts its own
+        // title (strip-first-line, #488); only continuation cards get the
+        // override title so their first line stays in the body.
+        const firstCard = buildSchema2Card(text, state, '');
+        await backend.updateCardFull(firstCard);
+      } else {
+        const contCard = new CardKitBackend(this.client);
+        const contCardJson = buildSchema2Card(text, state, '(续) ', title);
+        await contCard.createCard(contCardJson);
+        const newMsgId = await contCard.sendCard(
+          this.chatId,
+          this.replyToMsgId,
+          this.replyInThread,
+        );
+        this.onCardCreated?.(newMsgId);
+      }
     }
   }
 
