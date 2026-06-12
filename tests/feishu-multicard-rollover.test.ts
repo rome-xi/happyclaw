@@ -132,4 +132,40 @@ describe('MultiCardManager rollover (v1 degraded mode)', () => {
     expect(allContent).toContain('尾部独立行内容');
     expect(allContent).toContain('结束语');
   });
+
+  test('CJK 长回复每张卡 JSON 不超过字节上限（字节预算而非字符预算）', async () => {
+    // 回归 C4 真根因：拆卡预算曾按 UTF-16 字符数计，CJK 3 字节/字，1.8 万字
+    // 中文 ≈ 54KB > 飞书 ~30KB 上限 → 终态多卡渲染必败、僵尸「生成中」卡。
+    const { client, cardUpdate, cardCreate } = buildMockClient();
+    const controller = new StreamingCardController({
+      client: client as any,
+      chatId: 'oc_test',
+    });
+
+    controller.append('# 中文标题\n正文');
+    await vi.waitFor(() => expect((controller as any).state).toBe('streaming'));
+
+    // ~12000 个中文字符，UTF-8 约 36KB——字符数没超 18000，但字节数远超单卡上限
+    const cjk = '一二三四五六七八九十'.repeat(1200); // 12000 字
+    const bigCjk = `# 中文标题\n${cjk}\n收尾段落`;
+    await controller.complete(bigCjk);
+
+    // 校验每一次写入飞书的卡片 JSON（update + create）字节数都 <= 25KB
+    const CARD_SIZE_LIMIT = 25 * 1024;
+    const updateSizes = cardUpdate.mock.calls.map((c: any[]) =>
+      Buffer.byteLength(c[0]?.data?.card?.data || '', 'utf-8'),
+    );
+    const createSizes = cardCreate.mock.calls
+      .map((c: any[]) => c[0]?.data?.data || '')
+      .filter(Boolean)
+      .map((d: string) => Buffer.byteLength(d, 'utf-8'));
+    const allSizes = [...updateSizes, ...createSizes];
+    expect(allSizes.length).toBeGreaterThan(0);
+    for (const sz of allSizes) {
+      expect(sz).toBeLessThanOrEqual(CARD_SIZE_LIMIT);
+    }
+    // 必然拆成多张卡（12000 中文字 ~36KB > 单卡上限）
+    expect(cardCreate.mock.calls.length).toBeGreaterThan(2);
+  });
 });
+

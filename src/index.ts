@@ -715,12 +715,16 @@ const activeImReplyRoutes = new Map<string, string | null>();
 
 // ── IPC send_message 跨重试去重 ──
 // 错误退避重试会把整个 prompt 从头重跑，agent 在失败前已执行的 send_message
-// 会被原样再执行一遍，经 IPC watcher 即时送达用户（重复刷消息）。10 分钟窗口
-// 内相同 (源 group, 目标 chat, 内容 hash) 只投递一次。
+// 会被原样再执行一遍，经 IPC watcher 即时送达用户（重复刷消息）。
+//
+// 关键：抑制必须严格限定在「重试重放」窗口，否则会误杀合法的重复内容
+// （周期定时任务每次报告相同文案、用户明确要求重发同一句话）。因此始终记录
+// 每条 send 的指纹，但仅当该源 group 当前正处于失败重试轮次（retryCount>0）
+// 时，命中已记录的指纹才抑制——正常首轮永不抑制。
 const IPC_SEND_DEDUP_TTL_MS = 10 * 60_000;
 const IPC_SEND_DEDUP_MAX = 500;
 const recentIpcSends = new Map<string, number>(); // key → expireAt
-function isDuplicateIpcSend(
+function isRetryDuplicateIpcSend(
   sourceGroup: string,
   chatJid: string,
   text: string,
@@ -731,14 +735,17 @@ function isDuplicateIpcSend(
     .digest('hex')}`;
   const now = Date.now();
   const exp = recentIpcSends.get(key);
-  if (exp && exp > now) return true;
+  // 仅在该 group 处于重试重放时，已见过的指纹才视为重复并抑制。
+  const inRetry = queue.getRetryCount(`web:${sourceGroup}`) > 0
+    || queue.getRetryCount(sourceGroup) > 0;
+  const isDup = !!(exp && exp > now) && inRetry;
   recentIpcSends.set(key, now + IPC_SEND_DEDUP_TTL_MS);
   // 容量控制：Map 迭代为插入序，先进先出淘汰
   for (const k of recentIpcSends.keys()) {
     if (recentIpcSends.size <= IPC_SEND_DEDUP_MAX) break;
     recentIpcSends.delete(k);
   }
-  return false;
+  return isDup;
 }
 
 // Track consecutive IM send failures per JID for auto-unbind
@@ -4993,7 +5000,7 @@ function startIpcWatcher(): void {
             const data = JSON.parse(raw);
             if (data.type === 'message' && data.chatJid && data.text) {
               const targetGroup = registeredGroups[data.chatJid];
-              if (isDuplicateIpcSend(sourceGroup, data.chatJid, data.text)) {
+              if (isRetryDuplicateIpcSend(sourceGroup, data.chatJid, data.text)) {
                 logger.info(
                   { sourceGroup, chatJid: data.chatJid },
                   'Duplicate IPC send_message suppressed (retry replay window)',
@@ -6616,6 +6623,7 @@ async function processAgentConversation(
               agentId,
             );
             commitCursor();
+            clearStreamingSnapshot(virtualChatJid);
           } catch (err) {
             logger.warn(
               { err, chatJid, agentId },
@@ -6867,6 +6875,18 @@ async function processAgentConversation(
 
         commitCursor();
         resetIdleTimer();
+
+        // Per-turn snapshot cleanup — mirror of the main path (clearStreamingSnapshot
+        // after each substantive reply). Conversation agents stay warm for
+        // IDLE_TIMEOUT; without this, refreshing the page during the warm window
+        // restores a zombie「生成中」spinner from the stale agent snapshot. Skip
+        // partials (intermediate compression outputs, not the final reply).
+        if (
+          output.sourceKind !== 'overflow_partial' &&
+          output.sourceKind !== 'compact_partial'
+        ) {
+          clearStreamingSnapshot(virtualChatJid);
+        }
 
         // Spawn agents are fire-and-forget: close after first reply to free process slot.
         // Conversation agents stay warm and are reclaimed by IDLE_TIMEOUT — closing them

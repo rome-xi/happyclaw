@@ -182,6 +182,17 @@ const CARD_SIZE_LIMIT = 25 * 1024; // Feishu limit ~30KB, 5KB safety margin
  */
 const MAX_FINAL_SINGLE_CARD_CHARS = 15000;
 
+/**
+ * Per-card BODY byte budget for rollover/finalize splitting. Must be measured
+ * in UTF-8 BYTES, not chars: CJK is 3 bytes/char, so an 18000-CHAR budget
+ * yields ~54KB cards that the Feishu ~30KB API rejects — the exact failure
+ * that made long Chinese replies finalize into a zombie「生成中」card. Leaves
+ * headroom under CARD_SIZE_LIMIT for the card skeleton + JSON escaping.
+ */
+const FREEZE_SLICE_BYTES = 16 * 1024;
+
+const byteLen = (s: string): number => Buffer.byteLength(s, 'utf-8');
+
 export function extractTitleAndBody(text: string): {
   title: string;
   body: string;
@@ -1271,9 +1282,6 @@ class StreamingModeBackend {
 
 // ─── Multi-Card Manager ───────────────────────────────────────
 
-/** Max chars frozen into a single card during rollover (~25KB JSON budget). */
-const FREEZE_SLICE_CHARS = 18000;
-
 class MultiCardManager {
   private cards: CardKitBackend[] = [];
   private readonly client: lark.Client;
@@ -1294,6 +1302,14 @@ class MultiCardManager {
   private frozenPrefixChars = 0;
   /** Fence reopener when a freeze boundary fell inside a ``` code block. */
   private continuationPrefix = '';
+  /**
+   * Serializes commitContent calls. rollover() is a multi-await
+   * read-modify-write of frozenPrefixChars; two overlapping flushes (a slow
+   * one still in flight when the next fires) would double-freeze the same
+   * slice — losing ~16KB of text, duplicating (续) cards, and stranding a
+   * zombie「生成中」card. One in-flight chain makes the whole commit atomic.
+   */
+  private commitChain: Promise<unknown> = Promise.resolve();
 
   constructor(
     client: lark.Client,
@@ -1355,19 +1371,62 @@ class MultiCardManager {
     auxiliaryState?: AuxiliaryState,
     footerNote?: string,
   ): Promise<void> {
-    if (state === 'streaming' && this.needsRollover(text, auxiliaryState, footerNote)) {
+    // Serialize: rollover's frozenPrefixChars RMW must not interleave with
+    // another flush or a terminal patchCard.
+    const run = this.commitChain.then(() =>
+      this.commitContentInner(text, state, auxiliaryState, footerNote),
+    );
+    this.commitChain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  private async commitContentInner(
+    text: string,
+    state: 'streaming' | 'completed' | 'aborted',
+    auxiliaryState?: AuxiliaryState,
+    footerNote?: string,
+  ): Promise<void> {
+    // Roll over whenever the current card would exceed limits — for streaming
+    // AND terminal states. A long reply's final append can push past the byte
+    // budget and then immediately complete()/abort(); without terminal-state
+    // rollover that produces one oversized card the Feishu API rejects (the
+    // CJK >30KB zombie-card case). rollover() freezes prior cards and leaves
+    // the unfrozen tail for the current card; the terminal render below then
+    // applies `state` only to that bounded tail.
+    if (this.needsRollover(text, auxiliaryState, footerNote)) {
       await this.rollover(text);
     }
 
     const currentCard = this.cards[this.cards.length - 1];
     if (!currentCard) return;
 
-    const activeText = this.activeView(text);
     const titlePrefix = this.cardIndex > 0 ? '(续) ' : '';
     // Continuation cards keep the title extracted from the FULL text so all
     // cards of one reply share a consistent header.
     const overrideTitle =
       this.cardIndex > 0 ? extractTitleAndBody(text).title : undefined;
+
+    // After rollover the tail may STILL exceed one card (rollover caps at 8
+    // freezes, and the final unfrozen slice can be a full budget). For terminal
+    // states render the tail across as many cards as needed so nothing is
+    // dropped and no single card overflows.
+    const activeText = this.activeView(text);
+    if (
+      state !== 'streaming' &&
+      byteLen(activeText) > FREEZE_SLICE_BYTES
+    ) {
+      await this.renderTerminalTail(
+        activeText,
+        state,
+        titlePrefix,
+        overrideTitle,
+        footerNote,
+      );
+      return;
+    }
 
     const cardJson = buildSchema2Card(
       activeText,
@@ -1378,6 +1437,77 @@ class MultiCardManager {
       footerNote,
     );
     await currentCard.updateCard(cardJson);
+  }
+
+  /**
+   * Render an over-budget terminal tail across multiple cards: the current card
+   * + fresh continuation cards, each within FREEZE_SLICE_BYTES, only the last
+   * carrying the real terminal `state`.
+   */
+  private async renderTerminalTail(
+    tail: string,
+    state: 'completed' | 'aborted',
+    firstTitlePrefix: string,
+    overrideTitle: string | undefined,
+    footerNote?: string,
+  ): Promise<void> {
+    const chunks = splitCodeBlockSafe(tail, CARD_MD_LIMIT);
+    const groups: string[][] = [];
+    let cur: string[] = [];
+    let curBytes = 0;
+    for (const chunk of chunks) {
+      const cb = byteLen(chunk);
+      if (cur.length > 0 && curBytes + cb > FREEZE_SLICE_BYTES) {
+        groups.push(cur);
+        cur = [];
+        curBytes = 0;
+      }
+      cur.push(chunk);
+      curBytes += cb;
+    }
+    if (cur.length > 0) groups.push(cur);
+
+    for (let i = 0; i < groups.length; i++) {
+      const isLast = i === groups.length - 1;
+      const groupText = groups[i].join('\n\n');
+      const groupState = isLast ? state : ('frozen' as const);
+      const prefix = i === 0 ? firstTitlePrefix : '(续) ';
+      const titleOverride =
+        i === 0 ? overrideTitle : extractTitleAndBody(tail).title;
+      if (i === 0) {
+        const currentCard = this.cards[this.cards.length - 1];
+        if (!currentCard) return;
+        await currentCard.updateCard(
+          buildSchema2Card(
+            groupText,
+            groupState,
+            prefix,
+            titleOverride,
+            undefined,
+            isLast ? footerNote : undefined,
+          ),
+        );
+      } else {
+        const contCard = new CardKitBackend(this.client);
+        await contCard.createCard(
+          buildSchema2Card(
+            groupText,
+            groupState,
+            prefix,
+            titleOverride,
+            undefined,
+            isLast ? footerNote : undefined,
+          ),
+        );
+        const newMsgId = await contCard.sendCard(
+          this.chatId,
+          this.replyToMsgId,
+          this.replyInThread,
+        );
+        this.cards.push(contCard);
+        this.onCardCreated?.(newMsgId);
+      }
+    }
   }
 
   /** Whether the current card would exceed element-count or byte limits. */
@@ -1412,15 +1542,32 @@ class MultiCardManager {
     );
   }
 
-  /** Pick a freeze boundary near FREEZE_SLICE_CHARS on a paragraph/line break. */
+  /**
+   * Pick a freeze boundary near FREEZE_SLICE_BYTES (UTF-8) on a paragraph/line
+   * break. Byte-based so CJK content (3 bytes/char) doesn't overshoot the card
+   * size limit — a char-based budget would freeze ~3x too much per card.
+   */
   private pickSliceEnd(active: string): number {
-    if (active.length <= FREEZE_SLICE_CHARS) return active.length;
-    let idx = active.lastIndexOf('\n\n', FREEZE_SLICE_CHARS);
-    if (idx < FREEZE_SLICE_CHARS * 0.3) {
-      idx = active.lastIndexOf('\n', FREEZE_SLICE_CHARS);
+    if (byteLen(active) <= FREEZE_SLICE_BYTES) return active.length;
+    // Binary-search the char index whose UTF-8 prefix fits the byte budget.
+    let lo = 0;
+    let hi = active.length;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (byteLen(active.slice(0, mid)) <= FREEZE_SLICE_BYTES) lo = mid;
+      else hi = mid - 1;
     }
-    if (idx < FREEZE_SLICE_CHARS * 0.3) idx = FREEZE_SLICE_CHARS;
+    const budgetEnd = lo; // largest char count fitting the byte budget
+    // Prefer a paragraph/line break at or before budgetEnd for clean splits.
+    let idx = active.lastIndexOf('\n\n', budgetEnd);
+    if (idx < budgetEnd * 0.3) idx = active.lastIndexOf('\n', budgetEnd);
+    if (idx < budgetEnd * 0.3) idx = budgetEnd;
     return idx;
+  }
+
+  /** Whether the active (unfrozen) view still exceeds one card's byte budget. */
+  private activeExceedsBudget(fullText: string): boolean {
+    return byteLen(this.activeView(fullText)) > FREEZE_SLICE_BYTES;
   }
 
   /**
@@ -1501,10 +1648,7 @@ class MultiCardManager {
       this.cards.push(newCard);
       // Register the new card's messageId for interrupt button routing
       this.onCardCreated?.(newMessageId);
-    } while (
-      this.activeView(fullText).length > FREEZE_SLICE_CHARS &&
-      ++guard < 8
-    );
+    } while (this.activeExceedsBudget(fullText) && ++guard < 8);
   }
 
   getAllMessageIds(): string[] {
@@ -2177,6 +2321,11 @@ export class StreamingCardController {
     const effectiveLength =
       this.accumulatedText.length + this.stateVersion * 1000;
     this.flushCtrl.schedule(effectiveLength, async () => {
+      // Execution-time terminal guard: the callback runs after a delay, during
+      // which complete()/abort() may have finalized the card. Without this the
+      // v1 path (unlike scheduleTextFlush/scheduleAuxFlush) could repaint a
+      // finalized card back to「生成中」.
+      if (this.state !== 'streaming' && this.state !== 'creating') return;
       await this.patchCard('streaming');
     });
   }
@@ -2592,18 +2741,29 @@ export class StreamingCardController {
         // latter catches ASCII replies whose truncated JSON looks small)
         await backend.updateCardFull(cardJson);
       } else {
-        // 3b. Too large for single card — split on finalize (full content)
-        await this.splitOnFinalize(finalState);
+        // 3b. Too large for single card — split on finalize (full content).
+        // Set the flag BEFORE awaiting: patchUsageNote may fire mid-split and
+        // must not rebuild a single card over the just-created continuations.
         this.finalizedAsSplit = true;
+        await this.splitOnFinalize(finalState);
       }
     } catch (err) {
       logger.debug(
         { err, chatId: this.chatId },
         'Streaming finalize failed, trying truncated fallback',
       );
-      // Fallback: truncate and try once more
+      // Fallback: truncate to a byte budget (CJK is 3 bytes/char, so a
+      // char-count slice would still overflow) and try once more.
       try {
-        const truncated = this.accumulatedText.slice(0, 20000);
+        let lo = 0;
+        let hi = this.accumulatedText.length;
+        while (lo < hi) {
+          const mid = (lo + hi + 1) >> 1;
+          if (byteLen(this.accumulatedText.slice(0, mid)) <= FREEZE_SLICE_BYTES)
+            lo = mid;
+          else hi = mid - 1;
+        }
+        const truncated = this.accumulatedText.slice(0, lo);
         const fallbackCard = buildSchema2Card(
           truncated + '\n\n> ⚠️ 输出已截断',
           finalState,
@@ -2634,24 +2794,26 @@ export class StreamingCardController {
     const { title } = extractTitleAndBody(this.accumulatedText);
     const chunks = splitCodeBlockSafe(this.accumulatedText, CARD_MD_LIMIT);
 
-    // Group chunks into cards bounded by BOTH element count and char budget —
-    // a 43-chunk card could be ~170KB of JSON, far over the ~30KB API limit.
+    // Group chunks into cards bounded by element count AND UTF-8 byte budget.
+    // Char-count budgeting under-counts CJK 3x — a 43-chunk or 18000-char card
+    // can be 100KB+ / 54KB of JSON, far over the ~30KB API limit.
     const MAX_ELEMENTS_PER_CARD = 43;
     const groups: string[][] = [];
     let current: string[] = [];
-    let currentChars = 0;
+    let currentBytes = 0;
     for (const chunk of chunks) {
+      const chunkBytes = byteLen(chunk);
       if (
         current.length > 0 &&
         (current.length >= MAX_ELEMENTS_PER_CARD ||
-          currentChars + chunk.length > FREEZE_SLICE_CHARS)
+          currentBytes + chunkBytes > FREEZE_SLICE_BYTES)
       ) {
         groups.push(current);
         current = [];
-        currentChars = 0;
+        currentBytes = 0;
       }
       current.push(chunk);
-      currentChars += chunk.length;
+      currentBytes += chunkBytes;
     }
     if (current.length > 0) groups.push(current);
 
