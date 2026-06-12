@@ -1453,6 +1453,22 @@ class MultiCardManager {
         reopener = '```' + last.lang + '\n';
       }
 
+      // Open the fresh card FIRST. If createCard/sendCard throws, nothing has
+      // been mutated yet — the next flush simply retries the rollover. The old
+      // order (advance offsets → create card) lost the frozen slice when card
+      // creation failed: the offset had moved, so subsequent flushes rendered
+      // only the tail into the OLD card, overwriting the frozen content.
+      const newCard = new CardKitBackend(this.client);
+      const newCardJson = buildSchema2Card('...', 'streaming', '(续) ', title);
+      await newCard.createCard(newCardJson);
+      const newMessageId = await newCard.sendCard(
+        this.chatId,
+        this.replyToMsgId,
+        this.replyInThread,
+      );
+
+      // Freeze the old card (best-effort — on failure it keeps its last
+      // streamed view; the content is still readable).
       // Card 0 keeps the strip-first-line-as-title behavior (#488); continuation
       // cards get the override title so their first line stays in the body.
       const frozenCard = buildSchema2Card(
@@ -1473,25 +1489,15 @@ class MultiCardManager {
         }
       }
 
-      // Advance the frozen offset by the chars consumed from the full text
-      // (sliceEnd is measured on `active`, which starts with the reopener
-      // prefix from the previous split).
+      // Commit: advance the frozen offset by the chars consumed from the full
+      // text (sliceEnd is measured on `active`, which starts with the reopener
+      // prefix from the previous split), then adopt the new card.
       this.frozenPrefixChars += Math.max(
         0,
         sliceEnd - this.continuationPrefix.length,
       );
       this.continuationPrefix = reopener;
-
-      // Open a fresh card for the remainder.
       this.cardIndex++;
-      const newCard = new CardKitBackend(this.client);
-      const newCardJson = buildSchema2Card('...', 'streaming', '(续) ', title);
-      await newCard.createCard(newCardJson);
-      const newMessageId = await newCard.sendCard(
-        this.chatId,
-        this.replyToMsgId,
-        this.replyInThread,
-      );
       this.cards.push(newCard);
       // Register the new card's messageId for interrupt button routing
       this.onCardCreated?.(newMessageId);
@@ -1542,6 +1548,14 @@ export class StreamingCardController {
   /** True when finalize split content across multiple cards — patchUsageNote
    * must not rebuild a single card or it would overwrite the first card. */
   private finalizedAsSplit = false;
+  /** Serializes legacy im.v1.message.patch calls — that API has no sequence
+   * number, so an in-flight「生成中」patch landing AFTER the terminal patch
+   * would permanently revert the card to streaming state. */
+  private legacyPatchChain: Promise<unknown> = Promise.resolve();
+  /** In-flight createInitialCard() — complete() awaits it so a creation that
+   * fails AFTER complete() returned doesn't end as "no card AND no static
+   * fallback" (silent reply loss). */
+  private creationPromise: Promise<void> | null = null;
 
   // Streaming state
     private thinking = false;
@@ -1602,7 +1616,8 @@ export class StreamingCardController {
     if (this.state === 'idle') {
       // Create card immediately with thinking placeholder
       this.state = 'creating';
-      this.createInitialCard().catch((err) => {
+      this.creationPromise = this.createInitialCard();
+      this.creationPromise.catch((err) => {
         logger.warn(
           { err, chatId: this.chatId },
           'Streaming card: initial create failed (thinking), will use fallback',
@@ -1691,7 +1706,8 @@ export class StreamingCardController {
     this.stateVersion++;
     if (this.state === 'idle') {
       this.state = 'creating';
-      this.createInitialCard().catch((err) => {
+      this.creationPromise = this.createInitialCard();
+      this.creationPromise.catch((err) => {
         logger.warn(
           { err, chatId: this.chatId },
           'Streaming card: initial create failed (thinking), will use fallback',
@@ -1815,7 +1831,8 @@ export class StreamingCardController {
 
       if (this.state === 'idle') {
       this.state = 'creating';
-      this.createInitialCard().catch((err) => {
+      this.creationPromise = this.createInitialCard();
+      this.creationPromise.catch((err) => {
         logger.warn(
           { err, chatId: this.chatId },
           'Streaming card: initial create failed, will use fallback',
@@ -1838,6 +1855,18 @@ export class StreamingCardController {
    * Complete the streaming card with final text.
    */
   async complete(finalText: string): Promise<void> {
+    if (this.state !== 'streaming' && this.state !== 'creating') return;
+
+    // Card creation still in flight — wait for it to settle first. Returning
+    // "success" while the creation later fails would leave NO card and NO
+    // static fallback (the caller marks the IM delivery as handled), silently
+    // losing the reply.
+    if (this.state === 'creating' && this.creationPromise) {
+      await this.creationPromise.catch(() => {});
+      if ((this.state as StreamingState) === 'error') {
+        throw new Error('streaming card creation failed during complete()');
+      }
+    }
     if (this.state !== 'streaming' && this.state !== 'creating') return;
 
     const prevState = this.state;
@@ -2421,26 +2450,13 @@ export class StreamingCardController {
           patches.footerNote,
         );
       } catch (err) {
-        // Rich slot updates may fail if CardKit rejects deep element_id targeting.
-        // Fall back to legacy AUX_BEFORE/AFTER aggregation in that case.
+        // Aux panels are best-effort decoration — log and move on. (The old
+        // fallback patched AUX_BEFORE/AUX_AFTER, but the rich skeleton has no
+        // such element_ids, so it always failed silently and only burned QPS.)
         logger.debug(
           { err, chatId: this.chatId, mode: 'streaming' },
-          'Rich panel patch failed, falling back to legacy aux update',
+          'Rich panel patch failed (non-fatal)',
         );
-        try {
-          const auxState = this.getAuxiliaryState();
-          const { before, after } = buildAuxiliaryElements(auxState);
-          await this.streamingBackend!.updateAuxiliary(
-            ELEMENT_IDS.AUX_BEFORE,
-            serializeAuxContent(before),
-          );
-          await this.streamingBackend!.updateAuxiliary(
-            ELEMENT_IDS.AUX_AFTER,
-            serializeAuxContent(after),
-          );
-        } catch {
-          /* legacy aux is best-effort */
-        }
       }
     });
   }
@@ -2705,10 +2721,18 @@ export class StreamingCardController {
       const content = JSON.stringify(card);
 
       try {
-        await this.client.im.v1.message.patch({
-          path: { message_id: this.messageId },
-          data: { content },
-        });
+        const messageId = this.messageId;
+        const run = this.legacyPatchChain.then(() =>
+          this.client.im.v1.message.patch({
+            path: { message_id: messageId },
+            data: { content },
+          }),
+        );
+        this.legacyPatchChain = run.then(
+          () => undefined,
+          () => undefined,
+        );
+        await run;
         this.flushCtrl.markFlushed(this.accumulatedText.length);
         this.patchFailCount = 0;
       } catch (err) {

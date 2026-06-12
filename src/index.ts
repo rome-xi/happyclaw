@@ -267,6 +267,10 @@ export function feedStreamEventToCard(
       if (se.text) session.append(accumulatedText);
       break;
     case 'thinking_delta':
+      // 子 Agent（SDK Task）的思考带 parentToolUseId，在 task 面板独立呈现；
+      // 混入主卡思考面板会反复重新激活 thinking 态并污染内容（Web 端
+      // applyStreamEvent 与服务端快照均已隔离，此处对齐）。
+      if (se.parentToolUseId) break;
       if (se.text) {
         session.appendThinking(se.text);
       } else if (!accumulatedText) {
@@ -6538,9 +6542,13 @@ async function processAgentConversation(
       broadcastStreamEvent(chatJid, output.streamEvent, agentId);
 
       // ── 累积 text_delta 文本（中断时用于保存已输出内容）──
+      // 仅累积主 Agent 文本（无 parentToolUseId）：子 Agent（SDK Task）的中间
+      // 文本混入会污染飞书 agent 卡正文与 interrupt_partial 落库内容。
+      // 与主会话路径（processGroupMessages）的同名过滤保持一致。
       if (
         output.streamEvent.eventType === 'text_delta' &&
-        output.streamEvent.text
+        output.streamEvent.text &&
+        !output.streamEvent.parentToolUseId
       ) {
         agentStreamingAccText += output.streamEvent.text;
       }
