@@ -477,7 +477,11 @@ export function initDatabase(): void {
       thread_id TEXT,
       root_message_id TEXT,
       title_source TEXT,
-      last_active_at TEXT
+      last_active_at TEXT,
+      progress_summary TEXT,
+      progress_pct INTEGER,
+      progress_updated_at TEXT,
+      dispatched_from_agent_jid TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_agents_group ON agents(group_folder);
     CREATE INDEX IF NOT EXISTS idx_agents_jid ON agents(chat_jid);
@@ -757,6 +761,11 @@ export function initDatabase(): void {
   ensureColumn('agents', 'root_message_id', 'TEXT');
   ensureColumn('agents', 'title_source', 'TEXT');
   ensureColumn('agents', 'last_active_at', 'TEXT');
+  // Phase-1 background jobs: foreground-queryable progress channel
+  ensureColumn('agents', 'progress_summary', 'TEXT');
+  ensureColumn('agents', 'progress_pct', 'INTEGER');
+  ensureColumn('agents', 'progress_updated_at', 'TEXT');
+  ensureColumn('agents', 'dispatched_from_agent_jid', 'TEXT');
 
   // Add index on target_agent_id for fast lookup of IM bindings
   db.exec(
@@ -1359,7 +1368,7 @@ export function initDatabase(): void {
     }
   }
 
-  const SCHEMA_VERSION = '39';
+  const SCHEMA_VERSION = '40';
   db.prepare(
     'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
   ).run('schema_version', SCHEMA_VERSION);
@@ -4453,6 +4462,91 @@ export function updateAgentStatus(
   db.prepare(
     'UPDATE agents SET status = ?, completed_at = ?, result_summary = ? WHERE id = ?',
   ).run(status, completedAt, resultSummary ?? null, id);
+}
+
+/**
+ * Phase-1 background jobs: update a job's mid-flight progress (foreground reads this).
+ * Independent of status; safe to call frequently from the host as the job's runner
+ * emits task_progress / text. progress_pct optional (0-100).
+ */
+export function updateAgentProgress(
+  id: string,
+  progressSummary: string,
+  progressPct?: number,
+): void {
+  db.prepare(
+    'UPDATE agents SET progress_summary = ?, progress_pct = ?, progress_updated_at = ?, last_active_at = ? WHERE id = ?',
+  ).run(
+    progressSummary,
+    progressPct ?? null,
+    new Date().toISOString(),
+    new Date().toISOString(),
+    id,
+  );
+}
+
+/**
+ * Phase-1 background jobs: stamp the dispatching foreground agent's JID onto a
+ * job row. Kept separate from createAgent (which Phase 1-A intentionally left
+ * untouched) so the background-job path has a minimal, additive footprint.
+ */
+export function updateAgentDispatchedFrom(
+  id: string,
+  dispatchedFromAgentJid: string | null,
+): void {
+  db.prepare(
+    'UPDATE agents SET dispatched_from_agent_jid = ? WHERE id = ?',
+  ).run(dispatchedFromAgentJid, id);
+}
+
+export interface BackgroundJobRow {
+  id: string;
+  name: string;
+  status: string;
+  kind: string;
+  progress_summary: string | null;
+  progress_pct: number | null;
+  progress_updated_at: string | null;
+  last_active_at: string | null;
+  result_summary: string | null;
+  created_at: string;
+  completed_at: string | null;
+  dispatched_from_agent_jid: string | null;
+}
+
+/**
+ * Phase-1 background jobs: list background-kind jobs for a workspace home JID so the
+ * foreground agent can query progress. Pure read (DB-only) — never touches a running
+ * job process, so it is safe to call mid-turn. Optionally filter by the dispatching
+ * foreground agent JID (only "my" jobs).
+ */
+export function listBackgroundAgents(
+  chatJid: string,
+  dispatchedFromAgentJid?: string,
+): BackgroundJobRow[] {
+  const base =
+    "SELECT id, name, status, kind, progress_summary, progress_pct, progress_updated_at, last_active_at, result_summary, created_at, completed_at, dispatched_from_agent_jid FROM agents WHERE chat_jid = ? AND kind = 'background'";
+  if (dispatchedFromAgentJid) {
+    return db
+      .prepare(base + ' AND dispatched_from_agent_jid = ? ORDER BY created_at DESC')
+      .all(chatJid, dispatchedFromAgentJid) as BackgroundJobRow[];
+  }
+  return db
+    .prepare(base + ' ORDER BY created_at DESC')
+    .all(chatJid) as BackgroundJobRow[];
+}
+
+/**
+ * Phase-1 background jobs: fetch one job's progress row by id. Pure read — safe
+ * to call mid-turn from the foreground (get_job_progress MCP tool). Returns
+ * undefined if the id is unknown or not a background-kind job.
+ */
+export function getBackgroundJob(id: string): BackgroundJobRow | undefined {
+  return db
+    .prepare(
+      "SELECT id, name, status, kind, progress_summary, progress_pct, progress_updated_at, last_active_at, result_summary, created_at, completed_at, dispatched_from_agent_jid FROM agents WHERE id = ? AND kind = 'background'",
+    )
+    .get(id) as BackgroundJobRow | undefined;
 }
 
 export function updateAgentLastImJid(

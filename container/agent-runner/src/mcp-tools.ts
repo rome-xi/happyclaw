@@ -1567,5 +1567,247 @@ Use the skills panel in the UI to find the skill ID (directory name, e.g. "memor
   );
   }
 
+  // ── Phase 1-B: background jobs (all workspaces) ───────────────────────
+  // dispatch_background_job hands heavy / long work to an independent host
+  // process (opus-manager + Doubao workers via the host ark-mashup env) and
+  // returns immediately. The foreground polls progress with get_background_jobs
+  // / get_job_progress; the job itself nudges report_progress. Reuses the
+  // existing #agent: lane — no new wiring on the runner side. Available in
+  // every workspace: the originating chatJid (stamped below) lets the main
+  // process route the result back to home (web:{folder}) AND non-home
+  // (web:{uuid}) chats alike.
+  {
+    tools.push(
+      // --- dispatch_background_job ---
+      tool(
+        'dispatch_background_job',
+        `Dispatch a long-running or heavy task to an independent background job and return immediately with a job id (does NOT block this turn). The job runs as its own host process with full tool access and can fan out its own Workflow/subagents. Use for: batch processing, large migrations/audits, multi-file analysis, anything that would otherwise tie up this conversation. Poll progress with get_background_jobs / get_job_progress. The job's final answer is also injected back into this chat when it finishes.`,
+        {
+          prompt: z
+            .string()
+            .min(1)
+            .describe('The full task instruction for the background job.'),
+          name: z
+            .string()
+            .optional()
+            .describe('Optional short label for the job (shown in the job list).'),
+        },
+        async (args: { prompt: string; name?: string }) => {
+          const requestId = newRequestId();
+          try {
+            const result = await pollIpcResult(
+              TASKS_DIR,
+              {
+                type: 'dispatch_background_job',
+                requestId,
+                prompt: args.prompt,
+                name: args.name,
+                groupFolder: ctx.groupFolder,
+                chatJid: ctx.chatJid,
+                timestamp: new Date().toISOString(),
+              },
+              'dispatch_job_result',
+            );
+            if (!result.success) {
+              return {
+                content: [
+                  {
+                    type: 'text' as const,
+                    text: `Failed to dispatch background job: ${result.error || 'unknown error'}`,
+                  },
+                ],
+                isError: true,
+              };
+            }
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `Background job dispatched: id=${result.jobId} (short ${result.shortId}) "${result.name}". It runs independently; poll get_job_progress with this id, or get_background_jobs to list all.`,
+                },
+              ],
+            };
+          } catch {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: 'Timeout waiting for dispatch_background_job response.',
+                },
+              ],
+              isError: true,
+            };
+          }
+        },
+      ),
+
+      // --- report_progress ---
+      tool(
+        'report_progress',
+        `Report your own progress while running as a background job (no-op if not a background job). Call periodically on a long task so the foreground can see you are alive and how far along you are. Fire-and-forget.`,
+        {
+          summary: z
+            .string()
+            .min(1)
+            .describe('Short human-readable progress note (e.g. "processed 12/40 files").'),
+          pct: z
+            .number()
+            .min(0)
+            .max(100)
+            .optional()
+            .describe('Optional completion percentage 0-100.'),
+        },
+        async (args: { summary: string; pct?: number }) => {
+          const data: Record<string, unknown> = {
+            type: 'report_progress',
+            summary: args.summary,
+            groupFolder: ctx.groupFolder,
+            timestamp: new Date().toISOString(),
+          };
+          if (typeof args.pct === 'number') data.pct = args.pct;
+          writeIpcFile(TASKS_DIR, data);
+          return {
+            content: [{ type: 'text' as const, text: 'Progress reported.' }],
+          };
+        },
+      ),
+
+      // --- get_background_jobs ---
+      tool(
+        'get_background_jobs',
+        `List background jobs for this workspace with their status and latest progress. Pure read — safe to call anytime, never blocks. Set mine_only to see only jobs you dispatched.`,
+        {
+          mine_only: z
+            .boolean()
+            .optional()
+            .describe('Only jobs dispatched by the current agent (default: all).'),
+        },
+        async (args: { mine_only?: boolean }) => {
+          const requestId = newRequestId();
+          try {
+            const result = await pollIpcResult(
+              TASKS_DIR,
+              {
+                type: 'get_background_jobs',
+                requestId,
+                mineOnly: !!args.mine_only,
+                groupFolder: ctx.groupFolder,
+                timestamp: new Date().toISOString(),
+              },
+              'get_background_jobs_result',
+            );
+            if (!result.success) {
+              return {
+                content: [
+                  {
+                    type: 'text' as const,
+                    text: `Error listing background jobs: ${result.error || 'unknown error'}`,
+                  },
+                ],
+                isError: true,
+              };
+            }
+            const jobs = (result.jobs || []) as Array<Record<string, unknown>>;
+            if (jobs.length === 0) {
+              return {
+                content: [
+                  { type: 'text' as const, text: 'No background jobs.' },
+                ],
+              };
+            }
+            const formatted = jobs
+              .map((j) => {
+                const pct =
+                  typeof j.progressPct === 'number' ? ` ${j.progressPct}%` : '';
+                const prog = j.progress ? ` — ${String(j.progress).slice(0, 120)}` : '';
+                return `- [${j.shortId}] ${j.name} (${j.status}${pct})${prog}`;
+              })
+              .join('\n');
+            return {
+              content: [
+                { type: 'text' as const, text: `Background jobs:\n${formatted}` },
+              ],
+            };
+          } catch {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: 'Timeout waiting for background job list.',
+                },
+              ],
+              isError: true,
+            };
+          }
+        },
+      ),
+
+      // --- get_job_progress ---
+      tool(
+        'get_job_progress',
+        `Get one background job's status, latest progress, and final result (if finished) by its job id. Pure read — never blocks.`,
+        {
+          job_id: z.string().min(1).describe('The background job id to inspect.'),
+        },
+        async (args: { job_id: string }) => {
+          const requestId = newRequestId();
+          try {
+            const result = await pollIpcResult(
+              TASKS_DIR,
+              {
+                type: 'get_job_progress',
+                requestId,
+                jobId: args.job_id,
+                groupFolder: ctx.groupFolder,
+                timestamp: new Date().toISOString(),
+              },
+              'get_job_progress_result',
+            );
+            if (!result.success) {
+              return {
+                content: [
+                  {
+                    type: 'text' as const,
+                    text: `Error getting job progress: ${result.error || 'unknown error'}`,
+                  },
+                ],
+                isError: true,
+              };
+            }
+            const job = result.job as Record<string, unknown> | null;
+            if (!job) {
+              return {
+                content: [
+                  {
+                    type: 'text' as const,
+                    text: `No background job found with id ${args.job_id}.`,
+                  },
+                ],
+              };
+            }
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `Job [${job.shortId}] ${job.name}\nstatus: ${job.status}${typeof job.progressPct === 'number' ? ` (${job.progressPct}%)` : ''}\nprogress: ${job.progress ?? '(none yet)'}\nresult: ${job.result ?? '(not finished)'}`,
+                },
+              ],
+            };
+          } catch {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: 'Timeout waiting for job progress.',
+                },
+              ],
+              isError: true,
+            };
+          }
+        },
+      ),
+    );
+  }
+
   return tools;
 }

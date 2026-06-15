@@ -314,7 +314,7 @@ export interface AuthAuditLog {
 // --- Sub-Agent types ---
 
 export type AgentStatus = 'idle' | 'running' | 'completed' | 'error';
-export type AgentKind = 'task' | 'conversation' | 'spawn';
+export type AgentKind = 'task' | 'conversation' | 'spawn' | 'background';
 
 export interface SubAgent {
   id: string;

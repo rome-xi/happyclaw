@@ -70,6 +70,11 @@ import {
   createAgent,
   getAgent,
   updateAgentStatus,
+  updateAgentProgress,
+  updateAgentDispatchedFrom,
+  listBackgroundAgents,
+  getBackgroundJob,
+  type BackgroundJobRow,
   updateAgentLastImJid,
   updateAgentInfo,
   deleteAgent,
@@ -178,6 +183,7 @@ import {
   FeishuMessageMeta,
   MessageCursor,
   NewMessage,
+  AgentKind,
   RegisteredGroup,
   StreamEvent,
   SubAgent,
@@ -2491,6 +2497,124 @@ async function handleSpawnCommand(
 
   const shortId = agentId.slice(0, 4);
   return `⚡ 并行任务已启动 [${shortId}]: ${truncatedName}`;
+}
+
+/**
+ * Phase 1-B: kinds that run as fire-and-forget #agent: lane processes (spawned,
+ * finalized to completed/error rather than kept warm). Background jobs reuse the
+ * exact spawn lane, so every spawn-specific branch in processAgentConversation
+ * must admit 'background' too — this predicate is the single chokepoint.
+ */
+function isSpawnKind(kind: AgentKind): boolean {
+  return kind === 'spawn' || kind === 'background';
+}
+
+interface BackgroundJobResult {
+  jobId: string;
+  shortId: string;
+  name: string;
+}
+
+/**
+ * Phase 1-B: programmatic background-job dispatch (host side of the
+ * dispatch_background_job MCP tool). Mirrors the core of handleSpawnCommand but
+ * kind='background' (so listBackgroundAgents/getBackgroundJob see it) and records
+ * dispatched_from_agent_jid (the foreground agent that launched it). Reuses the
+ * existing #agent: virtual-JID lane — no new prefix, minimal blast radius.
+ */
+function createBackgroundJob(params: {
+  homeChatJid: string;
+  effectiveGroup: RegisteredGroup;
+  userId: string;
+  prompt: string;
+  name?: string;
+  dispatchedFromAgentJid: string;
+}): BackgroundJobResult {
+  const {
+    homeChatJid,
+    effectiveGroup,
+    userId,
+    prompt,
+    dispatchedFromAgentJid,
+  } = params;
+  const now = new Date().toISOString();
+  const agentId = crypto.randomUUID();
+  const messageId = crypto.randomUUID();
+  const user = getUserById(userId);
+  const senderName = user?.display_name || user?.username || userId;
+  const truncated = prompt.length > 30 ? prompt.slice(0, 30) + '…' : prompt;
+  const agentName = params.name?.trim() || `🛠️ ${truncated}`;
+
+  const newAgent: SubAgent = {
+    id: agentId,
+    group_folder: effectiveGroup.folder,
+    chat_jid: homeChatJid,
+    name: agentName,
+    prompt: '',
+    status: 'idle',
+    kind: 'background',
+    created_by: userId,
+    created_at: now,
+    completed_at: null,
+    result_summary: null,
+    last_im_jid: null,
+    // Reuse the spawn result-injection path: the final answer surfaces back in
+    // the dispatching chat for visibility (the foreground also polls progress).
+    spawned_from_jid: dispatchedFromAgentJid,
+  };
+  createAgent(newAgent);
+  updateAgentDispatchedFrom(agentId, dispatchedFromAgentJid);
+
+  ensureAgentDirectories(effectiveGroup.folder, agentId);
+
+  const virtualChatJid = `${homeChatJid}#agent:${agentId}`;
+  ensureChatExists(virtualChatJid);
+  updateChatName(virtualChatJid, agentName);
+  storeMessageDirect(
+    messageId,
+    virtualChatJid,
+    userId,
+    senderName,
+    prompt,
+    now,
+    false,
+  );
+  broadcastNewMessage(virtualChatJid, {
+    id: messageId,
+    chat_jid: virtualChatJid,
+    sender: userId,
+    sender_name: senderName,
+    content: prompt,
+    timestamp: now,
+    is_from_me: false,
+  });
+  broadcastAgentStatus(
+    homeChatJid,
+    agentId,
+    'idle',
+    agentName,
+    '',
+    undefined,
+    'background',
+  );
+
+  const taskId = `bg:${agentId}:${Date.now()}`;
+  queue.enqueueTask(virtualChatJid, taskId, async () => {
+    await processAgentConversation(homeChatJid, agentId);
+  });
+
+  logger.info(
+    {
+      homeChatJid,
+      agentId,
+      userId,
+      dispatchedFromAgentJid,
+      folder: effectiveGroup.folder,
+    },
+    'dispatch_background_job: background job created and enqueued',
+  );
+
+  return { jobId: agentId, shortId: agentId.slice(0, 4), name: agentName };
 }
 
 async function setTyping(jid: string, isTyping: boolean): Promise<void> {
@@ -5421,6 +5545,10 @@ function startIpcWatcher(): void {
           'discord_get_history_result_',
           'discord_get_channel_info_result_',
           'discord_get_server_info_result_',
+          // Phase 1-B background jobs
+          'dispatch_job_result_',
+          'get_background_jobs_result_',
+          'get_job_progress_result_',
         ];
         const isResultFile = (name: string) =>
           RESULT_FILE_PREFIXES.some((p) => name.startsWith(p));
@@ -5540,6 +5668,50 @@ function startIpcWatcher(): void {
   logger.info('IPC watcher started (event-driven + 5s fallback)');
 }
 
+/**
+ * Phase 1-B: write a request/response IPC result file back to the caller's tasks
+ * dir. A spawned-agent caller (ipcAgentId set) polls its own
+ * agents/{id}/tasks/ dir; the base runner polls the folder-level tasks/ dir.
+ * requestId MUST already be SAFE_REQUEST_ID_RE-validated by the caller.
+ */
+function writeTaskIpcResult(
+  sourceGroup: string,
+  ipcAgentId: string | null,
+  prefix: string,
+  requestId: string,
+  obj: object,
+): void {
+  const resultDir = ipcAgentId
+    ? path.join(DATA_DIR, 'ipc', sourceGroup, 'agents', ipcAgentId, 'tasks')
+    : path.join(DATA_DIR, 'ipc', sourceGroup, 'tasks');
+  const resolvedDir = path.resolve(resultDir);
+  const resultPath = path.resolve(resultDir, `${prefix}_${requestId}.json`);
+  if (!resultPath.startsWith(`${resolvedDir}${path.sep}`)) {
+    throw new Error('unsafe result file path');
+  }
+  fs.mkdirSync(resolvedDir, { recursive: true });
+  const tmp = `${resultPath}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(obj));
+  fs.renameSync(tmp, resultPath);
+}
+
+/** Phase 1-B: shape a BackgroundJobRow for the foreground MCP tools. */
+function serializeBackgroundJob(row: BackgroundJobRow): Record<string, unknown> {
+  return {
+    jobId: row.id,
+    shortId: row.id.slice(0, 4),
+    name: row.name,
+    status: row.status,
+    progress: row.progress_summary,
+    progressPct: row.progress_pct,
+    progressUpdatedAt: row.progress_updated_at,
+    lastActiveAt: row.last_active_at,
+    result: row.result_summary,
+    createdAt: row.created_at,
+    completedAt: row.completed_at,
+  };
+}
+
 async function processTaskIpc(
   data: {
     type: string;
@@ -5572,6 +5744,11 @@ async function processTaskIpc(
     // For discord_get_history
     limit?: number;
     before?: string;
+    // For Phase 1-B background jobs
+    jobId?: string;
+    summary?: string;
+    pct?: number;
+    mineOnly?: boolean;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isAdminHome: boolean, // Whether source is admin home container
@@ -5838,6 +6015,163 @@ async function processTaskIpc(
         }
       }
       break;
+
+    // ── Phase 1-B background jobs ──────────────────────────────────────
+    case 'dispatch_background_job': {
+      const requestId = data.requestId;
+      if (!requestId || !SAFE_REQUEST_ID_RE.test(requestId)) {
+        logger.warn(
+          { sourceGroup },
+          'dispatch_background_job: missing/invalid requestId',
+        );
+        break;
+      }
+      try {
+        const prompt = (data.prompt || '').trim();
+        if (!prompt) {
+          writeTaskIpcResult(sourceGroup, ipcAgentId, 'dispatch_job_result', requestId, {
+            success: false,
+            error: 'prompt is required',
+          });
+          break;
+        }
+        if (!sourceGroupEntry?.created_by) {
+          writeTaskIpcResult(sourceGroup, ipcAgentId, 'dispatch_job_result', requestId, {
+            success: false,
+            error: 'cannot resolve workspace owner',
+          });
+          break;
+        }
+        const { effectiveGroup } = resolveEffectiveGroup(sourceGroupEntry);
+        // Phase 1-B unlock: prefer the originating chat jid so non-home
+        // workspaces work too. Home workspaces stamp web:{folder} (jid ===
+        // web:{folder}, unchanged behavior); non-home stamp their real jid
+        // (e.g. web:{uuid}), which the old `web:${folder}` guess never matched
+        // — that mismatch left processAgentConversation unable to find the
+        // group and the job stuck idle. Validate the stamped jid actually
+        // belongs to this source workspace before trusting it; otherwise fall
+        // back to the legacy derivation.
+        const stampedJid = data.chatJid;
+        const stampedEntry = stampedJid
+          ? registeredGroups[stampedJid] ?? getRegisteredGroup(stampedJid)
+          : undefined;
+        const homeChatJid =
+          stampedJid && stampedEntry?.folder === effectiveGroup.folder
+            ? stampedJid
+            : `web:${effectiveGroup.folder}`;
+        const dispatchedFromAgentJid = ipcAgentId
+          ? `${homeChatJid}#agent:${ipcAgentId}`
+          : homeChatJid;
+        const job = createBackgroundJob({
+          homeChatJid,
+          effectiveGroup,
+          userId: sourceGroupEntry.created_by,
+          prompt,
+          name: data.name,
+          dispatchedFromAgentJid,
+        });
+        writeTaskIpcResult(sourceGroup, ipcAgentId, 'dispatch_job_result', requestId, {
+          success: true,
+          jobId: job.jobId,
+          shortId: job.shortId,
+          name: job.name,
+        });
+      } catch (err) {
+        logger.error({ sourceGroup, err }, 'dispatch_background_job failed');
+        try {
+          writeTaskIpcResult(sourceGroup, ipcAgentId, 'dispatch_job_result', requestId, {
+            success: false,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        } catch {
+          /* result dir unavailable */
+        }
+      }
+      break;
+    }
+
+    case 'report_progress': {
+      // Called by a background job's own runner → ipcAgentId is the job id.
+      if (!ipcAgentId) {
+        logger.warn(
+          { sourceGroup },
+          'report_progress: no agent context (must come from a background job)',
+        );
+        break;
+      }
+      const summary = (data.summary || '').trim();
+      if (!summary) break;
+      const job = getBackgroundJob(ipcAgentId);
+      if (!job) {
+        logger.warn(
+          { sourceGroup, ipcAgentId },
+          'report_progress: caller is not a background job',
+        );
+        break;
+      }
+      const pct =
+        typeof data.pct === 'number' && Number.isFinite(data.pct)
+          ? Math.max(0, Math.min(100, Math.round(data.pct)))
+          : undefined;
+      updateAgentProgress(ipcAgentId, summary.slice(0, 2000), pct);
+      break;
+    }
+
+    case 'get_background_jobs': {
+      const requestId = data.requestId;
+      if (!requestId || !SAFE_REQUEST_ID_RE.test(requestId)) break;
+      try {
+        const homeChatJid = sourceGroupEntry
+          ? `web:${resolveEffectiveGroup(sourceGroupEntry).effectiveGroup.folder}`
+          : `web:${sourceGroup}`;
+        const dispatchedFrom = ipcAgentId
+          ? `${homeChatJid}#agent:${ipcAgentId}`
+          : homeChatJid;
+        const jobs = listBackgroundAgents(
+          homeChatJid,
+          data.mineOnly ? dispatchedFrom : undefined,
+        );
+        writeTaskIpcResult(sourceGroup, ipcAgentId, 'get_background_jobs_result', requestId, {
+          success: true,
+          jobs: jobs.map(serializeBackgroundJob),
+        });
+      } catch (err) {
+        logger.error({ sourceGroup, err }, 'get_background_jobs failed');
+        try {
+          writeTaskIpcResult(sourceGroup, ipcAgentId, 'get_background_jobs_result', requestId, {
+            success: false,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        } catch {
+          /* ignore */
+        }
+      }
+      break;
+    }
+
+    case 'get_job_progress': {
+      const requestId = data.requestId;
+      if (!requestId || !SAFE_REQUEST_ID_RE.test(requestId)) break;
+      try {
+        const jobId = (data.jobId || '').trim();
+        const job = jobId ? getBackgroundJob(jobId) : undefined;
+        writeTaskIpcResult(sourceGroup, ipcAgentId, 'get_job_progress_result', requestId, {
+          success: true,
+          job: job ? serializeBackgroundJob(job) : null,
+        });
+      } catch (err) {
+        logger.error({ sourceGroup, err }, 'get_job_progress failed');
+        try {
+          writeTaskIpcResult(sourceGroup, ipcAgentId, 'get_job_progress_result', requestId, {
+            success: false,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        } catch {
+          /* ignore */
+        }
+      }
+      break;
+    }
 
     case 'discord_get_history':
     case 'discord_get_channel_info':
@@ -6307,7 +6641,7 @@ async function processAgentConversation(
   agentId: string,
 ): Promise<void> {
   const agent = getAgent(agentId);
-  if (!agent || (agent.kind !== 'conversation' && agent.kind !== 'spawn')) {
+  if (!agent || (agent.kind !== 'conversation' && !isSpawnKind(agent.kind))) {
     logger.warn(
       { chatJid, agentId },
       'processAgentConversation: agent not found or not a conversation/spawn',
@@ -6362,7 +6696,7 @@ async function processAgentConversation(
   if (missedMessages.length === 0) {
     // Spawn agents are fire-and-forget: if no messages are found (race condition
     // or cursor already advanced), mark as error so they don't stay idle forever.
-    if (agent.kind === 'spawn' && agent.status === 'idle') {
+    if (isSpawnKind(agent.kind) && agent.status === 'idle') {
       updateAgentStatus(agentId, 'error', '未找到待处理消息');
       broadcastAgentStatus(
         chatJid,
@@ -6449,7 +6783,7 @@ async function processAgentConversation(
       if (toSend.length === 0) {
         // Spawn agents are fire-and-forget: if expansion consumed all
         // messages with replies, mark as completed so the agent slot is freed.
-        if (agent.kind === 'spawn' && agent.status === 'idle') {
+        if (isSpawnKind(agent.kind) && agent.status === 'idle') {
           updateAgentStatus(agentId, 'completed');
           broadcastAgentStatus(
             chatJid,
@@ -6565,6 +6899,9 @@ async function processAgentConversation(
     : undefined;
   let agentStreamingAccText = '';
   let agentStreamInterrupted = false;
+  // Phase 1-B: throttle the background-job progress heartbeat so frequent
+  // text_delta events don't hammer SQLite (task_progress always flushes).
+  let lastBgHeartbeatAt = 0;
   // Mirrors the main session's `output.status === 'closed'` handling: set when
   // the container drained mid-query so the finally block finalizes the card as
   // "reconnecting" instead of leaving a zombie 生成中 card.
@@ -6661,6 +6998,37 @@ async function processAgentConversation(
         !output.streamEvent.parentToolUseId
       ) {
         agentStreamingAccText += output.streamEvent.text;
+      }
+
+      // ── Phase 1-B: background-job progress heartbeat ──
+      // The foreground polls get_background_jobs / get_job_progress, which read
+      // progress_summary off the agents row. Keep it fresh from the job's own
+      // stream: task_progress (a SDK Task fan-out step) flushes immediately;
+      // top-level text_delta nudges the timestamp at most once / 3s so a long
+      // single-step job still looks alive. Pure DB write — never blocks the job.
+      if (agent.kind === 'background') {
+        const ev = output.streamEvent;
+        const heartbeatSummary =
+          ev.eventType === 'task_progress'
+            ? ev.taskSummary || ev.summary || ev.taskDescription || undefined
+            : ev.eventType === 'text_delta' && !ev.parentToolUseId
+              ? agentStreamingAccText.slice(-200).trim() || undefined
+              : undefined;
+        if (heartbeatSummary) {
+          const nowMs = Date.now();
+          const isTaskProgress = ev.eventType === 'task_progress';
+          if (isTaskProgress || nowMs - lastBgHeartbeatAt >= 3000) {
+            lastBgHeartbeatAt = nowMs;
+            try {
+              updateAgentProgress(agentId, heartbeatSummary);
+            } catch (err) {
+              logger.debug(
+                { err, agentId },
+                'background heartbeat updateAgentProgress failed',
+              );
+            }
+          }
+        }
       }
 
       // ── Feed stream events into Feishu streaming card ──
@@ -7000,7 +7368,7 @@ async function processAgentConversation(
         // compression outputs, not the final result; closing now would kill the agent
         // before it finishes the actual task.
         if (
-          agent.kind === 'spawn' &&
+          isSpawnKind(agent.kind) &&
           text &&
           output.sourceKind !== 'overflow_partial' &&
           output.sourceKind !== 'compact_partial'
@@ -7326,7 +7694,7 @@ async function processAgentConversation(
 
     // ── Spawn result injection: write final output back to the source chat ──
     if (
-      agent.kind === 'spawn' &&
+      isSpawnKind(agent.kind) &&
       agent.spawned_from_jid &&
       lastAgentReplyText
     ) {
@@ -7374,8 +7742,18 @@ async function processAgentConversation(
     // don't accumulate in the active agent list.
     // MUST be inside finally so status is reset even on unhandled exceptions (#227).
     const endStatus =
-      agent.kind === 'spawn' ? (hadError ? 'error' : 'completed') : 'idle';
-    updateAgentStatus(agentId, endStatus, hadError ? lastError : undefined);
+      isSpawnKind(agent.kind) ? (hadError ? 'error' : 'completed') : 'idle';
+    // Phase 1-B fix: persist the final answer into result_summary on
+    // successful spawn/background completion so get_background_jobs /
+    // get_job_progress expose it via the `result` field (was always null —
+    // the foreground could only see the chat-injected message). Cap to keep
+    // the row lean; the full text still lands as an injected message above.
+    const endSummary = hadError
+      ? lastError
+      : isSpawnKind(agent.kind) && lastAgentReplyText
+        ? lastAgentReplyText.slice(0, 8000)
+        : undefined;
+    updateAgentStatus(agentId, endStatus, endSummary);
     broadcastAgentStatus(
       chatJid,
       agentId,
