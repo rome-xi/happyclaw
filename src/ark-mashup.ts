@@ -27,6 +27,17 @@ import { logger } from './logger.js';
  */
 const DEFAULT_WORKER_MODEL = 'ark/seed-code-0530';
 
+/**
+ * 自有混搭网关入口(替代直连公司 super-relay)。HappyClaw 把 ANTHROPIC_BASE_URL 指向它:
+ *   claude* 模型 → 网关笨透传到 api.anthropic.com(转发本进程自带 OAuth,最防封);
+ *   其它模型名(如 flagship/code/fast 档名)→ 网关转发本地 new-api 走分档/多 provider。
+ * 见 ~/gateway/claude_gateway.py。可用 env ARK_GATEWAY_URL 覆盖。
+ */
+const GATEWAY_URL = process.env.ARK_GATEWAY_URL || 'http://127.0.0.1:3011';
+/** 工人槽默认落"档位虚拟名"(由探针自动选每档最优);可被 config 的 per-slot 字段覆盖。 */
+const DEFAULT_SONNET_TIER = 'flagship';
+const DEFAULT_HAIKU_TIER = 'fast';
+
 export interface ArkMashupEnv {
   ANTHROPIC_BASE_URL: string;
   ANTHROPIC_CUSTOM_HEADERS: string;
@@ -68,21 +79,21 @@ export function getArkMashupEnv(): ArkMashupEnv | null {
     // 两个工人槽各自可被 per-slot 字段独立覆盖，未配则回落到 baseWorker（向后兼容旧的单旋钮行为）：
     //   sonnet 槽（“要脑子的工人”：adversarial verify / synthesize / judge）→ worker_model_sonnet
     //   haiku  槽（“体力工人”：读 / 析 / 批量转换 / 搜，扛大头）        → worker_model_haiku
-    const baseWorker =
-      process.env.ARK_WORKER_MODEL ||
-      (cfg.worker_model || '').trim() ||
-      DEFAULT_WORKER_MODEL;
     const sonnetModel =
       process.env.ARK_WORKER_MODEL_SONNET ||
       (cfg.worker_model_sonnet || '').trim() ||
-      baseWorker;
+      DEFAULT_SONNET_TIER;
     const haikuModel =
       process.env.ARK_WORKER_MODEL_HAIKU ||
       (cfg.worker_model_haiku || '').trim() ||
-      baseWorker;
+      DEFAULT_HAIKU_TIER;
+    // 切到自有网关:base_url = 本地网关;CUSTOM_HEADERS 只留 x-relay-passthrough 作为
+    // 「保留 OAuth」哨兵(container-runner 据此不删 session OAuth),网关会把 x-relay-* 头剥掉,
+    // 不外泄、也不再把 plat key 放进 header。工人槽落档名,由探针选每档最优。
+    void key; // 仍用上面的 key 非空校验确认 super-relay 配置有效;不再写进 header
     return {
-      ANTHROPIC_BASE_URL: baseUrl,
-      ANTHROPIC_CUSTOM_HEADERS: `x-relay-passthrough: anthropic\nx-relay-api-key: ${key}`,
+      ANTHROPIC_BASE_URL: GATEWAY_URL,
+      ANTHROPIC_CUSTOM_HEADERS: 'x-relay-passthrough: anthropic',
       ANTHROPIC_DEFAULT_SONNET_MODEL: sonnetModel,
       ANTHROPIC_DEFAULT_HAIKU_MODEL: haikuModel,
     };
