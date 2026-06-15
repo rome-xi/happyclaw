@@ -128,6 +128,7 @@ const OUTPUT_GUIDELINES = loadPrompt('output.md');
 const WEB_FETCH_GUIDELINES = loadPrompt('web-fetch.md');
 const BACKGROUND_TASK_GUIDELINES = loadPrompt('background-tasks.md');
 const CONVERSATION_AGENT_GUIDELINES = loadPrompt('agent-override.md');
+const FRONT_RESPONDER_GUIDELINES = loadPrompt('front-responder.md');
 const MEMORY_SYSTEM_HOME = loadPrompt('memory-system.home.md');
 const MEMORY_SYSTEM_GUEST = loadPrompt('memory-system.guest.md');
 
@@ -1292,6 +1293,14 @@ async function runQuery(
       : []),
     ...(containerInput.agentId
       ? [{ name: 'agent-override.md', text: CONVERSATION_AGENT_BLOCK }]
+      : []),
+    // Phase 2: the non-home foreground responder runs on the flagship tier
+    // (model !== home default opus[1m]) and is a base lane (no agentId). Tell
+    // it to handle requests accurately itself and hand only heavy / parallel
+    // labor to dispatch_background_job. Home / opus foregrounds and
+    // agent/background lanes never see this.
+    ...(!isHome && !containerInput.agentId && CLAUDE_MODEL !== 'opus[1m]'
+      ? [{ name: 'front-responder.md', text: `<front-responder>\n${FRONT_RESPONDER_GUIDELINES}\n</front-responder>` }]
       : []),
   ];
   const systemPromptAppend = promptPieces.map((piece) => piece.text).join('\n');

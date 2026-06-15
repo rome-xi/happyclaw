@@ -1518,8 +1518,26 @@ export async function runHostAgent(
         for (const [k, v] of Object.entries(mashup)) {
           hostEnv[k] = v;
         }
+        // Phase 2: a non-home workspace's FOREGROUND responder (base lane —
+        // no agentId / taskRunId) runs on the flagship tier (gateway →
+        // new-api → tier_probe's current strongest Claude-4.8-class provider).
+        // It stays accurate — makes its own judgments + dispatch decisions —
+        // and only hands heavy / long / parallel labor to
+        // dispatch_background_job. Flagship-via-gateway preserves accuracy
+        // while saving official Claude quota. Home workspaces stay on opus[1m]
+        // (official, 1M ctx — agent-runner default). Background / spawn /
+        // scheduled-task lanes in ANY workspace keep opus[1m] so they stay
+        // capable opus-manager + doubao-worker agents. An explicit
+        // ANTHROPIC_MODEL (container-env) always wins.
+        const isForegroundLane = !input.agentId && !input.taskRunId;
+        if (!group.is_home && isForegroundLane && !hostEnv['ANTHROPIC_MODEL']) {
+          hostEnv['ANTHROPIC_MODEL'] = 'flagship';
+        }
         logger.info(
-          { folder: group.folder },
+          {
+            folder: group.folder,
+            frontModel: hostEnv['ANTHROPIC_MODEL'] || 'opus[1m]',
+          },
           'ark-mashup: injected relay env (opus passthrough manager + doubao workers)',
         );
       }
