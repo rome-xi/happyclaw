@@ -56,22 +56,35 @@ export function getArkMashupEnv(): ArkMashupEnv | null {
       base_url?: string;
       api_key?: string;
       worker_model?: string;
+      worker_model_sonnet?: string;
+      worker_model_haiku?: string;
     };
     const baseUrl = (cfg.base_url || '').trim();
     const key = (cfg.api_key || '').trim();
     if (!baseUrl || !key) return null;
-    // 工人模型优先级：env 覆盖 > config 的 worker_model（运行时旋钮——改 JSON 即换模型，
-    // 无需重编/重启，下次 agent spawn 现读生效）> 兜底默认。
-    // 注意：不回退到 cfg.model——那是另一个豆包模型（extended-thinking），语义不同。
-    const workerModel =
+    // 工人模型优先级（全部为运行时旋钮——改 JSON 即换模型，无需重编/重启，下次 agent spawn 现读生效）：
+    //   通用兜底 baseWorker：env ARK_WORKER_MODEL > config.worker_model > 内置默认。
+    //   注意：不回退到 cfg.model——那是另一个豆包模型（extended-thinking），语义不同。
+    // 两个工人槽各自可被 per-slot 字段独立覆盖，未配则回落到 baseWorker（向后兼容旧的单旋钮行为）：
+    //   sonnet 槽（“要脑子的工人”：adversarial verify / synthesize / judge）→ worker_model_sonnet
+    //   haiku  槽（“体力工人”：读 / 析 / 批量转换 / 搜，扛大头）        → worker_model_haiku
+    const baseWorker =
       process.env.ARK_WORKER_MODEL ||
       (cfg.worker_model || '').trim() ||
       DEFAULT_WORKER_MODEL;
+    const sonnetModel =
+      process.env.ARK_WORKER_MODEL_SONNET ||
+      (cfg.worker_model_sonnet || '').trim() ||
+      baseWorker;
+    const haikuModel =
+      process.env.ARK_WORKER_MODEL_HAIKU ||
+      (cfg.worker_model_haiku || '').trim() ||
+      baseWorker;
     return {
       ANTHROPIC_BASE_URL: baseUrl,
       ANTHROPIC_CUSTOM_HEADERS: `x-relay-passthrough: anthropic\nx-relay-api-key: ${key}`,
-      ANTHROPIC_DEFAULT_SONNET_MODEL: workerModel,
-      ANTHROPIC_DEFAULT_HAIKU_MODEL: workerModel,
+      ANTHROPIC_DEFAULT_SONNET_MODEL: sonnetModel,
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: haikuModel,
     };
   } catch (err) {
     logger.warn({ err }, 'ark-mashup: failed to read super-relay config');
