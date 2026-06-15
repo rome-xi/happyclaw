@@ -9,7 +9,7 @@ import {
 } from '../schemas.js';
 import type { AuthUser, RegisteredGroup, ExecutionMode } from '../types.js';
 import { checkGroupLimit } from '../billing.js';
-import { DATA_DIR, GROUPS_DIR, isDockerAvailable } from '../config.js';
+import { DATA_DIR, GROUPS_DIR } from '../config.js';
 import {
   isHostExecutionGroup,
   hasHostExecutionPermission,
@@ -317,13 +317,13 @@ groupRoutes.post('/', authMiddleware, async (c) => {
     return c.json({ error: 'Group name is required' }, 400);
   }
 
-  // If user didn't specify execution mode, pick based on Docker availability
-  const executionMode = validation.data.execution_mode || (await isDockerAvailable() ? 'container' : 'host');
+  const authUser = c.get('user') as AuthUser;
+  // 默认执行模式：有 host 权限的用户(admin)默认 host，member 默认 container（新增工作区默认 host）
+  const executionMode =
+    validation.data.execution_mode || (hasHostExecutionPermission(authUser) ? 'host' : 'container');
   const customCwd = validation.data.custom_cwd; // Schema already trims and converts empty to undefined
   const initSourcePath = validation.data.init_source_path;
   const initGitUrl = validation.data.init_git_url;
-  const authUser = c.get('user') as AuthUser;
-
   // Billing: check group limit
   const groupLimit = checkGroupLimit(authUser.id, authUser.role);
   if (!groupLimit.allowed) {
