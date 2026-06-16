@@ -1,0 +1,26 @@
+[Unit]
+Description=HappyClaw (self-hosted Claude Code agent service)
+Wants=network-online.target
+After=network-online.target docker.service
+
+[Service]
+Type=simple
+
+# Change this to your repo path (must contain dist/ and web/dist/)
+WorkingDirectory=/opt/happyclaw
+
+# Optional: put overrides here (WEB_PORT, TRUST_PROXY, TZ, LOG_LEVEL...)
+EnvironmentFile=-/etc/happyclaw/happyclaw.env
+
+# If you use nvm/asdf and systemd can't find node, change this to an absolute path
+ExecStart=/usr/bin/env node dist/index.js
+
+Restart=on-failure
+RestartSec=3
+
+# Recommended: run as a dedicated user. Create it and chown the repo + data/ directory.
+# User=happyclaw
+# Group=happyclaw
+
+[Install]
+WantedBy=multi-user.target

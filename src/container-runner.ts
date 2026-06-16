@@ -825,6 +825,21 @@ export function buildVolumeMounts(
     readonly: true,
   });
 
+  // Mount agent-runner prompts from host — keeps system prompts in sync with src.
+  // entrypoint.sh 用 `ln -s /app/prompts /tmp/prompts`，覆盖镜像内旧副本，
+  // 避免新增 prompt 文件（如 front-responder.md）在旧镜像中缺失导致容器启动崩溃。
+  const agentRunnerPrompts = path.join(
+    projectRoot,
+    'container',
+    'agent-runner',
+    'prompts',
+  );
+  mounts.push({
+    hostPath: agentRunnerPrompts,
+    containerPath: '/app/prompts',
+    readonly: true,
+  });
+
   // Admin's effective Claude config: mount CLAUDE.md and rules/ into /workspace/
   // so the SDK's directory traversal (cwd → root) discovers them at /workspace/ level.
   // Only for admin-created workspaces; ordinary users must not inherit host-global config.

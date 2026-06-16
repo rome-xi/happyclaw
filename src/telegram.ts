@@ -1355,14 +1355,45 @@ export function createTelegramConnection(
       // message_thread_id is NOT passed to editMessageText — the message id
       // already identifies the target within its thread.
       const payload = text || '​';
+
+      // One retry on 429 flood control, honoring Telegram's retry_after. Edits
+      // are throttled (≥900ms) but bursts can still trip flood control; backing
+      // off keeps the stream alive instead of dropping the update.
+      const editOnce = async (content: string, html: boolean): Promise<void> => {
+        const api = bot!.api;
+        try {
+          if (html) {
+            await api.editMessageText(chatIdNum, messageId, content, {
+              parse_mode: 'HTML',
+            });
+          } else {
+            await api.editMessageText(chatIdNum, messageId, content);
+          }
+        } catch (err: any) {
+          const retryAfter =
+            err?.error_code === 429
+              ? err?.parameters?.retry_after ?? err?.parameters?.retryAfter
+              : undefined;
+          if (typeof retryAfter === 'number' && retryAfter > 0) {
+            await new Promise((r) =>
+              setTimeout(r, Math.min(retryAfter * 1000 + 250, 10_000)),
+            );
+            if (html) {
+              await api.editMessageText(chatIdNum, messageId, content, {
+                parse_mode: 'HTML',
+              });
+            } else {
+              await api.editMessageText(chatIdNum, messageId, content);
+            }
+            return;
+          }
+          throw err;
+        }
+      };
+
       if (asHtml) {
         try {
-          await bot.api.editMessageText(
-            chatIdNum,
-            messageId,
-            markdownToTelegramHtml(payload),
-            { parse_mode: 'HTML' },
-          );
+          await editOnce(markdownToTelegramHtml(payload), true);
           return;
         } catch (err) {
           // HTML parse failed (unclosed tags) — fall through to plain text.
@@ -1372,7 +1403,7 @@ export function createTelegramConnection(
           );
         }
       }
-      await bot.api.editMessageText(chatIdNum, messageId, payload);
+      await editOnce(payload, false);
     },
 
     async createForumTopic(

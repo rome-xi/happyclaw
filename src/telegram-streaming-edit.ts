@@ -27,8 +27,11 @@ import { logger } from './logger.js';
 
 // ─── Constants ───────────────────────────────────────────────
 
-const STREAM_UPDATE_INTERVAL = 1500; // ms — Telegram edit rate limit is strict
-const AUX_FLUSH_INTERVAL = 2000; // ms
+const STREAM_UPDATE_INTERVAL = 900; // ms — Telegram edit rate limit is strict;
+// kept under ~1/s but tighter than before for a livelier feel. The transport
+// honors 429 retry_after (see editStreamingMessage), so an occasional flood is
+// absorbed instead of crashing the stream.
+const AUX_FLUSH_INTERVAL = 1200; // ms
 // Telegram hard limit is 4096 chars; leave headroom for HTML tag overhead.
 const TG_MSG_LIMIT = 3800;
 const MAX_THINKING_CHARS = 500;
@@ -308,8 +311,16 @@ export class TelegramStreamingEditController {
 
   // ─── Auxiliary build ───────────────────────────────────────
 
-  /** Build the auxiliary prefix (thinking + tools + recent events) as plain text. */
-  private buildAuxPrefix(): string {
+  /**
+   * Build the auxiliary block (thinking + tools + recent events) as plain text.
+   *
+   * Rendered as a SUFFIX below the body (see composeContent): body stays at the
+   * top where it's readable, progress sits underneath. This is what keeps the
+   * card from looking "frozen" while a backgrounded turn waits on a Task — the
+   * user sees stable body text up top, not a wall of static progress lines with
+   * the reply buried beneath them.
+   */
+  private buildAuxBlock(): string {
     const parts: string[] = [];
 
     if (this.systemStatus) {
@@ -366,7 +377,20 @@ export class TelegramStreamingEditController {
       parts.push(`📝 调用轨迹\n${eventLines.join('\n')}`);
     }
 
-    return parts.length > 0 ? parts.join('\n\n') + '\n\n———\n\n' : '';
+    return parts.length > 0 ? parts.join('\n\n') : '';
+  }
+
+  /**
+   * Compose the mid-stream message: body on top, progress block underneath.
+   * When there is no body yet (pure thinking/tool phase), the aux block stands
+   * alone as a placeholder so the card isn't empty.
+   */
+  private composeContent(): string {
+    const aux = this.buildAuxBlock();
+    const body = this.accumulatedText;
+    if (!body.trim()) return aux;
+    if (!aux) return body;
+    return `${body}\n\n———\n\n${aux}`;
   }
 
   private static formatElapsed(ms: number): string {
@@ -449,7 +473,7 @@ export class TelegramStreamingEditController {
       this.auxFlushTimer = null;
       if (this.state === 'completed' || this.state === 'aborted') return;
       this.lastAuxFlushTime = Date.now();
-      const content = this.buildAuxPrefix() + this.accumulatedText;
+      const content = this.composeContent();
       this.editLast(content).catch((err: any) => {
         logger.debug({ err: err?.message }, 'Telegram aux flush failed');
       });
@@ -472,10 +496,11 @@ export class TelegramStreamingEditController {
       return;
     }
 
-    let content = this.buildAuxPrefix() + this.accumulatedText;
-    // Mid-stream: keep the tail if over the limit (full split only at complete()).
+    let content = this.composeContent();
+    // Mid-stream: keep the HEAD (body lives on top now) if over the limit; the
+    // full code-fence-aware split only runs at complete().
     if (content.length > TG_MSG_LIMIT) {
-      content = '...' + content.slice(-(TG_MSG_LIMIT - 3));
+      content = content.slice(0, TG_MSG_LIMIT - 3) + '...';
     }
     await this.editLast(content);
     this.lastUpdateTime = Date.now();

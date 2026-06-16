@@ -2849,8 +2849,14 @@ function loadState(): void {
     if (!group.is_home) continue;
 
     // Determine expected mode based on the owner's role
-    // Admin home groups use host mode, member home groups use container mode
-    const isAdminHome = group.folder === MAIN_GROUP_FOLDER;
+    // Admin home groups use host mode, member home groups use container mode.
+    // 注意：admin 的主容器 folder 不一定是 'main'（首个 admin 才是 main，
+    // 后续 admin 是 home-{userId}），所以按 owner 角色判断，而非仅认 folder 名。
+    const ownerRole = group.created_by
+      ? getUserById(group.created_by)?.role
+      : undefined;
+    const isAdminHome =
+      group.folder === MAIN_GROUP_FOLDER || ownerRole === 'admin';
     const expectedMode = isAdminHome ? 'host' : 'container';
 
     if (group.executionMode !== expectedMode) {

@@ -1,0 +1,9 @@
+[Unit]
+Description=Claude Traffic Guard - Block Claude API if exit IP is wrong
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/theonlyheart/happyclaw/scripts/claude-traffic-guard.sh
+User=root
