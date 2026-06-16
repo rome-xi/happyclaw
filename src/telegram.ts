@@ -91,6 +91,24 @@ export interface TelegramConnection {
    * forum / the bot lacks "Manage Topics" admin permission / the API failed.
    */
   createForumTopic(chatId: string, name: string): Promise<number | null>;
+  /**
+   * Send an initial streaming message and return its message_id. Used by the
+   * streaming-edit controller to create the placeholder it subsequently edits.
+   * Returns null if the bot is offline / chat id invalid / send failed.
+   */
+  sendStreamingMessage(chatId: string, text: string): Promise<number | null>;
+  /**
+   * Edit a previously-sent streaming message in place. `asHtml=true` runs the
+   * text through markdownToTelegramHtml (final render); otherwise it is sent as
+   * plain text (safe for mid-stream content with unclosed code fences).
+   * Throws on API failure so the controller can fall back.
+   */
+  editStreamingMessage(
+    chatId: string,
+    messageId: number,
+    text: string,
+    asHtml: boolean,
+  ): Promise<void>;
   isConnected(): boolean;
 }
 
@@ -1299,6 +1317,62 @@ export function createTelegramConnection(
       } catch (err) {
         logger.debug({ err, chatId }, 'Failed to send Telegram chat action');
       }
+    },
+
+    async sendStreamingMessage(
+      chatId: string,
+      text: string,
+    ): Promise<number | null> {
+      if (!bot) return null;
+      const { chatIdNum, threadOpt } = parseTopicTarget(chatId);
+      if (isNaN(chatIdNum)) {
+        logger.error({ chatId }, 'Invalid Telegram chat ID for streaming');
+        return null;
+      }
+      try {
+        const sent = await bot.api.sendMessage(chatIdNum, text || '​', {
+          ...threadOpt,
+        });
+        return sent.message_id;
+      } catch (err) {
+        logger.warn(
+          { err, chatId },
+          'Failed to send initial Telegram streaming message',
+        );
+        return null;
+      }
+    },
+
+    async editStreamingMessage(
+      chatId: string,
+      messageId: number,
+      text: string,
+      asHtml: boolean,
+    ): Promise<void> {
+      if (!bot) return;
+      const { chatIdNum } = parseTopicTarget(chatId);
+      if (isNaN(chatIdNum)) return;
+      // message_thread_id is NOT passed to editMessageText — the message id
+      // already identifies the target within its thread.
+      const payload = text || '​';
+      if (asHtml) {
+        try {
+          await bot.api.editMessageText(
+            chatIdNum,
+            messageId,
+            markdownToTelegramHtml(payload),
+            { parse_mode: 'HTML' },
+          );
+          return;
+        } catch (err) {
+          // HTML parse failed (unclosed tags) — fall through to plain text.
+          logger.debug(
+            { err, chatId },
+            'Telegram streaming HTML edit failed, retry as plain',
+          );
+        }
+      }
+      await bot.api.editMessageText(chatIdNum, messageId, payload);
     },
 
     async createForumTopic(

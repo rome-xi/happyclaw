@@ -54,14 +54,16 @@ import {
 import type { DingTalkStreamingCardController } from './dingtalk-streaming-card.js';
 import type { DiscordStreamingEditController } from './discord-streaming-edit.js';
 import type { QQStreamingController } from './qq-streaming-card.js';
+import type { TelegramStreamingEditController } from './telegram-streaming-edit.js';
 import { CHANNEL_PREFIXES } from './channel-prefixes.js';
 
-/** Union type for any streaming card controller (Feishu, DingTalk, Discord, or QQ) */
+/** Union type for any streaming card controller (Feishu, DingTalk, Discord, QQ, or Telegram) */
 export type StreamingSession =
   | StreamingCardController
   | DingTalkStreamingCardController
   | DiscordStreamingEditController
-  | QQStreamingController;
+  | QQStreamingController
+  | TelegramStreamingEditController;
 
 // ─── Unified Interface ──────────────────────────────────────────
 
@@ -444,6 +446,28 @@ export function createTelegramChannel(
     ): Promise<number | null> {
       if (!inner) return null;
       return inner.createForumTopic(chatId, name);
+    },
+
+    async createStreamingSession(
+      chatId: string,
+      onCardCreated?: (messageId: string) => void,
+    ): Promise<StreamingSession | undefined> {
+      if (!inner) return undefined;
+      const conn = inner;
+      const { TelegramStreamingEditController } = await import(
+        './telegram-streaming-edit.js'
+      );
+      return new TelegramStreamingEditController(
+        {
+          createMessage: (text: string) => conn.sendStreamingMessage(chatId, text),
+          editMessage: (messageId: number, text: string, asHtml: boolean) =>
+            conn.editStreamingMessage(chatId, messageId, text, asHtml),
+        },
+        {
+          onCardCreated,
+          fallbackSend: (text: string) => conn.sendMessage(chatId, text),
+        },
+      );
     },
 
     isConnected(): boolean {
