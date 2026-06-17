@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-cd /home/theonlyheart/happyclaw
+cd "$HOME/happyclaw"
 
 LOG_PREFIX="[auto-update]"
 BACKUP_REF=""

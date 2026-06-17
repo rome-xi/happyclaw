@@ -1,17 +1,25 @@
 #!/usr/bin/env bash
 # Claude 流量守护脚本
-# 定期检查出口 IP，如果不是预期的台北家宽 IP，阻断所有 Claude/Anthropic 相关流量
+# 定期检查出口 IP，如果不是预期的家宽 IP，阻断所有 Claude/Anthropic 相关流量
 # 双重拦截：iptables SNI 域名匹配 + /etc/hosts DNS 劫持
 # 覆盖：本机直接请求 + WireGuard VPN 转发的请求
 
 set -euo pipefail
 
 # ===== 配置 =====
-EXPECTED_IP="<REDACTED_IP>"
+# 预期出口 IP 从未入库的本地配置读取，避免把家庭公网 IP 写进仓库。
+# 在 ~/.config/claude-traffic-guard.env 里写： EXPECTED_IP="你的公网IP"
+GUARD_ENV="${CLAUDE_GUARD_ENV:-$HOME/.config/claude-traffic-guard.env}"
+[[ -r "$GUARD_ENV" ]] && source "$GUARD_ENV"
+EXPECTED_IP="${EXPECTED_IP:-}"
+if [[ -z "$EXPECTED_IP" ]]; then
+    echo "ERROR: 未配置 EXPECTED_IP（请在 $GUARD_ENV 中设置）" >&2
+    exit 1
+fi
 CHECK_URL="https://api.ipify.org"
 CHECK_TIMEOUT=10
 FLAG_FILE="/tmp/claude-traffic-blocked"
-LOG_FILE="/home/theonlyheart/happyclaw/data/logs/claude-guard.log"
+LOG_FILE="$HOME/happyclaw/data/logs/claude-guard.log"
 IPTABLES_CHAIN="CLAUDE_GUARD"
 HOSTS_MARKER="# CLAUDE_GUARD_BLOCK"
 
@@ -44,8 +52,8 @@ notify() {
     log "NOTIFY: $msg"
 
     # 尝试通过 Telegram bot 直接发送
-    if [[ -f /home/theonlyheart/happyclaw/scripts/notify-telegram.sh ]]; then
-        bash /home/theonlyheart/happyclaw/scripts/notify-telegram.sh "$msg" 2>/dev/null || true
+    if [[ -f "$HOME/happyclaw/scripts/notify-telegram.sh" ]]; then
+        bash "$HOME/happyclaw/scripts/notify-telegram.sh" "$msg" 2>/dev/null || true
     fi
 }
 
