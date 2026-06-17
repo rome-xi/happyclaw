@@ -418,6 +418,19 @@ export class GroupQueue {
     state.queryInFlight = false;
   }
 
+  /**
+   * Public check: does this group's main IPC input dir hold unconsumed
+   * `.json` messages (orphaned by an agent that exited in its idle window)?
+   * Used by processGroupMessages to avoid the "0 rows from DB → return without
+   * spawning" short-circuit when an orphan file is still on disk, which would
+   * otherwise leave the message forever unconsumed (see #inflight-message-drop).
+   * Only checks the conversation-lane input (no agentId/taskRunId).
+   */
+  hasUnconsumedIpcInput(groupFolder: string): boolean {
+    if (!groupFolder) return false;
+    return this.hasRemainingIpcMessages(groupFolder, null, null);
+  }
+
   getStuckPendingGroups(
     idleThresholdMs: number,
   ): Array<{ jid: string; idleMs: number }> {

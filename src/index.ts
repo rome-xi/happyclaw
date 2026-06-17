@@ -1800,11 +1800,25 @@ async function createBoundWorkspace(
   const folder = `flow-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
   const now = new Date().toISOString();
 
+  // Execution mode follows host-execution permission, NOT just Docker
+  // availability: users who may run host (admin) get 'host' by default so
+  // /new-created workspaces match their home/main runtime; others get
+  // 'container' when Docker is available, else fall back to 'host'.
+  // (Mirrors the web route's hasHostExecutionPermission gate; previously this
+  // path ignored permission and defaulted everyone to 'container'.)
+  const creator = getUserById(userId);
+  const canUseHost = creator?.role === 'admin';
+  const executionMode: 'host' | 'container' = canUseHost
+    ? 'host'
+    : (await isDockerAvailable())
+      ? 'container'
+      : 'host';
+
   const newGroup: RegisteredGroup = {
     name,
     folder,
     added_at: now,
-    executionMode: (await isDockerAvailable()) ? 'container' : 'host',
+    executionMode,
     created_by: userId,
   };
 
@@ -3119,7 +3133,26 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   const sinceCursor = lastAgentTimestamp[chatJid] || EMPTY_CURSOR;
   let missedMessages = getMessagesSince(chatJid, sinceCursor);
 
-  if (missedMessages.length === 0) return true;
+  if (missedMessages.length === 0) {
+    // The normal cursor found nothing — but an IPC message injected into a
+    // now-exited agent may still sit orphaned in the input dir. In that case
+    // lastAgentTimestamp was already advanced past it ('sent' path), so the
+    // re-read above misses it. Fall back to the un-advanced lastCommittedCursor
+    // so we re-pull it and spawn a runner whose boot drainIpcInput consumes the
+    // orphan. Without this the message is lost forever (see #inflight-message-drop).
+    if (group.folder && queue.hasUnconsumedIpcInput(group.folder)) {
+      const committed = lastCommittedCursor[chatJid] || EMPTY_CURSOR;
+      missedMessages = getMessagesSince(chatJid, committed);
+      if (missedMessages.length > 0) {
+        logger.warn(
+          { chatJid, folder: group.folder, count: missedMessages.length },
+          'Orphaned IPC input found with 0 rows from lastAgentTimestamp; ' +
+            'recovering via lastCommittedCursor',
+        );
+      }
+    }
+    if (missedMessages.length === 0) return true;
+  }
 
   // Admin home is shared as web:main, so select runtime owner from the latest
   // active admin sender to avoid writing global memory into another admin's
@@ -8017,6 +8050,12 @@ async function startMessageLoop(): Promise<void> {
               timestamp: lastProcessed.timestamp,
               id: lastProcessed.id,
             });
+            // Mark that messages were IPC-injected into the running agent so the
+            // runForGroup finally's recovery net (hasIpcInjectedMessages re-arm)
+            // also covers the IM path — mirrors the Web path (web.ts:631).
+            // Without this, IM-injected messages that land in the agent's idle
+            // exit window can be orphaned (see #inflight-message-drop).
+            queue.markIpcInjectedMessage(chatJid);
           } else {
             // no_active — enqueue for a new one
             queue.enqueueMessageCheck(chatJid);
