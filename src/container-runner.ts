@@ -1559,8 +1559,8 @@ export async function runHostAgent(
     }
 
     // Claude Code 进程伪装（借鉴 cloud-cli-proxy）：注入 BUN_OPTIONS --preload spoof JS，
-    // 让 claude 进程内 os.cpus()/hostname()/machine-id 等返回伪造值（AMD EPYC 美式主机），
-    // dns-guard 进程内拦截 statsig/sentry/growthbook 遥测。配太平洋时区 + en_US。
+    // 让 claude 进程内 os.cpus()/hostname()/machine-id 等返回伪造值（家用 PC，匹配美国家宽出口），
+    // dns-guard 进程内拦截 statsig/sentry/growthbook 遥测。配美东时区 + en_US。
     // 只注 BUN_OPTIONS（claude 是 Bun binary 读它）；不注 NODE_OPTIONS 避免污染 agent-runner（node）。
     //
     // 2026-07-06 已修复并重新启用：spoof 两文件所有直接赋值统一改成 define() helper
@@ -1569,14 +1569,14 @@ export async function runHostAgent(
     // 直接 `os.tmpdir = fn` 抛 TypeError → preload 阶段崩溃 → claude ~30ms exit 1，
     // stderr 静默（agent-runner 只能捕获 "process exited with code 1"），工作区回消息全丢。
     // 已用真实 Bun runtime（claude binary 本身 + BUN_OPTIONS=--preload）实测：
-    // 加载零报错，hostname/platform/cpus(AMD EPYC)/MAC/machine-id 全部劫持生效，
+    // 加载零报错，hostname/platform/cpus(Intel i5)/MAC/machine-id 全部劫持生效，
     // /.dockerenv=false、statsig DNS 被拦截（ECONNREFUSED），验证全 PASS。
     const ENABLE_SPOOF = true;
     const spoofScript = path.join(SPOOF_DIR, 'spoof-fingerprint.js');
     const dnsGuardScript = path.join(SPOOF_DIR, 'dns-guard.js');
     if (ENABLE_SPOOF && fs.existsSync(spoofScript) && fs.existsSync(dnsGuardScript)) {
       const folderTag = group.folder.replace(/[^a-zA-Z0-9]/g, '').slice(-6).toLowerCase();
-      hostEnv['SPOOF_HOSTNAME'] = `cloud-vm-${folderTag || 'claude'}`;
+      hostEnv['SPOOF_HOSTNAME'] = `desktop-${folderTag || 'pc'}`;
       hostEnv['BUN_OPTIONS'] = `--preload ${spoofScript} --preload ${dnsGuardScript}${hostEnv['BUN_OPTIONS'] ? ' ' + hostEnv['BUN_OPTIONS'] : ''}`;
       // 强制东部时区：出口 IP 实测在华盛顿特区(D.C.)，America/New_York (EST/EDT)。
       // 不用 || 兜底——前面链路已把 TZ 设成 Asia/Shanghai，必须覆盖才能和美国 IP 一致。

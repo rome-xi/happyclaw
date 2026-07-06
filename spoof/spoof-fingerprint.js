@@ -19,7 +19,7 @@ function define(target, key, value) {
 // 可通过环境变量覆盖，也可以直接改这里的默认值
 
 const SPOOF = {
-  hostname: process.env.SPOOF_HOSTNAME || "cloud-vm-" + crypto.randomBytes(3).toString("hex"),
+  hostname: process.env.SPOOF_HOSTNAME || "desktop-" + crypto.randomBytes(3).toString("hex"),
   username: process.env.SPOOF_USERNAME || "user",
   homedir:  process.env.SPOOF_HOMEDIR  || "/home/user",
   platform: process.env.SPOOF_PLATFORM || "linux",
@@ -32,7 +32,7 @@ const SPOOF = {
 
   // 伪造一个稳定的 MAC 地址（基于 hostname 派生，保证同一 hostname 总是同一个 MAC）
   mac: process.env.SPOOF_MAC || (() => {
-    const h = process.env.SPOOF_HOSTNAME || "cloud-vm-default";
+    const h = process.env.SPOOF_HOSTNAME || "desktop-default";
     const hash = crypto.createHash("sha256").update(h).digest("hex");
     return [
       "02", // locally administered bit
@@ -44,9 +44,26 @@ const SPOOF = {
     ].join(":");
   })(),
 
-  cpuModel: process.env.SPOOF_CPU_MODEL || "AMD EPYC 7763 64-Core Processor",
-  cpuCores: parseInt(process.env.SPOOF_CPU_CORES || "4", 10),
-  totalMem: parseInt(process.env.SPOOF_TOTAL_MEM || String(8 * 1024 * 1024 * 1024), 10),
+  cpuModel: process.env.SPOOF_CPU_MODEL || "Intel(R) Core(TM) i5-12400 CPU @ 2.50GHz",
+  cpuCores: parseInt(process.env.SPOOF_CPU_CORES || "12", 10),
+  totalMem: parseInt(process.env.SPOOF_TOTAL_MEM || String(16 * 1024 * 1024 * 1024), 10),
+
+  // 家用路由器内网 IP（192.168.1.x 网段；基于 hostname 派生，稳定且各工作区不同）
+  lanIp: process.env.SPOOF_LAN_IP || (() => {
+    const hash = crypto.createHash("sha256").update(process.env.SPOOF_HOSTNAME || "desktop-default").digest("hex");
+    const lastOctet = (parseInt(hash.slice(0, 2), 16) % 200) + 50; // 50-249
+    return `192.168.1.${lastOctet}`;
+  })(),
+
+  // 家用 PC 序列号 / 硬件 UUID（基于 hostname 派生，去 CLOUD/VPS 字样）
+  serial: (() => {
+    const hash = crypto.createHash("sha256").update(process.env.SPOOF_HOSTNAME || "desktop-default").digest("hex").toUpperCase();
+    return hash.slice(0, 4) + "-" + hash.slice(4, 10);
+  })(),
+  hardwareUuid: (() => {
+    const hash = crypto.createHash("sha256").update(process.env.SPOOF_HOSTNAME || "desktop-default").digest("hex");
+    return `${hash.slice(0,8)}-${hash.slice(8,12)}-4${hash.slice(13,16)}-8${hash.slice(17,20)}-${hash.slice(20,32)}`;
+  })(),
 };
 
 // ── Patch os.hostname() ────────────────────────────────────────
@@ -79,21 +96,21 @@ define(os, "freemem", () => Math.floor(SPOOF.totalMem * 0.6));
 define(os, "cpus", () =>
   Array.from({ length: SPOOF.cpuCores }, (_, i) => ({
     model: SPOOF.cpuModel,
-    speed: 2450,
+    speed: 2500,
     times: { user: 100000 + i * 1000, nice: 0, sys: 50000, idle: 900000, irq: 0 },
   }))
 );
 
 // ── Patch os.networkInterfaces() ───────────────────────────────
 define(os, "networkInterfaces", () => ({
-  eth0: [
+  enp3s0: [
     {
-      address: "10.0.0.2",
+      address: SPOOF.lanIp,
       netmask: "255.255.255.0",
       family: "IPv4",
       mac: SPOOF.mac,
       internal: false,
-      cidr: "10.0.0.2/24",
+      cidr: `${SPOOF.lanIp}/24`,
     },
   ],
   lo: [
@@ -131,8 +148,8 @@ try {
 const childProcess = require("child_process");
 
 const FINGERPRINT_COMMANDS = [
-  { pattern: /ioreg.*IOPlatformSerialNumber/, replacement: '"IOPlatformSerialNumber" = "CLOUD000000"' },
-  { pattern: /system_profiler\s+SPHardwareDataType/, replacement: "Serial Number (system): CLOUD000000\nHardware UUID: 00000000-0000-0000-0000-000000000000" },
+  { pattern: /ioreg.*IOPlatformSerialNumber/, replacement: `"IOPlatformSerialNumber" = "${SPOOF.serial}"` },
+  { pattern: /system_profiler\s+SPHardwareDataType/, replacement: `Serial Number (system): ${SPOOF.serial}\nHardware UUID: ${SPOOF.hardwareUuid}` },
   { pattern: /sysctl\s+kern\.uuid/, replacement: "kern.uuid: 00000000-0000-0000-0000-000000000000" },
   { pattern: /cat\s+\/etc\/machine-id/, replacement: crypto.createHash("sha256").update(SPOOF.hostname).digest("hex").slice(0, 32) },
   { pattern: /hostname/, replacement: SPOOF.hostname },
