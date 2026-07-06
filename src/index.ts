@@ -1806,13 +1806,9 @@ async function createBoundWorkspace(
   // 'container' when Docker is available, else fall back to 'host'.
   // (Mirrors the web route's hasHostExecutionPermission gate; previously this
   // path ignored permission and defaulted everyone to 'container'.)
-  const creator = getUserById(userId);
-  const canUseHost = creator?.role === 'admin';
-  const executionMode: 'host' | 'container' = canUseHost
-    ? 'host'
-    : (await isDockerAvailable())
-      ? 'container'
-      : 'host';
+  // 全 host 模式（家人靠谱 + 配合 claude-spoof 进程伪装）：所有新工作区默认 host。
+  // 原先仅 admin 用 host、非 admin 走 container（即「新工作区变 docker」问题的根因）。
+  const executionMode: 'host' | 'container' = 'host';
 
   const newGroup: RegisteredGroup = {
     name,
@@ -2862,16 +2858,9 @@ function loadState(): void {
   for (const [jid, group] of Object.entries(registeredGroups)) {
     if (!group.is_home) continue;
 
-    // Determine expected mode based on the owner's role
-    // Admin home groups use host mode, member home groups use container mode.
-    // 注意：admin 的主容器 folder 不一定是 'main'（首个 admin 才是 main，
-    // 后续 admin 是 home-{userId}），所以按 owner 角色判断，而非仅认 folder 名。
-    const ownerRole = group.created_by
-      ? getUserById(group.created_by)?.role
-      : undefined;
-    const isAdminHome =
-      group.folder === MAIN_GROUP_FOLDER || ownerRole === 'admin';
-    const expectedMode = isAdminHome ? 'host' : 'container';
+    // 全 host 模式：所有 home 工作区强制 host（家人靠谱 + claude-spoof 伪装）。
+    // 原先 admin home → host、member home → container。
+    const expectedMode: 'host' | 'container' = 'host';
 
     if (group.executionMode !== expectedMode) {
       group.executionMode = expectedMode;
