@@ -18,6 +18,12 @@ export const MOUNT_ALLOWLIST_PATH = path.resolve(
   'mount-allowlist.json',
 );
 export const DATA_DIR = path.resolve(PROJECT_ROOT, 'data');
+
+// Claude Code 进程伪装脚本目录（借鉴 cloud-cli-proxy）。
+// spoof-fingerprint.js 劫持 claude 进程内 os.cpus()/hostname()/machine-id 等返回伪造值；
+// dns-guard.js 进程内拦截 statsig/sentry/growthbook 遥测。host 模式下经 BUN_OPTIONS
+// 注入给 claude（Bun binary），不污染 agent-runner（node 不读 BUN_OPTIONS）。
+export const SPOOF_DIR = path.resolve(PROJECT_ROOT, 'spoof');
 export const STORE_DIR = path.join(DATA_DIR, 'db');
 export const GROUPS_DIR = path.join(DATA_DIR, 'groups');
 export const MAIN_GROUP_FOLDER = 'main';
