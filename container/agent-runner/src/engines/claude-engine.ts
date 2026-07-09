@@ -260,17 +260,26 @@ export class ClaudeEngine implements AgentEngine {
     }
 
     // ── 6. 构建 PreCompact hook ──
-    const hooksConfig = hooks?.preCompact
+    // 优先级：extra.preCompactHook（真实 SDK HookCallback）> hooks.preCompact（简单回调通知）
+    const externalPreCompact = extra.preCompactHook as HookCallback | undefined;
+    const hooksConfig = externalPreCompact || hooks?.preCompact
       ? ({
           PreCompact: [
             {
               hooks: [
-                (async (input: PreCompactHookInput) => {
-                  await hooks!.preCompact!({
-                    sessionId: session.id,
-                    agentId: (input as any).agent_id,
-                    transcriptPath: (input as any).transcript_path,
-                  });
+                (async (input: PreCompactHookInput, toolUseId: any, context: any) => {
+                  // 先调用真实的 SDK PreCompact hook（处理归档、trim、flag 设置）
+                  if (externalPreCompact) {
+                    return await externalPreCompact(input, toolUseId, context);
+                  }
+                  // 否则调用简单回调通知
+                  if (hooks?.preCompact) {
+                    await hooks.preCompact({
+                      sessionId: session.id,
+                      agentId: (input as any).agent_id,
+                      transcriptPath: (input as any).transcript_path,
+                    });
+                  }
                   return {};
                 }) as HookCallback,
               ],

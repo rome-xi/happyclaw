@@ -17,11 +17,10 @@
 import fs from 'fs';
 import path from 'path';
 import { execFileSync } from 'child_process';
-import { query, type HookCallback, type PreCompactHookInput, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
+import { type HookCallback, type PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { detectImageMimeTypeFromBase64Strict } from './image-detector.js';
 import { pruneProcessedHistoryImagesInTranscript as pruneProcessedHistoryImagesInTranscriptFile } from './history-image-prune.js';
 import { getChannelFromJid } from './channel-prefixes.js';
-import { StreamEventProcessor } from './stream-processor.js';
 
 import type {
   ContainerInput,
@@ -30,8 +29,7 @@ import type {
   SessionsIndex,
   ParsedMessage,
   StreamEvent,
-  SDKUserMessage,
-} from './types.js';
+  } from './types.js';
 import type { ClaudeContextAudit } from './stream-event.types.js';
 export type { StreamEventType, StreamEvent } from './types.js';
 
@@ -54,67 +52,6 @@ import type {
   EngineHooks,
   EngineSendResult,
 } from './engines/types.js';
-
-// ── MessageStream：SDK query() 的 user message 流 ──
-//
-// 实现 AsyncIterable<SDKUserMessage>，使 query() 保持 isSingleUserTurn=false
-// 模式（等待后续 IPC 消息），而不是单轮后立即结束。
-class MessageStream {
-  private done = false;
-  private queue: SDKUserMessage[] = [];
-  private waiting: (() => void) | null = null;
-  ended = false;
-
-  push(text: string, images?: Array<{ data: string; mimeType: string }>): string[] {
-    if (this.done) return [];
-    const rejected: string[] = [];
-    let content: SDKUserMessage['message']['content'];
-    if (images && images.length > 0) {
-      content = [{ type: 'text', text }];
-      for (const img of images) {
-        // 简单校验：图片 base64 不应为空
-        if (!img.data || img.data.length === 0) {
-          rejected.push('图片数据为空');
-          continue;
-        }
-        content.push({
-          type: 'image',
-          source: { type: 'base64', data: img.data, media_type: img.mimeType as ImageMediaType },
-        });
-      }
-    } else {
-      content = text;
-    }
-    this.queue.push({
-      type: 'user',
-      message: { role: 'user', content },
-      parent_tool_use_id: null,
-      session_id: '',
-    });
-    this.waiting?.();
-    return rejected;
-  }
-
-  end() {
-    this.done = true;
-    this.ended = true;
-    this.waiting?.();
-  }
-
-  close() {
-    this.end();
-  }
-
-  async *[Symbol.asyncIterator](): AsyncGenerator<SDKUserMessage> {
-    while (true) {
-      while (this.queue.length > 0) {
-        yield this.queue.shift()!;
-      }
-      if (this.done) return;
-      await new Promise<void>((r) => { this.waiting = r; });
-    }
-  }
-}
 
 // 路径解析：优先读取环境变量，降级到容器内默认路径（保持向后兼容）
 const WORKSPACE_GROUP = process.env.HAPPYCLAW_WORKSPACE_GROUP || '/workspace/group';
@@ -1072,10 +1009,20 @@ function pruneProcessedHistoryImagesInTranscript(sessionId: string | undefined):
  * allowing agent teams subagents to run to completion.
  * Also pipes IPC messages into the stream during the query.
  */
+/**
+ * Run a single query and stream results via writeOutput.
+ *
+ * 使用 ClaudeEngine 封装 SDK 调用：
+ * - Engine 负责 query() + StreamEventProcessor + 事件翻译
+ * - 本函数负责 IPC 轮询、sentinel 检测、系统提示词构建、context_audit 等编排逻辑
+ * - 通过 engine.pushToActive() / interruptActive() 等方法操作活动查询
+ */
 async function runQuery(
   prompt: string,
   sessionId: string | undefined,
-  mcpServerConfig: ReturnType<typeof createSdkMcpServer>,
+  engine: ClaudeEngine,
+  engineSession: EngineSession,
+  engineTools: EngineToolDefinition[],
   containerInput: ContainerInput,
   memoryRecall: string,
   resumeAt?: string,
@@ -1085,25 +1032,43 @@ async function runQuery(
   images?: Array<{ data: string; mimeType?: string }>,
   sourceKindOverride?: ContainerOutput['sourceKind'],
 ): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean; contextOverflow?: boolean; unrecoverableTranscriptError?: boolean; interruptedDuringQuery: boolean; sessionResumeFailed?: boolean; pipedMessagesDuringQuery: Array<{ text: string; images?: Array<{ data: string; mimeType?: string }> }> }> {
-  const stream = new MessageStream();
-  // Track messages piped into this query.  When the query is interrupted,
-  // these messages would otherwise be lost (consumed by the aborted query).
-  // The main loop uses them as the next prompt so the user's queued intent
-  // continues after the cancelled turn (#421, Claude Code-style queuing).
+  // Track messages piped into this query.
   const pipedMessagesDuringQuery: Array<{ text: string; images?: Array<{ data: string; mimeType?: string }> }> = [];
   let newSessionId: string | undefined;
-  let lastAssistantUuid: string | undefined;
-  let canonicalAssistantText: string | undefined;
-  let canonicalAssistantUuid: string | undefined;
-  const initialRejected = stream.push(
-    prompt,
-    images?.map((i) => ({ data: i.data, mimeType: i.mimeType || 'image/png' })),
-  );
+  let closedDuringQuery = false;
+  let interruptedDuringQuery = false;
+  let suppressOutputAfterInterrupt = false;
+  let visibleOutputStarted = false;
+  let resultCount = 0;
+  let postResultInterruptRequested = false;
+
+  // ── 图片预处理（过滤超大图 + 解析 MIME）──
+  let effectiveImages: Array<{ data: string; mimeType: string }> | undefined;
+  const initialRejected: string[] = [];
+  if (images && images.length > 0) {
+    const { valid, rejected } = filterOversizedImages(images);
+    initialRejected.push(...rejected);
+    if (valid.length > 0) {
+      effectiveImages = valid.map((img) => ({
+        data: img.data,
+        mimeType: resolveImageMimeType(img),
+      }));
+    }
+  }
+
+  // 全部图片被过滤 + text 为空时的兜底
+  let effectivePrompt = prompt;
+  const allImagesDropped = images && images.length > 0 && (!effectiveImages || effectiveImages.length === 0);
+  if (allImagesDropped && !effectivePrompt.trim()) {
+    effectivePrompt = `[用户发送了 ${images.length} 张图片，但因尺寸超出 API 限制（最大 ${IMAGE_MAX_DIMENSION}px）被跳过。请提示用户压缩或截取后重发。]`;
+  }
+
   const decorateStreamEvent = (event: StreamEvent): StreamEvent => ({
     ...event,
     turnId: containerInput.turnId,
     sessionId: newSessionId || sessionId,
   });
+
   const emit = (output: ContainerOutput): void => {
     if (output.streamEvent) {
       output = {
@@ -1124,143 +1089,10 @@ async function runQuery(
 
   // 如果有图片被拒绝，立即通知用户
   for (const reason of initialRejected) {
-    emit({ status: 'success', result: `\u26a0\ufe0f ${reason}`, newSessionId: undefined });
+    emit({ status: 'success', result: `⚠️ ${reason}`, newSessionId: undefined });
   }
 
-  // Poll IPC for follow-up messages and _close/_interrupt sentinel during the query
-  let ipcPolling = true;
-  let closedDuringQuery = false;
-  let interruptedDuringQuery = false;
-  let suppressOutputAfterInterrupt = false;
-  let visibleOutputStarted = false;
-  // After a result is received, allow a short window for the host to write _drain
-  // before force-closing the stream.
-  let resultReceivedAt: number | null = null;
-  const POST_RESULT_TIMEOUT_MS = 5_000;
-  // queryRef is set just before the for-await loop so pollIpcDuringQuery can call interrupt()
-  let queryRef: { interrupt(): Promise<void> } | null = null;
-  let messageCount = 0;
-  let resultCount = 0;
-  let postResultInterruptRequested = false;
-  // SDK transport is not ready until system/init is received. Piping user messages
-  // before init causes "ProcessTransport is not ready for writing" unhandled rejection.
-  let sdkTransportReady = false;
-
-  // 收尾阶段中止挂起的工具调用：当 stream 准备关闭（_close/_drain/post-result-timeout）时，
-  // SDK 可能仍卡在最终回复之后的某个工具调用上，光 stream.end() 不会让它退出。
-  // 这里主动 query.interrupt() 中止那个卡住的工具调用，让 for-await 自然结束、runner 回到
-  // waitForIpcMessage() 保持 warm——不杀整个 runner。interrupt 引发的 SDK 错误由 catch 分支
-  // 通过 postResultInterruptRequested 归类为 non-fatal（不退避、不上报为失败）。
-  const interruptQueryForShutdown = (reason: string) => {
-    if (!queryRef) return;
-    if (postResultInterruptRequested) return;
-    postResultInterruptRequested = true;
-    log(`${reason}, interrupting current query before closing stream`);
-    queryRef
-      .interrupt()
-      .catch((err: unknown) => log(`Shutdown interrupt failed: ${err}`));
-  };
-
-  const pollIpcDuringQuery = () => {
-    if (!ipcPolling) return;
-
-    if (shouldClose()) {
-      log('Close sentinel detected during query, ending stream');
-      closedDuringQuery = true;
-      interruptQueryForShutdown('Close sentinel detected during query');
-      stream.end();
-      ipcPolling = false;
-      ipcQueryWatcher.close();
-      return;
-    }
-    if (shouldInterrupt()) {
-      log('Interrupt sentinel detected, interrupting current query');
-      interruptedDuringQuery = true;
-      if (!visibleOutputStarted && resultCount === 0) {
-        suppressOutputAfterInterrupt = true;
-        log('Interrupt arrived before visible output, suppressing query output');
-      }
-      lastInterruptRequestedAt = Date.now();
-      queryRef?.interrupt().catch((err: unknown) => log(`Interrupt call failed: ${err}`));
-      stream.end();
-      ipcPolling = false;
-      ipcQueryWatcher.close();
-      return;
-    }
-    // _drain: finish current query then exit. Once a result has been received,
-    // the query is logically done but the MessageStream keeps the SDK alive.
-    // Treat drain as close at this point to release the container.
-    if (resultCount > 0 && shouldDrain()) {
-      log('Drain sentinel detected after query result, ending stream');
-      closedDuringQuery = true;
-      interruptQueryForShutdown('Drain sentinel detected after query result');
-      stream.end();
-      ipcPolling = false;
-      ipcQueryWatcher.close();
-      return;
-    }
-    // ── 结果后超时：result 已收到，给 host 短暂时间写 _drain ──
-    // 注意：不设置 closedDuringQuery — 这只是 stream 清理，不是退出信号。
-    // 主循环会继续进入 waitForIpcMessage()，等待 _close/_drain 才退出。
-    // 这保证了终端预热等场景下容器不会在查询完成后立即退出。
-    if (resultReceivedAt && Date.now() - resultReceivedAt > POST_RESULT_TIMEOUT_MS) {
-      log(`Post-result timeout (${POST_RESULT_TIMEOUT_MS / 1000}s), closing stream`);
-      interruptQueryForShutdown('Post-result timeout');
-      stream.end();
-      ipcPolling = false;
-      ipcQueryWatcher.close();
-      return;
-    }
-    // Side-queries (emitOutput=false, e.g. memory flush / CLAUDE.md update) must NOT
-    // consume user IPC messages — those belong to the main query loop. Only sentinels
-    // are checked above. Without this guard, a user message arriving during a side-query
-    // gets silently consumed, leaving queryInFlight=true on the host forever (bug #259).
-    if (!emitOutput) {
-      return; // No setTimeout needed — watcher will trigger next check on file change
-    }
-
-    // 预防性 invariant：当前所有 stream.end() 路径（sentinel handlers / interrupt-before-query
-    // / immediate-interrupt）都在同一同步 tick 把 ipcPolling=false，理论上 !ipcPolling 早退
-    // 已覆盖 stream.ended=true 的情况；此守护保留作为未来重构时的 invariant 断言，
-    // 避免后续改动引入"流已关闭但 polling 未停"的竞态窗口（消息会被 drain 后又被 stream.push 拒绝丢失）。
-    if (stream.ended) {
-      log('Stream already ended, skipping IPC drain (messages will be picked up by waitForIpcMessage)');
-      ipcPolling = false;
-      ipcQueryWatcher.close();
-      return;
-    }
-
-    // Don't pipe user messages before system/init — the SDK ProcessTransport is not
-    // ready yet and streamInput() will throw "ProcessTransport is not ready for writing".
-    // IPC files remain on disk; we'll drain them once sdkTransportReady is set.
-    if (!sdkTransportReady) {
-      return;
-    }
-
-    const { messages } = drainIpcInput();
-    for (const msg of messages) {
-      log(`Piping IPC message into active query (${msg.text.length} chars, ${msg.images?.length || 0} images)`);
-      pipedMessagesDuringQuery.push(msg);
-      const rejected = stream.push(
-        msg.text,
-        msg.images?.map((i) => ({ data: i.data, mimeType: i.mimeType || 'image/png' })),
-      );
-      for (const reason of rejected) {
-        emit({ status: 'success', result: `\u26a0\ufe0f ${reason}`, newSessionId: undefined });
-      }
-    }
-    // No setTimeout needed — watcher will trigger next check on file change
-  };
-
-  const ipcQueryWatcher = createIpcWatcher(() => {
-    if (!ipcPolling) return;
-    pollIpcDuringQuery();
-  });
-  // Initial drain to process any pre-existing files
-  pollIpcDuringQuery();
-
-  const processor = new StreamEventProcessor(emit, log);
-
+  // ── 构建系统提示词（与原逻辑完全一致）──
   const { isHome, isAdminHome } = normalizeHomeFlags(containerInput);
   const disableMemoryLayer = process.env.HAPPYCLAW_DISABLE_MEMORY_LAYER === 'true';
 
@@ -1286,11 +1118,6 @@ async function runQuery(
     ...(containerInput.agentId
       ? [{ name: 'agent-override.md', text: CONVERSATION_AGENT_BLOCK }]
       : []),
-    // Phase 2: the non-home foreground responder runs on the flagship tier
-    // (model !== home default opus[1m]) and is a base lane (no agentId). Tell
-    // it to handle requests accurately itself and hand only heavy / parallel
-    // labor to dispatch_background_job. Home / opus foregrounds and
-    // agent/background lanes never see this.
     ...(!isHome && !containerInput.agentId && CLAUDE_MODEL !== 'opus[1m]'
       ? [{ name: 'front-responder.md', text: `<front-responder>\n${FRONT_RESPONDER_GUIDELINES}\n</front-responder>` }]
       : []),
@@ -1299,333 +1126,306 @@ async function runQuery(
   const promptAudit = buildPromptAudit(promptPieces);
   const contextAuditBase = runtimeContextAuditBase(containerInput);
 
-  // 调试观察：HAPPYCLAW_DUMP_PROMPT=true 时把最终 system prompt 输出到 stderr
-  // host 已通过 logs/ 捕获 stderr，方便对比改 prompts/*.md 前后的差异
   if (process.env.HAPPYCLAW_DUMP_PROMPT === 'true') {
     log(`PROMPT DUMP (${systemPromptAppend.length} chars):\n${systemPromptAppend}\n--- END PROMPT DUMP ---`);
   }
 
-  // Home containers (admin & member) can access global and memory directories.
-  // Non-home containers only access memory directory; global CLAUDE.md is NOT
-  // injected into systemPrompt but remains accessible via filesystem (readonly mount).
-  // 禁用记忆层时 WORKSPACE_GLOBAL/MEMORY 环境变量未设置，fallback 到 /workspace/xxx
-  // 容器路径在宿主机不存在，会让 SDK 报警告；此时直接给空数组。
+  // ── 额外目录（与原逻辑一致）──
   const extraDirs = disableMemoryLayer
     ? []
     : isHome
       ? [WORKSPACE_GLOBAL, WORKSPACE_MEMORY]
       : [WORKSPACE_MEMORY];
 
+  // ── 解析 claude CLI 路径（与原逻辑一致）──
+  let pathToClaudeCodeExecutable: string | undefined;
+  try {
+    const resolvedPath = execFileSync('which', ['claude'], { timeout: 5_000, encoding: 'utf-8' }).trim();
+    if (resolvedPath) pathToClaudeCodeExecutable = resolvedPath;
+  } catch {
+    const commonPaths = [
+      '/usr/local/bin/claude',
+      '/usr/bin/claude',
+      path.join(process.env.HOME || '/root', '.local/bin/claude'),
+      '/app/node_modules/.bin/claude',
+    ];
+    for (const p of commonPaths) {
+      if (fs.existsSync(p)) { pathToClaudeCodeExecutable = p; break; }
+    }
+  }
+
+  // ── autoCompactWindow（与原逻辑一致）──
+  const autoCompactWindow = parseInt(process.env.AUTO_COMPACT_WINDOW ?? '0', 10);
+
+  // ── 构建 EngineConfig（包含所有 SDK 选项）──
+  const engineConfig: EngineConfig = {
+    model: CLAUDE_MODEL,
+    baseUrl: '',
+    apiKey: '',
+    cwd: WORKSPACE_GROUP,
+    systemPromptAppend,
+    additionalDirectories: extraDirs,
+    extra: {
+      allowedTools,
+      disallowedTools,
+      pathToClaudeCodeExecutable,
+      userMcpServers: loadUserMcpServers(),
+      plugins: containerInput.plugins,
+      autoCompactWindow: Number.isFinite(autoCompactWindow) && autoCompactWindow > 0 ? autoCompactWindow : undefined,
+      resumeAt,
+      settingSources: ['project', 'user'],
+    },
+  };
+
+  // 更新 session 的 config
+  engineSession.engineState._config = engineConfig;
+
+  // ── 构建 EngineMessage ──
+  const engineMessages: EngineMessage[] = [
+    { role: 'user', content: effectivePrompt, images: effectiveImages },
+  ];
+
+  // ── 构建 EngineAgent（空，PREDEFINED_AGENTS 由引擎自动加载）──
+  const engineAgents: EngineAgentDefinition[] = [];
+
+  // ── PreCompact hook（与原逻辑一致，flush text 改用 engine.getActiveFullText()）──
+  const preCompactHook = createPreCompactHook(isHome, isAdminHome, disableMemoryLayer, {
+    emit,
+    getFullText: () => engine.getActiveFullText(),
+    resetFullText: () => engine.resetActiveFullText(),
+  });
+
+  // 将 PreCompact hook 注入 engine config
+  (engineSession.engineState._config as any).extra.preCompactHook = preCompactHook;
+
+  // ── IPC 轮询（与原逻辑一致，但操作引擎方法而非 stream/queryRef）──
+  let ipcPolling = true;
+  let resultReceivedAt: number | null = null;
+  const POST_RESULT_TIMEOUT_MS = 5_000;
+
+  const interruptQueryForShutdown = (reason: string) => {
+    if (postResultInterruptRequested) return;
+    postResultInterruptRequested = true;
+    log(`${reason}, interrupting current query before closing stream`);
+    engine.interruptActive().catch((err: unknown) => log(`Shutdown interrupt failed: ${err}`));
+  };
+
+  const pollIpcDuringQuery = () => {
+    if (!ipcPolling) return;
+
+    if (shouldClose()) {
+      log('Close sentinel detected during query, ending stream');
+      closedDuringQuery = true;
+      interruptQueryForShutdown('Close sentinel detected during query');
+      engine.endActiveStream();
+      ipcPolling = false;
+      ipcQueryWatcher.close();
+      return;
+    }
+    if (shouldInterrupt()) {
+      log('Interrupt sentinel detected, interrupting current query');
+      interruptedDuringQuery = true;
+      if (!visibleOutputStarted && resultCount === 0) {
+        suppressOutputAfterInterrupt = true;
+        log('Interrupt arrived before visible output, suppressing query output');
+      }
+      markInterruptRequested();
+      engine.interruptActive().catch((err: unknown) => log(`Interrupt call failed: ${err}`));
+      engine.endActiveStream();
+      ipcPolling = false;
+      ipcQueryWatcher.close();
+      return;
+    }
+    if (resultCount > 0 && shouldDrain()) {
+      log('Drain sentinel detected after query result, ending stream');
+      closedDuringQuery = true;
+      interruptQueryForShutdown('Drain sentinel detected after query result');
+      engine.endActiveStream();
+      ipcPolling = false;
+      ipcQueryWatcher.close();
+      return;
+    }
+    if (resultReceivedAt && Date.now() - resultReceivedAt > POST_RESULT_TIMEOUT_MS) {
+      log(`Post-result timeout (${POST_RESULT_TIMEOUT_MS / 1000}s), closing stream`);
+      interruptQueryForShutdown('Post-result timeout');
+      engine.endActiveStream();
+      ipcPolling = false;
+      ipcQueryWatcher.close();
+      return;
+    }
+    // Side-queries (emitOutput=false) 不消费用户 IPC 消息
+    if (!emitOutput) return;
+
+    if (engine.isActiveStreamEnded()) {
+      log('Stream already ended, skipping IPC drain');
+      ipcPolling = false;
+      ipcQueryWatcher.close();
+      return;
+    }
+
+    // SDK transport 未就绪时不 pipe 消息
+    if (!engine.isActiveTransportReady()) return;
+
+    const { messages } = drainIpcInput();
+    for (const msg of messages) {
+      log(`Piping IPC message into active query (${msg.text.length} chars, ${msg.images?.length || 0} images)`);
+      pipedMessagesDuringQuery.push(msg);
+      const pipeImages = msg.images?.map((img) => ({ data: img.data, mimeType: img.mimeType || 'image/jpeg' }));
+      const rejected = engine.pushToActive(msg.text, pipeImages);
+      for (const reason of rejected) {
+        emit({ status: 'success', result: `⚠️ ${reason}`, newSessionId: undefined });
+      }
+    }
+  };
+
+  const ipcQueryWatcher = createIpcWatcher(() => {
+    if (!ipcPolling) return;
+    pollIpcDuringQuery();
+  });
+
+  // 检查 query 启动前的中断
   if (shouldInterrupt()) {
     log('Interrupt sentinel detected before query start, skipping query');
     interruptedDuringQuery = true;
     suppressOutputAfterInterrupt = true;
     ipcPolling = false;
-    // 这条 early-return 在下方 try 块之前，不被 finally 覆盖，需就地关闭 watcher（close 幂等）。
     ipcQueryWatcher.close();
-    stream.end();
-    return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery, pipedMessagesDuringQuery };
+    return { newSessionId, closedDuringQuery, interruptedDuringQuery, pipedMessagesDuringQuery };
   }
 
-  // SystemSettings.autoCompactWindow（通过 AUTO_COMPACT_WINDOW 环境变量注入）
-  // 0 = SDK 默认（约 1M）；>0 = 通过 settings flag-layer 提前触发对话压缩
-  const autoCompactWindow = parseInt(process.env.AUTO_COMPACT_WINDOW ?? '0', 10);
-  const flagSettings: Record<string, unknown> = {};
-  if (Number.isFinite(autoCompactWindow) && autoCompactWindow > 0) {
-    flagSettings.autoCompactWindow = autoCompactWindow;
-  }
+  // ── 启动引擎查询 ──
+  pollIpcDuringQuery(); // 初始 drain
 
-  // Resolve the actual claude CLI path using `which`.
-  // SDK 的 optionalDependencies（@anthropic-ai/claude-agent-sdk-linux-x64 等）在 npm 上是空包，
-  // 无法通过 node_modules/.bin/ 找到 working binary。通过 which 找到实际路径后传给 SDK。
-  let pathToClaudeCodeExecutable: string | undefined;
+  const abortController = new AbortController();
+  const generator = engine.sendMessage(
+    engineSession,
+    engineMessages,
+    engineTools,
+    engineAgents,
+    abortController.signal,
+    { preCompact: async (event) => {
+      // PreCompact hook 已通过 engineConfig.extra.preCompactHook 注入引擎
+      // 此回调仅作通知（引擎内部会调用 SDK 的 PreCompact hook）
+    }},
+  );
+
   try {
-    const resolvedPath = execFileSync('which', ['claude'], { timeout: 5_000, encoding: 'utf-8' }).trim();
-    if (resolvedPath) {
-      pathToClaudeCodeExecutable = resolvedPath;
-    }
-  } catch {
-    // Fallback: try to find it in common locations
-    const commonPaths = [
-      '/usr/local/bin/claude',
-      '/usr/bin/claude',
-      path.join(process.env.HOME || '/root', '.local/bin/claude'),
-      // 容器内 agent-runner 的本地依赖（package.json 声明了 @anthropic-ai/claude-code）
-      '/app/node_modules/.bin/claude',
-    ];
-    for (const p of commonPaths) {
-      if (fs.existsSync(p)) {
-        pathToClaudeCodeExecutable = p;
+    // ── 手动迭代 generator，同时获取 yield 的 StreamEvent 和 return 的 EngineSendResult ──
+    let finalResult: EngineSendResult | undefined;
+    while (true) {
+      const { value, done } = await generator.next();
+
+      if (done) {
+        finalResult = value as EngineSendResult;
         break;
       }
-    }
-  }
 
-  // Claude Code plugins injected by HappyClaw main process via ContainerInput.
-  // SDK converts this array to `--plugin-dir <path>` args for the spawned
-  // claude CLI, which loads each plugin's commands/agents/hooks/skills/mcp.
-  // Paths are already runtime-translated upstream (container-internal for
-  // Docker, host absolute for host mode).
-  const userPlugins =
-    containerInput.plugins && containerInput.plugins.length > 0
-      ? containerInput.plugins
-      : undefined;
-  if (userPlugins) {
-    log(`Loading ${userPlugins.length} plugin(s): ${userPlugins.map((p) => p.path).join(', ')}`);
-  }
+      // value 是 StreamEvent
+      const evt = value as StreamEvent;
 
-  try {
-    const q = query({
-      prompt: stream,
-      options: {
-        ...(pathToClaudeCodeExecutable && { pathToClaudeCodeExecutable }),
-        model: CLAUDE_MODEL,
-        cwd: WORKSPACE_GROUP,
-        additionalDirectories: extraDirs,
-        resume: sessionId,
-        ...(sessionId && resumeAt ? { resumeSessionAt: resumeAt } : {}),
-        systemPrompt: { type: 'preset' as const, preset: 'claude_code' as const, append: systemPromptAppend },
-        allowedTools,
-        ...(disallowedTools && { disallowedTools }),
-        thinking: { type: 'adaptive' as const, display: 'summarized' as const },
-        permissionMode: 'bypassPermissions',
-        allowDangerouslySkipPermissions: true,
-        agentProgressSummaries: true,
-        settingSources: ['project', 'user'],
-        // 启用全部已发现的技能到主会话。SDK 0.3.x 起 skills 是"打开技能的唯一正确位置"
-        // （用了它就无需再往 allowedTools 塞已废弃的 'Skill'）。'all' = 启用所有发现的技能，
-        // 显式声明比依赖 CLI 隐式默认更可靠，确保全局/项目/用户技能完整挂载生效。
-        skills: 'all',
-        includePartialMessages: true,
-        // Forward sub-agent (Task) text/thinking as stream events so the card's
-        // sub-agent transcript lights up live instead of only filling in when the
-        // Task completes. The stream-processor already renders these
-        // (agentScope:'subagent' deltas, stream-processor.ts ~979); this flag is
-        // what actually makes the SDK emit them.
-        forwardSubagentText: true,
-        ...(Object.keys(flagSettings).length > 0 ? { settings: flagSettings as any } : {}),
-        ...(userPlugins && { plugins: userPlugins }),
-        mcpServers: {
-          ...loadUserMcpServers(),     // 用户配置的 MCP（stdio/http/sse），SDK 原生支持
-          happyclaw: mcpServerConfig,  // 内置 SDK MCP 放最后，确保不被同名覆盖
-        },
-        hooks: {
-          PreCompact: [{ hooks: [createPreCompactHook(isHome, isAdminHome, disableMemoryLayer, {
-            emit,
-            getFullText: () => processor.getFullText(),
-            resetFullText: () => processor.resetFullTextAccumulator(),
-          })] }]
-        },
-        agents: PREDEFINED_AGENTS,
+      if (suppressOutputAfterInterrupt && evt.eventType !== 'init' && evt.eventType !== 'context_audit') {
+        continue;
       }
-    });
-    queryRef = q;
-    if (shouldInterrupt()) {
-      log('Interrupt sentinel already present when query started, interrupting immediately');
-      interruptedDuringQuery = true;
-      if (!visibleOutputStarted && resultCount === 0) {
-        suppressOutputAfterInterrupt = true;
-      }
-      queryRef.interrupt().catch((err: unknown) => log(`Immediate interrupt call failed: ${err}`));
-      stream.end();
-      ipcPolling = false;
-    }
-    for await (const message of q) {
-    // 流式事件处理
-    if (message.type === 'stream_event') {
-      if (!suppressOutputAfterInterrupt) {
+
+      if (evt.eventType !== 'init' && evt.eventType !== 'context_audit' && evt.eventType !== 'status') {
         visibleOutputStarted = true;
       }
-      if (suppressOutputAfterInterrupt) {
-        continue;
-      }
-      processor.processStreamEvent(message as any);
-      continue;
-    }
 
-    if (message.type === 'tool_progress') {
-      if (!suppressOutputAfterInterrupt) {
-        visibleOutputStarted = true;
-      }
-      if (suppressOutputAfterInterrupt) {
-        continue;
-      }
-      processor.processToolProgress(message as any);
-      continue;
-    }
+      // 处理 init 事件：更新 sessionId + 发射 context_audit
+      if (evt.eventType === 'init') {
+        newSessionId = evt.sessionId;
+        log(`Session initialized: ${newSessionId}`);
 
-    if (message.type === 'tool_use_summary') {
-      if (!suppressOutputAfterInterrupt) {
-        visibleOutputStarted = true;
-      }
-      if (suppressOutputAfterInterrupt) {
-        continue;
-      }
-      processor.processToolUseSummary(message as any);
-      continue;
-    }
-
-    // Rate limit event — notify user and keep activity alive
-    if (message.type === 'rate_limit_event') {
-      const info = (message as any).rate_limit_info;
-      if (info?.status === 'rejected') {
-        const resetsAt = info.resetsAt ? new Date(info.resetsAt * 1000).toLocaleTimeString() : '未知';
-        processor.emitStatus(`API 限流中，预计 ${resetsAt} 恢复`);
-      } else if (info?.status === 'allowed_warning') {
-        processor.emitStatus(`接近 API 限流阈值`);
-      }
-      continue;
-    }
-
-    // System messages
-    if (message.type === 'system') {
-      const sys = message as any;
-      if (processor.processSystemMessage(sys)) {
-        continue;
-      }
-    }
-
-    if (processor.processMiscMessage(message as any)) {
-      continue;
-    }
-
-    messageCount++;
-    const msgType = message.type === 'system' ? `system/${(message as { subtype?: string }).subtype}` : message.type;
-    const msgParentToolUseId = (message as any).parent_tool_use_id ?? null;
-    // 诊断：对所有 assistant/user 消息打印 parent_tool_use_id 和内容块类型
-    if (message.type === 'assistant' || message.type === 'user') {
-      const rawParent = (message as any).parent_tool_use_id;
-      const contentTypes = (Array.isArray((message as any).message?.content)
-        ? ((message as any).message.content as Array<{ type: string }>).map(b => b.type).join(',')
-        : typeof (message as any).message?.content === 'string' ? 'string' : 'none');
-      log(`[msg #${messageCount}] type=${msgType} parent_tool_use_id=${rawParent === undefined ? 'UNDEFINED' : rawParent === null ? 'NULL' : rawParent} content_types=[${contentTypes}] keys=[${Object.keys(message).join(',')}]`);
-    } else {
-      log(`[msg #${messageCount}] type=${msgType}${msgParentToolUseId ? ` parent=${msgParentToolUseId.slice(0, 12)}` : ''}`);
-    }
-
-    if (message.type !== 'system') {
-      visibleOutputStarted = true;
-    }
-    if (suppressOutputAfterInterrupt && message.type !== 'system') {
-      if (message.type === 'result') {
-        resultCount++;
-        resultReceivedAt = Date.now();
-      }
-      log(`[msg #${messageCount}] suppressed after early interrupt`);
-      continue;
-    }
-
-    // ── 子 Agent 消息转 StreamEvent ──
-    if (processor.processSubAgentMessage(message as any)) {
-      continue;
-    }
-
-    // ── Main-agent tool results → tool_result stream events ──
-    // (sub-agent results are handled inside processSubAgentMessage above)
-    if (message.type === 'user') {
-      processor.processMainToolResults(message as any);
-    }
-
-    if (message.type === 'assistant' && 'uuid' in message) {
-      lastAssistantUuid = (message as { uuid: string }).uuid;
-      const assistantMsg = message as Record<string, unknown>;
-      if ((assistantMsg.parent_tool_use_id ?? null) === null) {
-        const msgContent = (assistantMsg.message as Record<string, unknown> | undefined)?.content;
-        const topLevelText = Array.isArray(msgContent)
-          ? (msgContent as Array<{ type: string; text?: string }>)
-              .filter((block) => block.type === 'text' && typeof block.text === 'string')
-              .map((block) => block.text!)
-              .join('')
-          : '';
-        if (topLevelText) {
-          // Accumulate rather than overwrite. The SDK splits assistant output
-          // into multiple messages around each tool_use call (text → tool_use →
-          // text → tool_use → text...), so taking only the last message's text
-          // drops everything emitted before the first tool call. The canonical
-          // text must be the concatenation of all top-level text content blocks
-          // in this turn.
-          canonicalAssistantText = (canonicalAssistantText || '') + topLevelText;
-          canonicalAssistantUuid = assistantMsg.uuid as string;
-        }
-      }
-      processor.processAssistantMessage(message as any);
-    }
-
-    if (message.type === 'system' && message.subtype === 'init') {
-      newSessionId = message.session_id;
-      log(`Session initialized: ${newSessionId}`);
-      // Mark transport ready and drain any IPC messages that arrived before init.
-      sdkTransportReady = true;
-      pollIpcDuringQuery();
-
-      // Log skills and context usage for observability.
-      // getContextUsage() is a newer SDK API; feature-detect to avoid spamming
-      // error logs on older SDK versions where the method is absent.
-      const getCtxUsage = (q as unknown as { getContextUsage?: () => Promise<SdkContextUsage> }).getContextUsage;
-      let contextUsage: SdkContextUsage | undefined;
-      if (typeof getCtxUsage === 'function') {
+        // 获取 context usage 并发射 context_audit
         try {
-          contextUsage = await getCtxUsage.call(q);
-          if (contextUsage.skills) {
-            log(`Skills: ${contextUsage.skills.includedSkills}/${contextUsage.skills.totalSkills} loaded, ${contextUsage.skills.tokens} tokens`);
+          const ctxUsage = await engine.getContextUsage(engineSession);
+          const contextAudit = enrichContextAudit(contextAuditBase, promptAudit, ctxUsage as any);
+          // 1M 上下文缩水告警
+          if (CLAUDE_MODEL.includes('[1m]') && ctxUsage && ctxUsage.maxTokens > 0 && ctxUsage.maxTokens < 900_000) {
+            contextAudit.warnings.push(
+              `上下文窗口仅 ${Math.round(ctxUsage.maxTokens / 1000)}K tokens（预期约 1M），1M 上下文可能未生效`,
+            );
+            log(`[WARN] 1M context not active: maxTokens=${ctxUsage.maxTokens}`);
           }
-          log(`Context: ${contextUsage.totalTokens}/${contextUsage.maxTokens} tokens (${contextUsage.percentage.toFixed(1)}%)`);
+          emit({
+            status: 'stream',
+            result: null,
+            streamEvent: {
+              eventType: 'context_audit',
+              agentScope: 'system',
+              displayLevel: contextAudit.warnings.length > 0 ? 'primary' : 'detail',
+              title: 'Agent Context',
+              summary: `${contextAudit.skills.includedSkills ?? contextAudit.skills.totalSkills ?? 0} skills · ${contextAudit.rules.fileCount} rules`,
+              contextAudit,
+            },
+          });
         } catch (ctxErr) {
           log(`[debug] getContextUsage failed: ${ctxErr instanceof Error ? ctxErr.message : String(ctxErr)}`);
+          const contextAudit = enrichContextAudit(contextAuditBase, promptAudit, undefined);
+          emit({
+            status: 'stream',
+            result: null,
+            streamEvent: {
+              eventType: 'context_audit',
+              agentScope: 'system',
+              displayLevel: contextAudit.warnings.length > 0 ? 'primary' : 'detail',
+              title: 'Agent Context',
+              summary: `${contextAudit.skills.includedSkills ?? 0} skills · ${contextAudit.rules.fileCount} rules`,
+              contextAudit,
+            },
+          });
         }
+
+        // transport ready → drain 积压的 IPC 消息
+        pollIpcDuringQuery();
+        continue;
       }
-      const contextAudit = enrichContextAudit(contextAuditBase, promptAudit, contextUsage);
-      // 1M 上下文缩水告警：默认 opus[1m] 期望约 1M 上下文窗口，若 SDK / 模型资格判定
-      // 静默退回（例如 200K），在此立即暴露而非等到溢出。push 进 warnings 会让下方
-      // emit 的 displayLevel 自动升为 'primary'，在前端醒目展示。
-      if (CLAUDE_MODEL.includes('[1m]') && contextUsage && contextUsage.maxTokens > 0 && contextUsage.maxTokens < 900_000) {
-        contextAudit.warnings.push(
-          `上下文窗口仅 ${Math.round(contextUsage.maxTokens / 1000)}K tokens（预期约 1M），1M 上下文可能未生效`,
-        );
-        log(`[WARN] 1M context not active: maxTokens=${contextUsage.maxTokens}`);
+
+      // 发射事件
+      if (evt.eventType === 'usage') {
+        emit({
+          status: 'stream',
+          result: null,
+          streamEvent: evt,
+        });
+        log(`Usage: input=${evt.usage?.inputTokens} output=${evt.usage?.outputTokens} cost=$${evt.usage?.costUSD} turns=${evt.usage?.numTurns}`);
+      } else {
+        emit({
+          status: 'stream',
+          result: null,
+          streamEvent: evt,
+        });
       }
-      emit({
-        status: 'stream',
-        result: null,
-        streamEvent: {
-          eventType: 'context_audit',
-          agentScope: 'system',
-          displayLevel: contextAudit.warnings.length > 0 ? 'primary' : 'detail',
-          title: 'Agent Context',
-          summary: `${contextAudit.skills.includedSkills ?? contextAudit.skills.totalSkills ?? 0} skills · ${contextAudit.rules.fileCount} rules`,
-          contextAudit,
-        },
-      });
     }
 
-    if (message.type === 'result') {
-      resultCount++;
-      const textResult = 'result' in message ? (message as { result?: string }).result : null;
-      const resultSubtype = message.subtype;
-      log(`Result #${resultCount}: subtype=${resultSubtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
+    // ── 处理最终结果 ──
+    if (finalResult) {
+      const es = engineSession.engineState;
 
-      // SDK 在某些失败场景会返回 error_* subtype 且不抛异常。
-      // 不能把这类结果当 success(null)，否则前端会一直停留在"思考中"。
-      // 匹配策略：显式枚举已知的 error subtype，并用 startsWith('error') 兜底未知的未来 error subtype。
-      // 参考 SDK result subtype 约定：error_during_execution、error_max_turns 等均以 'error' 开头。
-      if (typeof resultSubtype === 'string' && (resultSubtype === 'error_during_execution' || resultSubtype.startsWith('error'))) {
-        // If session never initialized (no system/init), resume itself failed — report it
-        // so the caller can retry with a fresh session instead of crashing.
-        if (!newSessionId) {
-          log(`Session resume failed (no init): ${resultSubtype}`);
-          return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery, pipedMessagesDuringQuery, sessionResumeFailed: true };
-        }
-        const detail = textResult?.trim()
-          ? textResult.trim()
-          : `Claude Code execution failed (${resultSubtype})`;
-        throw new Error(detail);
+      // 从 engineState 读取错误标志
+      const hadContextOverflow = es.contextOverflow === true;
+      const hadUnrecoverableError = es.unrecoverableTranscriptError === true;
+      const hadSessionResumeFailed = es.sessionResumeFailed === true;
+
+      const lastAssistantUuid = es.lastAssistantUuid as string | undefined;
+
+      // Session resume 失败
+      if (hadSessionResumeFailed) {
+        log(`Session resume failed (no init): ${finalResult.finishReason}`);
+        return {
+          newSessionId,
+          lastAssistantUuid,
+          closedDuringQuery,
+          interruptedDuringQuery,
+          pipedMessagesDuringQuery,
+          sessionResumeFailed: true,
+        };
       }
 
-      // SDK 将某些 API 错误包装为 subtype=success 的 result（不抛异常）
-      if (textResult && isContextOverflowError(textResult)) {
-        log(`Context overflow detected in result: ${textResult.slice(0, 100)}`);
-        // ── 发射已累积的部分回复，避免用户已看到的流式内容丢失 ──
-        const partialText = processor.getFullText();
+      // 上下文溢出
+      if (hadContextOverflow) {
+        log(`Context overflow detected in result`);
+        const partialText = engine.getActiveFullText();
         if (partialText.trim()) {
           log(`Emitting overflow_partial with ${partialText.length} chars`);
           emit({
@@ -1636,101 +1436,71 @@ async function runQuery(
             finalizationReason: 'error',
           });
         }
-        processor.resetFullTextAccumulator();
-        return { newSessionId, lastAssistantUuid, closedDuringQuery, contextOverflow: true, interruptedDuringQuery, pipedMessagesDuringQuery };
-      }
-      if (textResult && isUnrecoverableTranscriptError(textResult)) {
-        log(`Unrecoverable transcript error in result: ${textResult.slice(0, 200)}`);
-        processor.resetFullTextAccumulator();
-        return { newSessionId, lastAssistantUuid, closedDuringQuery, unrecoverableTranscriptError: true, interruptedDuringQuery, pipedMessagesDuringQuery };
-      }
-
-      const { effectiveResult } = processor.processResult(textResult);
-      const finalText = canonicalAssistantText || effectiveResult;
-      emit({
-        status: 'success',
-        result: finalText,
-        newSessionId,
-        sdkMessageUuid: canonicalAssistantUuid || lastAssistantUuid,
-        sourceKind: sourceKindOverride ?? 'sdk_final',
-        finalizationReason: 'completed',
-      });
-      // After emitting an sdk_final result, rotate turnId so that if
-      // another result is emitted within the same query (e.g. user sent
-      // a follow-up via IPC mid-query), it won't overwrite this one (#214).
-      containerInput.turnId = generateTurnId();
-      // 同步重置已累积的 assistant 文本缓冲：单次 query 内若产生第二条 result
-      // （mid-query follow-up），canonicalAssistantText 不应携带上一 turn 的文本，
-      // 否则第二条回复会重复前一 turn 的内容前缀（与 turnId 轮转对称）。
-      canonicalAssistantText = undefined;
-      canonicalAssistantUuid = undefined;
-
-      // Emit usage stream event with token counts and cost
-      const resultMsg = message as Record<string, unknown>;
-      const sdkUsage = resultMsg.usage as Record<string, number> | undefined;
-      const sdkModelUsage = resultMsg.modelUsage as Record<string, Record<string, number>> | undefined;
-      if (sdkUsage) {
-        const modelUsageSummary: Record<string, { inputTokens: number; outputTokens: number; cacheReadInputTokens: number; cacheCreationInputTokens: number; costUSD: number }> = {};
-        if (sdkModelUsage && Object.keys(sdkModelUsage).length > 0) {
-          for (const [model, mu] of Object.entries(sdkModelUsage)) {
-            modelUsageSummary[model] = {
-              inputTokens: mu.inputTokens || 0,
-              outputTokens: mu.outputTokens || 0,
-              cacheReadInputTokens: mu.cacheReadInputTokens || 0,
-              cacheCreationInputTokens: mu.cacheCreationInputTokens || 0,
-              costUSD: mu.costUSD || 0,
-            };
-          }
-        } else {
-          // Fallback: use session-level model name when SDK doesn't provide per-model breakdown
-          modelUsageSummary[CLAUDE_MODEL] = {
-            inputTokens: sdkUsage.input_tokens || 0,
-            outputTokens: sdkUsage.output_tokens || 0,
-            cacheReadInputTokens: sdkUsage.cache_read_input_tokens || 0,
-            cacheCreationInputTokens: sdkUsage.cache_creation_input_tokens || 0,
-            costUSD: (resultMsg.total_cost_usd as number) || 0,
-          };
-        }
-        emit({
-          status: 'stream',
-          result: null,
-          streamEvent: {
-            eventType: 'usage',
-            usage: {
-              inputTokens: sdkUsage.input_tokens || 0,
-              outputTokens: sdkUsage.output_tokens || 0,
-              cacheReadInputTokens: sdkUsage.cache_read_input_tokens || 0,
-              cacheCreationInputTokens: sdkUsage.cache_creation_input_tokens || 0,
-              costUSD: (resultMsg.total_cost_usd as number) || 0,
-              durationMs: (resultMsg.duration_ms as number) || 0,
-              numTurns: (resultMsg.num_turns as number) || 0,
-              modelUsage: Object.keys(modelUsageSummary).length > 0 ? modelUsageSummary : undefined,
-            },
-          },
-        });
-        log(`Usage: input=${sdkUsage.input_tokens} output=${sdkUsage.output_tokens} cost=$${resultMsg.total_cost_usd} turns=${resultMsg.num_turns}`);
+        return {
+          newSessionId,
+          lastAssistantUuid,
+          closedDuringQuery,
+          contextOverflow: true,
+          interruptedDuringQuery,
+          pipedMessagesDuringQuery,
+        };
       }
 
-      // ── 标记结果已收到 ──
-      // pollIpcDuringQuery 会在 POST_RESULT_TIMEOUT_MS 后关闭 stream，
-      // 期间仍可检测 _drain/_close/_interrupt sentinel。
+      // 不可恢复转录错误
+      if (hadUnrecoverableError) {
+        log(`Unrecoverable transcript error in result`);
+        return {
+          newSessionId,
+          lastAssistantUuid,
+          closedDuringQuery,
+          unrecoverableTranscriptError: true,
+          interruptedDuringQuery,
+          pipedMessagesDuringQuery,
+        };
+      }
+
+      // 正常完成
+      resultCount++;
       resultReceivedAt = Date.now();
+
+      const finalText = finalResult.finalText;
+      if (finalText || finalResult.finishReason === 'stop') {
+        emit({
+          status: 'success',
+          result: finalText,
+          newSessionId,
+          sdkMessageUuid: lastAssistantUuid,
+          sourceKind: sourceKindOverride ?? 'sdk_final',
+          finalizationReason: 'completed',
+        });
+        // turnId 轮转（与原逻辑一致）
+        containerInput.turnId = generateTurnId();
+      }
+
+      return {
+        newSessionId,
+        lastAssistantUuid,
+        closedDuringQuery,
+        interruptedDuringQuery,
+        pipedMessagesDuringQuery,
+      };
     }
-  }
 
-  // Cleanup residual state（IPC watcher 统一由下方 finally 关闭）
-  processor.cleanup();
-
-  log(`Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}, interruptedDuringQuery: ${interruptedDuringQuery}`);
-  return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery, pipedMessagesDuringQuery };
+    // 无 finalResult
+    return {
+      newSessionId,
+      lastAssistantUuid: engineSession.engineState.lastAssistantUuid as string | undefined,
+      closedDuringQuery,
+      interruptedDuringQuery,
+      pipedMessagesDuringQuery,
+    };
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
 
-    // 检测上下文溢出错误
+    // 上下文溢出
     if (isContextOverflowError(errorMessage)) {
       log(`Context overflow detected: ${errorMessage}`);
-      // ── 发射已累积的部分回复，避免用户已看到的流式内容丢失 ──
-      const partialText = processor.getFullText();
+      const partialText = engine.getActiveFullText();
       if (partialText.trim()) {
         log(`Emitting overflow_partial (catch) with ${partialText.length} chars`);
         emit({
@@ -1741,78 +1511,48 @@ async function runQuery(
           finalizationReason: 'error',
         });
       }
-      return { newSessionId, lastAssistantUuid, closedDuringQuery, contextOverflow: true, interruptedDuringQuery, pipedMessagesDuringQuery };
+      return { newSessionId, lastAssistantUuid: engineSession.engineState.lastAssistantUuid as string | undefined, closedDuringQuery, contextOverflow: true, interruptedDuringQuery, pipedMessagesDuringQuery };
     }
 
-    // 检测不可恢复的转录错误
+    // 不可恢复转录错误
     if (isUnrecoverableTranscriptError(errorMessage)) {
       log(`Unrecoverable transcript error: ${errorMessage}`);
-      return { newSessionId, lastAssistantUuid, closedDuringQuery, unrecoverableTranscriptError: true, interruptedDuringQuery, pipedMessagesDuringQuery };
+      return { newSessionId, lastAssistantUuid: engineSession.engineState.lastAssistantUuid as string | undefined, closedDuringQuery, unrecoverableTranscriptError: true, interruptedDuringQuery, pipedMessagesDuringQuery };
     }
 
-    // 中断导致的 SDK 错误（error_during_execution 等）：正常返回，不抛出
+    // 中断导致的错误（non-fatal）
     if (interruptedDuringQuery) {
       log(`runQuery error during interrupt (non-fatal): ${errorMessage}`);
-      // 收尾：catch 路径跳过了正常出口的 processor.cleanup()，残留 <200 字符的
-      // 缓冲尾巴（未达 flush 阈值、定时器未触发）会永久丢失，导致 interrupt_partial 缺尾。
-      // cleanup() 幂等安全（seenTextualResult 时丢尾避重复，否则 flushBuffers）。
-      processor.cleanup();
-      return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery, pipedMessagesDuringQuery };
+      return { newSessionId, lastAssistantUuid: engineSession.engineState.lastAssistantUuid as string | undefined, closedDuringQuery, interruptedDuringQuery, pipedMessagesDuringQuery };
     }
 
-    // Shutdown 触发的 interrupt（_close/_drain/post-result-timeout）：interruptQueryForShutdown()
-    // 调用 query.interrupt() 中止挂起的工具调用，SDK 随后可能抛出 error_during_execution。
-    // 这与 _interrupt sentinel 是同一类"主动中止"，不是真正的执行失败——必须按 interrupted
-    // 同级处理为 non-fatal。否则在 result 尚未发射（resultCount===0，如 _close 在 query 刚起步就到）
-    // 时会落到下方 re-throw，被外层当 error 退避，把一次干净的 shutdown 误报成失败。
+    // Shutdown 触发的 interrupt
     if (postResultInterruptRequested) {
       log(`runQuery error after shutdown interrupt (non-fatal): ${errorMessage}`);
-      // 同 interruptedDuringQuery：补 cleanup() 刷新残留缓冲尾巴，避免 shutdown
-      // 中断时未达阈值的最后一小段文本丢失。
-      processor.cleanup();
-      return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery, pipedMessagesDuringQuery };
+      return { newSessionId, lastAssistantUuid: engineSession.engineState.lastAssistantUuid as string | undefined, closedDuringQuery, interruptedDuringQuery, pipedMessagesDuringQuery };
     }
 
-    // SDK 在 yield result 后可能再抛异常（如检测到 result text 含错误内容），
-    // 但此时 success 结果已通过 emit() 发送给调用方。再 re-throw 会导致
-    // 外层 catch 额外发射一条 error output 并 exit(1)，引发无意义的重试。
-    // 如果已成功发射过结果，将后续 SDK 异常降级为警告。
+    // 已发射结果后的 SDK 异常
     if (resultCount > 0) {
       log(`runQuery post-result SDK error (non-fatal, ${resultCount} result(s) already emitted): ${errorMessage}`);
       if (err instanceof Error && err.stack) {
         log(`runQuery post-result error stack:\n${err.stack}`);
       }
-      return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery, pipedMessagesDuringQuery };
+      return { newSessionId, lastAssistantUuid: engineSession.engineState.lastAssistantUuid as string | undefined, closedDuringQuery, interruptedDuringQuery, pipedMessagesDuringQuery };
     }
 
-    // 其他错误：记录完整堆栈后继续抛出
+    // 其他错误
     log(`runQuery error [${(err as NodeJS.ErrnoException).code ?? 'unknown'}]: ${errorMessage}`);
     if (err instanceof Error && err.stack) {
       log(`runQuery error stack:\n${err.stack}`);
     }
-    // 继续抛出
     throw err;
   } finally {
-    // IPC watcher 清理：覆盖 try 块内的正常出口、catch 抛出，以及 try 内所有 early-return
-    // （resume 失败 / 上下文溢出 / 不可恢复 transcript 错误）。query 启动前的中断 early-return
-    // 在 try 之外，已就地 close()。finally 必然执行，避免长生命周期容器累积 FSWatcher + 后备
-    // 定时器，以及旧 watcher 抢先 drain 本应进入新 query 的 IPC 消息。
     ipcPolling = false;
     ipcQueryWatcher.close();
   }
 }
 
-/**
- * process.exit() with SIGKILL safety net.
- * When SDK has pending async resources (background Task tools, MCP connections),
- * process.exit() may hang indefinitely. Force SIGKILL after 5 seconds.
- * See GitHub issue #236.
- *
- * The timer must NOT use .unref() — if process.exit() silently fails to
- * terminate (observed with SDK MCP transports holding the event loop),
- * an unref'd timer won't keep the loop alive and the SIGKILL never fires.
- * Using a ref'd timer guarantees the safety net triggers.
- */
 function forceExitWithSafetyNet(code: number): never {
   log(`Exiting with code ${code}, SIGKILL safety net in 5s`);
   setTimeout(() => {
@@ -1867,12 +1607,35 @@ async function main(): Promise<void> {
     workspaceMemory: WORKSPACE_MEMORY,
     disableMemoryLayer,
   };
-  const buildMcpServerConfig = () => createSdkMcpServer({
-    name: 'happyclaw',
-    version: '1.0.0',
-    tools: createMcpTools(mcpToolsConfig),
-  });
-  let mcpServerConfig = buildMcpServerConfig();
+  // ── AgentEngine: 创建 ClaudeEngine 实例 + 转换 MCP 工具为通用格式 ──
+  const engine = new ClaudeEngine({ logFn: log });
+
+  // 将 SDK MCP 工具转换为 EngineToolDefinition 通用格式
+  const buildEngineTools = (): EngineToolDefinition[] => {
+    const sdkTools = createMcpTools(mcpToolsConfig);
+    return sdkTools.map((t: any) => ({
+      name: t.name,
+      description: t.description,
+      inputSchema: t.inputSchema,
+      handler: async (input: Record<string, unknown>) => {
+        const result = await t.handler(input);
+        const text = result.content?.filter((c: any) => c.type === 'text').map((c: any) => c.text).join('') ?? '';
+        return { content: text, isError: result.isError };
+      },
+    }));
+  };
+  let engineTools = buildEngineTools();
+
+  // 创建引擎会话（resume sessionId 如果存在）
+  let engineSession: EngineSession = await engine.createSession(
+    {
+      model: CLAUDE_MODEL,
+      baseUrl: '',
+      apiKey: '',
+      cwd: WORKSPACE_GROUP,
+    },
+    sessionId,
+  );
 
   // 记忆刷新阶段的 disallowedTools：内置危险工具 + 除记忆工具外的全部已注册 MCP 工具。
   // 从 createMcpTools() 的注册全集动态派生，确保新增工具自动纳入屏蔽，避免再次遗漏
@@ -1961,7 +1724,9 @@ async function main(): Promise<void> {
       const queryResult = await runQuery(
         prompt,
         sessionId,
-        mcpServerConfig,
+        engine,
+        engineSession,
+        engineTools,
         containerInput,
         memoryRecallPrompt,
         resumeAt,
@@ -1996,7 +1761,11 @@ async function main(): Promise<void> {
         resumeAt = undefined;
         consecutiveCompactions = 0;
         // Rebuild MCP server to avoid "Already connected to a transport" error
-        mcpServerConfig = buildMcpServerConfig();
+        engineTools = buildEngineTools();
+        engineSession = await engine.createSession(
+          { model: CLAUDE_MODEL, baseUrl: '', apiKey: '', cwd: WORKSPACE_GROUP },
+          undefined,
+        );
         continue;
       }
 
@@ -2108,7 +1877,11 @@ async function main(): Promise<void> {
         if (nextMessage.sourceJid) mcpToolsConfig.chatJid = nextMessage.sourceJid;
         // Rebuild MCP server to avoid "Already connected to a transport" error
         // when the previous query was aborted mid-stream (#421).
-        mcpServerConfig = buildMcpServerConfig();
+        engineTools = buildEngineTools();
+        engineSession = await engine.createSession(
+          { model: CLAUDE_MODEL, baseUrl: '', apiKey: '', cwd: WORKSPACE_GROUP },
+          undefined,
+        );
         continue;
       }
 
@@ -2131,7 +1904,9 @@ async function main(): Promise<void> {
         const flushResult = await runQuery(
           flushPrompt,
           sessionId,
-          mcpServerConfig,
+          engine,
+          engineSession,
+          engineTools,
           containerInput,
           memoryRecallPrompt,
           resumeAt,
@@ -2183,7 +1958,9 @@ async function main(): Promise<void> {
           const autoContResult = await runQuery(
             autoContinuePrompt,
             sessionId,
-            mcpServerConfig,
+            engine,
+            engineSession,
+            engineTools,
             containerInput,
             memoryRecallPrompt,
             resumeAt,
@@ -2217,7 +1994,11 @@ async function main(): Promise<void> {
             sessionId = undefined;
             latestSessionId = undefined;
             resumeAt = undefined;
-            mcpServerConfig = buildMcpServerConfig();
+            engineTools = buildEngineTools();
+            engineSession = await engine.createSession(
+              { model: CLAUDE_MODEL, baseUrl: '', apiKey: '', cwd: WORKSPACE_GROUP },
+              undefined,
+            );
           }
           if (autoContResult.unrecoverableTranscriptError) {
             log('WARN: Unrecoverable transcript error during auto-continue, signaling reset');
