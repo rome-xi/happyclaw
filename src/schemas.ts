@@ -695,6 +695,8 @@ export const UnifiedProviderCreateSchema = z
     customEnv: z.record(z.string().max(256), z.string().max(4096)).optional(),
     weight: z.number().int().min(1).max(100).optional(),
     enabled: z.boolean().optional(),
+    /** 引擎类型：'anthropic' (默认) 或 'openai' */
+    engineType: z.enum(['anthropic', 'openai']).optional(),
   })
   .superRefine((data, ctx) => {
     if (
@@ -717,6 +719,7 @@ export const UnifiedProviderPatchSchema = z
     anthropicModel: z.string().max(128).optional(),
     customEnv: z.record(z.string().max(256), z.string().max(4096)).optional(),
     weight: z.number().int().min(1).max(100).optional(),
+    engineType: z.enum(['anthropic', 'openai']).optional(),
   })
   .refine(
     (data) =>
@@ -724,7 +727,8 @@ export const UnifiedProviderPatchSchema = z
       data.anthropicBaseUrl !== undefined ||
       data.anthropicModel !== undefined ||
       data.customEnv !== undefined ||
-      data.weight !== undefined,
+      data.weight !== undefined ||
+      data.engineType !== undefined,
     { message: 'At least one field must be provided' },
   );
 

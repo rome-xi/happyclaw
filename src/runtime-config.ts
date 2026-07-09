@@ -359,6 +359,7 @@ interface StoredProviderV4 {
   anthropicModel: string;
   secrets: EncryptedSecrets;
   customEnv?: Record<string, string>;
+  engineType?: 'anthropic' | 'openai';
   updatedAt: string;
 }
 
@@ -383,6 +384,12 @@ export interface UnifiedProvider {
   claudeCodeOauthToken: string;
   claudeOAuthCredentials: ClaudeOAuthCredentials | null;
   customEnv: Record<string, string>;
+  /**
+   * 引擎类型：决定 wire protocol。
+   * - 'anthropic': Anthropic Messages API（默认，向后兼容）
+   * - 'openai': OpenAI Responses API
+   */
+  engineType?: 'anthropic' | 'openai';
   updatedAt: string;
 }
 
@@ -405,6 +412,7 @@ export interface UnifiedProviderPublic {
   claudeOAuthCredentialsExpiresAt: number | null;
   claudeOAuthCredentialsAccessTokenMasked: string | null;
   customEnv: Record<string, string>;
+  engineType?: 'anthropic' | 'openai';
   updatedAt: string;
 }
 
@@ -1047,6 +1055,9 @@ function toStoredProviderV4(provider: UnifiedProvider): StoredProviderV4 {
     ...(Object.keys(sanitizedEnv).length > 0
       ? { customEnv: sanitizedEnv }
       : {}),
+    ...(provider.engineType && provider.engineType !== 'anthropic'
+      ? { engineType: provider.engineType }
+      : {}),
     updatedAt: provider.updatedAt || new Date().toISOString(),
   };
 }
@@ -1068,6 +1079,7 @@ function fromStoredProviderV4(stored: StoredProviderV4): UnifiedProvider {
     customEnv: sanitizeCustomEnvMap(stored.customEnv || {}, {
       skipReservedClaudeKeys: true,
     }),
+    engineType: stored.engineType || 'anthropic',
     updatedAt: stored.updatedAt || '',
   };
 }

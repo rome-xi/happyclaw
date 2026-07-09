@@ -18,6 +18,8 @@ export interface UnifiedProviderPublic {
   claudeOAuthCredentialsExpiresAt: number | null;
   claudeOAuthCredentialsAccessTokenMasked: string | null;
   customEnv: Record<string, string>;
+  /** 引擎类型：'anthropic' (默认) 或 'openai' */
+  engineType?: 'anthropic' | 'openai';
   updatedAt: string;
 }
 

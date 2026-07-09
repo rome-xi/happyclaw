@@ -15,6 +15,7 @@ import type { ProviderWithHealth, EnvRow } from './types';
 import { getErrorMessage } from './types';
 
 type ProviderType = 'official' | 'third_party';
+type EngineType = 'anthropic' | 'openai';
 type OfficialAuthTab = 'oauth' | 'setup_token' | 'api_key';
 
 const RESERVED_ENV_KEYS = new Set([
@@ -84,6 +85,7 @@ export function ProviderEditor({
   const [baseUrl, setBaseUrl] = useState('');
   const [model, setModel] = useState('');
   const [weight, setWeight] = useState(1);
+  const [engineType, setEngineType] = useState<EngineType>('anthropic');
 
   // 官方认证
   const [authTab, setAuthTab] = useState<OfficialAuthTab>('oauth');
@@ -117,6 +119,7 @@ export function ProviderEditor({
       setBaseUrl('');
       setModel('');
       setWeight(1);
+      setEngineType('anthropic');
       setAuthTab('oauth');
       setSetupToken('');
       setApiKey('');
@@ -132,6 +135,7 @@ export function ProviderEditor({
       setBaseUrl(provider.anthropicBaseUrl || '');
       setModel(provider.anthropicModel || '');
       setWeight(provider.weight);
+      setEngineType(provider.engineType || 'anthropic');
       setAuthTab('oauth');
       setSetupToken('');
       setApiKey('');
@@ -290,6 +294,10 @@ export function ProviderEditor({
 
         if (model.trim()) createBody.anthropicModel = model.trim();
 
+        if (engineType !== 'anthropic') {
+          createBody.engineType = engineType;
+        }
+
         await api.post('/api/config/claude/providers', createBody);
         setNotice('提供商已创建。');
       } else {
@@ -305,6 +313,10 @@ export function ProviderEditor({
         }
         if (model.trim()) {
           patchBody.anthropicModel = model.trim();
+        }
+
+        if (engineType !== (provider?.engineType || 'anthropic')) {
+          patchBody.engineType = engineType;
         }
 
         await api.patch(`/api/config/claude/providers/${provider!.id}`, patchBody);
@@ -687,6 +699,28 @@ export function ProviderEditor({
                 </p>
               </>
             )}
+          </div>
+
+          {/* ─── 引擎类型 ─── */}
+          <div className="border-t border-border pt-4">
+            <label className="block text-xs text-muted-foreground mb-1">引擎类型</label>
+            <select
+              value={engineType}
+              onChange={(e) => setEngineType(e.target.value as EngineType)}
+              disabled={saving}
+              className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary/30"
+            >
+              <option value="anthropic">Anthropic Messages API（默认）</option>
+              <option value="openai">OpenAI Responses API</option>
+            </select>
+            <p className="text-xs text-muted-foreground mt-1">
+              选择该 Provider 使用的 API wire protocol。
+              {engineType === 'openai' && (
+                <span className="text-amber-600 dark:text-amber-400 block mt-1">
+                  ⚠️ OpenAI 引擎为实验性功能，Sub-Agent 调度和自动上下文压缩暂不支持。
+                </span>
+              )}
+            </p>
           </div>
 
           {/* ─── 自定义环境变量 ─── */}

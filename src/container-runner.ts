@@ -26,6 +26,7 @@ import {
   getClaudeProviderConfig,
   getContainerEnvConfig,
   getEnabledProviders,
+  getProviders,
   getBalancingConfig,
   getSystemSettings,
   getEffectiveExternalDir,
@@ -1673,6 +1674,18 @@ export async function runHostAgent(
     // SubAgent 模型：仅非默认 'inherit' 时注入，避免覆盖 customEnv 同名值。
     if (hostSysSettings.subagentModel && hostSysSettings.subagentModel !== 'inherit') {
       hostEnv['SUBAGENT_MODEL'] = hostSysSettings.subagentModel;
+    }
+
+    // 引擎类型：根据选中的 Provider 的 engineType 注入
+    if (hostSelectedProfileId) {
+      const providerDef = getProviders().find((p) => p.id === hostSelectedProfileId);
+      if (providerDef?.engineType && providerDef.engineType !== 'anthropic') {
+        hostEnv['HAPPYCLAW_ENGINE_TYPE'] = providerDef.engineType;
+        logger.info(
+          { folder: group.folder, providerId: hostSelectedProfileId, engineType: providerDef.engineType },
+          '注入非默认引擎类型到 host agent',
+        );
+      }
     }
 
     // admin 主容器 + 系统设置 disableMemoryLayerForAdminHost 时禁用 HappyClaw 记忆层：

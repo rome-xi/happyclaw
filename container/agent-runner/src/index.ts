@@ -17,19 +17,20 @@
 import fs from 'fs';
 import path from 'path';
 import { execFileSync } from 'child_process';
-import { query, HookCallback, PreCompactHookInput, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
+import { query, type HookCallback, type PreCompactHookInput, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
 import { detectImageMimeTypeFromBase64Strict } from './image-detector.js';
 import { pruneProcessedHistoryImagesInTranscript as pruneProcessedHistoryImagesInTranscriptFile } from './history-image-prune.js';
 import { getChannelFromJid } from './channel-prefixes.js';
+import { StreamEventProcessor } from './stream-processor.js';
 
 import type {
   ContainerInput,
   ContainerOutput,
   ImageMediaType,
   SessionsIndex,
-  SDKUserMessage,
   ParsedMessage,
   StreamEvent,
+  SDKUserMessage,
 } from './types.js';
 import type { ClaudeContextAudit } from './stream-event.types.js';
 export type { StreamEventType, StreamEvent } from './types.js';
@@ -39,9 +40,81 @@ import {
   extractSessionHistory as extractSessionHistoryImpl,
   parseTranscript,
 } from './session-history.js';
-import { StreamEventProcessor } from './stream-processor.js';
 import { PREDEFINED_AGENTS } from './agent-definitions.js';
 import { createMcpTools } from './mcp-tools.js';
+
+// ── AgentEngine 引擎层 ──
+import { ClaudeEngine } from './engines/claude-engine.js';
+import type {
+  EngineConfig,
+  EngineSession,
+  EngineMessage,
+  EngineToolDefinition,
+  EngineAgentDefinition,
+  EngineHooks,
+  EngineSendResult,
+} from './engines/types.js';
+
+// ── MessageStream：SDK query() 的 user message 流 ──
+//
+// 实现 AsyncIterable<SDKUserMessage>，使 query() 保持 isSingleUserTurn=false
+// 模式（等待后续 IPC 消息），而不是单轮后立即结束。
+class MessageStream {
+  private done = false;
+  private queue: SDKUserMessage[] = [];
+  private waiting: (() => void) | null = null;
+  ended = false;
+
+  push(text: string, images?: Array<{ data: string; mimeType: string }>): string[] {
+    if (this.done) return [];
+    const rejected: string[] = [];
+    let content: SDKUserMessage['message']['content'];
+    if (images && images.length > 0) {
+      content = [{ type: 'text', text }];
+      for (const img of images) {
+        // 简单校验：图片 base64 不应为空
+        if (!img.data || img.data.length === 0) {
+          rejected.push('图片数据为空');
+          continue;
+        }
+        content.push({
+          type: 'image',
+          source: { type: 'base64', data: img.data, media_type: img.mimeType as ImageMediaType },
+        });
+      }
+    } else {
+      content = text;
+    }
+    this.queue.push({
+      type: 'user',
+      message: { role: 'user', content },
+      parent_tool_use_id: null,
+      session_id: '',
+    });
+    this.waiting?.();
+    return rejected;
+  }
+
+  end() {
+    this.done = true;
+    this.ended = true;
+    this.waiting?.();
+  }
+
+  close() {
+    this.end();
+  }
+
+  async *[Symbol.asyncIterator](): AsyncGenerator<SDKUserMessage> {
+    while (true) {
+      while (this.queue.length > 0) {
+        yield this.queue.shift()!;
+      }
+      if (this.done) return;
+      await new Promise<void>((r) => { this.waiting = r; });
+    }
+  }
+}
 
 // 路径解析：优先读取环境变量，降级到容器内默认路径（保持向后兼容）
 const WORKSPACE_GROUP = process.env.HAPPYCLAW_WORKSPACE_GROUP || '/workspace/group';
@@ -383,93 +456,6 @@ function filterOversizedImages(
     }
   }
   return { valid, rejected };
-}
-
-/**
- * Push-based async iterable for streaming user messages to the SDK.
- * Keeps the iterable alive until end() is called, preventing isSingleUserTurn.
- */
-class MessageStream {
-  private queue: SDKUserMessage[] = [];
-  private waiting: (() => void) | null = null;
-  private done = false;
-
-  push(text: string, images?: Array<{ data: string; mimeType?: string }>): string[] {
-    // stream.done=true 后禁止写入已关闭的 SDK transport，否则触发 "ProcessTransport is not ready for writing"
-    if (this.done) {
-      return ['Stream already ended, message will be processed in the next query'];
-    }
-
-    const rejectedReasons: string[] = [];
-    const originalImageCount = images?.length ?? 0;
-    let filteredImages = images;
-
-    if (filteredImages && filteredImages.length > 0) {
-      const { valid, rejected } = filterOversizedImages(filteredImages);
-      rejectedReasons.push(...rejected);
-      filteredImages = valid.length > 0 ? valid : undefined;
-    }
-
-    // 全部图片被过滤 + text 为空时，替换为说明文本，避免 SDK 收到空 user message
-    // 进而让主模型回复"消息是空的"。典型触发：Web 用户直接粘贴长图（height > 8000px）无文字。
-    let effectiveText = text;
-    const allImagesDropped =
-      originalImageCount > 0 && (!filteredImages || filteredImages.length === 0);
-    if (allImagesDropped && !effectiveText.trim()) {
-      effectiveText = `[用户发送了 ${originalImageCount} 张图片，但因尺寸超出 API 限制（最大 ${IMAGE_MAX_DIMENSION}px）被跳过。请提示用户压缩或截取后重发。]`;
-    }
-
-    let content:
-      | string
-      | Array<{ type: 'text'; text: string } | { type: 'image'; source: { type: 'base64'; media_type: ImageMediaType; data: string } }>;
-
-    if (filteredImages && filteredImages.length > 0) {
-      // 多模态消息：text + images
-      content = [
-        { type: 'text', text: effectiveText },
-        ...filteredImages.map((img) => ({
-          type: 'image' as const,
-          source: {
-            type: 'base64' as const,
-            media_type: resolveImageMimeType(img),
-            data: img.data,
-          },
-        })),
-      ];
-    } else {
-      // 纯文本消息
-      content = effectiveText;
-    }
-
-    this.queue.push({
-      type: 'user',
-      message: { role: 'user', content },
-      parent_tool_use_id: null,
-      session_id: '',
-    });
-    this.waiting?.();
-    return rejectedReasons;
-  }
-
-  get ended(): boolean {
-    return this.done;
-  }
-
-  end(): void {
-    this.done = true;
-    this.waiting?.();
-  }
-
-  async *[Symbol.asyncIterator](): AsyncGenerator<SDKUserMessage> {
-    while (true) {
-      while (this.queue.length > 0) {
-        yield this.queue.shift()!;
-      }
-      if (this.done) return;
-      await new Promise<void>(r => { this.waiting = r; });
-      this.waiting = null;
-    }
-  }
 }
 
 async function readStdin(): Promise<string> {
@@ -1109,7 +1095,10 @@ async function runQuery(
   let lastAssistantUuid: string | undefined;
   let canonicalAssistantText: string | undefined;
   let canonicalAssistantUuid: string | undefined;
-  const initialRejected = stream.push(prompt, images);
+  const initialRejected = stream.push(
+    prompt,
+    images?.map((i) => ({ data: i.data, mimeType: i.mimeType || 'image/png' })),
+  );
   const decorateStreamEvent = (event: StreamEvent): StreamEvent => ({
     ...event,
     turnId: containerInput.turnId,
@@ -1252,7 +1241,10 @@ async function runQuery(
     for (const msg of messages) {
       log(`Piping IPC message into active query (${msg.text.length} chars, ${msg.images?.length || 0} images)`);
       pipedMessagesDuringQuery.push(msg);
-      const rejected = stream.push(msg.text, msg.images);
+      const rejected = stream.push(
+        msg.text,
+        msg.images?.map((i) => ({ data: i.data, mimeType: i.mimeType || 'image/png' })),
+      );
       for (const reason of rejected) {
         emit({ status: 'success', result: `\u26a0\ufe0f ${reason}`, newSessionId: undefined });
       }
