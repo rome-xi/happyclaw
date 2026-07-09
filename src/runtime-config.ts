@@ -1292,6 +1292,7 @@ export function createProvider(input: {
   customEnv?: Record<string, string>;
   weight?: number;
   enabled?: boolean;
+  engineType?: 'anthropic' | 'openai';
 }): UnifiedProvider {
   const state = readStoredStateV4() || {
     providers: [],
@@ -1328,6 +1329,7 @@ export function createProvider(input: {
     customEnv: sanitizeCustomEnvMap(input.customEnv || {}, {
       skipReservedClaudeKeys: true,
     }),
+    engineType: input.engineType ?? 'anthropic',
     updatedAt: now,
   };
 
@@ -1344,6 +1346,7 @@ export function updateProvider(
     anthropicModel?: string;
     customEnv?: Record<string, string>;
     weight?: number;
+    engineType?: 'anthropic' | 'openai';
   },
 ): UnifiedProvider {
   const state = readStoredStateV4();
@@ -1373,6 +1376,9 @@ export function updateProvider(
       : {}),
     ...(patch.weight !== undefined
       ? { weight: Math.max(1, Math.min(100, patch.weight)) }
+      : {}),
+    ...(patch.engineType !== undefined
+      ? { engineType: patch.engineType }
       : {}),
     updatedAt: new Date().toISOString(),
   };
@@ -1530,20 +1536,22 @@ export function toPublicProvider(
       ? maskSecret(provider.claudeOAuthCredentials.accessToken)
       : null,
     customEnv: provider.customEnv || {},
+    engineType: provider.engineType || 'anthropic',
     updatedAt: provider.updatedAt,
   };
 }
 
 /**
- * Resolve a provider by ID to { config, customEnv } in a single disk read.
+ * Resolve a provider by ID to { config, customEnv, engineType } in a single disk read.
  * Used by container-runner for pool-selected providers.
  */
 export function resolveProviderById(providerId: string): {
   config: ClaudeProviderConfig;
   customEnv: Record<string, string>;
+  engineType: 'anthropic' | 'openai';
 } {
   const state = readStoredStateV4();
-  if (!state) return { config: defaultsFromEnv(), customEnv: {} };
+  if (!state) return { config: defaultsFromEnv(), customEnv: {}, engineType: 'anthropic' };
 
   const provider = state.providers.find((p) => p.id === providerId);
   if (!provider) {
@@ -1553,16 +1561,18 @@ export function resolveProviderById(providerId: string): {
     );
     const fallback =
       state.providers.find((p) => p.enabled) || state.providers[0];
-    if (!fallback) return { config: defaultsFromEnv(), customEnv: {} };
+    if (!fallback) return { config: defaultsFromEnv(), customEnv: {}, engineType: 'anthropic' };
     return {
       config: providerToConfig(fallback),
       customEnv: fallback.customEnv,
+      engineType: fallback.engineType || 'anthropic',
     };
   }
 
   return {
     config: providerToConfig(provider),
     customEnv: provider.customEnv,
+    engineType: provider.engineType || 'anthropic',
   };
 }
 
@@ -2492,6 +2502,7 @@ export function getCustomEnvForProfile(
 export function resolveProfileFull(profileId: string): {
   config: ClaudeProviderConfig;
   customEnv: Record<string, string>;
+  engineType: 'anthropic' | 'openai';
 } {
   return resolveProviderById(profileId);
 }

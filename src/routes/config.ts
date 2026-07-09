@@ -441,7 +441,9 @@ configRoutes.patch(
         ((validation.data.anthropicBaseUrl !== undefined &&
           validation.data.anthropicBaseUrl !== previous.anthropicBaseUrl) ||
           (validation.data.anthropicModel !== undefined &&
-            validation.data.anthropicModel !== previous.anthropicModel))
+            validation.data.anthropicModel !== previous.anthropicModel) ||
+          (validation.data.engineType !== undefined &&
+            validation.data.engineType !== (previous.engineType || 'anthropic')))
       );
       appendClaudeConfigAudit(actor, 'update_provider', [
         `id:${id}`,

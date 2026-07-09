@@ -167,6 +167,14 @@ export function ProviderList({
                           权重 {provider.weight}
                         </span>
                       )}
+                      {provider.engineType && provider.engineType !== 'anthropic' && (
+                        <span
+                          className="text-[11px] px-1.5 py-0.5 rounded shrink-0 bg-purple-100 dark:bg-purple-900/40 text-purple-700 dark:text-purple-300"
+                          title={`引擎类型：${provider.engineType}`}
+                        >
+                          {provider.engineType === 'openai' ? 'OpenAI' : provider.engineType}
+                        </span>
+                      )}
                     </div>
 
                     <div className="flex items-center gap-1.5 shrink-0">

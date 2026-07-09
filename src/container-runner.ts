@@ -271,6 +271,7 @@ function mkdirForContainer(dirPath: string): void {
 interface ResolvedProvider {
   config: ClaudeProviderConfig;
   customEnv: Record<string, string>;
+  engineType: 'anthropic' | 'openai';
 }
 
 /**
@@ -391,7 +392,7 @@ function trySelectPoolProvider(
       );
       return {
         profileId: overrideProviderId,
-        resolved: { config: resolved.config, customEnv: resolved.customEnv },
+        resolved,
         previousProviderId: existingBoundId,
         resetSession:
           !!existingBoundId && existingBoundId !== overrideProviderId,
@@ -432,10 +433,7 @@ function trySelectPoolProvider(
           );
           return {
             profileId: boundId,
-            resolved: {
-              config: resolved.config,
-              customEnv: resolved.customEnv,
-            },
+            resolved,
           };
         } catch (err) {
           logger.warn(
@@ -461,7 +459,7 @@ function trySelectPoolProvider(
       setSessionProviderId(groupFolder, agentId, enabledProviders[0].id);
       return {
         profileId: enabledProviders[0].id,
-        resolved: { config: resolved.config, customEnv: resolved.customEnv },
+        resolved,
         previousProviderId: boundId,
         resetSession: !!boundId && boundId !== enabledProviders[0].id,
       };
@@ -477,7 +475,7 @@ function trySelectPoolProvider(
     setSessionProviderId(groupFolder, agentId, profileId);
     return {
       profileId,
-      resolved: { config: resolved.config, customEnv: resolved.customEnv },
+      resolved,
       previousProviderId: boundId,
       resetSession: !!boundId && boundId !== profileId,
     };
@@ -768,6 +766,23 @@ export function buildVolumeMounts(
   // 此时不注入，避免覆盖用户可能在 provider customEnv 里设的 SUBAGENT_MODEL（与 autoCompact 对称）。
   if (sysSettings.subagentModel && sysSettings.subagentModel !== 'inherit') {
     envLines.push(`SUBAGENT_MODEL=${sysSettings.subagentModel}`);
+  }
+  // 引擎类型：engineType='openai' 时注入 OPENAI_* 变量供 agent-runner 使用
+  const providerEngineType = resolvedProvider?.engineType || 'anthropic';
+  if (providerEngineType === 'openai') {
+    const openaiBaseUrl = globalConfig.anthropicBaseUrl;
+    const openaiApiKey = globalConfig.anthropicAuthToken || globalConfig.anthropicApiKey;
+    if (openaiBaseUrl) {
+      envLines.push(`OPENAI_BASE_URL=${openaiBaseUrl}`);
+    }
+    if (openaiApiKey) {
+      envLines.push(`OPENAI_API_KEY=${openaiApiKey}`);
+    }
+    envLines.push(`HAPPYCLAW_ENGINE_TYPE=openai`);
+    logger.info(
+      { group: group.name, engineType: 'openai' },
+      '注入 OPENAI_* 环境变量到容器（engineType=openai）',
+    );
   }
   if (envLines.length > 0) {
     const envFilePath = path.join(envDir, 'env');
@@ -1681,6 +1696,16 @@ export async function runHostAgent(
       const providerDef = getProviders().find((p) => p.id === hostSelectedProfileId);
       if (providerDef?.engineType && providerDef.engineType !== 'anthropic') {
         hostEnv['HAPPYCLAW_ENGINE_TYPE'] = providerDef.engineType;
+        if (providerDef.engineType === 'openai') {
+          // 注入 OPENAI_* 变量供 agent-runner 使用
+          if (providerDef.anthropicBaseUrl) {
+            hostEnv['OPENAI_BASE_URL'] = providerDef.anthropicBaseUrl;
+          }
+          const openaiKey = providerDef.anthropicAuthToken || providerDef.anthropicApiKey;
+          if (openaiKey) {
+            hostEnv['OPENAI_API_KEY'] = openaiKey;
+          }
+        }
         logger.info(
           { folder: group.folder, providerId: hostSelectedProfileId, engineType: providerDef.engineType },
           '注入非默认引擎类型到 host agent',
