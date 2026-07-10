@@ -217,4 +217,31 @@ export interface AgentEngine {
    * 与 sendMessage 的 agents 参数合并。
    */
   registerAgents(agents: EngineAgentDefinition[]): void;
+
+  // ── 以下方法仅 ClaudeEngine 需要（SDK pipe-in + PreCompact flush），
+  // OpenAIEngine 等引擎不实现（可选）。caller 用 optional chaining 或 typeof 判断 ──
+
+  /** 向当前活动查询推送用户消息（IPC pipe-in）。返回错误列表（空 = 成功）。 */
+  pushToActive?(
+    text: string,
+    images?: Array<{ data: string; mimeType: string }>,
+  ): string[];
+
+  /** 中断当前活动查询。 */
+  interruptActive?(): Promise<void>;
+
+  /** 关闭当前活动查询的消息流。 */
+  endActiveStream?(): void;
+
+  /** 检查当前活动查询的 SDK transport 是否已就绪。 */
+  isActiveTransportReady?(): boolean;
+
+  /** 检查当前活动查询的消息流是否已结束。 */
+  isActiveStreamEnded?(): boolean;
+
+  /** 获取当前活动查询的累积文本（供 PreCompact hook flush 使用）。 */
+  getActiveFullText?(): string;
+
+  /** 重置累积文本（PreCompact hook flush 完毕后调用）。 */
+  resetActiveFullText?(): void;
 }

@@ -43,6 +43,8 @@ import { createMcpTools } from './mcp-tools.js';
 
 // ── AgentEngine 引擎层 ──
 import { ClaudeEngine } from './engines/claude-engine.js';
+import { createEngine } from './engines/index.js';
+import type { AgentEngine } from './engines/types.js';
 import type {
   EngineConfig,
   EngineSession,
@@ -1020,7 +1022,7 @@ function pruneProcessedHistoryImagesInTranscript(sessionId: string | undefined):
 async function runQuery(
   prompt: string,
   sessionId: string | undefined,
-  engine: ClaudeEngine,
+  engine: AgentEngine,
   engineSession: EngineSession,
   engineTools: EngineToolDefinition[],
   containerInput: ContainerInput,
@@ -1188,11 +1190,11 @@ async function runQuery(
   // ── 构建 EngineAgent（空，PREDEFINED_AGENTS 由引擎自动加载）──
   const engineAgents: EngineAgentDefinition[] = [];
 
-  // ── PreCompact hook（与原逻辑一致，flush text 改用 engine.getActiveFullText()）──
+  // ── PreCompact hook（与原逻辑一致，flush text 改用 engine.getActiveFullText?.() ?? ""）──
   const preCompactHook = createPreCompactHook(isHome, isAdminHome, disableMemoryLayer, {
     emit,
-    getFullText: () => engine.getActiveFullText(),
-    resetFullText: () => engine.resetActiveFullText(),
+    getFullText: () => engine.getActiveFullText?.() ?? "",
+    resetFullText: () => engine.resetActiveFullText?.(),
   });
 
   // 将 PreCompact hook 注入 engine config
@@ -1207,7 +1209,7 @@ async function runQuery(
     if (postResultInterruptRequested) return;
     postResultInterruptRequested = true;
     log(`${reason}, interrupting current query before closing stream`);
-    engine.interruptActive().catch((err: unknown) => log(`Shutdown interrupt failed: ${err}`));
+    engine.interruptActive?.().catch((err: unknown) => log(`Shutdown interrupt failed: ${err}`));
   };
 
   const pollIpcDuringQuery = () => {
@@ -1217,7 +1219,7 @@ async function runQuery(
       log('Close sentinel detected during query, ending stream');
       closedDuringQuery = true;
       interruptQueryForShutdown('Close sentinel detected during query');
-      engine.endActiveStream();
+      engine.endActiveStream?.();
       ipcPolling = false;
       ipcQueryWatcher.close();
       return;
@@ -1230,8 +1232,8 @@ async function runQuery(
         log('Interrupt arrived before visible output, suppressing query output');
       }
       markInterruptRequested();
-      engine.interruptActive().catch((err: unknown) => log(`Interrupt call failed: ${err}`));
-      engine.endActiveStream();
+      engine.interruptActive?.().catch((err: unknown) => log(`Interrupt call failed: ${err}`));
+      engine.endActiveStream?.();
       ipcPolling = false;
       ipcQueryWatcher.close();
       return;
@@ -1240,7 +1242,7 @@ async function runQuery(
       log('Drain sentinel detected after query result, ending stream');
       closedDuringQuery = true;
       interruptQueryForShutdown('Drain sentinel detected after query result');
-      engine.endActiveStream();
+      engine.endActiveStream?.();
       ipcPolling = false;
       ipcQueryWatcher.close();
       return;
@@ -1248,7 +1250,7 @@ async function runQuery(
     if (resultReceivedAt && Date.now() - resultReceivedAt > POST_RESULT_TIMEOUT_MS) {
       log(`Post-result timeout (${POST_RESULT_TIMEOUT_MS / 1000}s), closing stream`);
       interruptQueryForShutdown('Post-result timeout');
-      engine.endActiveStream();
+      engine.endActiveStream?.();
       ipcPolling = false;
       ipcQueryWatcher.close();
       return;
@@ -1256,7 +1258,11 @@ async function runQuery(
     // Side-queries (emitOutput=false) 不消费用户 IPC 消息
     if (!emitOutput) return;
 
-    if (engine.isActiveStreamEnded()) {
+    // 引擎不支持 pipe-in (如 OpenAIEngine) 时,跳过 IPC 消息注入 —
+    // OpenAI 引擎的语义是每次 sendMessage 一次性请求,不支持中途追加消息.
+    if (typeof engine.pushToActive !== 'function') return;
+
+    if (engine.isActiveStreamEnded?.() === true) {
       log('Stream already ended, skipping IPC drain');
       ipcPolling = false;
       ipcQueryWatcher.close();
@@ -1264,7 +1270,7 @@ async function runQuery(
     }
 
     // SDK transport 未就绪时不 pipe 消息
-    if (!engine.isActiveTransportReady()) return;
+    if (engine.isActiveTransportReady?.() !== true) return;
 
     const { messages } = drainIpcInput();
     for (const msg of messages) {
@@ -1425,7 +1431,7 @@ async function runQuery(
       // 上下文溢出
       if (hadContextOverflow) {
         log(`Context overflow detected in result`);
-        const partialText = engine.getActiveFullText();
+        const partialText = engine.getActiveFullText?.() ?? "";
         if (partialText.trim()) {
           log(`Emitting overflow_partial with ${partialText.length} chars`);
           emit({
@@ -1500,7 +1506,7 @@ async function runQuery(
     // 上下文溢出
     if (isContextOverflowError(errorMessage)) {
       log(`Context overflow detected: ${errorMessage}`);
-      const partialText = engine.getActiveFullText();
+      const partialText = engine.getActiveFullText?.() ?? "";
       if (partialText.trim()) {
         log(`Emitting overflow_partial (catch) with ${partialText.length} chars`);
         emit({
@@ -1607,8 +1613,11 @@ async function main(): Promise<void> {
     workspaceMemory: WORKSPACE_MEMORY,
     disableMemoryLayer,
   };
-  // ── AgentEngine: 创建 ClaudeEngine 实例 + 转换 MCP 工具为通用格式 ──
-  const engine = new ClaudeEngine({ logFn: log });
+  // ── AgentEngine: 根据 HAPPYCLAW_ENGINE_TYPE 环境变量选择引擎 + 转换 MCP 工具为通用格式 ──
+  // 主服务 (src/container-runner.ts) 会根据选中 Provider 的 engineType 注入该 env,
+  // 缺省或 anthropic 走 ClaudeEngine, openai 走 OpenAIEngine.
+  const engine = createEngine({ claudeOptions: { logFn: log }, openaiOptions: { logFn: log } });
+  log(`AgentEngine 选择: ${engine.engineType} (env HAPPYCLAW_ENGINE_TYPE=${process.env.HAPPYCLAW_ENGINE_TYPE || '(none)'})`);
 
   // 将 SDK MCP 工具转换为 EngineToolDefinition 通用格式
   const buildEngineTools = (): EngineToolDefinition[] => {
