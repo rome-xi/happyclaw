@@ -1160,8 +1160,13 @@ async function runQuery(
   const autoCompactWindow = parseInt(process.env.AUTO_COMPACT_WINDOW ?? '0', 10);
 
   // ── 构建 EngineConfig（包含所有 SDK 选项）──
+  // model 按引擎类型选默认: OpenAI 引擎读 OPENAI_MODEL, Claude 引擎读 ANTHROPIC_MODEL.
+  // 之前硬编码 CLAUDE_MODEL 会把 opus[1m] 送到 OpenAI 引擎, 导致上游 404/503.
+  const engineModel = engine.engineType === 'openai'
+    ? (process.env.OPENAI_MODEL || 'gpt-5.5')
+    : CLAUDE_MODEL;
   const engineConfig: EngineConfig = {
-    model: CLAUDE_MODEL,
+    model: engineModel,
     baseUrl: '',
     apiKey: '',
     cwd: WORKSPACE_GROUP,
