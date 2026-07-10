@@ -51,6 +51,8 @@ interface OpenAIOutputItem {
   name?: string;
   arguments?: string;
   status?: string;
+  /** function_call 的引用 id，回填 function_call_output 时使用（与 item.id 是两个不同的 id） */
+  call_id?: string;
 }
 
 interface OpenAIUsage {
@@ -87,8 +89,10 @@ async function* parseSseStream(
 
       buffer += decoder.decode(value, { stream: true });
 
-      // SSE 事件以空行分隔
-      const events = buffer.split('\n\n');
+      // SSE 帧以空行分隔。标准是 CRLF+CRLF（\r\n\r\n），但很多实现只用 LF+LF（\n\n）。
+      // AgentRouter 上游走 CRLF，必须先归一化换行符再按 \n\n 切分，否则永远拿不到完整帧。
+      const normalized = buffer.replace(/\r\n/g, '\n');
+      const events = normalized.split('\n\n');
       buffer = events.pop() || ''; // 最后一段可能不完整，保留
 
       for (const rawEvent of events) {
@@ -331,13 +335,26 @@ export class OpenAIEngine implements AgentEngine {
       );
     }
 
+    // pendingToolOutputs 缓存本轮循环收集到的 tool_result,下一轮循环开头会替换成 input
+    let pendingToolOutputs: Array<Record<string, unknown>> = [];
+
     while (loopCount < MAX_TOOL_LOOPS) {
       loopCount++;
+
+      // ── 决定本轮请求 input ──
+      // 用了 previous_response_id 时,历史 user/assistant/function_call 由服务端自动携带,
+      // 客户端只需要提交本轮新增的 items:
+      //   首轮无 previous_response_id → 发送原始 user message
+      //   非首轮已有 previous_response_id → 只发送 function_call_output 回填
+      const roundInput =
+        loopCount === 1 && !previousResponseId
+          ? inputItems
+          : pendingToolOutputs;
 
       // ── 构建请求体 ──
       const requestBody: Record<string, unknown> = {
         model,
-        input: inputItems,
+        input: roundInput,
         tools:
           allTools.length > 0 ? toolsToOpenAIFunctionDefs(allTools) : undefined,
         stream: true,
@@ -358,12 +375,15 @@ export class OpenAIEngine implements AgentEngine {
       let currentTurnText = ''; // 本轮完整文本
       const pendingToolCalls = new Map<
         string,
-        { name: string; argumentsBuffer: string }
+        { name: string; argumentsBuffer: string; callId: string }
       >();
       let hasToolCalls = false;
       let finalUsage: OpenAIUsage | null = null;
       let responseFailed = false;
       let responseErrorMsg = '';
+
+      // 清空上一轮 pending outputs（已随本轮请求发出）
+      pendingToolOutputs = [];
 
       try {
         const url = `${baseUrl.replace(/\/$/, '')}/responses`;
@@ -403,8 +423,9 @@ export class OpenAIEngine implements AgentEngine {
 
           switch (sseEvent.event) {
             case 'response.created': {
-              // data 直接是 response 对象（不是 { response: ... }）
-              const resp = sseEvent.data as unknown as OpenAIResponse;
+              // AgentRouter/OpenAI 都把 response 对象包在 data.response 里，而不是把 data 本身当 response
+              const resp = ((sseEvent.data as { response?: OpenAIResponse }).response
+                ?? sseEvent.data) as OpenAIResponse;
               currentResponseId = resp.id;
               previousResponseId = resp.id;
               session.id = resp.id;
@@ -463,16 +484,19 @@ export class OpenAIEngine implements AgentEngine {
             case 'response.output_item.added': {
               const item = (sseEvent.data as { item: OpenAIOutputItem }).item;
               if (item.type === 'function_call' && item.name && item.id) {
+                // pendingToolCalls 用 item.id 作 key 是因为 arguments.delta 事件带的是 item_id；
+                // 但回填 function_call_output 要用 item.call_id（模型给的引用 id, 与 item.id 不同）
                 pendingToolCalls.set(item.id, {
                   name: item.name,
                   argumentsBuffer: item.arguments || '',
+                  callId: item.call_id || item.id,
                 });
                 hasToolCalls = true;
 
                 yield {
                   eventType: 'tool_use_start',
                   toolName: item.name,
-                  toolUseId: item.id,
+                  toolUseId: item.call_id || item.id,
                   agentScope: 'main',
                   displayLevel: 'detail',
                   sessionId: currentResponseId,
@@ -514,7 +538,7 @@ export class OpenAIEngine implements AgentEngine {
                   yield {
                     eventType: 'tool_progress',
                     toolName: call.name,
-                    toolUseId: item.id,
+                    toolUseId: call.callId,
                     toolInputSummary: summarizeToolInput(
                       call.argumentsBuffer,
                     ),
@@ -551,7 +575,7 @@ export class OpenAIEngine implements AgentEngine {
                   yield {
                     eventType: 'tool_use_end',
                     toolName: call.name,
-                    toolUseId: item.id,
+                    toolUseId: call.callId,
                     agentScope: 'main',
                     displayLevel: 'detail',
                     sessionId: currentResponseId,
@@ -566,24 +590,20 @@ export class OpenAIEngine implements AgentEngine {
                   yield {
                     eventType: 'tool_result',
                     toolName: call.name,
-                    toolUseId: item.id,
+                    toolUseId: call.callId,
                     toolResult: truncatedResult,
                     agentScope: 'main',
                     displayLevel: 'detail',
                     sessionId: currentResponseId,
                   };
 
-                  // 将 function_call + function_call_output 加入 inputItems
-                  // 供下一轮循环使用
-                  inputItems.push({
-                    type: 'function_call',
-                    call_id: item.id,
-                    name: call.name,
-                    arguments: call.argumentsBuffer,
-                  });
-                  inputItems.push({
+                  // 记录待回填的 tool_result:
+                  // 用了 previous_response_id 时,历史 function_call 由 API 自动携带,
+                  // 我们只需要给它 function_call_output(用 call.callId 引用).
+                  // 因此累积到 pendingToolOutputs 而非直接 push 到 inputItems.
+                  pendingToolOutputs.push({
                     type: 'function_call_output',
-                    call_id: item.id,
+                    call_id: call.callId,
                     output: resultStr,
                   });
 
@@ -595,8 +615,9 @@ export class OpenAIEngine implements AgentEngine {
 
             case 'response.completed':
             case 'response.incomplete': {
-              // data 直接是 response 对象
-              const resp = sseEvent.data as unknown as OpenAIResponse;
+              // response 对象包在 data.response 里，同 response.created 的规则
+              const resp = ((sseEvent.data as { response?: OpenAIResponse }).response
+                ?? sseEvent.data) as OpenAIResponse;
               finalUsage = resp.usage || null;
 
               if (finalUsage) {
@@ -652,7 +673,8 @@ export class OpenAIEngine implements AgentEngine {
             }
 
             case 'response.failed': {
-              const resp = sseEvent.data as unknown as OpenAIResponse;
+              const resp = ((sseEvent.data as { response?: OpenAIResponse }).response
+                ?? sseEvent.data) as OpenAIResponse;
               responseFailed = true;
               responseErrorMsg = resp.error?.message || '未知错误';
               break;
