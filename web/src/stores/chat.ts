@@ -608,6 +608,7 @@ function isTerminalSystemMessage(message: Pick<Message, 'sender' | 'content'>): 
   // 流式状态由 status:interrupted（冻结）→ interrupt_partial（转正）两阶段处理。
   return message.sender === '__system__' && (
     message.content === 'context_reset' ||
+    message.content === 'context_compacted' ||
     message.content.startsWith('agent_error:') ||
     message.content.startsWith('agent_max_retries:') ||
     message.content.startsWith('context_overflow:')

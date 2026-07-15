@@ -16,6 +16,7 @@ describe('OWNER_REQUIRED_IM_COMMANDS set', () => {
     expect([...OWNER_REQUIRED_IM_COMMANDS].sort()).toEqual([
       'bind',
       'clear',
+      'compact',
       'new',
       'release_owner',
       'spawn',
@@ -73,8 +74,16 @@ describe('checkImOwnerCommand', () => {
 
   test('owner-required command: senderImId equals owner allowed', () => {
     expect(checkImOwnerCommand('clear', OWNED_GROUP, OWNER)).toEqual({ ok: true });
+    expect(checkImOwnerCommand('compact', OWNED_GROUP, OWNER)).toEqual({ ok: true });
     expect(checkImOwnerCommand('bind', OWNED_GROUP, OWNER)).toEqual({ ok: true });
     expect(checkImOwnerCommand('spawn', OWNED_GROUP, OWNER)).toEqual({ ok: true });
+  });
+
+  test('/compact is owner-gated like /clear', () => {
+    expect(checkImOwnerCommand('compact', OWNED_GROUP, STRANGER)).toEqual({
+      ok: false,
+      reason: '只有工作区 owner 才能执行此命令',
+    });
   });
 
   test('null/undefined group treated as unowned (bootstrap message)', () => {

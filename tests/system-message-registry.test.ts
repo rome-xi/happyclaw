@@ -17,6 +17,20 @@ describe('resolveSystemMessage', () => {
     });
   });
 
+  test('精确 context_compacted 返回压缩提示 divider', () => {
+    expect(resolveSystemMessage('context_compacted')).toEqual({
+      style: 'divider',
+      text: '上下文已压缩（历史将自动恢复）',
+    });
+  });
+
+  test('context_compacted: 前缀返回带详情的 divider', () => {
+    expect(resolveSystemMessage('context_compacted:已压缩至 12 条历史')).toEqual({
+      style: 'divider',
+      text: '已压缩至 12 条历史',
+    });
+  });
+
   test('query_interrupted 返回固定中文 divider', () => {
     expect(resolveSystemMessage('query_interrupted')).toEqual({
       style: 'divider',

@@ -1430,6 +1430,8 @@ async function handleCommand(
   switch (cmd) {
     case 'clear':
       return handleClearCommand(chatJid);
+    case 'compact':
+      return handleCompactCommand(chatJid);
     case 'list':
     case 'ls':
       return handleListCommand(chatJid);
@@ -1503,6 +1505,48 @@ async function handleClearCommand(chatJid: string): Promise<string> {
       'handleCommand /clear failed',
     );
     return '清除上下文失败，请稍后重试';
+  }
+}
+
+async function handleCompactCommand(chatJid: string): Promise<string> {
+  const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
+  if (!group) return '未找到当前工作区';
+
+  const target = resolveBoundChatTarget(
+    chatJid,
+    group,
+    (jid) => registeredGroups[jid] ?? getRegisteredGroup(jid),
+    getAgent,
+    findGroupNameByFolder,
+  );
+
+  try {
+    await executeSessionReset(
+      target.baseChatJid,
+      target.folder,
+      {
+        queue,
+        sessions,
+        broadcast: broadcastNewMessage,
+        setLastAgentTimestamp: setCursors,
+        markForRecovery: (jid) => recoveryGroups.add(jid),
+      },
+      target.agentId ?? undefined,
+      'compact',
+    );
+    return '已压缩对话上下文，历史摘要将在下一条消息时自动恢复 ✓';
+  } catch (err) {
+    logger.error(
+      {
+        chatJid,
+        targetChatJid: target.targetChatJid,
+        targetFolder: target.folder,
+        agentId: target.agentId,
+        err,
+      },
+      'handleCommand /compact failed',
+    );
+    return '压缩上下文失败，请稍后重试';
   }
 }
 
@@ -10113,6 +10157,7 @@ async function main(): Promise<void> {
     formatMessages,
     getLastAgentTimestamp: () => lastAgentTimestamp,
     setLastAgentTimestamp: setCursors,
+    markForRecovery: (jid: string) => recoveryGroups.add(jid),
     advanceCursors,
     advanceNextPullCursorOnly,
     advanceGlobalCursor: (cursor: MessageCursor) => {

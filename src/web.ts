@@ -108,7 +108,9 @@ import { logger } from './logger.js';
 import {
   executeSessionReset,
   isClearCommand,
+  isCompactCommand,
   SESSION_RESET_FAILURE_MESSAGE,
+  SESSION_COMPACT_FAILURE_MESSAGE,
 } from './commands.js';
 import {
   normalizeImageAttachments,
@@ -1309,6 +1311,77 @@ function setupWebSocket(server: any): WebSocketServer {
                 sender: '__system__',
                 sender_name: 'system',
                 content: SESSION_RESET_FAILURE_MESSAGE,
+                timestamp: errTs,
+                is_from_me: true,
+              });
+            }
+            return;
+          }
+
+          // ── /compact command: slim the SDK session without forgetting ──
+          // Unlike /clear, /compact drops the (possibly bloated) SDK session
+          // JSONL but does NOT advance the cursor — instead it flags the chat
+          // for recovery so the next query re-injects recent DB history into
+          // the fresh session. Same owner-only gate and agentId validation as
+          // /clear. Success is signalled via the context_compacted divider
+          // pushed by executeSessionReset; failure emits a system error row.
+          if (isCompactCommand(content) && deps && targetGroup) {
+            if (
+              !canModifyGroup(
+                { id: session.user_id, role: session.role },
+                { ...targetGroup, jid: chatJid },
+              )
+            ) {
+              sendWsError('Only the workspace owner can run /compact', chatJid);
+              return;
+            }
+            if (agentId) {
+              const agent = getAgent(agentId);
+              if (!agent || agent.chat_jid !== chatJid) {
+                sendWsError('Agent not found', chatJid);
+                return;
+              }
+            }
+            const errorTargetJid = agentId
+              ? `${chatJid}#agent:${agentId}`
+              : chatJid;
+            try {
+              await executeSessionReset(
+                chatJid,
+                targetGroup.folder,
+                {
+                  queue: deps.queue,
+                  sessions: deps.getSessions(),
+                  broadcast: broadcastNewMessage,
+                  setLastAgentTimestamp: deps.setLastAgentTimestamp,
+                  markForRecovery: deps.markForRecovery,
+                },
+                agentId,
+                'compact',
+              );
+            } catch (err) {
+              logger.error(
+                { chatJid, agentId, err },
+                '/compact command failed',
+              );
+              const errId = crypto.randomUUID();
+              const errTs = new Date().toISOString();
+              ensureChatExists(errorTargetJid);
+              storeMessageDirect(
+                errId,
+                errorTargetJid,
+                '__system__',
+                'system',
+                SESSION_COMPACT_FAILURE_MESSAGE,
+                errTs,
+                true,
+              );
+              broadcastNewMessage(errorTargetJid, {
+                id: errId,
+                chat_jid: errorTargetJid,
+                sender: '__system__',
+                sender_name: 'system',
+                content: SESSION_COMPACT_FAILURE_MESSAGE,
                 timestamp: errTs,
                 is_from_me: true,
               });

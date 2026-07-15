@@ -87,7 +87,7 @@ export function formatWorkspaceList(
   }
 
   lines.push('');
-  lines.push('💡 /sw <消息> 并行任务 · /recall 总结 · /clear 重置');
+  lines.push('💡 /sw <消息> 并行任务 · /recall 总结 · /compact 压缩 · /clear 重置');
   return lines.join('\n');
 }
 
@@ -261,6 +261,7 @@ export function formatSystemStatus(
  */
 export const OWNER_REQUIRED_IM_COMMANDS: ReadonlySet<string> = new Set([
   'clear',
+  'compact',
   'bind',
   'unbind',
   'new',

@@ -20,6 +20,12 @@ export interface CommandDeps {
   sessions: Record<string, string>;
   broadcast: (jid: string, msg: NewMessage & { is_from_me: boolean }) => void;
   setLastAgentTimestamp: (jid: string, cursor: MessageCursor) => void;
+  /**
+   * Mark a chat JID for recovery so the next query re-injects recent DB history
+   * into a fresh SDK session. Used by /compact (context-preserving) but NOT by
+   * /clear (which advances the cursor and intentionally forgets history).
+   */
+  markForRecovery?: (jid: string) => void;
 }
 
 // ─── Command parsing ────────────────────────────────────────────
@@ -28,8 +34,15 @@ export function isClearCommand(content: string): boolean {
   return content.trim().toLowerCase() === '/clear';
 }
 
+export function isCompactCommand(content: string): boolean {
+  return content.trim().toLowerCase() === '/compact';
+}
+
 export const SESSION_RESET_FAILURE_MESSAGE =
   'system_error:清除上下文失败，请稍后重试';
+
+export const SESSION_COMPACT_FAILURE_MESSAGE =
+  'system_error:压缩上下文失败，请稍后重试';
 
 // ─── Core reset ─────────────────────────────────────────────────
 
@@ -38,6 +51,7 @@ export async function executeSessionReset(
   folder: string,
   deps: CommandDeps,
   agentId?: string,
+  mode: 'clear' | 'compact' = 'clear',
 ): Promise<void> {
   const targetJid = agentId
     ? `${baseChatJid}#agent:${agentId}`
@@ -54,7 +68,9 @@ export async function executeSessionReset(
     );
   }
 
-  // 2. Clear .claude/ session files (preserve settings.json)
+  // 2. Clear .claude/ session files (preserve settings.json). Both /clear and
+  //    /compact drop the (potentially bloated) SDK session JSONL — the only
+  //    difference is what happens to the HappyClaw message cursor afterwards.
   clearSessionFiles(folder, agentId);
 
   // 3. Delete session from DB (+ in-memory cache for main session)
@@ -63,7 +79,11 @@ export async function executeSessionReset(
     delete deps.sessions[folder];
   }
 
-  // 4. Insert context_reset divider message into the correct JID
+  // 4. Insert a divider message into the correct JID. /clear uses
+  //    context_reset (hard reset, history forgotten); /compact uses
+  //    context_compacted (session slimmed, history re-injected next turn).
+  const dividerContent =
+    mode === 'compact' ? 'context_compacted' : 'context_reset';
   const dividerMessageId = crypto.randomUUID();
   const timestamp = new Date().toISOString();
   ensureChatExists(targetJid);
@@ -72,7 +92,7 @@ export async function executeSessionReset(
     targetJid,
     '__system__',
     'system',
-    'context_reset',
+    dividerContent,
     timestamp,
     true,
   );
@@ -82,13 +102,35 @@ export async function executeSessionReset(
     chat_jid: targetJid,
     sender: '__system__',
     sender_name: 'system',
-    content: 'context_reset',
+    content: dividerContent,
     timestamp,
     is_from_me: true,
   });
 
-  // 5. Advance lastAgentTimestamp so old messages before the reset are not
-  //    re-sent to the next fresh agent session.
+  if (mode === 'compact') {
+    // /compact preserves context: DON'T advance the cursor. Instead flag the
+    // chat(s) for recovery so the next query re-injects recent DB history into
+    // the fresh (slim) SDK session. Agent sessions re-inject automatically when
+    // getSession() returns undefined, so markForRecovery only matters for main
+    // conversations, but we call it for the affected JIDs uniformly.
+    if (deps.markForRecovery) {
+      if (agentId) {
+        deps.markForRecovery(targetJid);
+      } else {
+        for (const siblingJid of getJidsByFolder(folder)) {
+          deps.markForRecovery(siblingJid);
+        }
+      }
+    }
+    logger.info(
+      { baseChatJid, targetJid, folder, agentId },
+      'Session compacted via /compact command',
+    );
+    return;
+  }
+
+  // 5. (/clear only) Advance lastAgentTimestamp so old messages before the
+  //    reset are not re-sent to the next fresh agent session.
   if (agentId) {
     deps.setLastAgentTimestamp(targetJid, { timestamp, id: dividerMessageId });
   } else {

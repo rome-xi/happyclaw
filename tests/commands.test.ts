@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, test, vi } from 'vitest';
 
-import { isClearCommand } from '../src/commands.js';
+import { isClearCommand, isCompactCommand } from '../src/commands.js';
 
 // Hoisted so mock factories below can reference these before module evaluation.
 const {
@@ -50,6 +50,29 @@ describe('isClearCommand', () => {
   // Pin behavior: full-width slash is a different codepoint, must not match.
   test('rejects full-width slash', () => {
     expect(isClearCommand('／clear')).toBe(false);
+  });
+});
+
+describe('isCompactCommand', () => {
+  test('exact match', () => {
+    expect(isCompactCommand('/compact')).toBe(true);
+  });
+
+  test('case insensitive', () => {
+    expect(isCompactCommand('/Compact')).toBe(true);
+  });
+
+  test('whitespace tolerant', () => {
+    expect(isCompactCommand('  /compact  ')).toBe(true);
+  });
+
+  test('rejects trailing args', () => {
+    expect(isCompactCommand('/compact now')).toBe(false);
+  });
+
+  test('does not match /clear', () => {
+    expect(isCompactCommand('/clear')).toBe(false);
+    expect(isClearCommand('/compact')).toBe(false);
   });
 });
 
@@ -163,5 +186,77 @@ describe('executeSessionReset', () => {
         content: 'context_reset',
       }),
     );
+  });
+
+  test('compact mode: preserves cursor and flags chat(s) for recovery', async () => {
+    const { executeSessionReset } = await import('../src/commands.js');
+    const stopGroup = vi.fn(async () => {});
+    const broadcast = vi.fn();
+    const setLastAgentTimestamp = vi.fn();
+    const markForRecovery = vi.fn();
+    const sessions = { 'home-u1': 'session-main' } as Record<string, string>;
+
+    getJidsByFolderMock.mockReturnValue(['web:foo', 'feishu:bar']);
+
+    await executeSessionReset(
+      'web:foo',
+      'home-u1',
+      {
+        queue: { stopGroup },
+        sessions,
+        broadcast,
+        setLastAgentTimestamp,
+        markForRecovery,
+      },
+      undefined,
+      'compact',
+    );
+
+    // Session files + DB session dropped like /clear.
+    expect(deleteSessionMock).toHaveBeenCalledWith('home-u1', undefined);
+    expect(sessions).not.toHaveProperty('home-u1');
+
+    // Compact divider (not context_reset) broadcast.
+    expect(broadcast).toHaveBeenCalledWith(
+      'web:foo',
+      expect.objectContaining({ content: 'context_compacted' }),
+    );
+
+    // Cursor MUST NOT advance (that's the /clear behavior).
+    expect(setLastAgentTimestamp).not.toHaveBeenCalled();
+
+    // Every sibling JID flagged for recovery so history is re-injected.
+    expect(markForRecovery).toHaveBeenCalledTimes(2);
+    expect(markForRecovery).toHaveBeenCalledWith('web:foo');
+    expect(markForRecovery).toHaveBeenCalledWith('feishu:bar');
+  });
+
+  test('compact mode (agent): flags only the virtual JID for recovery', async () => {
+    const { executeSessionReset } = await import('../src/commands.js');
+    const stopGroup = vi.fn(async () => {});
+    const broadcast = vi.fn();
+    const setLastAgentTimestamp = vi.fn();
+    const markForRecovery = vi.fn();
+    const sessions = {} as Record<string, string>;
+
+    await executeSessionReset(
+      'web:foo',
+      'flow-x',
+      {
+        queue: { stopGroup },
+        sessions,
+        broadcast,
+        setLastAgentTimestamp,
+        markForRecovery,
+      },
+      'agent-9',
+      'compact',
+    );
+
+    expect(setLastAgentTimestamp).not.toHaveBeenCalled();
+    expect(markForRecovery).toHaveBeenCalledTimes(1);
+    expect(markForRecovery).toHaveBeenCalledWith('web:foo#agent:agent-9');
+    // Agent path must not fan out to sibling folder JIDs.
+    expect(getJidsByFolderMock).not.toHaveBeenCalled();
   });
 });

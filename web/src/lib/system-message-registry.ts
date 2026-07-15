@@ -9,6 +9,8 @@ interface SystemMessageRule {
 const SYSTEM_MESSAGE_RULES: SystemMessageRule[] = [
   { match: c => c === 'context_reset', style: 'divider', extract: () => '上下文已清除' },
   { match: c => c.startsWith('context_reset:'), style: 'divider', extract: c => c.slice('context_reset:'.length) },
+  { match: c => c === 'context_compacted', style: 'divider', extract: () => '上下文已压缩（历史将自动恢复）' },
+  { match: c => c.startsWith('context_compacted:'), style: 'divider', extract: c => c.slice('context_compacted:'.length) },
   { match: c => c === 'query_interrupted', style: 'divider', extract: () => '已中断' },
   { match: c => c.startsWith('agent_error:'), style: 'error', extract: c => c.slice('agent_error:'.length) },
   { match: c => c.startsWith('agent_max_retries:'), style: 'error', extract: c => c.slice('agent_max_retries:'.length) },

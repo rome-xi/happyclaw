@@ -35,6 +35,13 @@ export interface WebDeps {
   getLastAgentTimestamp: () => Record<string, MessageCursor>;
   setLastAgentTimestamp: (jid: string, cursor: MessageCursor) => void;
   /**
+   * Mark a chat JID for recovery so the next query re-injects recent DB history
+   * into a fresh SDK session. Used by the /compact slash command (which slims
+   * the SDK session without advancing the cursor). Contrast /clear, which
+   * advances the cursor and intentionally forgets history.
+   */
+  markForRecovery: (jid: string) => void;
+  /**
    * Lex-max-merge advance for BOTH cursors (lastAgentTimestamp +
    * lastCommittedCursor). Comparison uses lexicographic (timestamp, id) so a
    * later candidate never regresses the cursor below the current value.
