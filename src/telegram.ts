@@ -20,6 +20,44 @@ import {
   ProcessingLock,
   isStale as isGloballyStale,
 } from './im-safety/index.js';
+
+/**
+ * Run a Telegram API call, retrying on 429 flood control while honoring the
+ * server's retry_after. Telegram routinely asks for 15-20s backoff on long
+ * streaming edits, so a single 10s-capped retry (the old inline behavior) still
+ * lands inside the flood window and fails — dropping the final message. This
+ * waits the full requested delay (capped at 30s so we never hang forever) and
+ * retries up to `maxRetries` times. Non-429 errors propagate immediately.
+ */
+async function withFloodRetry<T>(
+  fn: () => Promise<T>,
+  maxRetries = 2,
+): Promise<T> {
+  let attempt = 0;
+  for (;;) {
+    try {
+      return await fn();
+    } catch (err: any) {
+      const retryAfter =
+        err?.error_code === 429
+          ? err?.parameters?.retry_after ?? err?.parameters?.retryAfter
+          : undefined;
+      if (
+        typeof retryAfter === 'number' &&
+        retryAfter > 0 &&
+        attempt < maxRetries
+      ) {
+        attempt++;
+        await new Promise((r) =>
+          setTimeout(r, Math.min(retryAfter * 1000 + 250, 30_000)),
+        );
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
 // ─── TelegramConnection Interface ──────────────────────────────
 
 export interface TelegramConnectionConfig {
@@ -1142,17 +1180,23 @@ export function createTelegramConnection(
         for (const mdChunk of mdChunks) {
           const html = markdownToTelegramHtml(mdChunk);
           try {
-            await bot.api.sendMessage(chatIdNum, html, {
-              parse_mode: 'HTML',
-              ...threadOpt,
-            });
+            // Honor 429 flood control: this is also the streaming-card fallback
+            // path, so if it fails the final message is lost entirely.
+            await withFloodRetry(() =>
+              bot!.api.sendMessage(chatIdNum, html, {
+                parse_mode: 'HTML',
+                ...threadOpt,
+              }),
+            );
           } catch (err) {
             // HTML parse failed (e.g. unclosed tags), fallback to plain text
             logger.debug(
               { err, chatId },
               'HTML parse failed, fallback to plain',
             );
-            await bot.api.sendMessage(chatIdNum, mdChunk, { ...threadOpt });
+            await withFloodRetry(() =>
+              bot!.api.sendMessage(chatIdNum, mdChunk, { ...threadOpt }),
+            );
           }
         }
 
@@ -1356,39 +1400,22 @@ export function createTelegramConnection(
       // already identifies the target within its thread.
       const payload = text || '​';
 
-      // One retry on 429 flood control, honoring Telegram's retry_after. Edits
-      // are throttled (≥900ms) but bursts can still trip flood control; backing
-      // off keeps the stream alive instead of dropping the update.
+      // Retry on 429 flood control, honoring Telegram's retry_after (up to 30s).
+      // Edits are throttled (≥900ms) but bursts — especially the long final
+      // edit in complete() — can still trip flood control; backing off the full
+      // requested window keeps the update from being dropped. If the final edit
+      // still fails, complete() falls back to sendMessage (also flood-aware).
       const editOnce = async (content: string, html: boolean): Promise<void> => {
         const api = bot!.api;
-        try {
-          if (html) {
-            await api.editMessageText(chatIdNum, messageId, content, {
-              parse_mode: 'HTML',
-            });
-          } else {
-            await api.editMessageText(chatIdNum, messageId, content);
-          }
-        } catch (err: any) {
-          const retryAfter =
-            err?.error_code === 429
-              ? err?.parameters?.retry_after ?? err?.parameters?.retryAfter
-              : undefined;
-          if (typeof retryAfter === 'number' && retryAfter > 0) {
-            await new Promise((r) =>
-              setTimeout(r, Math.min(retryAfter * 1000 + 250, 10_000)),
-            );
-            if (html) {
-              await api.editMessageText(chatIdNum, messageId, content, {
-                parse_mode: 'HTML',
-              });
-            } else {
-              await api.editMessageText(chatIdNum, messageId, content);
-            }
-            return;
-          }
-          throw err;
-        }
+        await withFloodRetry(
+          () =>
+            html
+              ? api.editMessageText(chatIdNum, messageId, content, {
+                  parse_mode: 'HTML',
+                })
+              : api.editMessageText(chatIdNum, messageId, content),
+          1,
+        );
       };
 
       if (asHtml) {
