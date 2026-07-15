@@ -126,6 +126,10 @@ export interface EngineSendResult {
   };
   /** 完成原因 */
   finishReason: 'stop' | 'max_turns' | 'interrupted' | 'error';
+  /** 本 result 发出时仍未 settle 的后台任务数（异步 Agent / backgrounded Bash）。
+   * >0 时 runner 不启动关流倒计时，保持 query 存活，等任务 settle 后 CLI 唤醒
+   * 模型汇总。仅 ClaudeEngine 填充；OpenAIEngine 无此概念（恒 0/undefined）。 */
+  pendingBgTasks?: number;
 }
 
 /** 引擎生命周期钩子 */

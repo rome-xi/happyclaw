@@ -109,14 +109,16 @@ export type MessageSourceKind =
   | 'user_command'
   | 'scheduled_task_prompt'
   | 'legacy'
-  | 'auto_continue';
+  | 'auto_continue'
+  | 'truncation_continue';
 
 export type MessageFinalizationReason =
   | 'completed'
   | 'interrupted'
   | 'error'
   | 'shutdown'
-  | 'crash_recovery';
+  | 'crash_recovery'
+  | 'truncated';
 
 export interface MessageAttachment {
   type: 'image';

@@ -672,6 +672,7 @@ export class ClaudeEngine implements AgentEngine {
                 }
               : undefined,
             finishReason: 'stop',
+            pendingBgTasks: processor.getPendingSdkTaskCount(),
           };
         }
 

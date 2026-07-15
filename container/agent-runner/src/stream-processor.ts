@@ -10,7 +10,12 @@
  */
 
 import type { ContainerOutput, StreamEvent } from './types.js';
-import { extractSkillName, summarizeToolInput, summarizeToolResult } from './utils.js';
+import { extractSkillName, shorten, summarizeToolInput, summarizeToolResult } from './utils.js';
+
+// SDK 任务终态（task_updated.patch.status 语义下"不会再有后续信号"的状态）。
+// web/src/stores/chat.ts、src/web.ts、src/index.ts 各有等价映射——SDK 新增
+// 终态时需同步检查；此处漏判的代价是 pendingSdkTasks 泄漏导致关流被永久推迟。
+const SDK_TERMINAL_TASK_STATUSES = new Set(['completed', 'failed', 'killed']);
 
 /** Tools with specialized input_json_delta handling — generic accumulation is skipped for these. */
 const SPECIAL_TOOLS = ['Skill', 'Task', 'Agent', 'AskUserQuestion', 'TodoWrite'];
@@ -95,6 +100,18 @@ export class StreamEventProcessor {
   // task_notification (which carries SDK task_id) can be translated
   // back to the tool_use_id used at creation time.
   private readonly sdkTaskIdToToolUseId = new Map<string, string>();
+
+  // 尚未 settle 的 SDK 任务（task_id → description）。
+  // task_started 时登记；settle 走两条互补路径（缺一不可，不是重复防御）：
+  // - task_notification：后台任务 / stopTask 的权威 settle 信号，任意 status
+  //  （completed/failed/stopped）都算 settle；
+  // - task_updated(terminal)：前台同步任务完成时以 patch.status 终态到达
+  //  （实验证实前台任务两者都发，但不能假设未来版本仍冗余）。
+  // 同步任务在 turn 内必然 settle，所以 result 到达时集合里剩下的就是跨 turn
+  // 存活的后台任务（异步 Agent / backgrounded Bash）——runner 据此决定 result
+  // 后是否推迟关流，避免把它们连坐杀掉。
+  // skip_transcript 的 housekeeping 任务不登记，防止内部自务任务卡住收尾。
+  private readonly pendingSdkTasks = new Map<string, string>();
 
   // Sub-agent active tools per parent task ID
   private readonly activeSubAgentToolsByTask = new Map<string, Set<string>>();
@@ -456,11 +473,20 @@ export class StreamEventProcessor {
     if (delta?.type === 'text_delta' && delta.text) {
       const bufKey = parentToolUseId || this.BUF_MAIN;
       this.getBuf(bufKey).text += delta.text;
-      if (bufKey === this.BUF_MAIN) this.fullTextAccumulator += delta.text;
+      if (bufKey === this.BUF_MAIN) {
+        this.fullTextAccumulator += delta.text;
+        // 主 agent 有新输出 ⇒ "上一个 textual result 之后无未定稿文本"不再成立。
+        // 否则单 query 多 turn（follow-up / 后台任务唤醒的汇总 turn）被中断时，
+        // cleanup() 会把新 turn 的缓冲尾巴当上一 turn 的残渣丢弃。
+        this.seenTextualResult = false;
+      }
       this.scheduleFlush();
     } else if (delta?.type === 'thinking_delta' && delta.thinking) {
       const bufKey = parentToolUseId || this.BUF_MAIN;
-      if (!parentToolUseId) this.mainThinkingStreamed = true;
+      if (!parentToolUseId) {
+        this.mainThinkingStreamed = true;
+        this.seenTextualResult = false;
+      }
       this.getBuf(bufKey).think += delta.thinking;
       this.scheduleFlush();
     } else if (delta?.type === 'input_json_delta' && delta.partial_json) {
@@ -755,6 +781,10 @@ export class StreamEventProcessor {
       }
       const effectiveToolUseId = message.tool_use_id || this.sdkTaskIdToToolUseId.get(message.task_id) || message.task_id;
       const desc = message.description || message.prompt || '';
+      if (message.task_id && !message.skip_transcript) {
+        this.pendingSdkTasks.set(message.task_id, desc);
+        this.log(`[pending-tasks] +${message.task_id.slice(0, 12)} (${shorten(desc, 60)}) → ${this.pendingSdkTasks.size} pending`);
+      }
       this.emitStreamEvent({
         eventType: 'task_start',
         agentScope: 'task',
@@ -791,6 +821,10 @@ export class StreamEventProcessor {
     }
     if (message.subtype === 'task_updated') {
       const effectiveToolUseId = this.sdkTaskIdToToolUseId.get(message.task_id) || message.task_id;
+      const patchStatus = message.patch?.status;
+      if (patchStatus && SDK_TERMINAL_TASK_STATUSES.has(patchStatus)) {
+        this.settlePendingSdkTask(message.task_id, `task_updated:${patchStatus}`);
+      }
       this.emitStreamEvent({
         eventType: 'task_updated',
         agentScope: 'task',
@@ -1271,6 +1305,7 @@ export class StreamEventProcessor {
    * We resolve the effective toolUseId via: message.tool_use_id → sdkTaskId map → raw task_id.
    */
   processTaskNotification(message: { task_id: string; tool_use_id?: string; status: string; summary: string; output_file?: string; usage?: any }): void {
+    this.settlePendingSdkTask(message.task_id, `task_notification:${message.status}`);
     const effectiveToolUseId = message.tool_use_id
       || this.sdkTaskIdToToolUseId.get(message.task_id)
       || message.task_id;
@@ -1310,6 +1345,22 @@ export class StreamEventProcessor {
     }
     // Clean up the mapping entry
     this.sdkTaskIdToToolUseId.delete(message.task_id);
+  }
+
+  private settlePendingSdkTask(taskId: string | undefined, reason: string): void {
+    if (!taskId || !this.pendingSdkTasks.has(taskId)) return;
+    this.pendingSdkTasks.delete(taskId);
+    this.log(`[pending-tasks] -${taskId.slice(0, 12)} (${reason}) → ${this.pendingSdkTasks.size} pending`);
+  }
+
+  /** 尚未 settle 的 SDK 任务数（异步 Agent / backgrounded Bash 等）。 */
+  getPendingSdkTaskCount(): number {
+    return this.pendingSdkTasks.size;
+  }
+
+  /** pending 任务的简述列表，用于日志与前端提示。 */
+  describePendingSdkTasks(): string[] {
+    return [...this.pendingSdkTasks.values()].map((d) => shorten(d, 80));
   }
 
   /**

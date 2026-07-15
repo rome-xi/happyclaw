@@ -245,7 +245,11 @@ export interface ContainerOutput {
   sessionId?: string;
   sdkMessageUuid?: string;
   sourceKind?: Exclude<MessageSourceKind, 'user_command'>;
-  finalizationReason?: 'completed' | 'interrupted' | 'error';
+  /** 'truncated'：上游断流截断的 partial（usage 双零指纹，runner 会自动续写） */
+  finalizationReason?: 'completed' | 'interrupted' | 'error' | 'truncated';
+  /** 本 result 发出时仍未 settle 的后台任务数（异步 Agent / backgrounded Bash）。
+   * >0 时主进程把流式卡片保持在「后台任务运行中」而非定稿。 */
+  pendingBgTasks?: number;
 }
 
 interface VolumeMount {

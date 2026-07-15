@@ -52,8 +52,13 @@ export interface ContainerOutput {
   turnId?: string;
   sessionId?: string;
   sdkMessageUuid?: string;
-  sourceKind?: 'sdk_final' | 'sdk_send_message' | 'interrupt_partial' | 'overflow_partial' | 'compact_partial' | 'legacy' | 'auto_continue';
-  finalizationReason?: 'completed' | 'interrupted' | 'error';
+  sourceKind?: 'sdk_final' | 'sdk_send_message' | 'interrupt_partial' | 'overflow_partial' | 'compact_partial' | 'legacy' | 'auto_continue' | 'truncation_continue';
+  /** 'truncated'：上游断流截断的 partial（usage 双零指纹，runner 会自动续写） */
+  finalizationReason?: 'completed' | 'interrupted' | 'error' | 'truncated';
+  /** 本 result 发出时仍未 settle 的后台任务数（异步 Agent / backgrounded Bash）。
+   * >0 时主进程应把流式卡片保持在「后台任务运行中」而非定稿，后续 turn 的
+   * 内容会继续追加到同一张卡。仅 sdk_final 类 result 携带。 */
+  pendingBgTasks?: number;
 }
 
 export interface SessionEntry {

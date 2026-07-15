@@ -202,3 +202,25 @@ export function generateFallbackName(): string {
   const time = new Date();
   return `conversation-${time.getHours().toString().padStart(2, '0')}${time.getMinutes().toString().padStart(2, '0')}`;
 }
+
+/**
+ * 判定一个 subtype=success 的 SDK result 是否为「上游断流截断」的合成结果。
+ *
+ * 指纹来源（实测事故）：第三方网关在长文本生成中途断流时，SDK 收不到终结帧
+ * （message_delta/message_stop + usage），只能把已缓冲的 partial 文本按
+ * subtype=success 收口，此时 result.usage 的 input/output tokens 均为 0——
+ * 而健康 turn 的 result.usage 恒为正（query 级累计值，且真实 turn 必产生
+ * output tokens）。正文非空 + usage 双零 = 截断合成结果的确定性指纹。
+ *
+ * 保守起见 usage 缺失不判定为截断（避免误伤未知的 SDK 变体）；误报的代价是
+ * 多发一次"请继续"的续写 turn（有次数上限），漏报的代价是半截回复被当成
+ * 完整回复交付。
+ */
+export function isSuspectTruncatedStreamResult(
+  usage: { input_tokens?: number; output_tokens?: number } | null | undefined,
+  resultTextLength: number,
+): boolean {
+  if (resultTextLength <= 0) return false;
+  if (!usage) return false;
+  return (usage.input_tokens ?? 0) === 0 && (usage.output_tokens ?? 0) === 0;
+}
