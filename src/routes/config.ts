@@ -563,7 +563,18 @@ configRoutes.delete(
 
     try {
       deleteProvider(id);
-      appendClaudeConfigAudit(actor, 'delete_provider', [`id:${id}`]);
+      // Sessions sticky-bound to a now-gone provider can never resume cleanly
+      // (their transcripts belong to that upstream). Drop the bindings and evict
+      // the in-memory session cache so the next turn starts fresh on a live one.
+      const { deletedCount, affectedFolders } =
+        deleteSessionsByProviderId(id);
+      if (deps) {
+        for (const folder of affectedFolders) delete deps.sessions[folder];
+      }
+      appendClaudeConfigAudit(actor, 'delete_provider', [
+        `id:${id}`,
+        ...(deletedCount > 0 ? [`clearedSessions:${deletedCount}`] : []),
+      ]);
       return c.json({ ok: true });
     } catch (err) {
       const message =
@@ -590,10 +601,20 @@ configRoutes.post(
         `enabled:${updated.enabled}`,
       ]);
 
-      const applied = await applyClaudeConfigToAllGroups(actor, {
-        trigger: 'provider_toggle',
-        providerId: id,
-      });
+      // Disabling a provider strands every session sticky-bound to it: their
+      // transcripts (incl. thinking-block signatures) were produced under this
+      // provider, so resuming them on a different upstream fails. Drop those
+      // bindings now so the next turn starts a fresh session on a still-enabled
+      // provider, instead of relying on lazy self-heal at spawn time. Enabling
+      // invalidates nothing, so only clear on the off transition.
+      const applied = await applyClaudeConfigToAllGroups(
+        actor,
+        {
+          trigger: 'provider_toggle',
+          providerId: id,
+        },
+        updated.enabled ? undefined : { clearSessionsForProviderId: id },
+      );
 
       return c.json({
         provider: toPublicProvider(updated),
