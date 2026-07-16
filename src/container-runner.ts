@@ -1554,19 +1554,20 @@ export async function runHostAgent(
           hostEnv[k] = v;
         }
         // Phase 2: a non-home workspace's FOREGROUND responder (base lane —
-        // no agentId / taskRunId) runs on the flagship tier (gateway →
-        // new-api → tier_probe's current strongest Claude-4.8-class provider).
-        // It stays accurate — makes its own judgments + dispatch decisions —
-        // and only hands heavy / long / parallel labor to
-        // dispatch_background_job. Flagship-via-gateway preserves accuracy
+        // no agentId / taskRunId) runs on the "high" tier (gateway →
+        // new-api → tier-prober's current strongest healthy Claude-class
+        // provider). It stays accurate — makes its own judgments + dispatch
+        // decisions — and only hands heavy / long / parallel labor to
+        // dispatch_background_job. High-tier-via-gateway preserves accuracy
         // while saving official Claude quota. Home workspaces stay on opus[1m]
         // (official, 1M ctx — agent-runner default). Background / spawn /
         // scheduled-task lanes in ANY workspace keep opus[1m] so they stay
         // capable opus-manager + doubao-worker agents. An explicit
-        // ANTHROPIC_MODEL (container-env) always wins.
+        // ANTHROPIC_MODEL (container-env) always wins. Tier name (env
+        // ARK_FOREGROUND_TIER) overridable without recompile.
         const isForegroundLane = !input.agentId && !input.taskRunId;
         if (!group.is_home && isForegroundLane && !hostEnv['ANTHROPIC_MODEL']) {
-          hostEnv['ANTHROPIC_MODEL'] = 'flagship';
+          hostEnv['ANTHROPIC_MODEL'] = process.env.ARK_FOREGROUND_TIER || 'high';
         }
         logger.info(
           {

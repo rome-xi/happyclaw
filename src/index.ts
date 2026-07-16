@@ -168,6 +168,7 @@ import type {
 } from './im-manager.js';
 import { GroupQueue } from './group-queue.js';
 import { startSchedulerLoop, triggerTaskNow } from './task-scheduler.js';
+import { startTierProber } from './tier-prober.js';
 import {
   checkBillingAccessFresh,
   formatBillingAccessDeniedMessage,
@@ -10497,6 +10498,11 @@ async function main(): Promise<void> {
 
   startIpcWatcher();
   recoverStreamingBuffer();
+
+  // 分档自动选优探针（内置，取代游离的 gateway/tier_probe.py cron）：
+  // 定时对 max/high/balance/fast 各档候选打 canary，把每档 new-api 映射到当前最优健康模型。
+  // best-effort，gateway/new-api 不在时静默 no-op，绝不影响主流程。
+  startTierProber();
   recoverPendingMessages();
   recoverConversationAgents();
   startStreamingBuffer();

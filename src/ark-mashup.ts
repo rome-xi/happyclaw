@@ -30,12 +30,19 @@ const DEFAULT_WORKER_MODEL = 'ark/seed-code-0530';
 /**
  * 自有混搭网关入口(替代直连公司 super-relay)。HappyClaw 把 ANTHROPIC_BASE_URL 指向它:
  *   claude* 模型 → 网关笨透传到 api.anthropic.com(转发本进程自带 OAuth,最防封);
- *   其它模型名(如 flagship/code/fast 档名)→ 网关转发本地 new-api 走分档/多 provider。
+ *   其它模型名(如 max/high/balance/fast 档名)→ 网关转发本地 new-api 走分档/多 provider。
  * 见 ~/gateway/claude_gateway.py。可用 env ARK_GATEWAY_URL 覆盖。
+ *
+ * 四档体系(2026-07-15 起,替代旧 flagship/code/fast):
+ *   max     —— 最强能力,硬任务(capability 策略,优先最强挂了降级)
+ *   high    —— 高质量日常主力(capability)
+ *   balance —— 性价比,可含 GPT/GLM(speed)
+ *   fast    —— 轻活最快(speed)
+ * 各档候选与选优由 HappyClaw 内置探针(src/tier-prober.ts)动态维护 new-api model_mapping。
  */
 const GATEWAY_URL = process.env.ARK_GATEWAY_URL || 'http://127.0.0.1:3011';
 /** 工人槽默认落"档位虚拟名"(由探针自动选每档最优);可被 config 的 per-slot 字段覆盖。 */
-const DEFAULT_SONNET_TIER = 'flagship';
+const DEFAULT_SONNET_TIER = 'high';
 const DEFAULT_HAIKU_TIER = 'fast';
 
 export interface ArkMashupEnv {
