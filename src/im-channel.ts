@@ -134,6 +134,8 @@ export interface IMChannel {
   setTyping(chatId: string, isTyping: boolean): Promise<void>;
   /** Clear the ack reaction for a chat (e.g. when streaming card handled the reply) */
   clearAckReaction?(chatId: string): void;
+  /** Create a forum topic (Telegram supergroup) */
+  createForumTopic?(chatId: string, name: string): Promise<number | null>;
   isConnected(): boolean;
   syncGroups?(): Promise<void>;
   /** Create a streaming card session for real-time card updates (Feishu or DingTalk) */

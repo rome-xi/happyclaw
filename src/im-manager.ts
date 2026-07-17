@@ -386,6 +386,21 @@ class IMConnectionManager {
     }
   }
 
+  async createForumTopic(jid: string, name: string): Promise<number | null> {
+    const channelType = getChannelType(jid);
+    if (!channelType) {
+      logger.debug({ jid }, 'Unknown channel type for JID, skip createForumTopic');
+      return null;
+    }
+    const chatId = extractChatId(jid);
+    const channel = this.findChannelForJid(jid, channelType);
+    if (channel?.createForumTopic) {
+      return channel.createForumTopic(chatId, name);
+    }
+    logger.debug({ jid, channelType }, 'Channel does not support forum topics');
+    return null;
+  }
+
   /**
    * Fetch recent messages from a Discord channel/DM, auto-routing via JID prefix.
    * Throws if the JID is not a Discord channel or no Discord connection is available.

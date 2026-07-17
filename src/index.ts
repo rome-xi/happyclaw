@@ -107,6 +107,7 @@ import {
   type StreamingSession,
 } from './im-channel.js';
 import { getParentGroupJid, buildTelegramJid } from './telegram.js';
+import * as lark from '@larksuiteoapi/node-sdk';
 import {
   registerStreamingSession,
   unregisterStreamingSession,
@@ -1448,7 +1449,7 @@ async function handleCommand(
     case 'bind':
       return handleBindCommand(chatJid, rawArgs);
     case 'new':
-      return handleNewCommand(chatJid, rawArgs);
+      return handleNewCommand(chatJid, rawArgs, senderImId);
     case 'require_mention':
       return handleRequireMentionCommand(chatJid, rawArgs, senderImId);
     case 'owner_mention':
@@ -1811,6 +1812,7 @@ function handleBindCommand(chatJid: string, rawSpec: string): string {
 async function handleNewCommand(
   chatJid: string,
   rawName: string,
+  senderImId?: string,
 ): Promise<string> {
   const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
   if (!group) return '当前 IM 未绑定工作区';
@@ -1829,7 +1831,14 @@ async function handleNewCommand(
     return `正在创建话题「${name}」…`;
   }
 
-  // Non-Telegram channels: create the workspace and bind the current chat to it.
+  // Feishu group chats: create a brand-new Feishu group (bot creates it, so the
+  // bot is automatically a member), pull the sender in, bind a fresh workspace
+  // to it, and announce in the new group.
+  if (chatJid.startsWith('feishu:')) {
+    return handleNewCommandWithFeishuGroup(chatJid, name, userId, group, senderImId);
+  }
+
+  // Non-Telegram/non-Feishu channels: create the workspace and bind the current chat to it.
   return await createWorkspaceAndBind(chatJid, name, userId, group);
 }
 
@@ -1955,6 +1964,87 @@ async function handleNewCommandWithTopic(
       chatJid,
       '创建话题失败，请确认该群已开启「话题(Topics)」功能，且 bot 拥有「管理话题」管理员权限',
     );
+  }
+}
+
+/**
+ * Feishu /new: create a brand-new Feishu group (the bot creates it, so it is
+ * automatically a member), pull the sender in, bind a fresh workspace to the
+ * new group, and announce there. Falls back to binding the current chat on
+ * API failure (no Feishu config / create failed).
+ */
+async function handleNewCommandWithFeishuGroup(
+  chatJid: string,
+  name: string,
+  userId: string,
+  group: RegisteredGroup,
+  senderImId?: string,
+): Promise<string> {
+  const { config: feishuConfig } = getFeishuProviderConfigWithSource();
+  if (!feishuConfig.appId || !feishuConfig.appSecret) {
+    return createWorkspaceAndBind(chatJid, name, userId, group);
+  }
+
+  try {
+    const client = new lark.Client({
+      appId: feishuConfig.appId,
+      appSecret: feishuConfig.appSecret,
+      appType: lark.AppType.SelfBuild,
+    });
+
+    const groupName = `【happyclaw】${name}`;
+    const createParams: Record<string, unknown> = {
+      name: groupName,
+      description: `happyclaw 工作区：${name}`,
+      chat_mode: 'group',
+      chat_type: 'private',
+    };
+    if (senderImId) {
+      createParams.user_id_list = [senderImId];
+      createParams.owner_id = senderImId;
+    }
+    const createRes = (await client.im.v1.chat.create({
+      data: createParams,
+    })) as { data?: { chat_id?: string } };
+    const chatId = createRes?.data?.chat_id;
+    if (!chatId) {
+      throw new Error('Feishu API returned no chat_id');
+    }
+
+    const feishuJid = `feishu:${chatId}`;
+    const { newJid, folder } = await createBoundWorkspace(name, userId);
+
+    const feishuGroup: RegisteredGroup = {
+      name,
+      folder,
+      added_at: new Date().toISOString(),
+      created_by: userId,
+      is_home: false,
+      executionMode: 'host',
+      target_main_jid: newJid,
+      reply_policy: 'source_only',
+      owner_im_id: senderImId || undefined,
+    };
+    registerGroup(feishuJid, feishuGroup);
+    registeredGroups[feishuJid] = feishuGroup;
+    imSendFailCounts.delete(feishuJid);
+    imHealthCheckFailCounts.delete(feishuJid);
+
+    ensureChatExists(feishuJid);
+    updateChatName(feishuJid, groupName);
+    addGroupMember(folder, userId, 'owner', userId);
+
+    const welcome = `工作区「${name}」已创建并绑定到此群\n📁 ${folder}\n\n直接在这里发消息即可`;
+    await imManager.sendMessage(feishuJid, welcome);
+
+    return `飞书群「${groupName}」已创建并绑定工作区\n📁 ${folder}\n👥 已拉你入群\n\n新群里直接发消息即可`;
+  } catch (err) {
+    logger.error(
+      { err, chatJid, name },
+      'Failed to create Feishu group for /new command',
+    );
+    const result = await createWorkspaceAndBind(chatJid, name, userId, group);
+    return `创建飞书群失败，已回退到绑定当前聊天：\n${result}`;
   }
 }
 
