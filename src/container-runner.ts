@@ -766,6 +766,10 @@ export function buildVolumeMounts(
   if (sysSettings.autoCompactWindow > 0) {
     envLines.push(`AUTO_COMPACT_WINDOW=${sysSettings.autoCompactWindow}`);
   }
+  // 调度时区：显式对齐主服务解析端的 TIMEZONE，让 agent 注入的"当前时间"和回执
+  // 展示与 next_run 计算同一基准。host 模式下 spoof 会把 TZ 覆盖成 America/New_York
+  // （指纹伪装），若不单独给调度时区，agent 看到的本地时间会和主服务解析差好几小时。
+  envLines.push(`HAPPYCLAW_SCHEDULE_TZ=${TIMEZONE}`);
   // SubAgent 模型：仅在显式配置了非默认值时注入。默认 'inherit' 与省略 model 等价，
   // 此时不注入，避免覆盖用户可能在 provider customEnv 里设的 SUBAGENT_MODEL（与 autoCompact 对称）。
   if (sysSettings.subagentModel && sysSettings.subagentModel !== 'inherit') {
@@ -1727,6 +1731,12 @@ export async function runHostAgent(
       isCreatorAdmin &&
       !!group.is_home &&
       getSystemSettings().disableMemoryLayerForAdminHost;
+
+    // 调度时区：与主服务解析 schedule 串的 TIMEZONE 对齐。spoof 会把 TZ 覆盖成
+    // America/New_York（指纹伪装用），若 agent 的“当前时间”/回执沿用 TZ，就会和主
+    // 进程按 TIMEZONE 解析 once/cron 的语义错位（实测差 12h）。故单独用这个 env 传递
+    // 调度时区，让 agent-runner 的 currentTimeZone() 优先读它，spoof 的 TZ 只管指纹。
+    hostEnv['HAPPYCLAW_SCHEDULE_TZ'] = TIMEZONE;
 
     // 路径映射
     hostEnv['HAPPYCLAW_WORKSPACE_GROUP'] = groupDir;
