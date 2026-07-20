@@ -858,13 +858,17 @@ groupRoutes.delete('/:jid', authMiddleware, async (c) => {
     if (orphanWorkspaceJid) {
       const remainingBindings = getGroupsByTargetMainJid(orphanWorkspaceJid);
       const orphanGroup = getRegisteredGroup(orphanWorkspaceJid);
-      if (remainingBindings.length === 0 && orphanGroup && !orphanGroup.is_home) {
+      if (
+        remainingBindings.length === 0 &&
+        orphanGroup &&
+        !orphanGroup.is_home
+      ) {
         // Stop the container/process before cleaning up files.
         const stopJids = Array.from(
           new Set([
             orphanWorkspaceJid,
             ...getJidsByFolder(orphanGroup.folder),
-            ...deps.queue.listActiveDescendantJids(orphanWorkspaceJid),
+            ...deps.queue.listDescendantJids(orphanWorkspaceJid),
           ]),
         );
         try {
@@ -880,14 +884,18 @@ groupRoutes.delete('/:jid', authMiddleware, async (c) => {
           // and let the user retry the workspace deletion later.
           return c.json({
             success: true,
-            warning: 'IM binding removed, but associated workspace could not be fully cleaned up.',
+            warning:
+              'IM binding removed, but associated workspace could not be fully cleaned up.',
           });
         }
         deleteGroupData(orphanWorkspaceJid, orphanGroup.folder);
         removeFlowArtifacts(orphanGroup.folder);
         delete deps.getRegisteredGroups()[orphanWorkspaceJid];
         delete deps.getSessions()[orphanGroup.folder];
-        deps.setLastAgentTimestamp(orphanWorkspaceJid, { timestamp: '', id: '' });
+        deps.setLastAgentTimestamp(orphanWorkspaceJid, {
+          timestamp: '',
+          id: '',
+        });
         // Also clean up IM context bindings for the deleted workspace.
         deleteImContextBindingsByWorkspace(orphanWorkspaceJid);
       }

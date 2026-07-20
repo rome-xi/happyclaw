@@ -81,8 +81,67 @@ const RESERVED_CLAUDE_ENV_KEYS = new Set([
   'CLAUDE_CODE_OAUTH_TOKEN',
   'ANTHROPIC_BASE_URL',
   'ANTHROPIC_AUTH_TOKEN',
+  'ANTHROPIC_API_KEY',
   'ANTHROPIC_MODEL',
+  'HAPPYCLAW_CLAUDE_ENDPOINT_KIND',
 ]);
+
+export const CLAUDE_ENDPOINT_KIND_ENV = 'HAPPYCLAW_CLAUDE_ENDPOINT_KIND';
+
+const INHERITED_PROVIDER_ENV_KEYS = [
+  CLAUDE_ENDPOINT_KIND_ENV,
+  'CLAUDE_CODE_OAUTH_TOKEN',
+  'ANTHROPIC_BASE_URL',
+  'ANTHROPIC_AUTH_TOKEN',
+  'ANTHROPIC_API_KEY',
+  'ANTHROPIC_MODEL',
+  'ANTHROPIC_CUSTOM_HEADERS',
+  'ANTHROPIC_DEFAULT_OPUS_MODEL',
+  'ANTHROPIC_DEFAULT_SONNET_MODEL',
+  'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+  'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
+  'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC',
+  'CLAUDE_CODE_EFFORT_LEVEL',
+  'CLAUDE_CODE_NO_FLICKER',
+  'API_TIMEOUT_MS',
+  'HAPPYCLAW_ENGINE_TYPE',
+  'OPENAI_BASE_URL',
+  'OPENAI_API_KEY',
+  'OPENAI_MODEL',
+] as const;
+
+/**
+ * Provider selection is authoritative for each run. Remove values inherited
+ * from the HappyClaw parent before applying the selected provider so switching
+ * accounts or wire protocols cannot silently retain an earlier endpoint/key.
+ */
+export function clearInheritedProviderEnv(
+  env: Record<string, string | undefined>,
+): void {
+  for (const key of INHERITED_PROVIDER_ENV_KEYS) delete env[key];
+}
+
+const THIRD_PARTY_CONFIGURABLE_ENV_KEYS = new Set([
+  'ANTHROPIC_DEFAULT_OPUS_MODEL',
+  'ANTHROPIC_DEFAULT_SONNET_MODEL',
+  'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+  'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
+  'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC',
+  'CLAUDE_CODE_EFFORT_LEVEL',
+  'CLAUDE_CODE_NO_FLICKER',
+  'API_TIMEOUT_MS',
+]);
+
+const THIRD_PARTY_RUNTIME_DEFAULTS = {
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+  CLAUDE_CODE_EFFORT_LEVEL: 'max',
+  CLAUDE_CODE_NO_FLICKER: '1',
+  API_TIMEOUT_MS: '3000000',
+} as const;
+
+function isOneMillionContextModel(model: string): boolean {
+  return /\[1m\]$/i.test(model.trim());
+}
 const DANGEROUS_ENV_VARS = new Set([
   // Code execution / preload attacks
   'LD_PRELOAD',
@@ -2472,10 +2531,48 @@ export function buildClaudeEnvLines(
     lines.push(`ANTHROPIC_MODEL=${sanitizeEnvValue(config.anthropicModel)}`);
   }
 
-  // Use explicit profileCustomEnv if provided (pool mode), otherwise active profile
+  // Use explicit profileCustomEnv if provided (pool mode), otherwise active profile.
   const customEnv = profileCustomEnv ?? getActiveProfileCustomEnv();
+
+  // Give Anthropic-compatible third-party endpoints a predictable Claude Code
+  // runtime. Provider-level advanced values may override these defaults. This
+  // preserves the four-tier provider's explicit opus/high/fast mapping while
+  // making newly added providers work well without eight manual env rows.
+  if (config.anthropicBaseUrl) {
+    const configuredValue = (key: string, fallback: string): string =>
+      Object.hasOwn(customEnv, key)
+        ? sanitizeCustomEnvValue(key, customEnv[key])
+        : fallback;
+
+    if (config.anthropicModel) {
+      const model = sanitizeEnvValue(config.anthropicModel);
+      lines.push(
+        `ANTHROPIC_DEFAULT_OPUS_MODEL=${configuredValue('ANTHROPIC_DEFAULT_OPUS_MODEL', model)}`,
+      );
+      lines.push(
+        `ANTHROPIC_DEFAULT_SONNET_MODEL=${configuredValue('ANTHROPIC_DEFAULT_SONNET_MODEL', model)}`,
+      );
+      lines.push(
+        `ANTHROPIC_DEFAULT_HAIKU_MODEL=${configuredValue('ANTHROPIC_DEFAULT_HAIKU_MODEL', model)}`,
+      );
+    }
+
+    lines.push(
+      `CLAUDE_CODE_AUTO_COMPACT_WINDOW=${configuredValue(
+        'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
+        isOneMillionContextModel(config.anthropicModel) ? '1000000' : '200000',
+      )}`,
+    );
+    for (const [key, value] of Object.entries(THIRD_PARTY_RUNTIME_DEFAULTS)) {
+      lines.push(`${key}=${configuredValue(key, value)}`);
+    }
+  }
+
   for (const [key, value] of Object.entries(customEnv)) {
     if (RESERVED_CLAUDE_ENV_KEYS.has(key)) continue;
+    if (config.anthropicBaseUrl && THIRD_PARTY_CONFIGURABLE_ENV_KEYS.has(key)) {
+      continue;
+    }
     lines.push(`${key}=${sanitizeCustomEnvValue(key, value)}`);
   }
 
@@ -2885,7 +2982,10 @@ export function buildContainerEnvLines(
   profileCustomEnv?: Record<string, string>,
 ): string[] {
   const merged = mergeClaudeEnvConfig(global, override);
-  const lines = buildClaudeEnvLines(merged, profileCustomEnv);
+  const lines = [
+    `${CLAUDE_ENDPOINT_KIND_ENV}=${merged.anthropicBaseUrl ? 'custom' : 'official'}`,
+    ...buildClaudeEnvLines(merged, profileCustomEnv),
+  ];
 
   // Append custom env vars (with safety sanitization as defense-in-depth)
   if (override.customEnv) {
@@ -2903,6 +3003,16 @@ export function buildContainerEnvLines(
         logger.warn(
           { key },
           'Blocked dangerous env variable in buildContainerEnvLines',
+        );
+        continue;
+      }
+      if (
+        RESERVED_CLAUDE_ENV_KEYS.has(key) ||
+        (merged.anthropicBaseUrl && THIRD_PARTY_CONFIGURABLE_ENV_KEYS.has(key))
+      ) {
+        logger.warn(
+          { key },
+          'Skipping provider-managed Claude environment variable in workspace override',
         );
         continue;
       }

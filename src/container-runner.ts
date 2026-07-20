@@ -29,6 +29,7 @@ import {
 } from './mount-security.js';
 import {
   buildContainerEnvLines,
+  clearInheritedProviderEnv,
   getClaudeProviderConfig,
   getContainerEnvConfig,
   getEnabledProviders,
@@ -1564,6 +1565,7 @@ export async function runHostAgent(
   // in a different way, so dropping it restores normal name resolution. No-op
   // on non-macOS hosts (the var does not exist there).
   delete hostEnv['XPC_FLAGS'];
+  clearInheritedProviderEnv(hostEnv);
 
   // ─── Provider Pool selection (host mode) ───
   const containerOverride = getContainerEnvConfig(group.folder);

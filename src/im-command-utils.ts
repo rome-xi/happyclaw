@@ -266,6 +266,7 @@ export const OWNER_REQUIRED_IM_COMMANDS: ReadonlySet<string> = new Set([
   'unbind',
   'sw',
   'spawn',
+  'new',
   // release_owner is the reclaim path: only the current owner can release;
   // gate handles the "must equal current owner_im_id" check uniformly.
   'release_owner',

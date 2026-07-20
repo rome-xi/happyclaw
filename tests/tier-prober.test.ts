@@ -1,8 +1,14 @@
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import Database from 'better-sqlite3';
 import { describe, expect, test } from 'vitest';
 
 import {
   buildTierUpdatePayload,
   currentTierState,
+  readChannelKeyFromSqlite,
+  selectStableTierWinner,
   selectTierWinner,
   validateSourceChannel,
   type Candidate,
@@ -35,6 +41,35 @@ describe('tier winner selection', () => {
     );
     expect(selectTierWinner(candidates, {}, 'speed')).toBeNull();
   });
+
+  test('rejects a one-shot winner and selects a burst-stable candidate', async () => {
+    const results: Record<string, ProbeResult> = {
+      'model-a': { ok: true, correct: true, latencyMs: 100 },
+      'model-b': { ok: true, correct: true, latencyMs: 300 },
+    };
+    const attempts = new Map<string, number>();
+    const winner = await selectStableTierWinner(
+      candidates,
+      results,
+      'speed',
+      async (model) => {
+        const attempt = (attempts.get(model) || 0) + 1;
+        attempts.set(model, attempt);
+        if (model === 'model-a' && attempt === 2) {
+          return { ok: false, correct: false, latencyMs: 999_999 };
+        }
+        return {
+          ok: true,
+          correct: true,
+          latencyMs: model === 'model-a' ? 120 : 320,
+        };
+      },
+    );
+
+    expect(winner).toEqual(candidates[1]);
+    expect(results['model-a'].ok).toBe(false);
+    expect(attempts.get('model-b')).toBe(2);
+  });
 });
 
 describe('tier source validation', () => {
@@ -61,6 +96,27 @@ describe('tier source validation', () => {
       valid: false,
       reason,
     });
+  });
+});
+
+describe('tier source key loading', () => {
+  test('reads a source key from a local new-api SQLite database', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'tier-prober-'));
+    const databasePath = path.join(directory, 'one-api.db');
+    const database = new Database(databasePath);
+    try {
+      database.exec('CREATE TABLE channels (id INTEGER PRIMARY KEY, key TEXT)');
+      database
+        .prepare('INSERT INTO channels (id, key) VALUES (?, ?)')
+        .run(7, 'local-source-key');
+      expect(readChannelKeyFromSqlite(7, databasePath)).toBe(
+        'local-source-key',
+      );
+      expect(readChannelKeyFromSqlite(8, databasePath)).toBe('');
+    } finally {
+      database.close();
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
   });
 });
 

@@ -160,4 +160,123 @@ describe('ClaudeEngine Workflow lifecycle', () => {
       0.6,
     );
   });
+
+  test('suppresses a stale wait result and waits for the corrected final summary', async () => {
+    const events: Array<Record<string, unknown>> = [
+      { type: 'system', subtype: 'init', session_id: 'session-guard' },
+      {
+        type: 'system',
+        subtype: 'task_started',
+        task_id: 'task-guard',
+        tool_use_id: 'tool-guard',
+        description: '后台分析',
+      },
+      {
+        type: 'assistant',
+        uuid: 'assistant-start',
+        parent_tool_use_id: null,
+        message: { content: [{ type: 'text', text: '后台分析已启动。' }] },
+      },
+      {
+        type: 'result',
+        subtype: 'success',
+        result: '后台分析已启动。',
+        usage: { input_tokens: 100, output_tokens: 20 },
+        total_cost_usd: 1,
+        duration_ms: 1_000,
+        num_turns: 1,
+      },
+      {
+        type: 'system',
+        subtype: 'task_notification',
+        task_id: 'task-guard',
+        tool_use_id: 'tool-guard',
+        status: 'completed',
+        summary: '分析完成',
+      },
+      {
+        type: 'assistant',
+        uuid: 'assistant-stale',
+        parent_tool_use_id: null,
+        message: {
+          content: [{ type: 'text', text: '1/2 完成，等待其余 1 个 Agent。' }],
+        },
+      },
+      {
+        type: 'result',
+        subtype: 'success',
+        result: '1/2 完成，等待其余 1 个 Agent。',
+        usage: { input_tokens: 150, output_tokens: 30 },
+        total_cost_usd: 1.5,
+        duration_ms: 1_500,
+        num_turns: 2,
+      },
+      {
+        type: 'assistant',
+        uuid: 'assistant-final',
+        parent_tool_use_id: null,
+        message: { content: [{ type: 'text', text: '这里是最终完整汇总。' }] },
+      },
+      {
+        type: 'result',
+        subtype: 'success',
+        result: '这里是最终完整汇总。',
+        usage: { input_tokens: 170, output_tokens: 40 },
+        total_cost_usd: 1.7,
+        duration_ms: 1_700,
+        num_turns: 3,
+      },
+    ];
+    const fakeQuery = {
+      interrupt: vi.fn(async () => undefined),
+      async *[Symbol.asyncIterator]() {
+        for (const event of events) yield event;
+      },
+    };
+    const engine = new ClaudeEngine({
+      logFn: vi.fn(),
+      queryFn: (() => fakeQuery) as unknown as NonNullable<
+        ClaudeEngineOptions['queryFn']
+      >,
+      createMcpServerFn: (() => ({
+        type: 'sdk',
+        name: 'happyclaw',
+      })) as unknown as NonNullable<ClaudeEngineOptions['createMcpServerFn']>,
+    });
+    const session = await engine.createSession({
+      model: 'max',
+      baseUrl: 'http://127.0.0.1:3011',
+      apiKey: 'local-sentinel',
+      cwd: process.cwd(),
+      extra: { pathToClaudeCodeExecutable: '/bin/true' },
+    });
+    const reported: EngineSendResult[] = [];
+    const yielded: Array<{ eventType: string; statusText?: string }> = [];
+    const generator = engine.sendMessage(
+      session,
+      [{ role: 'user', content: '开始分析' }],
+      [],
+      [],
+      undefined,
+      { onResult: async (result) => void reported.push(result) },
+    );
+
+    while (true) {
+      const next = await generator.next();
+      if (next.done) break;
+      yielded.push(next.value as { eventType: string; statusText?: string });
+    }
+
+    expect(reported.map((result) => result.finalText)).toEqual([
+      '后台分析已启动。',
+      '这里是最终完整汇总。',
+    ]);
+    expect(
+      yielded.some(
+        (event) =>
+          event.eventType === 'status' &&
+          event.statusText === '后台任务已全部完成，正在自动汇总最终结果',
+      ),
+    ).toBe(true);
+  });
 });

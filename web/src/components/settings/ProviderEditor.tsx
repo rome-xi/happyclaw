@@ -1,16 +1,20 @@
 import { useCallback, useEffect, useState } from 'react';
-import {
-  ExternalLink,
-  Key,
-  Loader2,
-  Plus,
-  X,
-} from 'lucide-react';
+import { Eye, EyeOff, ExternalLink, Key, Loader2, Plus, X } from 'lucide-react';
 
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
+import { Switch } from '@/components/ui/switch';
 import { api } from '../../api/client';
+import {
+  buildProviderModel,
+  parseProviderModel,
+} from '../../utils/provider-model';
 import type { ProviderWithHealth, EnvRow } from './types';
 import { getErrorMessage } from './types';
 
@@ -26,7 +30,10 @@ const RESERVED_ENV_KEYS = new Set([
   'ANTHROPIC_MODEL',
 ]);
 
-function buildCustomEnv(rows: EnvRow[]): { customEnv: Record<string, string>; error: string | null } {
+function buildCustomEnv(rows: EnvRow[]): {
+  customEnv: Record<string, string>;
+  error: string | null;
+} {
   const customEnv: Record<string, string> = {};
 
   for (const [idx, row] of rows.entries()) {
@@ -45,7 +52,10 @@ function buildCustomEnv(rows: EnvRow[]): { customEnv: Record<string, string>; er
       };
     }
     if (RESERVED_ENV_KEYS.has(key)) {
-      return { customEnv: {}, error: `${key} 属于系统保留字段，请在配置表单中填写` };
+      return {
+        customEnv: {},
+        error: `${key} 属于系统保留字段，请在配置表单中填写`,
+      };
     }
     if (customEnv[key] !== undefined) {
       return { customEnv: {}, error: `环境变量 Key "${key}" 重复` };
@@ -84,6 +94,7 @@ export function ProviderEditor({
   const [name, setName] = useState('');
   const [baseUrl, setBaseUrl] = useState('');
   const [model, setModel] = useState('');
+  const [oneMillionContext, setOneMillionContext] = useState(false);
   const [weight, setWeight] = useState(1);
   const [engineType, setEngineType] = useState<EngineType>('anthropic');
 
@@ -105,6 +116,9 @@ export function ProviderEditor({
 
   // 环境变量
   const [customEnvRows, setCustomEnvRows] = useState<EnvRow[]>([]);
+  const [showCustomEnvValues, setShowCustomEnvValues] = useState<
+    Record<number, boolean>
+  >({});
 
   // 状态
   const [saving, setSaving] = useState(false);
@@ -112,12 +126,14 @@ export function ProviderEditor({
   // 初始化表单
   useEffect(() => {
     if (!open) return;
+    setShowCustomEnvValues({});
 
     if (isCreate) {
       setProviderType('third_party');
       setName('');
       setBaseUrl('');
       setModel('');
+      setOneMillionContext(false);
       setWeight(1);
       setEngineType('anthropic');
       setAuthTab('oauth');
@@ -133,7 +149,14 @@ export function ProviderEditor({
       setProviderType(provider.type);
       setName(provider.name);
       setBaseUrl(provider.anthropicBaseUrl || '');
-      setModel(provider.anthropicModel || '');
+      if (provider.type === 'third_party') {
+        const selection = parseProviderModel(provider.anthropicModel || '');
+        setModel(selection.model);
+        setOneMillionContext(selection.oneMillionContext);
+      } else {
+        setModel(provider.anthropicModel || '');
+        setOneMillionContext(false);
+      }
       setWeight(provider.weight);
       setEngineType(provider.engineType || 'anthropic');
       setAuthTab('oauth');
@@ -144,12 +167,15 @@ export function ProviderEditor({
       setAuthToken('');
       setAuthTokenDirty(false);
       setClearTokenOnSave(false);
-      const envRows = Object.entries(provider.customEnv || {}).map(([key, value]) => ({ key, value }));
+      const envRows = Object.entries(provider.customEnv || {}).map(
+        ([key, value]) => ({ key, value }),
+      );
       setCustomEnvRows(envRows);
     }
   }, [open, isCreate, provider]);
 
-  const addRow = () => setCustomEnvRows((prev) => [...prev, { key: '', value: '' }]);
+  const addRow = () =>
+    setCustomEnvRows((prev) => [...prev, { key: '', value: '' }]);
   const removeRow = (index: number) =>
     setCustomEnvRows((prev) => prev.filter((_, i) => i !== index));
   const updateRow = (index: number, field: keyof EnvRow, value: string) =>
@@ -206,9 +232,26 @@ export function ProviderEditor({
 
   // ─── 保存 ──────────────────────────────────────────────────
   const handleSave = async () => {
-    const trimmedName = name.trim();
+    const normalizedModel =
+      providerType === 'third_party'
+        ? buildProviderModel(model, oneMillionContext)
+        : model.trim();
+    if (providerType === 'third_party' && !normalizedModel) {
+      setError('请填写第三方 API 支持的模型名称');
+      return;
+    }
+    const trimmedName =
+      name.trim() ||
+      (providerType === 'third_party'
+        ? parseProviderModel(normalizedModel).model
+        : '');
     if (!trimmedName) {
       setError('请填写提供商名称');
+      return;
+    }
+
+    if (providerType === 'third_party' && !baseUrl.trim()) {
+      setError('请填写 API 端点');
       return;
     }
 
@@ -259,7 +302,9 @@ export function ProviderEditor({
             if (trimmed.startsWith('{')) {
               try {
                 const parsed = JSON.parse(trimmed) as Record<string, unknown>;
-                const oauth = parsed.claudeAiOauth as Record<string, unknown> | undefined;
+                const oauth = parsed.claudeAiOauth as
+                  | Record<string, unknown>
+                  | undefined;
                 if (oauth?.accessToken && oauth?.refreshToken) {
                   createBody.claudeOAuthCredentials = {
                     accessToken: oauth.accessToken,
@@ -292,7 +337,7 @@ export function ProviderEditor({
           }
         }
 
-        if (model.trim()) createBody.anthropicModel = model.trim();
+        if (normalizedModel) createBody.anthropicModel = normalizedModel;
 
         if (engineType !== 'anthropic') {
           createBody.engineType = engineType;
@@ -311,15 +356,18 @@ export function ProviderEditor({
         if (providerType === 'third_party') {
           patchBody.anthropicBaseUrl = baseUrl.trim();
         }
-        if (model.trim()) {
-          patchBody.anthropicModel = model.trim();
-        }
+        // Explicitly send an empty value for official providers so users can
+        // switch an existing fixed model back to the SDK default.
+        patchBody.anthropicModel = normalizedModel;
 
         if (engineType !== (provider?.engineType || 'anthropic')) {
           patchBody.engineType = engineType;
         }
 
-        await api.patch(`/api/config/claude/providers/${provider!.id}`, patchBody);
+        await api.patch(
+          `/api/config/claude/providers/${provider!.id}`,
+          patchBody,
+        );
 
         // 更新密钥（如果有变更）
         const secretsBody: Record<string, unknown> = {};
@@ -340,7 +388,9 @@ export function ProviderEditor({
             if (trimmed.startsWith('{')) {
               try {
                 const parsed = JSON.parse(trimmed) as Record<string, unknown>;
-                const oauth = parsed.claudeAiOauth as Record<string, unknown> | undefined;
+                const oauth = parsed.claudeAiOauth as
+                  | Record<string, unknown>
+                  | undefined;
                 if (oauth?.accessToken && oauth?.refreshToken) {
                   secretsBody.claudeOAuthCredentials = {
                     accessToken: oauth.accessToken,
@@ -375,7 +425,10 @@ export function ProviderEditor({
         }
 
         if (hasSecretsChange) {
-          await api.put(`/api/config/claude/providers/${provider!.id}/secrets`, secretsBody);
+          await api.put(
+            `/api/config/claude/providers/${provider!.id}/secrets`,
+            secretsBody,
+          );
         }
 
         setNotice('提供商配置已保存。');
@@ -383,7 +436,9 @@ export function ProviderEditor({
 
       onSave();
     } catch (err) {
-      setError(getErrorMessage(err, isCreate ? '创建提供商失败' : '保存提供商失败'));
+      setError(
+        getErrorMessage(err, isCreate ? '创建提供商失败' : '保存提供商失败'),
+      );
     } finally {
       setSaving(false);
     }
@@ -400,14 +455,18 @@ export function ProviderEditor({
     <Dialog open={open} onOpenChange={(v) => !v && handleClose()}>
       <DialogContent className="sm:max-w-xl max-h-[90vh] overflow-y-auto">
         <DialogHeader>
-          <DialogTitle>{isCreate ? '添加提供商' : `编辑提供商：${provider?.name}`}</DialogTitle>
+          <DialogTitle>
+            {isCreate ? '添加提供商' : `编辑提供商：${provider?.name}`}
+          </DialogTitle>
         </DialogHeader>
 
         <div className="space-y-4">
           {/* 类型选择（仅创建模式） */}
           {isCreate && (
             <div>
-              <label className="block text-xs text-muted-foreground mb-1">提供商类型</label>
+              <label className="block text-xs text-muted-foreground mb-1">
+                提供商类型
+              </label>
               <div className="inline-flex rounded-lg border border-border p-1 bg-muted">
                 <button
                   type="button"
@@ -437,13 +496,19 @@ export function ProviderEditor({
 
           {/* 名称 */}
           <div>
-            <label className="block text-xs text-muted-foreground mb-1">名称</label>
+            <label className="block text-xs text-muted-foreground mb-1">
+              名称
+            </label>
             <Input
               type="text"
               value={name}
               onChange={(e) => setName(e.target.value)}
               disabled={saving}
-              placeholder={providerType === 'official' ? '如：Claude 官方' : '如：OpenRouter-主账号'}
+              placeholder={
+                providerType === 'official'
+                  ? '如：Claude 官方'
+                  : '如：OpenRouter-主账号'
+              }
             />
           </div>
 
@@ -451,7 +516,9 @@ export function ProviderEditor({
           {providerType === 'official' && (
             <div className="space-y-4">
               <div>
-                <label className="block text-xs text-muted-foreground mb-2">认证方式</label>
+                <label className="block text-xs text-muted-foreground mb-2">
+                  认证方式
+                </label>
                 <div className="inline-flex rounded-lg border border-border p-1 bg-muted">
                   {(['oauth', 'setup_token', 'api_key'] as const).map((tab) => (
                     <button
@@ -464,7 +531,11 @@ export function ProviderEditor({
                           : 'text-muted-foreground'
                       }`}
                     >
-                      {tab === 'oauth' ? 'OAuth 登录' : tab === 'setup_token' ? 'Setup Token' : 'API Key'}
+                      {tab === 'oauth'
+                        ? 'OAuth 登录'
+                        : tab === 'setup_token'
+                          ? 'Setup Token'
+                          : 'API Key'}
                     </button>
                   ))}
                 </div>
@@ -472,42 +543,65 @@ export function ProviderEditor({
 
               {authTab === 'oauth' && (
                 <div className="rounded-lg border border-teal-200 bg-teal-50/50 p-4 space-y-3">
-                  <div className="text-sm font-medium text-foreground">一键登录 Claude（推荐）</div>
+                  <div className="text-sm font-medium text-foreground">
+                    一键登录 Claude（推荐）
+                  </div>
                   <div className="text-xs text-muted-foreground">
-                    点击按钮后会打开 claude.ai 授权页面，完成授权后将页面上显示的授权码粘贴回来。
+                    点击按钮后会打开 claude.ai
+                    授权页面，完成授权后将页面上显示的授权码粘贴回来。
                   </div>
 
                   {/* 编辑模式显示现有凭据 */}
                   {!isCreate && provider?.hasClaudeOAuthCredentials && (
                     <div className="rounded-md border border-emerald-200 dark:border-emerald-800 bg-emerald-50/50 dark:bg-emerald-950/30 p-3 space-y-1 text-xs">
                       <div className="text-emerald-700 dark:text-emerald-300">
-                        Access Token: {provider.claudeOAuthCredentialsAccessTokenMasked || '***'}
+                        Access Token:{' '}
+                        {provider.claudeOAuthCredentialsAccessTokenMasked ||
+                          '***'}
                       </div>
                       {provider.claudeOAuthCredentialsExpiresAt && (
-                        <div className={
-                          provider.claudeOAuthCredentialsExpiresAt <= Date.now()
-                            ? 'text-red-700 dark:text-red-400 font-medium'
-                            : 'text-emerald-700 dark:text-emerald-300'
-                        }>
-                          过期时间: {new Date(provider.claudeOAuthCredentialsExpiresAt).toLocaleString('zh-CN')}
+                        <div
+                          className={
+                            provider.claudeOAuthCredentialsExpiresAt <=
+                            Date.now()
+                              ? 'text-red-700 dark:text-red-400 font-medium'
+                              : 'text-emerald-700 dark:text-emerald-300'
+                          }
+                        >
+                          过期时间:{' '}
+                          {new Date(
+                            provider.claudeOAuthCredentialsExpiresAt,
+                          ).toLocaleString('zh-CN')}
                           {provider.claudeOAuthCredentialsExpiresAt > Date.now()
                             ? ` (${Math.round((provider.claudeOAuthCredentialsExpiresAt - Date.now()) / 60000)} 分钟后)`
                             : ' (已过期)'}
                         </div>
                       )}
-                      <div className="text-emerald-600">SDK 会在 token 过期时自动刷新。</div>
+                      <div className="text-emerald-600">
+                        SDK 会在 token 过期时自动刷新。
+                      </div>
                     </div>
                   )}
 
                   {!oauthState ? (
-                    <Button onClick={handleOAuthStart} disabled={saving || oauthLoading}>
-                      {oauthLoading ? <Loader2 className="size-4 animate-spin" /> : <ExternalLink className="size-4" />}
-                      {!isCreate && provider?.hasClaudeOAuthCredentials ? '重新登录 Claude' : '一键登录 Claude'}
+                    <Button
+                      onClick={handleOAuthStart}
+                      disabled={saving || oauthLoading}
+                    >
+                      {oauthLoading ? (
+                        <Loader2 className="size-4 animate-spin" />
+                      ) : (
+                        <ExternalLink className="size-4" />
+                      )}
+                      {!isCreate && provider?.hasClaudeOAuthCredentials
+                        ? '重新登录 Claude'
+                        : '一键登录 Claude'}
                     </Button>
                   ) : (
                     <div className="space-y-2">
                       <div className="text-xs text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 rounded-md px-3 py-2">
-                        授权窗口已打开，请在 claude.ai 完成授权后，将页面上显示的授权码粘贴到下方。
+                        授权窗口已打开，请在 claude.ai
+                        完成授权后，将页面上显示的授权码粘贴到下方。
                       </div>
                       <div className="flex gap-2">
                         <Input
@@ -518,8 +612,13 @@ export function ProviderEditor({
                           placeholder="粘贴授权码"
                           className="flex-1"
                         />
-                        <Button onClick={handleOAuthCallback} disabled={oauthExchanging || !oauthCode.trim()}>
-                          {oauthExchanging && <Loader2 className="size-4 animate-spin" />}
+                        <Button
+                          onClick={handleOAuthCallback}
+                          disabled={oauthExchanging || !oauthCode.trim()}
+                        >
+                          {oauthExchanging && (
+                            <Loader2 className="size-4 animate-spin" />
+                          )}
                           确认
                         </Button>
                         <Button
@@ -551,14 +650,18 @@ export function ProviderEditor({
                     onChange={(e) => setSetupToken(e.target.value)}
                     disabled={saving}
                     placeholder={
-                      !isCreate && (provider?.hasClaudeCodeOauthToken || provider?.hasClaudeOAuthCredentials)
+                      !isCreate &&
+                      (provider?.hasClaudeCodeOauthToken ||
+                        provider?.hasClaudeOAuthCredentials)
                         ? '输入新值覆盖'
                         : '粘贴 setup-token 或 cat ~/.claude/.credentials.json 输出'
                     }
                   />
                   <p className="text-xs text-muted-foreground">
                     支持粘贴{' '}
-                    <code className="bg-muted px-1 rounded">cat ~/.claude/.credentials.json</code>{' '}
+                    <code className="bg-muted px-1 rounded">
+                      cat ~/.claude/.credentials.json
+                    </code>{' '}
                     的 JSON 内容
                   </p>
                 </div>
@@ -608,7 +711,9 @@ export function ProviderEditor({
           {providerType === 'third_party' && (
             <div className="space-y-4">
               <div>
-                <label className="block text-xs text-muted-foreground mb-1">ANTHROPIC_BASE_URL</label>
+                <label className="block text-xs text-muted-foreground mb-1">
+                  ANTHROPIC_BASE_URL
+                </label>
                 <Input
                   type="text"
                   value={baseUrl}
@@ -695,15 +800,37 @@ export function ProviderEditor({
                   className="font-mono"
                 />
                 <p className="text-xs text-muted-foreground mt-1">
-                  注入为 ANTHROPIC_MODEL 环境变量，值取决于第三方 API 支持的模型。
+                  注入为 ANTHROPIC_MODEL 环境变量，值取决于第三方 API
+                  支持的模型。
                 </p>
+                <div className="mt-3 flex items-center justify-between gap-4 rounded-lg border border-border/80 bg-muted/30 px-3 py-2.5">
+                  <div className="min-w-0">
+                    <div className="text-xs font-medium text-foreground">
+                      1M 上下文窗口
+                    </div>
+                    <p className="mt-1 text-[11px] leading-4 text-muted-foreground">
+                      开启后保存为{' '}
+                      <code className="break-all text-foreground">
+                        {buildProviderModel(model, true) || '模型名[1m]'}
+                      </code>
+                    </p>
+                  </div>
+                  <Switch
+                    checked={oneMillionContext}
+                    onCheckedChange={setOneMillionContext}
+                    disabled={saving || !model.trim()}
+                    aria-label="启用 1M 上下文窗口"
+                  />
+                </div>
               </>
             )}
           </div>
 
           {/* ─── 引擎类型 ─── */}
           <div className="border-t border-border pt-4">
-            <label className="block text-xs text-muted-foreground mb-1">引擎类型</label>
+            <label className="block text-xs text-muted-foreground mb-1">
+              引擎类型
+            </label>
             <select
               value={engineType}
               onChange={(e) => setEngineType(e.target.value as EngineType)}
@@ -717,7 +844,8 @@ export function ProviderEditor({
               选择该 Provider 使用的 API wire protocol。
               {engineType === 'openai' && (
                 <span className="text-amber-600 dark:text-amber-400 block mt-1">
-                  ⚠️ OpenAI 引擎为实验性功能，Sub-Agent 调度和自动上下文压缩暂不支持。
+                  ⚠️ OpenAI 引擎为实验性功能，Sub-Agent
+                  调度和自动上下文压缩暂不支持。
                 </span>
               )}
             </p>
@@ -726,7 +854,9 @@ export function ProviderEditor({
           {/* ─── 自定义环境变量 ─── */}
           <div className="border-t border-border pt-4">
             <div className="flex items-center justify-between mb-2">
-              <label className="text-xs text-muted-foreground">其他自定义环境变量（可选）</label>
+              <label className="text-xs text-muted-foreground">
+                其他自定义环境变量（可选）
+              </label>
               <button
                 type="button"
                 onClick={addRow}
@@ -745,7 +875,10 @@ export function ProviderEditor({
             ) : (
               <div className="space-y-2">
                 {customEnvRows.map((row, idx) => (
-                  <div key={idx} className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+                  <div
+                    key={idx}
+                    className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2"
+                  >
                     <Input
                       type="text"
                       value={row.key}
@@ -754,12 +887,33 @@ export function ProviderEditor({
                       className="w-full sm:w-[38%] px-2.5 py-1.5 text-xs font-mono h-auto"
                     />
                     <Input
-                      type="text"
+                      type={showCustomEnvValues[idx] ? 'text' : 'password'}
                       value={row.value}
                       onChange={(e) => updateRow(idx, 'value', e.target.value)}
                       placeholder="value"
                       className="flex-1 px-2.5 py-1.5 text-xs font-mono h-auto"
                     />
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setShowCustomEnvValues((current) => ({
+                          ...current,
+                          [idx]: !current[idx],
+                        }))
+                      }
+                      className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
+                      aria-label={
+                        showCustomEnvValues[idx]
+                          ? '隐藏环境变量值'
+                          : '显示环境变量值'
+                      }
+                    >
+                      {showCustomEnvValues[idx] ? (
+                        <EyeOff className="h-4 w-4" />
+                      ) : (
+                        <Eye className="h-4 w-4" />
+                      )}
+                    </button>
                     <button
                       type="button"
                       onClick={() => removeRow(idx)}
@@ -789,7 +943,11 @@ export function ProviderEditor({
               min={1}
               max={100}
               value={weight}
-              onChange={(e) => setWeight(Math.max(1, Math.min(100, parseInt(e.target.value) || 1)))}
+              onChange={(e) =>
+                setWeight(
+                  Math.max(1, Math.min(100, parseInt(e.target.value) || 1)),
+                )
+              }
               disabled={saving}
               className="w-24"
             />
@@ -801,8 +959,12 @@ export function ProviderEditor({
           </div>
 
           {/* ─── 操作按钮 ─── */}
-          <div className="flex justify-end gap-2 pt-2">
-            <Button variant="outline" onClick={handleClose} disabled={saving || oauthExchanging}>
+          <div className="sticky -bottom-4 z-10 -mx-4 flex justify-end gap-2 border-t border-border bg-background/95 px-4 pb-4 pt-3 backdrop-blur supports-[backdrop-filter]:bg-background/85">
+            <Button
+              variant="outline"
+              onClick={handleClose}
+              disabled={saving || oauthExchanging}
+            >
               取消
             </Button>
             {/* OAuth 模式下创建时不需要保存按钮（OAuth 回调会自动触发 onSave） */}

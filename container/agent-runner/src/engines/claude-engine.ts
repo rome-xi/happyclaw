@@ -39,7 +39,11 @@ import type { StreamEvent } from '../stream-event.types.js';
 import type { ContainerOutput } from '../types.js';
 import { StreamEventProcessor } from '../stream-processor.js';
 import { PREDEFINED_AGENTS } from '../agent-definitions.js';
-import { AssistantTextTracker } from '../utils.js';
+import {
+  AssistantTextTracker,
+  buildBackgroundTaskSummaryPrompt,
+  shouldForceBackgroundTaskSummary,
+} from '../utils.js';
 
 // ── SDK User Message 类型 ──
 
@@ -207,7 +211,7 @@ export class ClaudeEngine implements AgentEngine {
     const config = (session.engineState._config as
       | EngineConfig
       | undefined) ?? {
-      model: process.env.ANTHROPIC_MODEL || 'opus[1m]',
+      model: process.env.ANTHROPIC_MODEL?.trim() ?? '',
       baseUrl: '',
       apiKey: '',
       cwd: process.cwd(),
@@ -360,7 +364,7 @@ export class ClaudeEngine implements AgentEngine {
       prompt: stream,
       options: {
         ...(pathToClaudeCodeExecutable && { pathToClaudeCodeExecutable }),
-        model: config.model,
+        ...(config.model ? { model: config.model } : {}),
         cwd: config.cwd,
         resume: session.id || undefined,
         ...(session.id && resumeAt ? { resumeSessionAt: resumeAt } : {}),
@@ -439,6 +443,9 @@ export class ClaudeEngine implements AgentEngine {
     let canonicalAssistantUuid: string | undefined;
     const assistantTextTracker = new AssistantTextTracker();
     let reportedAnyResult = false;
+    let sawPendingBackgroundTasks = false;
+    let backgroundSummaryForceAttempts = 0;
+    const maxBackgroundSummaryForceAttempts = 2;
     const lastReportedUsage = {
       inputTokens: 0,
       outputTokens: 0,
@@ -678,6 +685,38 @@ export class ClaudeEngine implements AgentEngine {
             assistantTextTracker.pickFinalText(effectiveResult) || '';
           canonicalAssistantText = finalText || undefined;
           const pendingBgTasks = processor.getPendingSdkTaskCount();
+          if (pendingBgTasks > 0) sawPendingBackgroundTasks = true;
+
+          if (
+            shouldForceBackgroundTaskSummary({
+              emitOutput: !!hooks?.onResult,
+              sawPendingBackgroundTasks,
+              pendingBgTasks,
+              finalText,
+              attempts: backgroundSummaryForceAttempts,
+              maxAttempts: maxBackgroundSummaryForceAttempts,
+            })
+          ) {
+            backgroundSummaryForceAttempts++;
+            this.logFn(
+              `Result #${resultCount} still looked like a background-task wait reply after all tasks settled; forcing final summary (${backgroundSummaryForceAttempts}/${maxBackgroundSummaryForceAttempts})`,
+            );
+            yield {
+              eventType: 'status',
+              agentScope: 'system',
+              statusText: '后台任务已全部完成，正在自动汇总最终结果',
+              summary: '后台任务已全部完成，正在自动汇总最终结果',
+              displayLevel: 'primary',
+            };
+            assistantTextTracker.reset();
+            canonicalAssistantText = undefined;
+            canonicalAssistantUuid = undefined;
+            const rejected = stream.push(buildBackgroundTaskSummaryPrompt());
+            if (rejected.length === 0) continue;
+            this.logFn(
+              `Forced background summary prompt was rejected: ${rejected.join('; ')}`,
+            );
+          }
 
           // SDK 的 usage/modelUsage 是会话累计值。一个 Workflow 会在同一
           // query 中产生多条 result，必须按上一条累计值做 delta，否则每个
@@ -742,8 +781,9 @@ export class ClaudeEngine implements AgentEngine {
                 });
               }
             } else {
-              const previous = lastReportedModelUsage.get(config.model);
-              modelUsageSummary[config.model] = {
+              const fallbackModelKey = config.model || 'default';
+              const previous = lastReportedModelUsage.get(fallbackModelKey);
+              modelUsageSummary[fallbackModelKey] = {
                 inputTokens: delta(
                   sdkUsage.input_tokens,
                   previous?.inputTokens || 0,
@@ -765,7 +805,7 @@ export class ClaudeEngine implements AgentEngine {
                   previous?.costUSD || 0,
                 ),
               };
-              lastReportedModelUsage.set(config.model, {
+              lastReportedModelUsage.set(fallbackModelKey, {
                 inputTokens: sdkUsage.input_tokens || 0,
                 outputTokens: sdkUsage.output_tokens || 0,
                 cacheReadInputTokens: sdkUsage.cache_read_input_tokens || 0,
@@ -866,6 +906,9 @@ export class ClaudeEngine implements AgentEngine {
               );
               continue;
             }
+
+            sawPendingBackgroundTasks = false;
+            backgroundSummaryForceAttempts = 0;
 
             processor.cleanup();
             yield* this.drainQueue(eventQueue);

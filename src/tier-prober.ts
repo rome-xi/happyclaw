@@ -19,6 +19,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import Database from 'better-sqlite3';
 import { logger } from './logger.js';
 
 const NEWAPI = process.env.NEWAPI_URL || 'http://127.0.0.1:3010';
@@ -35,6 +36,9 @@ const TOKEN_FILE =
 const ADMIN_CRED =
   process.env.NEWAPI_ADMIN_CRED ||
   path.join(os.homedir(), 'new-api-data', 'ADMIN_CREDENTIALS.txt');
+const NEWAPI_SQLITE =
+  process.env.NEWAPI_SQLITE_DB ||
+  path.join(os.homedir(), 'new-api-data', 'one-api.db');
 
 const CANARY_Q = 'Reply with ONLY the number, nothing else: what is 12*9?';
 const CANARY_A = '108';
@@ -196,6 +200,46 @@ export function selectTierWinner(
   );
 }
 
+/**
+ * Re-check a provisional winner twice before routing real traffic to it. The
+ * worst observed latency replaces the optimistic first sample, so an endpoint
+ * that is fast once but slow or rate-limited under a tiny burst is downgraded.
+ * `confirmedModels` may be shared by tiers that reuse the same candidates.
+ */
+export async function selectStableTierWinner(
+  order: Candidate[],
+  results: Record<string, ProbeResult>,
+  policy: Policy,
+  confirm: (model: string) => Promise<ProbeResult>,
+  confirmedModels = new Set<string>(),
+): Promise<Candidate | null> {
+  while (true) {
+    const winner = selectTierWinner(order, results, policy);
+    if (!winner || confirmedModels.has(winner.model)) return winner;
+
+    const samples = [results[winner.model]];
+    let stable = true;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let sample: ProbeResult;
+      try {
+        sample = await confirm(winner.model);
+      } catch {
+        sample = { ok: false, correct: false, latencyMs: 999_999 };
+      }
+      samples.push(sample);
+      if (!sample.ok || !sample.correct) stable = false;
+    }
+    confirmedModels.add(winner.model);
+    results[winner.model] = stable
+      ? {
+          ok: true,
+          correct: true,
+          latencyMs: Math.max(...samples.map((sample) => sample.latencyMs)),
+        }
+      : { ok: false, correct: false, latencyMs: 999_999 };
+  }
+}
+
 function readToken(): string {
   if (process.env.NEWAPI_TOKEN) return process.env.NEWAPI_TOKEN.trim();
   try {
@@ -205,20 +249,29 @@ function readToken(): string {
   }
 }
 
-function readAdminPassword(): string {
-  if (process.env.NEWAPI_ADMIN_PASSWORD) {
-    return process.env.NEWAPI_ADMIN_PASSWORD;
+function readAdminCredentials(): { username: string; password: string } | null {
+  const envPassword = process.env.NEWAPI_ADMIN_PASSWORD?.trim();
+  const envUsername = process.env.NEWAPI_ADMIN_USERNAME?.trim();
+  if (envPassword) {
+    return { username: envUsername || 'admin', password: envPassword };
   }
   try {
     const txt = fs.readFileSync(ADMIN_CRED, 'utf-8');
+    let username = envUsername || '';
+    let password = '';
     for (const ln of txt.split('\n')) {
-      if (ln.startsWith('密码:'))
-        return ln.split(':').slice(1).join(':').trim();
+      const separator = ln.search(/[:：]/);
+      if (separator < 0) continue;
+      const label = ln.slice(0, separator).trim().toLowerCase();
+      const value = ln.slice(separator + 1).trim();
+      if (['用户名', 'username', 'user'].includes(label)) username = value;
+      if (['密码', 'password', 'pass'].includes(label)) password = value;
     }
+    if (password) return { username: username || 'admin', password };
   } catch {
     /* ignore */
   }
-  return '';
+  return null;
 }
 
 /** 给单个真实模型打 canary。429/超时/错误 → ok=false。 */
@@ -261,25 +314,34 @@ async function probeOne(model: string, token: string): Promise<ProbeResult> {
   }
 }
 
-// ── new-api admin：登录取 cookie，读/写渠道 model_mapping ──
+// ── new-api admin：登录取认证头，读/写渠道 model_mapping ──
 
-async function adminLogin(): Promise<string | null> {
-  const pw = readAdminPassword();
-  if (!pw) {
-    logger.warn('tier-prober: admin password unavailable');
+type AdminHeaders = Record<string, string>;
+
+async function adminLogin(): Promise<AdminHeaders | null> {
+  const credentials = readAdminCredentials();
+  if (!credentials) {
+    logger.warn('tier-prober: admin credentials unavailable');
     return null;
   }
   try {
     const r = await fetch(`${NEWAPI}/api/user/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: 'admin', password: pw }),
+      body: JSON.stringify(credentials),
       signal: AbortSignal.timeout(15_000),
     });
+    const body = (await r.json().catch(() => null)) as any;
     const setCookie = r.headers.get('set-cookie');
-    if (!r.ok || !setCookie) return null;
-    // 取 session cookie 的 name=value 部分
-    return setCookie.split(';')[0];
+    if (!r.ok || body?.success !== true) return null;
+    const accessToken = body?.data?.access_token;
+    const userId = body?.data?.user?.id ?? body?.data?.id ?? 1;
+    const headers: AdminHeaders = { 'New-Api-User': String(userId) };
+    if (setCookie) headers['Cookie'] = setCookie.split(';')[0];
+    if (typeof accessToken === 'string' && accessToken) {
+      headers['Authorization'] = `Bearer ${accessToken}`;
+    }
+    return headers['Cookie'] || headers['Authorization'] ? headers : null;
   } catch (err) {
     logger.warn(
       { err: (err as Error).message },
@@ -289,13 +351,41 @@ async function adminLogin(): Promise<string | null> {
   }
 }
 
+/**
+ * new-api deliberately redacts channel keys from normal list/detail responses.
+ * On an all-local installation, read the selected key directly from its SQLite
+ * control-plane database. The value stays in memory and is never logged.
+ */
+export function readChannelKeyFromSqlite(
+  channelId: number,
+  databasePath = NEWAPI_SQLITE,
+): string {
+  if (!Number.isSafeInteger(channelId) || channelId <= 0) return '';
+  if (!databasePath || !fs.existsSync(databasePath)) return '';
+  let database: Database.Database | null = null;
+  try {
+    database = new Database(databasePath, {
+      readonly: true,
+      fileMustExist: true,
+    });
+    const row = database
+      .prepare('SELECT key FROM channels WHERE id = ? LIMIT 1')
+      .get(channelId) as { key?: unknown } | undefined;
+    return typeof row?.key === 'string' ? row.key.trim() : '';
+  } catch {
+    return '';
+  } finally {
+    database?.close();
+  }
+}
+
 async function getChannelByName(
-  cookie: string,
+  adminHeaders: AdminHeaders,
   name: string,
 ): Promise<Record<string, unknown> | null> {
   try {
     const list = await fetch(`${NEWAPI}/api/channel/?p=0&page_size=50`, {
-      headers: { Cookie: cookie, 'New-Api-User': '1' },
+      headers: adminHeaders,
       signal: AbortSignal.timeout(15_000),
     });
     const d = (await list.json()) as any;
@@ -303,10 +393,15 @@ async function getChannelByName(
     const hit = (items || []).find((c: { name: string }) => c.name === name);
     if (!hit) return null;
     const full = await fetch(`${NEWAPI}/api/channel/${hit.id}`, {
-      headers: { Cookie: cookie, 'New-Api-User': '1' },
+      headers: adminHeaders,
       signal: AbortSignal.timeout(15_000),
     });
-    return ((await full.json()) as any)?.data ?? null;
+    const channel = ((await full.json()) as any)?.data;
+    if (!channel || typeof channel !== 'object') return null;
+    const apiKey = typeof channel.key === 'string' ? channel.key.trim() : '';
+    if (apiKey && !/\*{3,}/.test(apiKey)) return channel;
+    const localKey = readChannelKeyFromSqlite(Number(hit.id));
+    return localKey ? { ...channel, key: localKey } : channel;
   } catch {
     return null;
   }
@@ -319,7 +414,7 @@ async function getChannelByName(
  * PUT 原样回传其余字段（含 channel_info），实测保持 blob 类型不被破坏。
  */
 async function applyTierUpstream(
-  cookie: string,
+  adminHeaders: AdminHeaders,
   tierChannel: Record<string, unknown>,
   srcChannel: Record<string, unknown>,
   tierModel: string,
@@ -335,9 +430,8 @@ async function applyTierUpstream(
     const r = await fetch(`${NEWAPI}/api/channel/`, {
       method: 'PUT',
       headers: {
+        ...adminHeaders,
         'Content-Type': 'application/json',
-        Cookie: cookie,
-        'New-Api-User': '1',
       },
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(15_000),
@@ -389,8 +483,8 @@ export async function runTierProbeOnce(): Promise<void> {
     logger.warn('tier-prober: new-api token unavailable, skip');
     return;
   }
-  const cookie = await adminLogin();
-  if (!cookie) {
+  const adminHeaders = await adminLogin();
+  if (!adminHeaders) {
     logger.warn('tier-prober: no admin session, skip round');
     return;
   }
@@ -401,7 +495,7 @@ export async function runTierProbeOnce(): Promise<void> {
     name: string,
   ): Promise<Record<string, unknown> | null> => {
     if (!(name in srcCache))
-      srcCache[name] = await getChannelByName(cookie, name);
+      srcCache[name] = await getChannelByName(adminHeaders, name);
     return srcCache[name];
   };
 
@@ -451,11 +545,23 @@ export async function runTierProbeOnce(): Promise<void> {
     }
   }
 
+  const confirmedModels = new Set<string>();
   for (const [tier, cfg] of Object.entries(TIERS)) {
     const eligible = cfg.order.filter((candidate) =>
       validatedSources.has(`${candidate.src}\0${candidate.model}`),
     );
-    const winnerCand = selectTierWinner(eligible, results, cfg.policy);
+    const winnerCand = await selectStableTierWinner(
+      eligible,
+      results,
+      cfg.policy,
+      async (model) => {
+        // A small burst is intentional: reject providers that pass one canary
+        // but immediately rate-limit normal interactive follow-up messages.
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        return probeOne(model, token);
+      },
+      confirmedModels,
+    );
     if (!winnerCand) {
       logger.warn(
         { tier },
@@ -464,7 +570,7 @@ export async function runTierProbeOnce(): Promise<void> {
       continue;
     }
 
-    const tierChannel = await getChannelByName(cookie, cfg.channel);
+    const tierChannel = await getChannelByName(adminHeaders, cfg.channel);
     if (!tierChannel) {
       logger.warn(
         { tier, channel: cfg.channel },
@@ -492,7 +598,7 @@ export async function runTierProbeOnce(): Promise<void> {
       );
     } else {
       const ok = await applyTierUpstream(
-        cookie,
+        adminHeaders,
         tierChannel,
         srcChannel,
         cfg.tierModel,

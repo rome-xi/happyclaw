@@ -250,6 +250,50 @@ export function isSuspectTruncatedStreamResult(
   return (usage.input_tokens ?? 0) === 0 && (usage.output_tokens ?? 0) === 0;
 }
 
+const STALE_BACKGROUND_WAIT_PATTERNS = [
+  /等待其余\s*\d+\s*个\s*(?:Agent|agent|任务|后台任务)/u,
+  /\d+\s*\/\s*\d+\s*完成[\s\S]{0,80}等待/u,
+  /后台\s*(?:Agent|agent|任务)[\s\S]{0,80}(?:完成后|结束后)[\s\S]{0,80}(?:继续汇总|自动唤醒|继续)/u,
+  /(?:任务|Agent|agent)[\s\S]{0,80}(?:运行中|还在跑|尚未完成)[\s\S]{0,80}(?:继续汇总|等待)/u,
+  /(?:I'll|I will)\s+wait\s+for\s+the\s+(?:other|remaining)\s+\d+\s+(?:agents|tasks)/iu,
+  /(?:waiting|wait)\s+for\s+(?:the\s+)?(?:other|remaining)\s+\d+\s+(?:agents|tasks)/iu,
+];
+
+export function isStaleBackgroundWaitReply(
+  text: string | null | undefined,
+): boolean {
+  const trimmed = text?.trim();
+  if (!trimmed) return false;
+  return STALE_BACKGROUND_WAIT_PATTERNS.some((pattern) =>
+    pattern.test(trimmed),
+  );
+}
+
+export function shouldForceBackgroundTaskSummary(params: {
+  emitOutput: boolean;
+  sawPendingBackgroundTasks: boolean;
+  pendingBgTasks: number;
+  finalText: string | null | undefined;
+  attempts: number;
+  maxAttempts: number;
+}): boolean {
+  if (!params.emitOutput || !params.sawPendingBackgroundTasks) return false;
+  if (params.pendingBgTasks !== 0 || params.attempts >= params.maxAttempts) {
+    return false;
+  }
+  return isStaleBackgroundWaitReply(params.finalText);
+}
+
+export function buildBackgroundTaskSummaryPrompt(): string {
+  return [
+    '<system-reminder>',
+    'All background Task agents for the previous user request have now completed.',
+    'Your previous draft still said you were waiting for remaining agents, so it was stale.',
+    'Do not send another progress update. Use the completed task notifications and produce the final user-facing synthesis now.',
+    '</system-reminder>',
+  ].join('\n');
+}
+
 /** AssistantTextTracker 处理的 content block 最小形状（SDK assistant 消息的 content 数组元素）。 */
 export interface AssistantContentBlock {
   type: string;
