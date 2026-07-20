@@ -7,6 +7,7 @@ import path from 'path';
 import { CronExpressionParser } from 'cron-parser';
 import { sdkQuery } from '../sdk-query.js';
 import { GROUPS_DIR } from '../config.js';
+import { HOST_ONLY_MODE } from '../execution-mode.js';
 import { removeFlowArtifacts } from '../file-manager.js';
 import type { Variables } from '../web-context.js';
 import { authMiddleware } from '../middleware/auth.js';
@@ -28,7 +29,7 @@ import type { AuthUser } from '../types.js';
 import { TIMEZONE } from '../config.js';
 import {
   isHostExecutionGroup,
-  hasHostExecutionPermission,
+  canUseHostExecution,
   canAccessGroup,
   getWebDeps,
 } from '../web-context.js';
@@ -42,7 +43,11 @@ const tasksRoutes = new Hono<{ Variables: Variables }>();
  * 历史 task.created_by=null 的也放行（兼容老数据；管理员可视情况手动迁移）。
  * 返回 null = 通过；返回 Response = 404（统一伪装为 not_found，避免泄漏存在性）。
  */
-function denyForeignTask(c: any, existing: { created_by?: string | null }, authUser: AuthUser): Response | null {
+function denyForeignTask(
+  c: any,
+  existing: { created_by?: string | null },
+  authUser: AuthUser,
+): Response | null {
   if (authUser.role === 'admin') return null;
   if (!existing.created_by) return null; // legacy task without owner — admin-only effectively
   if (existing.created_by === authUser.id) return null;
@@ -56,20 +61,27 @@ tasksRoutes.get('/', authMiddleware, async (c) => {
   const allGroups = getAllRegisteredGroups();
   const tasks = getAllTasks().filter((task) => {
     // Host-mode tasks are only visible to admin
-    if (task.execution_mode === 'host' && authUser.role !== 'admin') {
+    if (task.execution_mode === 'host' && !canUseHostExecution(authUser)) {
       return false;
     }
     const group = allGroups[task.chat_jid];
     // Conservative: if group can't be resolved, only admin can see (may be orphaned task)
     if (!group) return authUser.role === 'admin';
-    if (!canAccessGroup({ id: authUser.id, role: authUser.role }, { ...group, jid: task.chat_jid }))
+    if (
+      !canAccessGroup(
+        { id: authUser.id, role: authUser.role },
+        { ...group, jid: task.chat_jid },
+      )
+    )
       return false;
-    if (isHostExecutionGroup(group) && !hasHostExecutionPermission(authUser))
+    if (isHostExecutionGroup(group) && !canUseHostExecution(authUser))
       return false;
     return true;
   });
   const visibleTaskIds = new Set(tasks.map((t) => t.id));
-  const filteredRunningIds = getRunningTaskIds().filter((id) => visibleTaskIds.has(id));
+  const filteredRunningIds = getRunningTaskIds().filter((id) =>
+    visibleTaskIds.has(id),
+  );
 
   // Build jid → name mapping for all registered groups (including IM channels).
   // Mirror the visibility rule used by GET /api/groups (src/routes/groups.ts:190-192):
@@ -79,8 +91,14 @@ tasksRoutes.get('/', authMiddleware, async (c) => {
   // write; this filter is purely for surface consistency.
   const groupNames: Record<string, string> = {};
   for (const [jid, group] of Object.entries(allGroups)) {
-    if (!canAccessGroup({ id: authUser.id, role: authUser.role }, { ...group, jid })) continue;
-    if (isHostExecutionGroup(group) && !hasHostExecutionPermission(authUser)) continue;
+    if (
+      !canAccessGroup(
+        { id: authUser.id, role: authUser.role },
+        { ...group, jid },
+      )
+    )
+      continue;
+    if (isHostExecutionGroup(group) && !canUseHostExecution(authUser)) continue;
     groupNames[jid] = group.name || jid;
   }
 
@@ -153,7 +171,7 @@ tasksRoutes.post('/', authMiddleware, async (c) => {
   if (!canAccessGroup({ id: authUser.id, role: authUser.role }, group)) {
     return c.json({ error: 'Group not found' }, 404);
   }
-  if (isHostExecutionGroup(group) && !hasHostExecutionPermission(authUser)) {
+  if (isHostExecutionGroup(group) && !canUseHostExecution(authUser)) {
     return c.json(
       { error: 'Insufficient permissions for host execution mode' },
       403,
@@ -167,20 +185,21 @@ tasksRoutes.post('/', authMiddleware, async (c) => {
   }
 
   // Determine execution_mode by inheriting from the source workspace.
-  // - Source is host: default host (admin-only via hasHostExecutionPermission
-  //   check above), allow explicit container downgrade.
+  // - Source is host: default host, allow explicit container downgrade when
+  //   the personalized host-only switch is disabled.
   // - Source is container: default container; explicit host request rejected
   //   even for admins, to keep task execution consistent with its workspace.
-  const sourceIsHost = isHostExecutionGroup(group);
+  const sourceIsHost = HOST_ONLY_MODE || isHostExecutionGroup(group);
   let taskExecutionMode: 'host' | 'container';
-  if (validation.data.execution_mode === 'host') {
+  if (HOST_ONLY_MODE) {
+    taskExecutionMode = 'host';
+  } else if (validation.data.execution_mode === 'host') {
     if (!sourceIsHost) {
       return c.json(
         { error: '当前工作区运行在容器模式，任务不能使用宿主机执行模式' },
         400,
       );
     }
-    // Non-admin already blocked above by isHostExecutionGroup + hasHostExecutionPermission check
     taskExecutionMode = 'host';
   } else if (validation.data.execution_mode === 'container') {
     taskExecutionMode = 'container';
@@ -194,11 +213,16 @@ tasksRoutes.post('/', authMiddleware, async (c) => {
   let nextRun: string;
   if (schedule_type === 'cron') {
     try {
-      const cronNext = CronExpressionParser.parse(schedule_value, { tz: TIMEZONE })
+      const cronNext = CronExpressionParser.parse(schedule_value, {
+        tz: TIMEZONE,
+      })
         .next()
         .toISOString();
       if (!cronNext) {
-        return c.json({ error: 'Cron expression produced no next run time' }, 400);
+        return c.json(
+          { error: 'Cron expression produced no next run time' },
+          400,
+        );
       }
       nextRun = cronNext;
     } catch {
@@ -245,7 +269,7 @@ tasksRoutes.patch('/:id', authMiddleware, async (c) => {
     if (!canAccessGroup({ id: authUser.id, role: authUser.role }, group)) {
       return c.json({ error: 'Task not found' }, 404);
     }
-    if (isHostExecutionGroup(group) && !hasHostExecutionPermission(authUser)) {
+    if (isHostExecutionGroup(group) && !canUseHostExecution(authUser)) {
       return c.json(
         { error: 'Insufficient permissions for host execution mode' },
         403,
@@ -276,19 +300,27 @@ tasksRoutes.patch('/:id', authMiddleware, async (c) => {
   }
 
   // Only admin can set execution_mode to 'host'
-  if (validation.data.execution_mode === 'host' && authUser.role !== 'admin') {
+  if (
+    validation.data.execution_mode === 'host' &&
+    !canUseHostExecution(authUser)
+  ) {
     return c.json({ error: '只有管理员可以设置宿主机执行模式' }, 403);
   }
 
   // Validate chat_jid if being changed
-  const patchData = { ...validation.data } as typeof validation.data & { group_folder?: string };
+  const patchData = { ...validation.data } as typeof validation.data & {
+    group_folder?: string;
+  };
+  if (HOST_ONLY_MODE) patchData.execution_mode = 'host';
   let effectiveTargetGroup: ReturnType<typeof getRegisteredGroup> = group;
   if (validation.data.chat_jid !== undefined) {
     const targetGroup = getRegisteredGroup(validation.data.chat_jid);
     if (!targetGroup) {
       return c.json({ error: '目标群组不存在' }, 404);
     }
-    if (!canAccessGroup({ id: authUser.id, role: authUser.role }, targetGroup)) {
+    if (
+      !canAccessGroup({ id: authUser.id, role: authUser.role }, targetGroup)
+    ) {
       return c.json({ error: '无权访问目标群组' }, 403);
     }
     // Keep group_folder in sync with chat_jid
@@ -316,15 +348,42 @@ tasksRoutes.patch('/:id', authMiddleware, async (c) => {
     );
   }
 
-  // Auto-recalculate next_run when schedule changes (avoid pulling cron-parser into frontend)
-  if (patchData.schedule_type !== undefined || patchData.schedule_value !== undefined) {
+  // Recalculate when the schedule changes, or when resuming a recurring task
+  // whose next_run was cleared after a schedule error. Without this, the UI can
+  // create an active task that getDueTasks will never see.
+  const scheduleChanged =
+    patchData.schedule_type !== undefined ||
+    patchData.schedule_value !== undefined;
+  const resumingWithoutNextRun =
+    patchData.status === 'active' &&
+    existing.status !== 'active' &&
+    existing.next_run == null &&
+    existing.schedule_type !== 'once' &&
+    patchData.next_run === undefined;
+
+  // A completed one-shot has a past timestamp. A bare resume would either
+  // re-fire it or strand it as active with no next_run; require a new schedule.
+  if (
+    patchData.status === 'active' &&
+    existing.status === 'completed' &&
+    existing.schedule_type === 'once' &&
+    !scheduleChanged
+  ) {
+    return c.json(
+      { error: '已完成的一次性任务无法重新启用，请修改其调度时间或新建任务。' },
+      400,
+    );
+  }
+
+  if (scheduleChanged || resumingWithoutNextRun) {
     const schedType = patchData.schedule_type ?? existing.schedule_type;
     const schedValue = patchData.schedule_value ?? existing.schedule_value;
     try {
       if (schedType === 'cron') {
-        patchData.next_run = CronExpressionParser.parse(schedValue, { tz: TIMEZONE })
-          .next()
-          .toISOString() || new Date().toISOString();
+        patchData.next_run =
+          CronExpressionParser.parse(schedValue, { tz: TIMEZONE })
+            .next()
+            .toISOString() || new Date().toISOString();
       } else if (schedType === 'interval') {
         // Number() not parseInt(): parseInt('1e16',10) === 1 silently truncates
         // and the patch ends up with a 1ms interval. Same upper bound as create.
@@ -350,7 +409,10 @@ tasksRoutes.patch('/:id', authMiddleware, async (c) => {
         patchData.next_run = new Date(ts).toISOString();
       }
     } catch {
-      return c.json({ error: 'Invalid schedule value for the given schedule type' }, 400);
+      return c.json(
+        { error: 'Invalid schedule value for the given schedule type' },
+        400,
+      );
     }
   }
 
@@ -372,7 +434,7 @@ tasksRoutes.delete('/:id', authMiddleware, (c) => {
     if (!canAccessGroup({ id: authUser.id, role: authUser.role }, group)) {
       return c.json({ error: 'Task not found' }, 404);
     }
-    if (isHostExecutionGroup(group) && !hasHostExecutionPermission(authUser)) {
+    if (isHostExecutionGroup(group) && !canUseHostExecution(authUser)) {
       return c.json(
         { error: 'Insufficient permissions for host execution mode' },
         403,
@@ -433,7 +495,7 @@ tasksRoutes.post('/:id/run', authMiddleware, (c) => {
     if (!canAccessGroup({ id: authUser.id, role: authUser.role }, group)) {
       return c.json({ error: 'Task not found' }, 404);
     }
-    if (isHostExecutionGroup(group) && !hasHostExecutionPermission(authUser)) {
+    if (isHostExecutionGroup(group) && !canUseHostExecution(authUser)) {
       return c.json(
         { error: 'Insufficient permissions for host execution mode' },
         403,
@@ -473,7 +535,7 @@ tasksRoutes.get('/:id/logs', authMiddleware, (c) => {
     if (!canAccessGroup({ id: authUser.id, role: authUser.role }, group)) {
       return c.json({ error: 'Task not found' }, 404);
     }
-    if (isHostExecutionGroup(group) && !hasHostExecutionPermission(authUser)) {
+    if (isHostExecutionGroup(group) && !canUseHostExecution(authUser)) {
       return c.json(
         { error: 'Insufficient permissions for host execution mode' },
         403,
@@ -535,7 +597,12 @@ function buildParsePrompt(description: string): string {
 function parseAiResult(
   result: string,
   description: string,
-): { prompt: string; schedule_type: string; schedule_value: string; summary: string } | null {
+): {
+  prompt: string;
+  schedule_type: string;
+  schedule_value: string;
+  summary: string;
+} | null {
   try {
     let jsonStr = result;
     const fenced = result.match(/```(?:json)?\s*([\s\S]*?)```/);
@@ -558,7 +625,8 @@ function parseAiResult(
 tasksRoutes.post('/ai', authMiddleware, async (c) => {
   const authUser = c.get('user') as AuthUser;
   const body = await c.req.json().catch(() => ({}));
-  const description = typeof body.description === 'string' ? body.description.trim() : '';
+  const description =
+    typeof body.description === 'string' ? body.description.trim() : '';
   if (!description) {
     return c.json({ error: '请输入任务描述' }, 400);
   }
@@ -585,7 +653,7 @@ tasksRoutes.post('/ai', authMiddleware, async (c) => {
     if (!canAccessGroup({ id: authUser.id, role: authUser.role }, group)) {
       return c.json({ error: 'Group not found' }, 404);
     }
-    if (isHostExecutionGroup(group) && !hasHostExecutionPermission(authUser)) {
+    if (isHostExecutionGroup(group) && !canUseHostExecution(authUser)) {
       return c.json(
         { error: 'Insufficient permissions for host execution mode' },
         403,
@@ -593,14 +661,15 @@ tasksRoutes.post('/ai', authMiddleware, async (c) => {
     }
     groupFolder = group.folder;
     chatJid = requestedChatJid;
-    sourceIsHost = isHostExecutionGroup(group);
+    sourceIsHost = HOST_ONLY_MODE || isHostExecutionGroup(group);
   } else {
     const homeGroup = getUserHomeGroup(authUser.id);
     if (!homeGroup) return c.json({ error: 'Home group not found' }, 400);
     groupFolder = homeGroup.folder;
     chatJid = homeGroup.jid;
     const registered = getRegisteredGroup(homeGroup.jid);
-    sourceIsHost = registered ? isHostExecutionGroup(registered) : false;
+    sourceIsHost =
+      HOST_ONLY_MODE || (registered ? isHostExecutionGroup(registered) : false);
   }
 
   const taskId = crypto.randomUUID();
@@ -633,7 +702,10 @@ tasksRoutes.post('/ai', authMiddleware, async (c) => {
     notify_channels: notifyChannels,
   });
 
-  logger.info({ taskId, description: description.slice(0, 80) }, 'AI task created, parsing in background');
+  logger.info(
+    { taskId, description: description.slice(0, 80) },
+    'AI task created, parsing in background',
+  );
 
   // Background: parse with SDK and update task
   void (async () => {
@@ -669,11 +741,15 @@ tasksRoutes.post('/ai', authMiddleware, async (c) => {
       let nextRun: string | null = null;
       try {
         if (parsed.schedule_type === 'cron') {
-          nextRun = CronExpressionParser.parse(parsed.schedule_value, { tz: TIMEZONE })
+          nextRun = CronExpressionParser.parse(parsed.schedule_value, {
+            tz: TIMEZONE,
+          })
             .next()
             .toISOString();
         } else if (parsed.schedule_type === 'interval') {
-          nextRun = new Date(Date.now() + Number(parsed.schedule_value)).toISOString();
+          nextRun = new Date(
+            Date.now() + Number(parsed.schedule_value),
+          ).toISOString();
         } else {
           nextRun = new Date(parsed.schedule_value).toISOString();
         }
@@ -685,7 +761,10 @@ tasksRoutes.post('/ai', authMiddleware, async (c) => {
           status: 'paused',
           prompt: parsed.prompt,
         });
-        logger.warn({ taskId, scheduleValue: parsed.schedule_value }, 'AI parsed schedule invalid, task paused');
+        logger.warn(
+          { taskId, scheduleValue: parsed.schedule_value },
+          'AI parsed schedule invalid, task paused',
+        );
         return;
       }
 
@@ -700,7 +779,11 @@ tasksRoutes.post('/ai', authMiddleware, async (c) => {
       });
 
       logger.info(
-        { taskId, scheduleType: parsed.schedule_type, scheduleValue: parsed.schedule_value },
+        {
+          taskId,
+          scheduleType: parsed.schedule_type,
+          scheduleValue: parsed.schedule_value,
+        },
         'AI task parse complete, activated',
       );
     } catch (err) {
@@ -710,7 +793,9 @@ tasksRoutes.post('/ai', authMiddleware, async (c) => {
         updateTask(taskId, { status: 'paused' });
       }
     }
-  })().catch((err) => logger.error({ taskId, err }, 'Unhandled AI task parse error'));
+  })().catch((err) =>
+    logger.error({ taskId, err }, 'Unhandled AI task parse error'),
+  );
 
   return c.json({ success: true, taskId });
 });
@@ -720,14 +805,18 @@ tasksRoutes.post('/ai', authMiddleware, async (c) => {
  */
 tasksRoutes.post('/parse', authMiddleware, async (c) => {
   const body = await c.req.json().catch(() => ({}));
-  const description = typeof body.description === 'string' ? body.description.trim() : '';
+  const description =
+    typeof body.description === 'string' ? body.description.trim() : '';
   if (!description) {
     return c.json({ error: '请输入任务描述' }, 400);
   }
 
   try {
     const model = process.env.RECALL_MODEL || undefined;
-    const result = await sdkQuery(buildParsePrompt(description), { model, timeout: 30_000 });
+    const result = await sdkQuery(buildParsePrompt(description), {
+      model,
+      timeout: 30_000,
+    });
 
     if (!result) {
       return c.json({ error: 'AI 解析失败，请重试或切换到手动模式' }, 502);

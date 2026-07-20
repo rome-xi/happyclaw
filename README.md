@@ -21,6 +21,11 @@
 
 ---
 
+> **Dennis 的个性化 fork**：本分支默认启用全宿主机运行、四档 Clash 式模型选优、
+> ChatGPT Pro / AgentRouter 候选、Codex Pro 生图、带指令的真实 `/compact`，以及
+> Web/IM 续写完整性修复。第二台设备的迁移与部署步骤见
+> [个性化 fork 部署指南](docs/PERSONAL-FORK-DEPLOYMENT.md)。
+
 | 聊天界面 — 工具调用追踪 | 聊天界面 — Markdown 渲染 | 聊天界面 — 图片生成 + 文件管理 |
 |:--------------------:|:-------------------:|:----------------------:|
 | <img src="docs/screenshots/chat-tool-tracking.png" width="280" /> | <img src="docs/screenshots/chat-markdown.png" width="280" /> | <img src="docs/screenshots/chat-image-gen.png" width="280" /> |
@@ -279,7 +284,7 @@ Agent 自主维护跨会话的持久记忆：
   - Linux: 参考 [NodeSource](https://github.com/nodesource/distributions) 或使用 `nvm`
   - Windows: [官网下载](https://nodejs.org)
 
-- **[Docker](https://www.docker.com/)** — 容器模式运行 Agent（member 用户需要；admin 仅宿主机模式可不装）
+- **[Docker](https://www.docker.com/)** — Dennis fork 默认全宿主机运行，HappyClaw 本身不需要；仅外置 new-api 选择 Docker 部署或显式设置 `HAPPYCLAW_HOST_ONLY=false` 时需要
   - macOS: 推荐 [OrbStack](https://orbstack.dev)（更轻量），也可用 [Docker Desktop](https://www.docker.com/products/docker-desktop/)
   - Linux: `curl -fsSL https://get.docker.com | sh`
   - Windows: [Docker Desktop](https://www.docker.com/products/docker-desktop/)
@@ -300,7 +305,7 @@ Agent 自主维护跨会话的持久记忆：
 
 ```bash
 # 1. 克隆仓库
-git clone https://github.com/riba2534/happyclaw.git
+git clone https://github.com/rome-xi/happyclaw.git
 cd happyclaw
 
 # 2. 一键启动（首次自动安装依赖 + 编译）
@@ -321,16 +326,17 @@ make start
 > 所有配置通过 Web 界面完成，不依赖任何配置文件。API 密钥 AES-256-GCM 加密存储。
 
 
-### 启用容器模式
+### 宿主机固定模式（Dennis fork）
 
-admin 用户默认使用宿主机模式（无需 Docker），开箱即用。如果需要容器模式（member 用户注册后自动使用）：
+本 fork 默认 `HAPPYCLAW_HOST_ONLY=true`。已有数据库中的工作区和 IM 别名会在启动时统一迁移为宿主机模式，新建工作区、SubAgent 与定时任务也只走宿主机 runner，不检查或构建 HappyClaw Agent Docker 镜像。
+
+若要临时恢复上游的混合执行模式，必须显式关闭该开关后再构建容器镜像：
 
 ```bash
+export HAPPYCLAW_HOST_ONLY=false
 # 构建容器镜像
 ./container/build.sh
 ```
-
-新用户注册后会自动创建容器模式的主工作区（`home-{userId}`），无需额外配置。
 
 ### 配置飞书集成
 

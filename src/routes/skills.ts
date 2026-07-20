@@ -174,10 +174,17 @@ function discoverSkills(userId: string, userRole?: string): Skill[] {
   return result;
 }
 
-function getSkillDetail(skillId: string, userId: string, userRole?: string): SkillDetail | null {
+function getSkillDetail(
+  skillId: string,
+  userId: string,
+  userRole?: string,
+): SkillDetail | null {
   if (!validateSkillId(skillId)) return null;
 
-  const searchDirs: Array<{ rootDir: string; source: 'user' | 'project' | 'external' }> = [
+  const searchDirs: Array<{
+    rootDir: string;
+    source: 'user' | 'project' | 'external';
+  }> = [
     { rootDir: getUserSkillsDir(userId), source: 'user' },
     { rootDir: getProjectSkillsDir(), source: 'project' },
   ];
@@ -588,7 +595,6 @@ skillsRoutes.get('/search/detail', authMiddleware, async (c) => {
   return c.json({ detail: null });
 });
 
-
 skillsRoutes.get('/:id', authMiddleware, (c) => {
   const id = c.req.param('id');
   const authUser = c.get('user') as AuthUser;
@@ -700,7 +706,9 @@ skillsRoutes.delete('/user-all', authMiddleware, (c) => {
         try {
           fs.rmSync(p, { recursive: true, force: true });
           deleted++;
-        } catch { /* ignore */ }
+        } catch {
+          /* ignore */
+        }
       }
     }
   } catch {
@@ -863,11 +871,70 @@ skillsRoutes.post('/:id/reinstall', authMiddleware, async (c) => {
     );
   }
 
-  // Delete then reinstall
-  const deleteResult = deleteSkillForUser(authUser.id, id);
-  if (!deleteResult.success) {
+  // A package may install several sibling skills. Back up every sibling so a
+  // failed reinstall cannot destroy the others halfway through.
+  const userDir = getUserSkillsDir(authUser.id);
+  const siblingIds = Object.keys(manifest.skills).filter(
+    (skillId) => manifest.skills[skillId]?.packageName === meta.packageName,
+  );
+  if (!siblingIds.includes(id)) siblingIds.push(id);
+  for (const skillId of siblingIds) {
+    if (!validateSkillPath(userDir, path.join(userDir, skillId))) {
+      return c.json({ error: 'Invalid skill path' }, 400);
+    }
+  }
+
+  type SkillBackup = {
+    skillId: string;
+    dir: string;
+    backupDir: string | null;
+    meta: SkillsManifest['skills'][string];
+  };
+  const backups: SkillBackup[] = [];
+  const restoreBackups = (): void => {
+    for (const backup of backups) {
+      try {
+        if (backup.backupDir) {
+          fs.rmSync(backup.dir, { recursive: true, force: true });
+          fs.renameSync(backup.backupDir, backup.dir);
+        }
+        const restoredManifest = readSkillsManifest(authUser.id);
+        restoredManifest.skills[backup.skillId] = backup.meta;
+        writeSkillsManifest(authUser.id, restoredManifest);
+      } catch {
+        /* best-effort; backup remains available for manual recovery */
+      }
+    }
+  };
+
+  try {
+    for (const skillId of siblingIds) {
+      const entry = manifest.skills[skillId];
+      const dir = path.join(userDir, skillId);
+      const backupDir = `${dir}.reinstall-bak`;
+      let savedBackupDir: string | null = null;
+      if (fs.existsSync(dir)) {
+        fs.rmSync(backupDir, { recursive: true, force: true });
+        fs.renameSync(dir, backupDir);
+        savedBackupDir = backupDir;
+      }
+      if (entry) {
+        backups.push({
+          skillId,
+          dir,
+          backupDir: savedBackupDir,
+          meta: entry,
+        });
+      }
+      removeFromSkillsManifest(authUser.id, skillId);
+    }
+  } catch (err) {
+    restoreBackups();
     return c.json(
-      { error: 'Failed to delete old skill', details: deleteResult.error },
+      {
+        error: 'Failed to back up old skill',
+        details: err instanceof Error ? err.message : 'Unknown error',
+      },
       500,
     );
   }
@@ -877,10 +944,20 @@ skillsRoutes.post('/:id/reinstall', authMiddleware, async (c) => {
     meta.packageName,
   );
   if (!installResult.success) {
+    restoreBackups();
     return c.json(
       { error: 'Failed to reinstall skill', details: installResult.error },
       500,
     );
+  }
+
+  for (const backup of backups) {
+    if (!backup.backupDir) continue;
+    try {
+      fs.rmSync(backup.backupDir, { recursive: true, force: true });
+    } catch {
+      /* harmless leftover backup */
+    }
   }
 
   return c.json({ success: true, installed: installResult.installed });

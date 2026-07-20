@@ -1,6 +1,10 @@
 import { beforeEach, describe, expect, test, vi } from 'vitest';
 
-import { isClearCommand, isCompactCommand } from '../src/commands.js';
+import {
+  isClearCommand,
+  isCompactCommand,
+  isCompactWithArgsCommand,
+} from '../src/commands.js';
 
 // Hoisted so mock factories below can reference these before module evaluation.
 const {
@@ -73,6 +77,23 @@ describe('isCompactCommand', () => {
   test('does not match /clear', () => {
     expect(isCompactCommand('/clear')).toBe(false);
     expect(isClearCommand('/compact')).toBe(false);
+  });
+});
+
+describe('isCompactWithArgsCommand', () => {
+  test('matches custom manual-compaction instructions', () => {
+    expect(isCompactWithArgsCommand('/compact 保留部署和鉴权细节')).toBe(true);
+    expect(isCompactWithArgsCommand('  /COMPACT\tkeep decisions  ')).toBe(true);
+  });
+
+  test('does not steal the legacy bare command', () => {
+    expect(isCompactWithArgsCommand('/compact')).toBe(false);
+    expect(isCompactWithArgsCommand('/compact   ')).toBe(false);
+  });
+
+  test('rejects lookalikes', () => {
+    expect(isCompactWithArgsCommand('/compactor keep this')).toBe(false);
+    expect(isCompactWithArgsCommand('please /compact this')).toBe(false);
   });
 });
 

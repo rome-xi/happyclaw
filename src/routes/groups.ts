@@ -10,9 +10,11 @@ import {
 import type { AuthUser, RegisteredGroup, ExecutionMode } from '../types.js';
 import { checkGroupLimit } from '../billing.js';
 import { DATA_DIR, GROUPS_DIR } from '../config.js';
+import { HOST_ONLY_MODE } from '../execution-mode.js';
 import {
   isHostExecutionGroup,
   hasHostExecutionPermission,
+  canUseHostExecution,
   canAccessGroup,
   canModifyGroup,
   canDeleteGroup,
@@ -120,7 +122,12 @@ interface GroupPayloadItem {
   can_modify?: boolean;
   can_manage_members?: boolean;
   pinned_at?: string;
-  activation_mode?: 'auto' | 'always' | 'when_mentioned' | 'owner_mentioned' | 'disabled';
+  activation_mode?:
+    | 'auto'
+    | 'always'
+    | 'when_mentioned'
+    | 'owner_mentioned'
+    | 'disabled';
   conversation_source?: 'manual' | 'feishu_thread';
   conversation_nav_mode?: 'horizontal' | 'vertical_threads';
 }
@@ -153,8 +160,7 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
     if (isHome && group.created_by !== user.id) continue;
 
     // Host execution groups require admin unless it's the user's own home group
-    if (isHost && !isAdmin && !(isHome && group.created_by === user.id))
-      continue;
+    if (isHost && !canUseHostExecution(user)) continue;
 
     // User isolation: all users only see their own groups + shared groups
     if (!canAccessGroup({ id: user.id, role: user.role }, { ...group, jid }))
@@ -222,7 +228,9 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
         latest?.timestamp ||
         chats.get(jid)?.last_message_time ||
         group.added_at,
-      execution_mode: group.executionMode || 'container',
+      execution_mode: HOST_ONLY_MODE
+        ? 'host'
+        : group.executionMode || 'container',
       custom_cwd: isAdmin ? group.customCwd : undefined,
       is_home: isHome || undefined,
       is_my_home: (isHome && group.created_by === user.id) || undefined,
@@ -318,9 +326,10 @@ groupRoutes.post('/', authMiddleware, async (c) => {
   }
 
   const authUser = c.get('user') as AuthUser;
-  // 默认执行模式：有 host 权限的用户(admin)默认 host，member 默认 container（新增工作区默认 host）
-  const executionMode =
-    validation.data.execution_mode || (hasHostExecutionPermission(authUser) ? 'host' : 'container');
+  const executionMode = HOST_ONLY_MODE
+    ? 'host'
+    : validation.data.execution_mode ||
+      (hasHostExecutionPermission(authUser) ? 'host' : 'container');
   const customCwd = validation.data.custom_cwd; // Schema already trims and converts empty to undefined
   const initSourcePath = validation.data.init_source_path;
   const initGitUrl = validation.data.init_git_url;
@@ -350,13 +359,19 @@ groupRoutes.post('/', authMiddleware, async (c) => {
   }
 
   if (executionMode === 'host') {
-    if (!hasHostExecutionPermission(authUser)) {
+    if (!canUseHostExecution(authUser)) {
       return c.json(
         { error: 'Insufficient permissions for host execution mode' },
         403,
       );
     }
     if (customCwd) {
+      if (!hasHostExecutionPermission(authUser)) {
+        return c.json(
+          { error: 'Insufficient permissions: custom_cwd requires admin' },
+          403,
+        );
+      }
       if (!path.isAbsolute(customCwd)) {
         return c.json({ error: 'custom_cwd must be an absolute path' }, 400);
       }
@@ -611,7 +626,9 @@ groupRoutes.post('/', authMiddleware, async (c) => {
     deletable: true,
     lastMessage: undefined,
     lastMessageTime: now,
-    execution_mode: group.executionMode || 'container',
+    execution_mode: HOST_ONLY_MODE
+      ? 'host'
+      : group.executionMode || 'container',
     custom_cwd: isAdmin ? group.customCwd : undefined,
     is_my_home: undefined,
     is_shared: undefined,
@@ -675,7 +692,7 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
   }
 
   // member 用户不允许使用 host 模式（安全限制）
-  if (execution_mode === 'host' && !hasHostExecutionPermission(authUser)) {
+  if (execution_mode === 'host' && !canUseHostExecution(authUser)) {
     return c.json(
       { error: 'Insufficient permissions for host execution mode' },
       403,
@@ -710,10 +727,7 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
     if (!jid.startsWith('web:') && authUser.role !== 'admin') {
       return c.json({ error: 'This group cannot be edited' }, 403);
     }
-    if (
-      isHostExecutionGroup(existing) &&
-      !hasHostExecutionPermission(authUser)
-    ) {
+    if (isHostExecutionGroup(existing) && !canUseHostExecution(authUser)) {
       return c.json(
         { error: 'Insufficient permissions for host execution mode' },
         403,
@@ -742,8 +756,9 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
     const updated: RegisteredGroup = {
       ...existing,
       name: name || existing.name,
-      executionMode:
-        execution_mode !== undefined
+      executionMode: HOST_ONLY_MODE
+        ? 'host'
+        : execution_mode !== undefined
           ? (execution_mode as ExecutionMode)
           : existing.executionMode,
       activation_mode:
@@ -772,7 +787,10 @@ groupRoutes.post('/:jid/reset-owner', authMiddleware, async (c) => {
 
   const authUser = c.get('user') as AuthUser;
   if (authUser.role !== 'admin') {
-    return c.json({ error: 'Only an admin can reset the workspace owner' }, 403);
+    return c.json(
+      { error: 'Only an admin can reset the workspace owner' },
+      403,
+    );
   }
 
   const jid = c.req.param('jid');
@@ -878,7 +896,7 @@ groupRoutes.delete('/:jid', authMiddleware, async (c) => {
     return c.json({ success: true });
   }
 
-  if (isHostExecutionGroup(existing) && !hasHostExecutionPermission(authUser)) {
+  if (isHostExecutionGroup(existing) && !canUseHostExecution(authUser)) {
     return c.json(
       { error: 'Insufficient permissions for host execution mode' },
       403,
@@ -929,12 +947,27 @@ groupRoutes.delete('/:jid', authMiddleware, async (c) => {
     );
   }
 
-  // Wait for container to fully stop before cleaning up its files
+  // Stop active and capacity-blocked descendants before deleting their folder.
+  const deleteSiblingJids = getJidsByFolder(existing.folder);
+  const deleteDescendantJids = Array.from(
+    new Set(
+      deleteSiblingJids.flatMap((candidateJid) =>
+        deps.queue.listDescendantJids(candidateJid),
+      ),
+    ),
+  );
+  const deleteStopJids = Array.from(
+    new Set([...deleteSiblingJids, jid, ...deleteDescendantJids]),
+  );
   try {
-    await deps.queue.stopGroup(jid);
+    await Promise.all(
+      deleteStopJids.map((candidateJid) =>
+        deps.queue.stopGroup(candidateJid, { force: true }),
+      ),
+    );
   } catch (err) {
     logger.error(
-      { jid, err },
+      { jid, deleteStopJids, err },
       'Failed to stop container before deleting group',
     );
     return c.json(
@@ -968,7 +1001,10 @@ groupRoutes.post('/:jid/stop', authMiddleware, async (c) => {
   // member may stop only a run they started themselves (the queue's current-run
   // initiator), not the owner's. Mirrors the delete-message owner-or-sender model.
   if (
-    !canModifyGroup({ id: authUser.id, role: authUser.role }, { ...group, jid }) &&
+    !canModifyGroup(
+      { id: authUser.id, role: authUser.role },
+      { ...group, jid },
+    ) &&
     deps.queue.getActiveRunInitiator(jid) !== authUser.id
   ) {
     return c.json(
@@ -1016,7 +1052,9 @@ groupRoutes.post('/:jid/interrupt', authMiddleware, async (c) => {
     deps.queue.getActiveRunInitiator(jid) !== authUser.id
   ) {
     return c.json(
-      { error: 'Only the workspace owner or the run initiator can interrupt it' },
+      {
+        error: 'Only the workspace owner or the run initiator can interrupt it',
+      },
       403,
     );
   }
@@ -1078,7 +1116,7 @@ groupRoutes.post('/:jid/reset-session', authMiddleware, async (c) => {
   ) {
     return c.json({ error: 'Group not found' }, 404);
   }
-  if (isHostExecutionGroup(group) && !hasHostExecutionPermission(authUser)) {
+  if (isHostExecutionGroup(group) && !canUseHostExecution(authUser)) {
     return c.json(
       { error: 'Insufficient permissions for host execution mode' },
       403,
@@ -1229,7 +1267,7 @@ groupRoutes.post('/:jid/clear-history', authMiddleware, async (c) => {
   ) {
     return c.json({ error: 'Group not found' }, 404);
   }
-  if (isHostExecutionGroup(group) && !hasHostExecutionPermission(authUser)) {
+  if (isHostExecutionGroup(group) && !canUseHostExecution(authUser)) {
     return c.json(
       { error: 'Insufficient permissions for host execution mode' },
       403,
@@ -1245,9 +1283,7 @@ groupRoutes.post('/:jid/clear-history', authMiddleware, async (c) => {
   //    with their cwd/session dirs pulled out from under them (ENOENT / undefined
   //    behavior in container mode).
   const descendantJids = Array.from(
-    new Set(
-      siblingJids.flatMap((j) => deps.queue.listActiveDescendantJids(j)),
-    ),
+    new Set(siblingJids.flatMap((j) => deps.queue.listDescendantJids(j))),
   );
   const stopJids = [...siblingJids, ...descendantJids];
   try {
@@ -1365,7 +1401,7 @@ groupRoutes.get('/:jid/messages', authMiddleware, async (c) => {
   if (!canAccessGroup({ id: authUser.id, role: authUser.role }, group)) {
     return c.json({ error: 'Group not found' }, 404);
   }
-  if (isHostExecutionGroup(group) && !hasHostExecutionPermission(authUser)) {
+  if (isHostExecutionGroup(group) && !canUseHostExecution(authUser)) {
     return c.json(
       { error: 'Insufficient permissions for host execution mode' },
       403,
@@ -1488,7 +1524,7 @@ groupRoutes.get('/:jid/env', authMiddleware, (c) => {
   if (!canAccessGroup({ id: user.id, role: user.role }, group)) {
     return c.json({ error: 'Group not found' }, 404);
   }
-  if (isHostExecutionGroup(group) && !hasHostExecutionPermission(user)) {
+  if (isHostExecutionGroup(group) && !canUseHostExecution(user)) {
     return c.json(
       { error: 'Insufficient permissions for host execution mode' },
       403,
@@ -1503,7 +1539,10 @@ groupRoutes.get('/:jid/env', authMiddleware, (c) => {
     user.role !== 'admin' &&
     !canModifyGroup({ id: user.id, role: user.role }, { ...group, jid })
   ) {
-    return c.json({ error: 'Forbidden: only the workspace owner can read env' }, 403);
+    return c.json(
+      { error: 'Forbidden: only the workspace owner can read env' },
+      403,
+    );
   }
   if (
     user.role !== 'admin' &&
@@ -1526,7 +1565,7 @@ groupRoutes.put('/:jid/env', authMiddleware, async (c) => {
   if (!canAccessGroup({ id: envUser.id, role: envUser.role }, group)) {
     return c.json({ error: 'Group not found' }, 404);
   }
-  if (isHostExecutionGroup(group) && !hasHostExecutionPermission(envUser)) {
+  if (isHostExecutionGroup(group) && !canUseHostExecution(envUser)) {
     return c.json(
       { error: 'Insufficient permissions for host execution mode' },
       403,
@@ -1540,7 +1579,10 @@ groupRoutes.put('/:jid/env', authMiddleware, async (c) => {
     envUser.role !== 'admin' &&
     !canModifyGroup({ id: envUser.id, role: envUser.role }, { ...group, jid })
   ) {
-    return c.json({ error: 'Forbidden: only the workspace owner can modify env' }, 403);
+    return c.json(
+      { error: 'Forbidden: only the workspace owner can modify env' },
+      403,
+    );
   }
   if (
     envUser.role !== 'admin' &&
@@ -1796,7 +1838,11 @@ groupRoutes.put('/:jid/mcp', authMiddleware, async (c) => {
   const selected_mcps = body.selected_mcps;
 
   // Validate mcp_mode
-  if (mcp_mode !== undefined && mcp_mode !== 'inherit' && mcp_mode !== 'custom') {
+  if (
+    mcp_mode !== undefined &&
+    mcp_mode !== 'inherit' &&
+    mcp_mode !== 'custom'
+  ) {
     return c.json({ error: 'Invalid mcp_mode' }, 400);
   }
 
@@ -1816,7 +1862,8 @@ groupRoutes.put('/:jid/mcp', authMiddleware, async (c) => {
   const updatedGroup: RegisteredGroup = {
     ...group,
     mcp_mode: mcp_mode ?? group.mcp_mode ?? 'inherit',
-    selected_mcps: selected_mcps !== undefined ? selected_mcps : group.selected_mcps,
+    selected_mcps:
+      selected_mcps !== undefined ? selected_mcps : group.selected_mcps,
   };
 
   setRegisteredGroup(jid, updatedGroup);

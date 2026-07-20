@@ -39,12 +39,21 @@ function exists(p: string | undefined): p is string {
   return !!p && fs.existsSync(p);
 }
 
+function lexists(p: string): boolean {
+  try {
+    fs.lstatSync(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function countChildDirs(dir: string | undefined): number {
   if (!exists(dir)) return 0;
   try {
-    return fs.readdirSync(dir, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
-      .length;
+    return fs
+      .readdirSync(dir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() || entry.isSymbolicLink()).length;
   } catch {
     return 0;
   }
@@ -53,9 +62,12 @@ function countChildDirs(dir: string | undefined): number {
 function countRuleFiles(dir: string | undefined): number {
   if (!exists(dir)) return 0;
   try {
-    return fs.readdirSync(dir, { withFileTypes: true })
-      .filter((entry) => entry.isFile() || entry.isDirectory() || entry.isSymbolicLink())
-      .length;
+    return fs
+      .readdirSync(dir, { withFileTypes: true })
+      .filter(
+        (entry) =>
+          entry.isFile() || entry.isDirectory() || entry.isSymbolicLink(),
+      ).length;
   } catch {
     return 0;
   }
@@ -83,11 +95,13 @@ function linkEntries(
   sourceDir: string | undefined,
   targetDir: string,
   include: (entry: fs.Dirent) => boolean,
+  onConflict?: (name: string) => void,
 ): void {
   if (!exists(sourceDir)) return;
   for (const entry of fs.readdirSync(sourceDir, { withFileTypes: true })) {
     if (!include(entry)) continue;
     const linkPath = path.join(targetDir, entry.name);
+    if (onConflict && lexists(linkPath)) onConflict(entry.name);
     removePath(linkPath);
     try {
       fs.symlinkSync(path.join(sourceDir, entry.name), linkPath);
@@ -97,14 +111,22 @@ function linkEntries(
   }
 }
 
-export function buildClaudeContextPlan(args: ClaudeContextPlanArgs): ClaudeContextPlan {
+export function buildClaudeContextPlan(
+  args: ClaudeContextPlanArgs,
+): ClaudeContextPlan {
   const ownerId = args.group.created_by;
   const isAdminOwned =
     args.ownerHomeFolder === ADMIN_HOME_FOLDER ||
     (!!args.group.is_home && args.group.folder === ADMIN_HOME_FOLDER);
-  const claudeMdSource = isAdminOwned ? path.join(args.externalClaudeDir, 'CLAUDE.md') : undefined;
-  const rulesSourceDir = isAdminOwned ? path.join(args.externalClaudeDir, 'rules') : undefined;
-  const externalSkillsDir = isAdminOwned ? path.join(args.externalClaudeDir, 'skills') : undefined;
+  const claudeMdSource = isAdminOwned
+    ? path.join(args.externalClaudeDir, 'CLAUDE.md')
+    : undefined;
+  const rulesSourceDir = isAdminOwned
+    ? path.join(args.externalClaudeDir, 'rules')
+    : undefined;
+  const externalSkillsDir = isAdminOwned
+    ? path.join(args.externalClaudeDir, 'skills')
+    : undefined;
   const builtinSkillsDir =
     args.executionMode === 'container'
       ? '/opt/builtin-skills'
@@ -126,16 +148,21 @@ export function buildClaudeContextPlan(args: ClaudeContextPlanArgs): ClaudeConte
     : undefined;
 
   const warnings: string[] = [];
-  if (isAdminOwned && !exists(claudeMdSource)) warnings.push('CLAUDE.md missing');
+  if (isAdminOwned && !exists(claudeMdSource))
+    warnings.push('CLAUDE.md missing');
   if (isAdminOwned && !exists(rulesSourceDir)) warnings.push('rules missing');
-  if (isAdminOwned && !exists(externalSkillsDir)) warnings.push('external skills missing');
+  if (isAdminOwned && !exists(externalSkillsDir))
+    warnings.push('external skills missing');
 
   const audit: ClaudeContextAudit = {
     executionMode: args.executionMode,
     externalClaudeDir: isAdminOwned ? args.externalClaudeDir : undefined,
     claudeMd: {
       sourcePath: claudeMdSource,
-      runtimePath: args.executionMode === 'container' ? '/workspace/CLAUDE.md' : hostClaudeRuntime,
+      runtimePath:
+        args.executionMode === 'container'
+          ? '/workspace/CLAUDE.md'
+          : hostClaudeRuntime,
       status: exists(claudeMdSource)
         ? args.executionMode === 'container'
           ? 'mounted'
@@ -147,7 +174,10 @@ export function buildClaudeContextPlan(args: ClaudeContextPlanArgs): ClaudeConte
     },
     rules: {
       sourcePath: rulesSourceDir,
-      runtimePath: args.executionMode === 'container' ? '/workspace/.claude/rules' : hostRulesRuntime,
+      runtimePath:
+        args.executionMode === 'container'
+          ? '/workspace/.claude/rules'
+          : hostRulesRuntime,
       status: exists(rulesSourceDir)
         ? args.executionMode === 'container'
           ? 'mounted'
@@ -162,35 +192,49 @@ export function buildClaudeContextPlan(args: ClaudeContextPlanArgs): ClaudeConte
         {
           name: 'builtin',
           sourcePath: builtinSkillsDir,
-          runtimePath: args.executionMode === 'container'
-            ? '/home/node/.claude/skills'
-            : hostSkillsRuntime,
-          count: countChildDirs(args.executionMode === 'container' ? undefined : builtinSkillsDir),
+          runtimePath:
+            args.executionMode === 'container'
+              ? '/home/node/.claude/skills'
+              : hostSkillsRuntime,
+          count: countChildDirs(
+            args.executionMode === 'container' ? undefined : builtinSkillsDir,
+          ),
         },
-        ...(externalSkillsDir ? [{
-          name: 'external' as const,
-          sourcePath: externalSkillsDir,
-          runtimePath: args.executionMode === 'container'
-            ? '/workspace/external-skills'
-            : hostSkillsRuntime,
-          count: countChildDirs(externalSkillsDir),
-        }] : []),
+        ...(externalSkillsDir
+          ? [
+              {
+                name: 'external' as const,
+                sourcePath: externalSkillsDir,
+                runtimePath:
+                  args.executionMode === 'container'
+                    ? '/workspace/external-skills'
+                    : hostSkillsRuntime,
+                count: countChildDirs(externalSkillsDir),
+              },
+            ]
+          : []),
         {
           name: 'project',
           sourcePath: projectSkillsDir,
-          runtimePath: args.executionMode === 'container'
-            ? '/workspace/project-skills'
-            : hostSkillsRuntime,
+          runtimePath:
+            args.executionMode === 'container'
+              ? '/workspace/project-skills'
+              : hostSkillsRuntime,
           count: countChildDirs(projectSkillsDir),
         },
-        ...(userSkillsDir ? [{
-          name: 'user' as const,
-          sourcePath: userSkillsDir,
-          runtimePath: args.executionMode === 'container'
-            ? '/workspace/user-skills'
-            : hostSkillsRuntime,
-          count: countChildDirs(userSkillsDir),
-        }] : []),
+        ...(userSkillsDir
+          ? [
+              {
+                name: 'user' as const,
+                sourcePath: userSkillsDir,
+                runtimePath:
+                  args.executionMode === 'container'
+                    ? '/workspace/user-skills'
+                    : hostSkillsRuntime,
+                count: countChildDirs(userSkillsDir),
+              },
+            ]
+          : []),
       ],
     },
     happyclawPrompt: { totalBytes: 0, files: [] },
@@ -223,11 +267,32 @@ export function syncHostClaudeContext(
       removePath(path.join(skillsDir, entry.name));
     }
   }
-  const includeSkill = (entry: fs.Dirent) => entry.isDirectory() || entry.isSymbolicLink();
-  linkEntries(plan.builtinSkillsDir, skillsDir, includeSkill);
-  linkEntries(plan.externalSkillsDir, skillsDir, includeSkill);
-  linkEntries(plan.projectSkillsDir, skillsDir, includeSkill);
-  linkEntries(plan.userSkillsDir, skillsDir, includeSkill);
+  const includeSkill = (entry: fs.Dirent) =>
+    entry.isDirectory() || entry.isSymbolicLink();
+  const skillConflicts = new Set<string>();
+  const recordSkillConflict = (name: string) => skillConflicts.add(name);
+  linkEntries(
+    plan.builtinSkillsDir,
+    skillsDir,
+    includeSkill,
+    recordSkillConflict,
+  );
+  linkEntries(
+    plan.externalSkillsDir,
+    skillsDir,
+    includeSkill,
+    recordSkillConflict,
+  );
+  linkEntries(
+    plan.projectSkillsDir,
+    skillsDir,
+    includeSkill,
+    recordSkillConflict,
+  );
+  linkEntries(plan.userSkillsDir, skillsDir, includeSkill, recordSkillConflict);
+  for (const name of skillConflicts) {
+    warnings.push(`skill name conflict: ${name}（后序来源覆盖前序）`);
+  }
 
   const rulesDir = path.join(groupSessionsDir, 'rules');
   fs.mkdirSync(rulesDir, { recursive: true });

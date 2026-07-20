@@ -19,7 +19,11 @@ export function shorten(input: string, maxLen = 180): string {
 export function redactSensitive(input: unknown, depth = 0): unknown {
   if (depth > 3) return '[truncated]';
   if (input == null) return input;
-  if (typeof input === 'string' || typeof input === 'number' || typeof input === 'boolean') {
+  if (
+    typeof input === 'string' ||
+    typeof input === 'number' ||
+    typeof input === 'boolean'
+  ) {
     return input;
   }
   if (Array.isArray(input)) {
@@ -29,7 +33,9 @@ export function redactSensitive(input: unknown, depth = 0): unknown {
     const obj = input as Record<string, unknown>;
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(obj)) {
-      if (/(token|password|secret|api[_-]?key|authorization|cookie)/iu.test(k)) {
+      if (
+        /(token|password|secret|api[_-]?key|authorization|cookie)/iu.test(k)
+      ) {
         out[k] = '[REDACTED]';
       } else {
         out[k] = redactSensitive(v, depth + 1);
@@ -66,8 +72,10 @@ export function redactInlineSecrets(value: string): string {
       // to cover postgres / mongodb / redis / mysql / ftp / ssh / git etc.
       // The DSN form `<scheme>://user:pass@host/...` is universal; restrict
       // the scheme to a reasonable identifier shape to avoid colon-rich text.
-      .replace(/(\b[a-z][a-z0-9+.\-]{1,15}:\/\/[^\s\/:@]+:)[^\s@\/?#]+(@)/gi,
-        '$1[REDACTED]$2')
+      .replace(
+        /(\b[a-z][a-z0-9+.\-]{1,15}:\/\/[^\s\/:@]+:)[^\s@\/?#]+(@)/gi,
+        '$1[REDACTED]$2',
+      )
       // key=value / key:value with explicit secret-shaped key. Anchor 不再
       // 用 lazy `[A-Za-z0-9_]*?` 兜底（O(n^2) ReDoS 源头），改成显式枚举
       // 常见前缀 + 限定长度。截止字符增加 ; , 拦多 cookie 行。
@@ -95,7 +103,10 @@ export function redactInlineSecrets(value: string): string {
       .replace(/\bSG\.[A-Za-z0-9_\-]{16,}\.[A-Za-z0-9_\-]{16,}/g, '[REDACTED]')
       .replace(/\bnpm_[A-Za-z0-9]{30,}/g, '[REDACTED]')
       // private key / pem 头标识，整段一路擦到 END 标记
-      .replace(/-----BEGIN [A-Z ]+PRIVATE KEY-----[\s\S]*?-----END [A-Z ]+PRIVATE KEY-----/g, '[REDACTED PRIVATE KEY]')
+      .replace(
+        /-----BEGIN [A-Z ]+PRIVATE KEY-----[\s\S]*?-----END [A-Z ]+PRIVATE KEY-----/g,
+        '[REDACTED PRIVATE KEY]',
+      )
   );
 }
 
@@ -112,7 +123,15 @@ export function summarizeToolInput(input: unknown): string | undefined {
 
   if (typeof input === 'object') {
     const obj = input as Record<string, unknown>;
-    const keyCandidates = ['command', 'query', 'path', 'pattern', 'prompt', 'url', 'name'];
+    const keyCandidates = [
+      'command',
+      'query',
+      'path',
+      'pattern',
+      'prompt',
+      'url',
+      'name',
+    ];
     for (const key of keyCandidates) {
       const value = obj[key];
       if (typeof value === 'string' && value.trim()) {
@@ -140,7 +159,10 @@ export function summarizeToolInput(input: unknown): string | undefined {
  * and clamp the length so the trace stays readable without dumping a 10K-line
  * bash output into the card. Returns undefined for empty / non-textual results.
  */
-export function summarizeToolResult(content: unknown, maxLen = 400): string | undefined {
+export function summarizeToolResult(
+  content: unknown,
+  maxLen = 400,
+): string | undefined {
   let text: string | undefined;
   if (typeof content === 'string') {
     text = content;
@@ -167,7 +189,10 @@ export function summarizeToolResult(content: unknown, maxLen = 400): string | un
  * Extract a skill name from Skill tool input.
  * Tries skillName, skill, name, command fields, then regex-matches leading slashes.
  */
-export function extractSkillName(toolName: unknown, input: unknown): string | undefined {
+export function extractSkillName(
+  toolName: unknown,
+  input: unknown,
+): string | undefined {
   if (toolName !== 'Skill') return undefined;
   if (!input || typeof input !== 'object') return undefined;
   const obj = input as Record<string, unknown>;
@@ -223,6 +248,75 @@ export function isSuspectTruncatedStreamResult(
   if (resultTextLength <= 0) return false;
   if (!usage) return false;
   return (usage.input_tokens ?? 0) === 0 && (usage.output_tokens ?? 0) === 0;
+}
+
+/** AssistantTextTracker 处理的 content block 最小形状（SDK assistant 消息的 content 数组元素）。 */
+export interface AssistantContentBlock {
+  type: string;
+  text?: string;
+}
+
+/**
+ * Turn 内 assistant 文本分段追踪：把「工具调用之间的过程旁白」与「最后一次
+ * 工具调用之后的最终回复」分开。
+ *
+ * SDK 把 assistant 输出按 tool_use 切成多条消息（text → tool_use → text → …）。
+ * 旧实现把 turn 内所有 top-level text block 无分隔拼接为定稿正文，导致模型在
+ * 每次工具调用前输出的过程叙述（"我先检查 X"、"现在打开 Y"）混进最终回复，
+ * 且句子之间无缝粘连。本类按 content block 顺序维护：遇到 top-level tool_use
+ * 时把已累积文本归入 narration（旁白，不进定稿正文）；turn 结束时
+ * currentSegment 即最后一次工具调用之后的文本——与 SDK result 字段 /
+ * Claude Code 的最终回复语义一致。
+ */
+export class AssistantTextTracker {
+  private currentSegment = '';
+  private narrationSegments: string[] = [];
+
+  /**
+   * 按顺序处理一条 top-level assistant 消息的 content blocks。
+   * 返回该消息是否含文本（调用方据此更新 canonical uuid）。
+   */
+  addContentBlocks(blocks: AssistantContentBlock[]): boolean {
+    let sawText = false;
+    for (const block of blocks) {
+      if (
+        block.type === 'text' &&
+        typeof block.text === 'string' &&
+        block.text
+      ) {
+        this.currentSegment += block.text;
+        sawText = true;
+      } else if (block.type === 'tool_use') {
+        this.rotateSegment();
+      }
+    }
+    return sawText;
+  }
+
+  private rotateSegment(): void {
+    if (this.currentSegment.trim()) {
+      this.narrationSegments.push(this.currentSegment);
+    }
+    this.currentSegment = '';
+  }
+
+  /**
+   * 定稿正文选择链：最终段 → SDK result → 最后一段旁白。
+   * 旁白兜底针对「模型以工具调用收尾」的 turn（如挂起序列的中间 turn 派完
+   * 后台任务即停），此时最后一段旁白通常是对用户有意义的状态说明
+   * （"三个调研任务已派出，等待完成"）。
+   */
+  pickFinalText(sdkResult: string | null | undefined): string | null {
+    if (this.currentSegment.trim()) return this.currentSegment;
+    if (sdkResult && sdkResult.trim()) return sdkResult;
+    return this.narrationSegments.at(-1) ?? null;
+  }
+
+  /** mid-query follow-up 产生第二条 result 时与 turnId 一起重置。 */
+  reset(): void {
+    this.currentSegment = '';
+    this.narrationSegments = [];
+  }
 }
 
 /**

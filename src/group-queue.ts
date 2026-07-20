@@ -256,7 +256,7 @@ export class GroupQueue {
     const isHost = this.isHostMode(groupJid);
     const systemCapacity = isHost
       ? this.activeHostProcessCount <
-          getSystemSettings().maxConcurrentHostProcesses
+        getSystemSettings().maxConcurrentHostProcesses
       : this.activeContainerCount < getSystemSettings().maxConcurrentContainers;
     if (!systemCapacity) return false;
 
@@ -362,24 +362,23 @@ export class GroupQueue {
     return count;
   }
 
-  /**
-   * List all active virtual-JID runners that belong to the same folder family
-   * as `baseJid` (i.e. sub-agents `{...}#agent:{id}` and scheduled tasks
-   * `{...}#task:{id}`), excluding the base JID itself. Used by workspace-level
-   * operations (e.g. clear-history) that need to stop every descendant process
-   * before wiping the folder's filesystem.
-   *
-   * Matching is done via serializationKey (folder-based), so descendants
-   * launched from any sibling JID sharing the same folder are all returned.
-   */
-  listActiveDescendantJids(baseJid: string): string[] {
+  /** List active or queued virtual runners in the same folder family. Queued
+   * descendants must be stopped before delete/clear, otherwise drainWaiting can
+   * launch them after their workspace has already been removed. */
+  listDescendantJids(baseJid: string): string[] {
     const baseKey = this.getSerializationKey(baseJid);
     const prefix = baseKey + '#';
     const result: string[] = [];
     for (const [jid, state] of this.groups.entries()) {
-      if (!state.active) continue;
       const key = this.getSerializationKey(jid);
-      if (key.startsWith(prefix)) result.push(jid);
+      if (!key.startsWith(prefix)) continue;
+      if (
+        state.active ||
+        state.pendingTasks.length > 0 ||
+        this.waitingGroups.has(jid)
+      ) {
+        result.push(jid);
+      }
     }
     return result;
   }
@@ -782,7 +781,14 @@ export class GroupQueue {
       return;
     }
     try {
-      if (!this.hasRemainingIpcMessages(state.groupFolder, state.agentId, state.taskRunId)) return;
+      if (
+        !this.hasRemainingIpcMessages(
+          state.groupFolder,
+          state.agentId,
+          state.taskRunId,
+        )
+      )
+        return;
 
       if (state.agentId && this.onUnconsumedAgentIpcFn) {
         logger.warn(
@@ -814,7 +820,7 @@ export class GroupQueue {
         : path.join(DATA_DIR, 'ipc', groupFolder, 'input');
     try {
       const files = fs.readdirSync(inputDir);
-      return files.some(f => f.endsWith('.json'));
+      return files.some((f) => f.endsWith('.json'));
     } catch {
       return false;
     }
@@ -925,7 +931,6 @@ export class GroupQueue {
       return false;
     }
   }
-
 
   /**
    * Force-stop a group's active container and clear queued work.
@@ -1140,6 +1145,16 @@ export class GroupQueue {
     reason: 'messages' | 'drain',
   ): Promise<void> {
     const state = this.getGroup(groupJid);
+    // Defensive re-entrancy guard: never start a second runner on a GroupState
+    // that is already active. Pending work is picked up by the active runner's
+    // finally → drainGroup, so returning here loses nothing.
+    if (state.active) {
+      logger.warn(
+        { groupJid, reason },
+        'runForGroup called on already-active group, ignoring re-entry',
+      );
+      return;
+    }
     const isHostMode = this.isHostMode(groupJid);
     state.active = true;
     state.activeRunnerIsTask = false;
@@ -1193,7 +1208,11 @@ export class GroupQueue {
         : false;
       if (state.groupFolder) {
         try {
-          this.cleanupIpcSentinels(state.groupFolder, state.agentId, state.taskRunId);
+          this.cleanupIpcSentinels(
+            state.groupFolder,
+            state.agentId,
+            state.taskRunId,
+          );
         } catch (err) {
           logger.warn({ groupJid, err }, 'Failed to clean up IPC sentinels');
         }
@@ -1268,6 +1287,18 @@ export class GroupQueue {
 
   private async runTask(groupJid: string, task: QueuedTask): Promise<void> {
     const state = this.getGroup(groupJid);
+    // Defensive re-entrancy guard (see runForGroup): a task must never start on
+    // an already-active GroupState, or it would overwrite the live process
+    // handle and double-count the concurrency slot.
+    if (state.active) {
+      logger.warn(
+        { groupJid, taskId: task.id },
+        'runTask called on already-active group, re-queuing task',
+      );
+      state.pendingTasks.unshift(task);
+      this.waitingGroups.add(groupJid);
+      return;
+    }
     const isHostMode = this.isHostMode(groupJid);
     state.active = true;
     state.activeRunnerIsTask = true;
@@ -1305,7 +1336,11 @@ export class GroupQueue {
       // Clean up stale sentinel files before clearing groupFolder/agentId
       if (state.groupFolder) {
         try {
-          this.cleanupIpcSentinels(state.groupFolder, state.agentId, state.taskRunId);
+          this.cleanupIpcSentinels(
+            state.groupFolder,
+            state.agentId,
+            state.taskRunId,
+          );
         } catch (err) {
           logger.warn({ groupJid, err }, 'Failed to clean up IPC sentinels');
         }
@@ -1436,8 +1471,36 @@ export class GroupQueue {
 
     this.waitingGroups.delete(groupJid);
 
+    // GC one-shot virtual JIDs (#task:/#agent:) once fully idle. Each task run
+    // uses a unique taskRunId → a unique JID, so without this the groups Map
+    // grows without bound. Only virtual JIDs are collected; real chat JIDs are
+    // bounded by the number of registered groups and keep useful state. We only
+    // reach here when there are no pending tasks and no runnable messages.
+    if (this.isVirtualJid(groupJid)) {
+      const s = this.groups.get(groupJid);
+      if (
+        s &&
+        !s.active &&
+        !s.queryInFlight &&
+        !s.pendingMessages &&
+        s.pendingTasks.length === 0 &&
+        !s.retryTimer &&
+        !s.restarting &&
+        !this.waitingGroups.has(groupJid)
+      ) {
+        this.groups.delete(groupJid);
+        this.contextOverflowGroups.delete(groupJid);
+        // fall through to drainWaiting so other waiting groups still get a slot
+      }
+    }
+
     // Nothing pending for this group; check if other groups are waiting for a slot
     this.drainWaiting();
+  }
+
+  /** Virtual JIDs are one-shot per run (`{jid}#task:{id}` / `{jid}#agent:{id}`). */
+  private isVirtualJid(jid: string): boolean {
+    return jid.includes('#task:') || jid.includes('#agent:');
   }
 
   private drainWaiting(): void {
@@ -1448,7 +1511,14 @@ export class GroupQueue {
 
     for (const jid of candidates) {
       const activeRunner = this.findActiveRunnerFor(jid);
-      if (activeRunner && activeRunner !== jid) continue;
+      // Any active runner sharing this serialization key — including jid's OWN
+      // runner — means no new runner may start. enqueueMessageCheck adds a jid
+      // to waitingGroups even while its own runner is active (state.active), so
+      // without checking self-active we would start a SECOND concurrent runner
+      // on the same GroupState (duplicate replies, orphaned containers, broken
+      // counters). Pending work is drained by the active runner's
+      // finally → drainGroup, so skipping here is safe (no starvation).
+      if (activeRunner) continue;
       if (!this.hasCapacityFor(jid)) continue;
 
       this.waitingGroups.delete(jid);
@@ -1562,9 +1632,23 @@ export class GroupQueue {
     for (const [, state] of this.groups) {
       if (!state.active || !state.groupFolder) continue;
       const inputDir = state.taskRunId
-        ? path.join(DATA_DIR, 'ipc', state.groupFolder, 'tasks-run', state.taskRunId, 'input')
+        ? path.join(
+            DATA_DIR,
+            'ipc',
+            state.groupFolder,
+            'tasks-run',
+            state.taskRunId,
+            'input',
+          )
         : state.agentId
-          ? path.join(DATA_DIR, 'ipc', state.groupFolder, 'agents', state.agentId, 'input')
+          ? path.join(
+              DATA_DIR,
+              'ipc',
+              state.groupFolder,
+              'agents',
+              state.agentId,
+              'input',
+            )
           : path.join(DATA_DIR, 'ipc', state.groupFolder, 'input');
       try {
         fs.mkdirSync(inputDir, { recursive: true });

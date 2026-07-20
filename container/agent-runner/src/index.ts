@@ -17,7 +17,10 @@
 import fs from 'fs';
 import path from 'path';
 import { execFileSync } from 'child_process';
-import { type HookCallback, type PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
+import {
+  type HookCallback,
+  type PreCompactHookInput,
+} from '@anthropic-ai/claude-agent-sdk';
 import { detectImageMimeTypeFromBase64Strict } from './image-detector.js';
 import { pruneProcessedHistoryImagesInTranscript as pruneProcessedHistoryImagesInTranscriptFile } from './history-image-prune.js';
 import { getChannelFromJid } from './channel-prefixes.js';
@@ -29,11 +32,16 @@ import type {
   SessionsIndex,
   ParsedMessage,
   StreamEvent,
-  } from './types.js';
+} from './types.js';
 import type { ClaudeContextAudit } from './stream-event.types.js';
 export type { StreamEventType, StreamEvent } from './types.js';
 
-import { sanitizeFilename, generateFallbackName, isSuspectTruncatedStreamResult, formatLocalNow } from './utils.js';
+import {
+  sanitizeFilename,
+  generateFallbackName,
+  isSuspectTruncatedStreamResult,
+  formatLocalNow,
+} from './utils.js';
 import {
   extractSessionHistory as extractSessionHistoryImpl,
   parseTranscript,
@@ -56,9 +64,12 @@ import type {
 } from './engines/types.js';
 
 // 路径解析：优先读取环境变量，降级到容器内默认路径（保持向后兼容）
-const WORKSPACE_GROUP = process.env.HAPPYCLAW_WORKSPACE_GROUP || '/workspace/group';
-const WORKSPACE_GLOBAL = process.env.HAPPYCLAW_WORKSPACE_GLOBAL || '/workspace/global';
-const WORKSPACE_MEMORY = process.env.HAPPYCLAW_WORKSPACE_MEMORY || '/workspace/memory';
+const WORKSPACE_GROUP =
+  process.env.HAPPYCLAW_WORKSPACE_GROUP || '/workspace/group';
+const WORKSPACE_GLOBAL =
+  process.env.HAPPYCLAW_WORKSPACE_GLOBAL || '/workspace/global';
+const WORKSPACE_MEMORY =
+  process.env.HAPPYCLAW_WORKSPACE_MEMORY || '/workspace/memory';
 const WORKSPACE_IPC = process.env.HAPPYCLAW_WORKSPACE_IPC || '/workspace/ipc';
 
 // 模型配置：支持别名（opus/sonnet/haiku）或完整模型 ID
@@ -70,33 +81,59 @@ const IPC_INPUT_DIR = path.join(WORKSPACE_IPC, 'input');
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_FALLBACK_POLL_MS = 5000; // 后备轮询间隔（仅防止 inotify 事件丢失）
 
-
 let needsMemoryFlush = false;
 let hadCompaction = false;
+
+/**
+ * 判断 prompt 是否是要透传给 SDK/CLI 的内建 slash 命令。
+ *
+ * 用于跳过 `[当前时间:]` 前缀注入——CLI 的 slash 解析要求消息**以 `/` 开头**
+ * （去除前导空白），前缀会把它变成普通用户消息（不触发内建命令）。
+ *
+ * **只白名单已知会透传到 SDK 的 slash 命令**（当前仅 `/compact`），避免误伤
+ * "用户真的想让模型解释一段 `/etc/xxx` 路径"这类合法内容（R1 缓解）。
+ * 其他 IM/Web slash 命令（`/clear`、`/list` 等）由主服务在入口层拦截处理，
+ * 不会到 agent-runner，因此不需要在这里放过。
+ */
+function isSdkPassthroughSlashCommand(prompt: string): boolean {
+  const trimmed = prompt.replace(/^\s+/, '');
+  // `/compact` 或 `/compact <arg>`；大小写不敏感（与入口层 isCompactCommand 一致）
+  return /^\/compact(\s|$)/i.test(trimmed);
+}
 // Module-level session ID so SIGTERM handler can emit it before exit.
 // Updated in main() whenever a query returns a new session.
 let latestSessionId: string | undefined;
 
 const DEFAULT_ALLOWED_TOOLS = [
   'Bash',
-  'Read', 'Write', 'Edit', 'Glob', 'Grep',
-  'WebSearch', 'WebFetch',
-  'Task', 'TaskOutput', 'TaskStop',
-  'TeamCreate', 'TeamDelete', 'SendMessage',
+  'Read',
+  'Write',
+  'Edit',
+  'Glob',
+  'Grep',
+  'WebSearch',
+  'WebFetch',
+  'Task',
+  'TaskOutput',
+  'TaskStop',
+  'TeamCreate',
+  'TeamDelete',
+  'SendMessage',
   // 'Skill' removed: since SDK 0.3.x skills are enabled via the `skills` option
   // (skills: 'all' below), not by listing a 'Skill' tool here. Keeping the dead
   // entry just invited confusion.
-  'TodoWrite', 'ToolSearch',
+  'TodoWrite',
+  'ToolSearch',
   'NotebookEdit',
-  'mcp__happyclaw__*'
+  'mcp__happyclaw__*',
 ];
 
 const MEMORY_FLUSH_ALLOWED_TOOLS = [
   'mcp__happyclaw__memory_search',
   'mcp__happyclaw__memory_get',
   'mcp__happyclaw__memory_append',
-  'Read',  // 读取全局 CLAUDE.md 当前内容
-  'Edit',  // 编辑全局 CLAUDE.md（永久记忆）
+  'Read', // 读取全局 CLAUDE.md 当前内容
+  'Edit', // 编辑全局 CLAUDE.md（永久记忆）
 ];
 
 // Memory flush 期间禁用的工具（disallowedTools 会从模型上下文中完全移除这些工具）
@@ -106,10 +143,22 @@ const MEMORY_FLUSH_ALLOWED_TOOLS = [
 // 动态派生（见 memoryFlushDisallowedTools），只保留 memory_append/get/search，
 // 避免后续新增 MCP 工具后再次遗漏屏蔽（如曾漏掉的 send_image/send_file/discord_*/*_skill）。
 const MEMORY_FLUSH_DISALLOWED_BUILTINS = [
-  'Bash', 'Write', 'WebSearch', 'WebFetch', 'Glob', 'Grep',
-  'Task', 'TaskOutput', 'TaskStop',
-  'TeamCreate', 'TeamDelete', 'SendMessage',
-  'TodoWrite', 'ToolSearch', 'Skill', 'NotebookEdit',
+  'Bash',
+  'Write',
+  'WebSearch',
+  'WebFetch',
+  'Glob',
+  'Grep',
+  'Task',
+  'TaskOutput',
+  'TaskStop',
+  'TeamCreate',
+  'TeamDelete',
+  'SendMessage',
+  'TodoWrite',
+  'ToolSearch',
+  'Skill',
+  'NotebookEdit',
 ];
 // 记忆刷新期间仍需保留可用的 MCP 工具（读写记忆正是 flush 的目的）。
 const MEMORY_FLUSH_KEEP_MCP = new Set([
@@ -130,7 +179,9 @@ const PROMPTS_DIR = path.join(
 );
 
 function loadPrompt(...segments: string[]): string {
-  return fs.readFileSync(path.join(PROMPTS_DIR, ...segments), 'utf-8').trimEnd();
+  return fs
+    .readFileSync(path.join(PROMPTS_DIR, ...segments), 'utf-8')
+    .trimEnd();
 }
 
 const SECURITY_RULES = loadPrompt('security-rules.md');
@@ -146,6 +197,8 @@ const MEMORY_SYSTEM_GUEST = loadPrompt('memory-system.guest.md');
 
 const GUIDELINES_BLOCK = `<guidelines>\n${OUTPUT_GUIDELINES}\n${WEB_FETCH_GUIDELINES}\n${BACKGROUND_TASK_GUIDELINES}\n</guidelines>`;
 const CONVERSATION_AGENT_BLOCK = `<agent-override>\n${CONVERSATION_AGENT_GUIDELINES}\n</agent-override>`;
+const CHANNEL_FORMAT_COMMON =
+  '用户也可在 Web 端查看完整 Markdown；不要因为消息来源而缩短、降级或省略答案。';
 
 interface PromptPiece {
   name: string;
@@ -170,7 +223,9 @@ function byteLength(text: string): number {
   return Buffer.byteLength(text, 'utf-8');
 }
 
-function buildPromptAudit(pieces: PromptPiece[]): ClaudeContextAudit['happyclawPrompt'] {
+function buildPromptAudit(
+  pieces: PromptPiece[],
+): ClaudeContextAudit['happyclawPrompt'] {
   const files = pieces.map((piece) => ({
     name: piece.name,
     bytes: byteLength(piece.text),
@@ -189,32 +244,52 @@ function buildSecurityRulesPrompt(disableMemoryLayer: boolean): string {
   );
 }
 
-function runtimeContextAuditBase(containerInput: ContainerInput): ClaudeContextAudit {
+function runtimeContextAuditBase(
+  containerInput: ContainerInput,
+): ClaudeContextAudit {
   return {
     executionMode: containerInput.contextAudit?.executionMode ?? 'container',
     cwd: WORKSPACE_GROUP,
     claudeConfigDir: process.env.CLAUDE_CONFIG_DIR,
     externalClaudeDir: containerInput.contextAudit?.externalClaudeDir,
     claudeMd: containerInput.contextAudit?.claudeMd ?? { status: 'unknown' },
-    rules: containerInput.contextAudit?.rules ?? { status: 'unknown', fileCount: 0 },
+    rules: containerInput.contextAudit?.rules ?? {
+      status: 'unknown',
+      fileCount: 0,
+    },
     skills: containerInput.contextAudit?.skills ?? { sources: [] },
-    happyclawPrompt: containerInput.contextAudit?.happyclawPrompt ?? { totalBytes: 0, files: [] },
+    happyclawPrompt: containerInput.contextAudit?.happyclawPrompt ?? {
+      totalBytes: 0,
+      files: [],
+    },
     warnings: [...(containerInput.contextAudit?.warnings ?? [])],
   };
 }
 
-function classifySkillSource(source: string): ClaudeContextAudit['skills']['sources'][number]['name'] {
+function classifySkillSource(
+  source: string,
+): ClaudeContextAudit['skills']['sources'][number]['name'] {
   if (source.includes('/opt/builtin-skills')) return 'builtin';
-  if (source.includes('/external-skills') || source.includes('/.claude/skills')) return 'external';
-  if (source.includes('/project-skills') || source.includes('/container/skills')) return 'project';
-  if (source.includes('/user-skills') || source.includes('/data/skills/')) return 'user';
+  if (source.includes('/external-skills') || source.includes('/.claude/skills'))
+    return 'external';
+  if (
+    source.includes('/project-skills') ||
+    source.includes('/container/skills')
+  )
+    return 'project';
+  if (source.includes('/user-skills') || source.includes('/data/skills/'))
+    return 'user';
   if (source.includes('/plugins/')) return 'plugin';
   return 'unknown';
 }
 
 function pathMatches(candidate: string, expected?: string): boolean {
   if (!expected) return false;
-  return candidate === expected || candidate.endsWith(expected) || expected.endsWith(candidate);
+  return (
+    candidate === expected ||
+    candidate.endsWith(expected) ||
+    expected.endsWith(candidate)
+  );
 }
 
 function enrichContextAudit(
@@ -242,23 +317,28 @@ function enrichContextAudit(
   }
 
   const memoryFiles = ctxUsage.memoryFiles ?? [];
-  const claudeMemory = memoryFiles.find((file) =>
-    pathMatches(file.path, audit.claudeMd.runtimePath)
-    || pathMatches(file.path, audit.claudeMd.sourcePath)
+  const claudeMemory = memoryFiles.find(
+    (file) =>
+      pathMatches(file.path, audit.claudeMd.runtimePath) ||
+      pathMatches(file.path, audit.claudeMd.sourcePath),
   );
   if (claudeMemory) {
     audit.claudeMd.loaded = true;
     audit.claudeMd.tokens = claudeMemory.tokens;
-  } else if (audit.claudeMd.status === 'linked' || audit.claudeMd.status === 'mounted') {
+  } else if (
+    audit.claudeMd.status === 'linked' ||
+    audit.claudeMd.status === 'mounted'
+  ) {
     audit.claudeMd.loaded = false;
     audit.warnings.push('CLAUDE.md not reported by SDK memoryFiles');
   }
 
   const loadedRuleFiles = memoryFiles
-    .filter((file) =>
-      pathMatches(file.path, audit.rules.runtimePath)
-      || pathMatches(file.path, audit.rules.sourcePath)
-      || file.path.includes('/rules/')
+    .filter(
+      (file) =>
+        pathMatches(file.path, audit.rules.runtimePath) ||
+        pathMatches(file.path, audit.rules.sourcePath) ||
+        file.path.includes('/rules/'),
     )
     .map((file) => ({ path: file.path, tokens: file.tokens }));
   audit.rules.loadedFiles = loadedRuleFiles;
@@ -271,13 +351,18 @@ function enrichContextAudit(
     audit.skills.totalSkills = ctxUsage.skills.totalSkills;
     audit.skills.includedSkills = ctxUsage.skills.includedSkills;
     audit.skills.tokens = ctxUsage.skills.tokens;
-    if (ctxUsage.skills.totalSkills > 150) audit.warnings.push('skills count > 150');
-    if (ctxUsage.skills.tokens > 15000) audit.warnings.push('skills tokens > 15000');
+    if (ctxUsage.skills.totalSkills > 150)
+      audit.warnings.push('skills count > 150');
+    if (ctxUsage.skills.tokens > 15000)
+      audit.warnings.push('skills tokens > 15000');
 
     const tokensBySource = new Map<string, number>();
     for (const skill of ctxUsage.skills.skillFrontmatter ?? []) {
       const key = classifySkillSource(skill.source);
-      tokensBySource.set(key, (tokensBySource.get(key) ?? 0) + (skill.tokens ?? 0));
+      tokensBySource.set(
+        key,
+        (tokensBySource.get(key) ?? 0) + (skill.tokens ?? 0),
+      );
     }
     audit.skills.sources = audit.skills.sources.map((source) => ({
       ...source,
@@ -297,7 +382,9 @@ const CHANNEL_GUIDELINES: Record<string, string> = (() => {
   for (const file of fs.readdirSync(channelsDir)) {
     if (!file.endsWith('.md')) continue;
     const channelKey = file.slice(0, -'.md'.length);
-    result[channelKey] = fs.readFileSync(path.join(channelsDir, file), 'utf-8').trimEnd();
+    result[channelKey] = fs
+      .readFileSync(path.join(channelsDir, file), 'utf-8')
+      .trimEnd();
   }
   return result;
 })();
@@ -308,7 +395,10 @@ const CHANNEL_GUIDELINES: Record<string, string> = (() => {
  * - 若声明缺失或与内容不一致，使用内容识别值
  * - 最后兜底 image/jpeg
  */
-function resolveImageMimeType(img: { data: string; mimeType?: string }): ImageMediaType {
+function resolveImageMimeType(img: {
+  data: string;
+  mimeType?: string;
+}): ImageMediaType {
   const declared =
     typeof img.mimeType === 'string' && img.mimeType.startsWith('image/')
       ? img.mimeType.toLowerCase()
@@ -316,7 +406,9 @@ function resolveImageMimeType(img: { data: string; mimeType?: string }): ImageMe
   const detected = detectImageMimeTypeFromBase64Strict(img.data);
 
   if (declared && detected && declared !== detected) {
-    log(`Image MIME mismatch: declared=${declared}, detected=${detected}, using detected`);
+    log(
+      `Image MIME mismatch: declared=${declared}, detected=${detected}, using detected`,
+    );
     return detected as ImageMediaType;
   }
 
@@ -328,52 +420,93 @@ function resolveImageMimeType(img: { data: string; mimeType?: string }): ImageMe
  * 仅解析头部字节，不需要完整解码图片。
  * 返回 null 表示无法识别格式。
  */
-function getImageDimensions(base64Data: string): { width: number; height: number } | null {
+function getImageDimensions(
+  base64Data: string,
+): { width: number; height: number } | null {
   try {
     const headerB64 = base64Data.slice(0, 400);
     const buf = Buffer.from(headerB64, 'base64');
 
     // PNG: 固定位置 (bytes 16-23)
-    if (buf.length >= 24 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47) {
+    if (
+      buf.length >= 24 &&
+      buf[0] === 0x89 &&
+      buf[1] === 0x50 &&
+      buf[2] === 0x4e &&
+      buf[3] === 0x47
+    ) {
       return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
     }
 
     // JPEG: 扫描 SOF marker（SOF 可能在大 EXIF/ICC 之后，需要 ~30KB）
-    if (buf.length >= 4 && buf[0] === 0xFF && buf[1] === 0xD8) {
+    if (buf.length >= 4 && buf[0] === 0xff && buf[1] === 0xd8) {
       const JPEG_SCAN_B64_LEN = 40000; // ~30KB binary，覆盖大多数 EXIF/ICC 场景
-      const fullHeader = Buffer.from(base64Data.slice(0, JPEG_SCAN_B64_LEN), 'base64');
+      const fullHeader = Buffer.from(
+        base64Data.slice(0, JPEG_SCAN_B64_LEN),
+        'base64',
+      );
       for (let i = 2; i < fullHeader.length - 9; i++) {
-        if (fullHeader[i] !== 0xFF) continue;
+        if (fullHeader[i] !== 0xff) continue;
         const marker = fullHeader[i + 1];
-        if (marker >= 0xC0 && marker <= 0xC3) {
-          return { width: fullHeader.readUInt16BE(i + 7), height: fullHeader.readUInt16BE(i + 5) };
+        if (marker >= 0xc0 && marker <= 0xc3) {
+          return {
+            width: fullHeader.readUInt16BE(i + 7),
+            height: fullHeader.readUInt16BE(i + 5),
+          };
         }
-        if (marker !== 0xD8 && marker !== 0xD9 && marker !== 0x00) {
+        if (marker !== 0xd8 && marker !== 0xd9 && marker !== 0x00) {
           i += 1 + fullHeader.readUInt16BE(i + 2);
         }
       }
     }
 
     // GIF: bytes 6-9 (little-endian)
-    if (buf.length >= 10 && buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46) {
+    if (
+      buf.length >= 10 &&
+      buf[0] === 0x47 &&
+      buf[1] === 0x49 &&
+      buf[2] === 0x46
+    ) {
       return { width: buf.readUInt16LE(6), height: buf.readUInt16LE(8) };
     }
 
     // BMP: bytes 18-25
-    if (buf.length >= 26 && buf[0] === 0x42 && buf[1] === 0x4D) {
-      return { width: buf.readInt32LE(18), height: Math.abs(buf.readInt32LE(22)) };
+    if (buf.length >= 26 && buf[0] === 0x42 && buf[1] === 0x4d) {
+      return {
+        width: buf.readInt32LE(18),
+        height: Math.abs(buf.readInt32LE(22)),
+      };
     }
 
     // WebP
-    if (buf.length >= 30 && buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46) {
+    if (
+      buf.length >= 30 &&
+      buf[0] === 0x52 &&
+      buf[1] === 0x49 &&
+      buf[2] === 0x46 &&
+      buf[3] === 0x46
+    ) {
       const fourCC = buf.toString('ascii', 12, 16);
-      if (fourCC === 'VP8 ' && buf.length >= 30) return { width: buf.readUInt16LE(26) & 0x3FFF, height: buf.readUInt16LE(28) & 0x3FFF };
-      if (fourCC === 'VP8L' && buf.length >= 25) { const b = buf.readUInt32LE(21); return { width: (b & 0x3FFF) + 1, height: ((b >> 14) & 0x3FFF) + 1 }; }
-      if (fourCC === 'VP8X' && buf.length >= 30) return { width: (buf[24] | (buf[25] << 8) | (buf[26] << 16)) + 1, height: (buf[27] | (buf[28] << 8) | (buf[29] << 16)) + 1 };
+      if (fourCC === 'VP8 ' && buf.length >= 30)
+        return {
+          width: buf.readUInt16LE(26) & 0x3fff,
+          height: buf.readUInt16LE(28) & 0x3fff,
+        };
+      if (fourCC === 'VP8L' && buf.length >= 25) {
+        const b = buf.readUInt32LE(21);
+        return { width: (b & 0x3fff) + 1, height: ((b >> 14) & 0x3fff) + 1 };
+      }
+      if (fourCC === 'VP8X' && buf.length >= 30)
+        return {
+          width: (buf[24] | (buf[25] << 8) | (buf[26] << 16)) + 1,
+          height: (buf[27] | (buf[28] << 8) | (buf[29] << 16)) + 1,
+        };
     }
 
     return null;
-  } catch { return null; }
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -386,7 +519,10 @@ function filterOversizedImages(
   const rejected: string[] = [];
   for (const img of images) {
     const dims = getImageDimensions(img.data);
-    if (dims && (dims.width > IMAGE_MAX_DIMENSION || dims.height > IMAGE_MAX_DIMENSION)) {
+    if (
+      dims &&
+      (dims.width > IMAGE_MAX_DIMENSION || dims.height > IMAGE_MAX_DIMENSION)
+    ) {
       const reason = `图片尺寸 ${dims.width}×${dims.height} 超过 API 限制（最大 ${IMAGE_MAX_DIMENSION}px），已跳过`;
       log(reason);
       rejected.push(reason);
@@ -401,7 +537,9 @@ async function readStdin(): Promise<string> {
   return new Promise((resolve, reject) => {
     let data = '';
     process.stdin.setEncoding('utf8');
-    process.stdin.on('data', chunk => { data += chunk; });
+    process.stdin.on('data', (chunk) => {
+      data += chunk;
+    });
     process.stdin.on('end', () => resolve(data));
     process.stdin.on('error', reject);
   });
@@ -428,7 +566,10 @@ function generateTurnId(): string {
  * Normalize isMain/isHome/isAdminHome flags for backward compatibility.
  * If the host sends the old `isMain` field, treat it as isHome=true + isAdminHome=true.
  */
-function normalizeHomeFlags(input: ContainerInput): { isHome: boolean; isAdminHome: boolean } {
+function normalizeHomeFlags(input: ContainerInput): {
+  isHome: boolean;
+  isAdminHome: boolean;
+} {
   if (input.isHome !== undefined) {
     return { isHome: !!input.isHome, isAdminHome: !!input.isAdminHome };
   }
@@ -448,7 +589,7 @@ function isContextOverflowError(msg: string): boolean {
     /exceeds.*token limit/i,
     /context window.*exceeded/i,
   ];
-  return patterns.some(pattern => pattern.test(msg));
+  return patterns.some((pattern) => pattern.test(msg));
 }
 
 /**
@@ -460,8 +601,12 @@ function isContextOverflowError(msg: string): boolean {
  */
 function isImageMimeMismatchError(msg: string): boolean {
   return (
-    /image\s+was\s+specified\s+using\s+the\s+image\/[a-z0-9.+-]+\s+media\s+type,\s+but\s+the\s+image\s+appears\s+to\s+be\s+(?:an?\s+)?image\/[a-z0-9.+-]+\s+image/i.test(msg) ||
-    /image\/[a-z0-9.+-]+\s+media\s+type.*appears\s+to\s+be.*image\/[a-z0-9.+-]+/i.test(msg)
+    /image\s+was\s+specified\s+using\s+the\s+image\/[a-z0-9.+-]+\s+media\s+type,\s+but\s+the\s+image\s+appears\s+to\s+be\s+(?:an?\s+)?image\/[a-z0-9.+-]+\s+image/i.test(
+      msg,
+    ) ||
+    /image\/[a-z0-9.+-]+\s+media\s+type.*appears\s+to\s+be.*image\/[a-z0-9.+-]+/i.test(
+      msg,
+    )
   );
 }
 
@@ -474,7 +619,10 @@ function isUnrecoverableTranscriptError(msg: string): boolean {
   return isApiReject && (isImageSizeError || isMimeMismatch);
 }
 
-function getSessionSummary(sessionId: string, transcriptPath: string): string | null {
+function getSessionSummary(
+  sessionId: string,
+  transcriptPath: string,
+): string | null {
   const projectDir = path.dirname(transcriptPath);
   const indexPath = path.join(projectDir, 'sessions-index.json');
 
@@ -484,13 +632,17 @@ function getSessionSummary(sessionId: string, transcriptPath: string): string | 
   }
 
   try {
-    const index: SessionsIndex = JSON.parse(fs.readFileSync(indexPath, 'utf-8'));
-    const entry = index.entries.find(e => e.sessionId === sessionId);
+    const index: SessionsIndex = JSON.parse(
+      fs.readFileSync(indexPath, 'utf-8'),
+    );
+    const entry = index.entries.find((e) => e.sessionId === sessionId);
     if (entry?.summary) {
       return entry.summary;
     }
   } catch (err) {
-    log(`Failed to read sessions index: ${err instanceof Error ? err.message : String(err)}`);
+    log(
+      `Failed to read sessions index: ${err instanceof Error ? err.message : String(err)}`,
+    );
   }
 
   return null;
@@ -521,7 +673,8 @@ function trimSessionJsonl(jsonlPath: string): void {
         const entry = JSON.parse(nonEmptyLines[i].line);
         if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
           lastBoundaryPos = i;
-          preservedHeadUuid = entry.compact_metadata?.preserved_segment?.head_uuid;
+          preservedHeadUuid =
+            entry.compact_metadata?.preserved_segment?.head_uuid;
           break;
         }
       } catch {
@@ -545,21 +698,29 @@ function trimSessionJsonl(jsonlPath: string): void {
     let trimStartPos = lastBoundaryPos;
     if (preservedHeadUuid) {
       const preservedPos = nonEmptyLines.findIndex((e) => {
-        try { return JSON.parse(e.line).uuid === preservedHeadUuid; } catch { return false; }
+        try {
+          return JSON.parse(e.line).uuid === preservedHeadUuid;
+        } catch {
+          return false;
+        }
       });
       if (preservedPos >= 0 && preservedPos < trimStartPos) {
         trimStartPos = preservedPos;
-        log(`Session trim: preserving segment from head_uuid=${preservedHeadUuid.slice(0, 8)} (pos ${preservedPos} < boundary ${lastBoundaryPos})`);
+        log(
+          `Session trim: preserving segment from head_uuid=${preservedHeadUuid.slice(0, 8)} (pos ${preservedPos} < boundary ${lastBoundaryPos})`,
+        );
       }
     }
 
     // Keep entries from trimStartPos onwards
-    const trimmedLines = nonEmptyLines.slice(trimStartPos).map(e => e.line);
+    const trimmedLines = nonEmptyLines.slice(trimStartPos).map((e) => e.line);
     const removedCount = trimStartPos;
 
     const TRIM_MIN_ENTRIES = 50; // Skip trimming if fewer entries before boundary (not worth the I/O)
     if (removedCount < TRIM_MIN_ENTRIES) {
-      log(`Session trim: only ${removedCount} entries before boundary, skipping`);
+      log(
+        `Session trim: only ${removedCount} entries before boundary, skipping`,
+      );
       return;
     }
 
@@ -570,10 +731,14 @@ function trimSessionJsonl(jsonlPath: string): void {
 
     const sizeBefore = Buffer.byteLength(content, 'utf-8');
     const sizeAfter = fs.statSync(jsonlPath).size;
-    log(`Session trim: ${nonEmptyLines.length} → ${trimmedLines.length} entries (removed ${removedCount}), ` +
-        `${(sizeBefore / 1024 / 1024).toFixed(1)}MB → ${(sizeAfter / 1024 / 1024).toFixed(1)}MB`);
+    log(
+      `Session trim: ${nonEmptyLines.length} → ${trimmedLines.length} entries (removed ${removedCount}), ` +
+        `${(sizeBefore / 1024 / 1024).toFixed(1)}MB → ${(sizeAfter / 1024 / 1024).toFixed(1)}MB`,
+    );
   } catch (err) {
-    log(`Session trim failed: ${err instanceof Error ? err.message : String(err)}`);
+    log(
+      `Session trim failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
   }
 }
 
@@ -587,7 +752,11 @@ function createPreCompactHook(
   isHome: boolean,
   _isAdminHome: boolean,
   disableMemoryLayer: boolean,
-  deps: { emit: (output: ContainerOutput) => void; getFullText: () => string; resetFullText: () => void },
+  deps: {
+    emit: (output: ContainerOutput) => void;
+    getFullText: () => string;
+    resetFullText: () => void;
+  },
 ): HookCallback {
   return async (input, _toolUseId, _context) => {
     const preCompact = input as PreCompactHookInput;
@@ -597,7 +766,9 @@ function createPreCompactHook(
     // Skip sub-agent compactions — they'd archive the unchanged main transcript
     // and set hadCompaction, triggering spurious auto-continue + memory flush (#321)
     if (preCompact.agent_id) {
-      log(`PreCompact: skipping sub-agent compact (agent_id=${preCompact.agent_id})`);
+      log(
+        `PreCompact: skipping sub-agent compact (agent_id=${preCompact.agent_id})`,
+      );
       return {};
     }
 
@@ -605,7 +776,9 @@ function createPreCompactHook(
     // This ensures users see the partial response even after compaction.
     const partialText = deps.getFullText();
     if (partialText.trim()) {
-      log(`PreCompact: flushing ${partialText.length} chars as compact_partial`);
+      log(
+        `PreCompact: flushing ${partialText.length} chars as compact_partial`,
+      );
       deps.emit({
         status: 'success',
         result: partialText,
@@ -644,7 +817,9 @@ function createPreCompactHook(
 
       log(`Archived conversation to ${filePath}`);
     } catch (err) {
-      log(`Failed to archive transcript: ${err instanceof Error ? err.message : String(err)}`);
+      log(
+        `Failed to archive transcript: ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
 
     // ── Trim session JSONL to prevent unbounded growth ──
@@ -652,9 +827,30 @@ function createPreCompactHook(
     // Must run AFTER archiving (archive needs full transcript).
     trimSessionJsonl(transcriptPath);
 
-    // Flag compaction so the query loop auto-continues instead of
-    // waiting for user input (non-blocking compaction #229).
-    hadCompaction = true;
+    // 区分 manual vs auto trigger（SDK PreCompactHookInput.trigger 字段）：
+    // - auto：上下文将满自动触发 → 置 hadCompaction，主循环 auto-continue
+    //   分支会开一个"继续。" query 让 agent 自然衔接（非阻塞压缩 #229）
+    // - manual：用户 `/compact <instructions>` 主动触发 → **不**置 hadCompaction，
+    //   跳过 auto-continue（用户只是想压缩，不想让 agent 自动接话）
+    //
+    // custom_instructions（`/compact` 后面的重点保留 arg）由 SDK/CLI 内部
+    // 在生成摘要时消费（拼进摘要 prompt），HappyClaw 侧只做日志、不需要
+    // 重新加工。参考 sdk.d.ts:2189-2193 PreCompactHookInput 定义。
+    const trigger = preCompact.trigger ?? 'auto';
+    const customInstructions = preCompact.custom_instructions ?? null;
+    if (trigger === 'manual') {
+      log(
+        `PreCompact: manual trigger, skipping auto-continue; custom_instructions=${
+          customInstructions === null
+            ? 'null'
+            : `${customInstructions.length} chars`
+        }`,
+      );
+    } else {
+      // Flag compaction so the query loop auto-continues instead of
+      // waiting for user input (non-blocking compaction #229).
+      hadCompaction = true;
+    }
 
     // Flag memory flush for home containers (full memory write access)
     // Skip in native Claude mode — user's ~/.claude/ Playbook handles memory persistence
@@ -687,15 +883,19 @@ function extractSessionHistory(oldSessionId: string): string | null {
   });
 }
 
-function formatTranscriptMarkdown(messages: ParsedMessage[], title?: string | null): string {
+function formatTranscriptMarkdown(
+  messages: ParsedMessage[],
+  title?: string | null,
+): string {
   const now = new Date();
-  const formatDateTime = (d: Date) => d.toLocaleString('en-US', {
-    month: 'short',
-    day: 'numeric',
-    hour: 'numeric',
-    minute: '2-digit',
-    hour12: true
-  });
+  const formatDateTime = (d: Date) =>
+    d.toLocaleString('en-US', {
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true,
+    });
 
   const lines: string[] = [];
   lines.push(`# ${title || 'Conversation'}`);
@@ -707,9 +907,10 @@ function formatTranscriptMarkdown(messages: ParsedMessage[], title?: string | nu
 
   for (const msg of messages) {
     const sender = msg.role === 'user' ? 'User' : 'HappyClaw';
-    const content = msg.content.length > 2000
-      ? msg.content.slice(0, 2000) + '...'
-      : msg.content;
+    const content =
+      msg.content.length > 2000
+        ? msg.content.slice(0, 2000) + '...'
+        : msg.content;
     lines.push(`**${sender}**: ${content}`);
     lines.push('');
   }
@@ -722,7 +923,11 @@ function formatTranscriptMarkdown(messages: ParsedMessage[], title?: string | nu
  */
 function shouldClose(): boolean {
   if (fs.existsSync(IPC_INPUT_CLOSE_SENTINEL)) {
-    try { fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL); } catch { /* ignore */ }
+    try {
+      fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL);
+    } catch {
+      /* ignore */
+    }
     return true;
   }
   return false;
@@ -743,14 +948,19 @@ function clearInterruptRequested(): void {
 }
 
 function isWithinInterruptGraceWindow(): boolean {
-  return lastInterruptRequestedAt > 0 && Date.now() - lastInterruptRequestedAt <= INTERRUPT_GRACE_WINDOW_MS;
+  return (
+    lastInterruptRequestedAt > 0 &&
+    Date.now() - lastInterruptRequestedAt <= INTERRUPT_GRACE_WINDOW_MS
+  );
 }
 
 function isInterruptRelatedError(err: unknown): boolean {
   const errno = err as NodeJS.ErrnoException;
   const message = err instanceof Error ? err.message : String(err ?? '');
-  return errno?.code === 'ABORT_ERR'
-    || /abort|aborted|interrupt|interrupted|cancelled|canceled/i.test(message);
+  return (
+    errno?.code === 'ABORT_ERR' ||
+    /abort|aborted|interrupt|interrupted|cancelled|canceled/i.test(message)
+  );
 }
 
 /**
@@ -758,7 +968,11 @@ function isInterruptRelatedError(err: unknown): boolean {
  */
 function shouldInterrupt(): boolean {
   if (fs.existsSync(IPC_INPUT_INTERRUPT_SENTINEL)) {
-    try { fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL); } catch { /* ignore */ }
+    try {
+      fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL);
+    } catch {
+      /* ignore */
+    }
     markInterruptRequested();
     return true;
   }
@@ -770,11 +984,15 @@ function cleanupStartupInterruptSentinel(): void {
     const stat = fs.statSync(IPC_INPUT_INTERRUPT_SENTINEL);
     const ageMs = Date.now() - stat.mtimeMs;
     if (ageMs <= INTERRUPT_GRACE_WINDOW_MS) {
-      log(`Preserving recent interrupt sentinel at startup (${Math.round(ageMs)}ms old)`);
+      log(
+        `Preserving recent interrupt sentinel at startup (${Math.round(ageMs)}ms old)`,
+      );
       return;
     }
     fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL);
-    log(`Removed stale interrupt sentinel at startup (${Math.round(ageMs)}ms old)`);
+    log(
+      `Removed stale interrupt sentinel at startup (${Math.round(ageMs)}ms old)`,
+    );
   } catch {
     /* ignore */
   }
@@ -787,7 +1005,11 @@ function cleanupStartupInterruptSentinel(): void {
  */
 function shouldDrain(): boolean {
   if (fs.existsSync(IPC_INPUT_DRAIN_SENTINEL)) {
-    try { fs.unlinkSync(IPC_INPUT_DRAIN_SENTINEL); } catch { /* ignore */ }
+    try {
+      fs.unlinkSync(IPC_INPUT_DRAIN_SENTINEL);
+    } catch {
+      /* ignore */
+    }
     return true;
   }
   return false;
@@ -809,8 +1031,9 @@ interface IpcDrainResult {
 function drainIpcInput(): IpcDrainResult {
   const result: IpcDrainResult = { messages: [] };
   try {
-    const files = fs.readdirSync(IPC_INPUT_DIR)
-      .filter(f => f.endsWith('.json'))
+    const files = fs
+      .readdirSync(IPC_INPUT_DIR)
+      .filter((f) => f.endsWith('.json'))
       .sort();
 
     for (const file of files) {
@@ -823,12 +1046,19 @@ function drainIpcInput(): IpcDrainResult {
             text: data.text,
             images: data.images,
             taskId: typeof data.taskId === 'string' ? data.taskId : undefined,
-            sourceJid: typeof data.sourceJid === 'string' ? data.sourceJid : undefined,
+            sourceJid:
+              typeof data.sourceJid === 'string' ? data.sourceJid : undefined,
           });
         }
       } catch (err) {
-        log(`Failed to process input file ${file}: ${err instanceof Error ? err.message : String(err)}`);
-        try { fs.unlinkSync(filePath); } catch { /* ignore */ }
+        log(
+          `Failed to process input file ${file}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        try {
+          fs.unlinkSync(filePath);
+        } catch {
+          /* ignore */
+        }
       }
     }
   } catch (err) {
@@ -857,7 +1087,9 @@ function createIpcWatcher(onFileDetected: () => void): { close: () => void } {
   };
 
   // Ensure IPC_INPUT_DIR exists
-  try { fs.mkdirSync(IPC_INPUT_DIR, { recursive: true }); } catch {}
+  try {
+    fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
+  } catch {}
 
   try {
     // Listen to all event types — 'rename' covers atomic writes on Linux,
@@ -866,27 +1098,37 @@ function createIpcWatcher(onFileDetected: () => void): { close: () => void } {
       debouncedDetect();
     });
     watcher.on('error', (err) => {
-      log(`IPC watcher error: ${err.message}, degrading to ${IPC_FALLBACK_POLL_MS}ms fallback polling`);
+      log(
+        `IPC watcher error: ${err.message}, degrading to ${IPC_FALLBACK_POLL_MS}ms fallback polling`,
+      );
       watcher?.close();
       watcher = null;
     });
   } catch (err) {
-    log(`Failed to create IPC watcher: ${err instanceof Error ? err.message : String(err)}, using fallback polling`);
+    log(
+      `Failed to create IPC watcher: ${err instanceof Error ? err.message : String(err)}, using fallback polling`,
+    );
   }
 
   // Fallback polling for reliability
   fallbackTimer = setInterval(() => {
     if (!closed) onFileDetected();
   }, IPC_FALLBACK_POLL_MS);
-  fallbackTimer.unref();  // Don't prevent process from naturally exiting
+  fallbackTimer.unref(); // Don't prevent process from naturally exiting
 
   return {
     close() {
       closed = true;
       watcher?.close();
       watcher = null;
-      if (debounceTimer) { clearTimeout(debounceTimer); debounceTimer = null; }
-      if (fallbackTimer) { clearInterval(fallbackTimer); fallbackTimer = null; }
+      if (debounceTimer) {
+        clearTimeout(debounceTimer);
+        debounceTimer = null;
+      }
+      if (fallbackTimer) {
+        clearInterval(fallbackTimer);
+        fallbackTimer = null;
+      }
     },
   };
 }
@@ -895,7 +1137,12 @@ function createIpcWatcher(onFileDetected: () => void): { close: () => void } {
  * Wait for a new IPC message or _close sentinel.
  * Returns the messages (with optional images), or null if _close.
  */
-function waitForIpcMessage(): Promise<{ text: string; images?: Array<{ data: string; mimeType?: string }>; taskId?: string; sourceJid?: string } | null> {
+function waitForIpcMessage(): Promise<{
+  text: string;
+  images?: Array<{ data: string; mimeType?: string }>;
+  taskId?: string;
+  sourceJid?: string;
+} | null> {
   return new Promise((resolve) => {
     let resolved = false;
     const tryDrain = () => {
@@ -930,13 +1177,19 @@ function waitForIpcMessage(): Promise<{ text: string; images?: Array<{ data: str
         // to it (take the last one — later messages supersede earlier in a batch).
         let combinedTaskId: string | undefined;
         for (let i = messages.length - 1; i >= 0; i--) {
-          if (messages[i].taskId) { combinedTaskId = messages[i].taskId; break; }
+          if (messages[i].taskId) {
+            combinedTaskId = messages[i].taskId;
+            break;
+          }
         }
         // Same convention for sourceJid: per-channel MCP tools should see the
         // chat the most recent message arrived from.
         let combinedSourceJid: string | undefined;
         for (let i = messages.length - 1; i >= 0; i--) {
-          if (messages[i].sourceJid) { combinedSourceJid = messages[i].sourceJid; break; }
+          if (messages[i].sourceJid) {
+            combinedSourceJid = messages[i].sourceJid;
+            break;
+          }
         }
         resolved = true;
         ipcWatcher?.close();
@@ -956,7 +1209,10 @@ function waitForIpcMessage(): Promise<{ text: string; images?: Array<{ data: str
   });
 }
 
-function buildMemoryRecallPrompt(isHome: boolean, disableMemoryLayer: boolean): string {
+function buildMemoryRecallPrompt(
+  isHome: boolean,
+  disableMemoryLayer: boolean,
+): string {
   // 禁用记忆层：完全跳过 HappyClaw 的记忆系统提示，让用户本机 ~/.claude/ Playbook 接管
   if (disableMemoryLayer) return '';
   return isHome ? MEMORY_SYSTEM_HOME : MEMORY_SYSTEM_GUEST;
@@ -973,10 +1229,13 @@ function loadUserMcpServers(): Record<string, unknown> {
       if (parsed && typeof parsed === 'object') {
         return parsed as Record<string, unknown>;
       }
-    } catch { /* fall through to settings.json */ }
+    } catch {
+      /* fall through to settings.json */
+    }
   }
-  const configDir = process.env.CLAUDE_CONFIG_DIR
-    || path.join(process.env.HOME || '/home/node', '.claude');
+  const configDir =
+    process.env.CLAUDE_CONFIG_DIR ||
+    path.join(process.env.HOME || '/home/node', '.claude');
   const settingsFile = path.join(configDir, 'settings.json');
   try {
     if (fs.existsSync(settingsFile)) {
@@ -985,13 +1244,18 @@ function loadUserMcpServers(): Record<string, unknown> {
         return settings.mcpServers;
       }
     }
-  } catch { /* ignore parse errors */ }
+  } catch {
+    /* ignore parse errors */
+  }
   return {};
 }
 
-function pruneProcessedHistoryImagesInTranscript(sessionId: string | undefined): void {
-  const configDir = process.env.CLAUDE_CONFIG_DIR
-    || path.join(process.env.HOME || '/home/node', '.claude');
+function pruneProcessedHistoryImagesInTranscript(
+  sessionId: string | undefined,
+): void {
+  const configDir =
+    process.env.CLAUDE_CONFIG_DIR ||
+    path.join(process.env.HOME || '/home/node', '.claude');
   const result = pruneProcessedHistoryImagesInTranscriptFile({
     claudeConfigDir: configDir,
     sessionId,
@@ -1000,7 +1264,7 @@ function pruneProcessedHistoryImagesInTranscript(sessionId: string | undefined):
   if (result.didMutate) {
     log(
       `History image prune: removed ${result.prunedImages} image block(s)` +
-      `${result.transcriptPath ? ` from ${result.transcriptPath}` : ''}`,
+        `${result.transcriptPath ? ` from ${result.transcriptPath}` : ''}`,
     );
   }
 }
@@ -1033,9 +1297,29 @@ async function runQuery(
   disallowedTools?: string[],
   images?: Array<{ data: string; mimeType?: string }>,
   sourceKindOverride?: ContainerOutput['sourceKind'],
-): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean; contextOverflow?: boolean; unrecoverableTranscriptError?: boolean; interruptedDuringQuery: boolean; sessionResumeFailed?: boolean; pipedMessagesDuringQuery: Array<{ text: string; images?: Array<{ data: string; mimeType?: string }> }>; suspectTruncatedTail?: string }> {
+): Promise<{
+  newSessionId?: string;
+  lastAssistantUuid?: string;
+  closedDuringQuery: boolean;
+  contextOverflow?: boolean;
+  unrecoverableTranscriptError?: boolean;
+  interruptedDuringQuery: boolean;
+  sessionResumeFailed?: boolean;
+  pipedMessagesDuringQuery: Array<{
+    text: string;
+    images?: Array<{ data: string; mimeType?: string }>;
+    taskId?: string;
+    sourceJid?: string;
+  }>;
+  suspectTruncatedTail?: string;
+}> {
   // Track messages piped into this query.
-  const pipedMessagesDuringQuery: Array<{ text: string; images?: Array<{ data: string; mimeType?: string }> }> = [];
+  const pipedMessagesDuringQuery: Array<{
+    text: string;
+    images?: Array<{ data: string; mimeType?: string }>;
+    taskId?: string;
+    sourceJid?: string;
+  }> = [];
   let newSessionId: string | undefined;
   let closedDuringQuery = false;
   let interruptedDuringQuery = false;
@@ -1060,7 +1344,10 @@ async function runQuery(
 
   // 全部图片被过滤 + text 为空时的兜底
   let effectivePrompt = prompt;
-  const allImagesDropped = images && images.length > 0 && (!effectiveImages || effectiveImages.length === 0);
+  const allImagesDropped =
+    images &&
+    images.length > 0 &&
+    (!effectiveImages || effectiveImages.length === 0);
   if (allImagesDropped && !effectivePrompt.trim()) {
     effectivePrompt = `[用户发送了 ${images.length} 张图片，但因尺寸超出 API 限制（最大 ${IMAGE_MAX_DIMENSION}px）被跳过。请提示用户压缩或截取后重发。]`;
   }
@@ -1069,7 +1356,12 @@ async function runQuery(
   // once/cron 取值（#563）。刻意放在 user message（缓存前缀之后的未缓存区）而非 system
   // prompt：① 不会因每 turn 时间不同而击穿整段 system+历史的 prompt cache；② 长会话里
   // 每个 turn 都拿到新鲜时间，而非会话启动那一刻的陈旧时间。
-  effectivePrompt = `[当前时间: ${formatLocalNow()}]\n${effectivePrompt}`;
+  //
+  // 例外：SDK 透传 slash 命令（如 `/compact <instructions>`）必须以 `/` 开头才能被 CLI
+  // 识别为内建命令，加时间前缀会破坏识别 → 跳过。见 isSdkPassthroughSlashCommand 注释。
+  if (!isSdkPassthroughSlashCommand(effectivePrompt)) {
+    effectivePrompt = `[当前时间: ${formatLocalNow()}]\n${effectivePrompt}`;
+  }
 
   const decorateStreamEvent = (event: StreamEvent): StreamEvent => ({
     ...event,
@@ -1097,12 +1389,17 @@ async function runQuery(
 
   // 如果有图片被拒绝，立即通知用户
   for (const reason of initialRejected) {
-    emit({ status: 'success', result: `⚠️ ${reason}`, newSessionId: undefined });
+    emit({
+      status: 'success',
+      result: `⚠️ ${reason}`,
+      newSessionId: undefined,
+    });
   }
 
   // ── 构建系统提示词（与原逻辑完全一致）──
   const { isHome, isAdminHome } = normalizeHomeFlags(containerInput);
-  const disableMemoryLayer = process.env.HAPPYCLAW_DISABLE_MEMORY_LAYER === 'true';
+  const disableMemoryLayer =
+    process.env.HAPPYCLAW_DISABLE_MEMORY_LAYER === 'true';
 
   const channel = getChannelFromJid(containerInput.chatJid);
   const channelGuidelines = CHANNEL_GUIDELINES[channel] ?? '';
@@ -1113,21 +1410,45 @@ async function runQuery(
     : null;
 
   const promptPieces: PromptPiece[] = [
-    { name: 'interaction.md', text: `<behavior>\n${INTERACTION_GUIDELINES}\n</behavior>` },
-    { name: 'skill-routing.md', text: `<skill-routing>\n${SKILL_ROUTING_GUIDELINES}\n</skill-routing>` },
-    { name: 'security-rules.md', text: `<security>\n${buildSecurityRulesPrompt(disableMemoryLayer)}\n</security>` },
+    {
+      name: 'interaction.md',
+      text: `<behavior>\n${INTERACTION_GUIDELINES}\n</behavior>`,
+    },
+    {
+      name: 'skill-routing.md',
+      text: `<skill-routing>\n${SKILL_ROUTING_GUIDELINES}\n</skill-routing>`,
+    },
+    {
+      name: 'security-rules.md',
+      text: `<security>\n${buildSecurityRulesPrompt(disableMemoryLayer)}\n</security>`,
+    },
     ...(memoryRecall && memoryPromptName
-      ? [{ name: memoryPromptName, text: `<memory-system>\n${memoryRecall}\n</memory-system>` }]
+      ? [
+          {
+            name: memoryPromptName,
+            text: `<memory-system>\n${memoryRecall}\n</memory-system>`,
+          },
+        ]
       : []),
     { name: 'guidelines', text: GUIDELINES_BLOCK },
     ...(channelGuidelines
-      ? [{ name: `channels/${channel}.md`, text: `<channel-format>\n${channelGuidelines}\n</channel-format>` }]
+      ? [
+          {
+            name: `channels/${channel}.md`,
+            text: `<channel-format>\n${channelGuidelines}\n${CHANNEL_FORMAT_COMMON}\n</channel-format>`,
+          },
+        ]
       : []),
     ...(containerInput.agentId
       ? [{ name: 'agent-override.md', text: CONVERSATION_AGENT_BLOCK }]
       : []),
     ...(!isHome && !containerInput.agentId && CLAUDE_MODEL !== 'opus[1m]'
-      ? [{ name: 'front-responder.md', text: `<front-responder>\n${FRONT_RESPONDER_GUIDELINES}\n</front-responder>` }]
+      ? [
+          {
+            name: 'front-responder.md',
+            text: `<front-responder>\n${FRONT_RESPONDER_GUIDELINES}\n</front-responder>`,
+          },
+        ]
       : []),
   ];
   const systemPromptAppend = promptPieces.map((piece) => piece.text).join('\n');
@@ -1135,7 +1456,9 @@ async function runQuery(
   const contextAuditBase = runtimeContextAuditBase(containerInput);
 
   if (process.env.HAPPYCLAW_DUMP_PROMPT === 'true') {
-    log(`PROMPT DUMP (${systemPromptAppend.length} chars):\n${systemPromptAppend}\n--- END PROMPT DUMP ---`);
+    log(
+      `PROMPT DUMP (${systemPromptAppend.length} chars):\n${systemPromptAppend}\n--- END PROMPT DUMP ---`,
+    );
   }
 
   // ── 额外目录（与原逻辑一致）──
@@ -1148,7 +1471,10 @@ async function runQuery(
   // ── 解析 claude CLI 路径（与原逻辑一致）──
   let pathToClaudeCodeExecutable: string | undefined;
   try {
-    const resolvedPath = execFileSync('which', ['claude'], { timeout: 5_000, encoding: 'utf-8' }).trim();
+    const resolvedPath = execFileSync('which', ['claude'], {
+      timeout: 5_000,
+      encoding: 'utf-8',
+    }).trim();
     if (resolvedPath) pathToClaudeCodeExecutable = resolvedPath;
   } catch {
     const commonPaths = [
@@ -1158,19 +1484,26 @@ async function runQuery(
       '/app/node_modules/.bin/claude',
     ];
     for (const p of commonPaths) {
-      if (fs.existsSync(p)) { pathToClaudeCodeExecutable = p; break; }
+      if (fs.existsSync(p)) {
+        pathToClaudeCodeExecutable = p;
+        break;
+      }
     }
   }
 
   // ── autoCompactWindow（与原逻辑一致）──
-  const autoCompactWindow = parseInt(process.env.AUTO_COMPACT_WINDOW ?? '0', 10);
+  const autoCompactWindow = parseInt(
+    process.env.AUTO_COMPACT_WINDOW ?? '0',
+    10,
+  );
 
   // ── 构建 EngineConfig（包含所有 SDK 选项）──
   // model 按引擎类型选默认: OpenAI 引擎读 OPENAI_MODEL, Claude 引擎读 ANTHROPIC_MODEL.
   // 之前硬编码 CLAUDE_MODEL 会把 opus[1m] 送到 OpenAI 引擎, 导致上游 404/503.
-  const engineModel = engine.engineType === 'openai'
-    ? (process.env.OPENAI_MODEL || 'gpt-5.5')
-    : CLAUDE_MODEL;
+  const engineModel =
+    engine.engineType === 'openai'
+      ? process.env.OPENAI_MODEL || 'gpt-5.5'
+      : CLAUDE_MODEL;
   const engineConfig: EngineConfig = {
     model: engineModel,
     baseUrl: '',
@@ -1184,7 +1517,10 @@ async function runQuery(
       pathToClaudeCodeExecutable,
       userMcpServers: loadUserMcpServers(),
       plugins: containerInput.plugins,
-      autoCompactWindow: Number.isFinite(autoCompactWindow) && autoCompactWindow > 0 ? autoCompactWindow : undefined,
+      autoCompactWindow:
+        Number.isFinite(autoCompactWindow) && autoCompactWindow > 0
+          ? autoCompactWindow
+          : undefined,
       resumeAt,
       settingSources: ['project', 'user'],
     },
@@ -1202,14 +1538,20 @@ async function runQuery(
   const engineAgents: EngineAgentDefinition[] = [];
 
   // ── PreCompact hook（与原逻辑一致，flush text 改用 engine.getActiveFullText?.() ?? ""）──
-  const preCompactHook = createPreCompactHook(isHome, isAdminHome, disableMemoryLayer, {
-    emit,
-    getFullText: () => engine.getActiveFullText?.() ?? "",
-    resetFullText: () => engine.resetActiveFullText?.(),
-  });
+  const preCompactHook = createPreCompactHook(
+    isHome,
+    isAdminHome,
+    disableMemoryLayer,
+    {
+      emit,
+      getFullText: () => engine.getActiveFullText?.() ?? '',
+      resetFullText: () => engine.resetActiveFullText?.(),
+    },
+  );
 
   // 将 PreCompact hook 注入 engine config
-  (engineSession.engineState._config as any).extra.preCompactHook = preCompactHook;
+  (engineSession.engineState._config as any).extra.preCompactHook =
+    preCompactHook;
 
   // ── IPC 轮询（与原逻辑一致，但操作引擎方法而非 stream/queryRef）──
   let ipcPolling = true;
@@ -1220,7 +1562,9 @@ async function runQuery(
     if (postResultInterruptRequested) return;
     postResultInterruptRequested = true;
     log(`${reason}, interrupting current query before closing stream`);
-    engine.interruptActive?.().catch((err: unknown) => log(`Shutdown interrupt failed: ${err}`));
+    engine
+      .interruptActive?.()
+      .catch((err: unknown) => log(`Shutdown interrupt failed: ${err}`));
   };
 
   const pollIpcDuringQuery = () => {
@@ -1240,10 +1584,14 @@ async function runQuery(
       interruptedDuringQuery = true;
       if (!visibleOutputStarted && resultCount === 0) {
         suppressOutputAfterInterrupt = true;
-        log('Interrupt arrived before visible output, suppressing query output');
+        log(
+          'Interrupt arrived before visible output, suppressing query output',
+        );
       }
       markInterruptRequested();
-      engine.interruptActive?.().catch((err: unknown) => log(`Interrupt call failed: ${err}`));
+      engine
+        .interruptActive?.()
+        .catch((err: unknown) => log(`Interrupt call failed: ${err}`));
       engine.endActiveStream?.();
       ipcPolling = false;
       ipcQueryWatcher.close();
@@ -1258,8 +1606,13 @@ async function runQuery(
       ipcQueryWatcher.close();
       return;
     }
-    if (resultReceivedAt && Date.now() - resultReceivedAt > POST_RESULT_TIMEOUT_MS) {
-      log(`Post-result timeout (${POST_RESULT_TIMEOUT_MS / 1000}s), closing stream`);
+    if (
+      resultReceivedAt &&
+      Date.now() - resultReceivedAt > POST_RESULT_TIMEOUT_MS
+    ) {
+      log(
+        `Post-result timeout (${POST_RESULT_TIMEOUT_MS / 1000}s), closing stream`,
+      );
       interruptQueryForShutdown('Post-result timeout');
       engine.endActiveStream?.();
       ipcPolling = false;
@@ -1285,14 +1638,35 @@ async function runQuery(
 
     const { messages } = drainIpcInput();
     for (const msg of messages) {
-      log(`Piping IPC message into active query (${msg.text.length} chars, ${msg.images?.length || 0} images)`);
+      log(
+        `Piping IPC message into active query (${msg.text.length} chars, ${msg.images?.length || 0} images)`,
+      );
       pipedMessagesDuringQuery.push(msg);
-      const pipeImages = msg.images?.map((img) => ({ data: img.data, mimeType: img.mimeType || 'image/jpeg' }));
+      const pipeImages = msg.images?.map((img) => ({
+        data: img.data,
+        mimeType: img.mimeType || 'image/jpeg',
+      }));
       // 与初始 user message 一致，给每条 piped 消息前置当前本地时间（#563 CR）。
-      const pipeText = `[当前时间: ${formatLocalNow()}]\n${msg.text}`;
+      // SDK 透传 slash 命令（如 `/compact <instructions>`）必须以 `/` 开头，
+      // 跳过时间前缀。半路 pipe `/compact` 到运行中 query 的 SDK 行为不确定
+      // （可能与正在生成的 assistant turn 冲突），保留原样透传，让 SDK 自行处理；
+      // 若 SDK 拒绝，会通过 pushToActive 的返回值反馈 rejected reason。
+      const isSlash = isSdkPassthroughSlashCommand(msg.text);
+      const pipeText = isSlash
+        ? msg.text
+        : `[当前时间: ${formatLocalNow()}]\n${msg.text}`;
+      if (isSlash) {
+        log(
+          `Pipe-in slash command detected, skipping time prefix: ${msg.text.slice(0, 40)}`,
+        );
+      }
       const rejected = engine.pushToActive(pipeText, pipeImages);
       for (const reason of rejected) {
-        emit({ status: 'success', result: `⚠️ ${reason}`, newSessionId: undefined });
+        emit({
+          status: 'success',
+          result: `⚠️ ${reason}`,
+          newSessionId: undefined,
+        });
       }
     }
   };
@@ -1309,23 +1683,84 @@ async function runQuery(
     suppressOutputAfterInterrupt = true;
     ipcPolling = false;
     ipcQueryWatcher.close();
-    return { newSessionId, closedDuringQuery, interruptedDuringQuery, pipedMessagesDuringQuery };
+    return {
+      newSessionId,
+      closedDuringQuery,
+      interruptedDuringQuery,
+      pipedMessagesDuringQuery,
+    };
   }
 
   // ── 启动引擎查询 ──
   pollIpcDuringQuery(); // 初始 drain
 
   const abortController = new AbortController();
+  let latestSuspectTruncatedTail: string | undefined;
+
+  const publishEngineResult = (engineResult: EngineSendResult): void => {
+    if (engineResult.newSessionId) newSessionId = engineResult.newSessionId;
+    resultCount++;
+
+    const finalText = engineResult.finalText || '';
+    const sdkUsage = engineResult.usage
+      ? {
+          input_tokens: engineResult.usage.inputTokens,
+          output_tokens: engineResult.usage.outputTokens,
+        }
+      : undefined;
+    const suspectTruncated =
+      emitOutput &&
+      !!finalText &&
+      isSuspectTruncatedStreamResult(sdkUsage, finalText.length);
+    const pendingBgTasks = emitOutput ? (engineResult.pendingBgTasks ?? 0) : 0;
+
+    if (suspectTruncated) {
+      latestSuspectTruncatedTail = finalText.slice(-200);
+      log(
+        `Result #${resultCount} suspected truncated stream (zero-usage success, ${finalText.length} chars), will auto-continue`,
+      );
+    } else if (pendingBgTasks === 0) {
+      latestSuspectTruncatedTail = undefined;
+    }
+
+    // Do not start the post-result shutdown timer while a Workflow/background
+    // task is alive. The Claude engine keeps consuming the same SDK iterator;
+    // its task notification will wake the model and produce a final summary.
+    resultReceivedAt = pendingBgTasks > 0 ? null : Date.now();
+
+    if (finalText || engineResult.finishReason === 'stop') {
+      emit({
+        status: 'success',
+        result: finalText,
+        newSessionId,
+        sdkMessageUuid: engineSession.engineState.lastAssistantUuid as
+          | string
+          | undefined,
+        sourceKind: sourceKindOverride ?? 'sdk_final',
+        finalizationReason: suspectTruncated ? 'truncated' : 'completed',
+        pendingBgTasks,
+      });
+      containerInput.turnId = generateTurnId();
+    }
+  };
+
   const generator = engine.sendMessage(
     engineSession,
     engineMessages,
     engineTools,
     engineAgents,
     abortController.signal,
-    { preCompact: async (event) => {
-      // PreCompact hook 已通过 engineConfig.extra.preCompactHook 注入引擎
-      // 此回调仅作通知（引擎内部会调用 SDK 的 PreCompact hook）
-    }},
+    {
+      preCompact: async (event) => {
+        // PreCompact hook 已通过 engineConfig.extra.preCompactHook 注入引擎
+        // 此回调仅作通知（引擎内部会调用 SDK 的 PreCompact hook）
+      },
+      onResult: emitOutput
+        ? async (engineResult) => {
+            publishEngineResult(engineResult);
+          }
+        : undefined,
+    },
   );
 
   try {
@@ -1342,11 +1777,19 @@ async function runQuery(
       // value 是 StreamEvent
       const evt = value as StreamEvent;
 
-      if (suppressOutputAfterInterrupt && evt.eventType !== 'init' && evt.eventType !== 'context_audit') {
+      if (
+        suppressOutputAfterInterrupt &&
+        evt.eventType !== 'init' &&
+        evt.eventType !== 'context_audit'
+      ) {
         continue;
       }
 
-      if (evt.eventType !== 'init' && evt.eventType !== 'context_audit' && evt.eventType !== 'status') {
+      if (
+        evt.eventType !== 'init' &&
+        evt.eventType !== 'context_audit' &&
+        evt.eventType !== 'status'
+      ) {
         visibleOutputStarted = true;
       }
 
@@ -1358,13 +1801,24 @@ async function runQuery(
         // 获取 context usage 并发射 context_audit
         try {
           const ctxUsage = await engine.getContextUsage(engineSession);
-          const contextAudit = enrichContextAudit(contextAuditBase, promptAudit, ctxUsage as any);
+          const contextAudit = enrichContextAudit(
+            contextAuditBase,
+            promptAudit,
+            ctxUsage as any,
+          );
           // 1M 上下文缩水告警
-          if (CLAUDE_MODEL.includes('[1m]') && ctxUsage && ctxUsage.maxTokens > 0 && ctxUsage.maxTokens < 900_000) {
+          if (
+            CLAUDE_MODEL.includes('[1m]') &&
+            ctxUsage &&
+            ctxUsage.maxTokens > 0 &&
+            ctxUsage.maxTokens < 900_000
+          ) {
             contextAudit.warnings.push(
               `上下文窗口仅 ${Math.round(ctxUsage.maxTokens / 1000)}K tokens（预期约 1M），1M 上下文可能未生效`,
             );
-            log(`[WARN] 1M context not active: maxTokens=${ctxUsage.maxTokens}`);
+            log(
+              `[WARN] 1M context not active: maxTokens=${ctxUsage.maxTokens}`,
+            );
           }
           emit({
             status: 'stream',
@@ -1372,22 +1826,30 @@ async function runQuery(
             streamEvent: {
               eventType: 'context_audit',
               agentScope: 'system',
-              displayLevel: contextAudit.warnings.length > 0 ? 'primary' : 'detail',
+              displayLevel:
+                contextAudit.warnings.length > 0 ? 'primary' : 'detail',
               title: 'Agent Context',
               summary: `${contextAudit.skills.includedSkills ?? contextAudit.skills.totalSkills ?? 0} skills · ${contextAudit.rules.fileCount} rules`,
               contextAudit,
             },
           });
         } catch (ctxErr) {
-          log(`[debug] getContextUsage failed: ${ctxErr instanceof Error ? ctxErr.message : String(ctxErr)}`);
-          const contextAudit = enrichContextAudit(contextAuditBase, promptAudit, undefined);
+          log(
+            `[debug] getContextUsage failed: ${ctxErr instanceof Error ? ctxErr.message : String(ctxErr)}`,
+          );
+          const contextAudit = enrichContextAudit(
+            contextAuditBase,
+            promptAudit,
+            undefined,
+          );
           emit({
             status: 'stream',
             result: null,
             streamEvent: {
               eventType: 'context_audit',
               agentScope: 'system',
-              displayLevel: contextAudit.warnings.length > 0 ? 'primary' : 'detail',
+              displayLevel:
+                contextAudit.warnings.length > 0 ? 'primary' : 'detail',
               title: 'Agent Context',
               summary: `${contextAudit.skills.includedSkills ?? 0} skills · ${contextAudit.rules.fileCount} rules`,
               contextAudit,
@@ -1407,7 +1869,9 @@ async function runQuery(
           result: null,
           streamEvent: evt,
         });
-        log(`Usage: input=${evt.usage?.inputTokens} output=${evt.usage?.outputTokens} cost=$${evt.usage?.costUSD} turns=${evt.usage?.numTurns}`);
+        log(
+          `Usage: input=${evt.usage?.inputTokens} output=${evt.usage?.outputTokens} cost=$${evt.usage?.costUSD} turns=${evt.usage?.numTurns}`,
+        );
       } else {
         emit({
           status: 'stream',
@@ -1444,7 +1908,7 @@ async function runQuery(
       // 上下文溢出
       if (hadContextOverflow) {
         log(`Context overflow detected in result`);
-        const partialText = engine.getActiveFullText?.() ?? "";
+        const partialText = engine.getActiveFullText?.() ?? '';
         if (partialText.trim()) {
           log(`Emitting overflow_partial with ${partialText.length} chars`);
           emit({
@@ -1478,43 +1942,10 @@ async function runQuery(
         };
       }
 
-      // 正常完成
-      resultCount++;
-
-      const finalText = finalResult.finalText;
-      // ── 截断指纹检测 + 后台任务数 ──
-      // 上游网关长文本生成中途断流时，SDK 收不到终结帧，把已缓冲的半截文本按
-      // subtype=success 收口（usage input/output tokens 双零）。此处检出后随
-      // finalizationReason='truncated' 送达主进程，并返回结尾片段交给会话循环
-      // 自动开续写 turn，否则半截回复会被当成完整回复交付（TG/Web 只见半截）。
-      // finalizationReason / pendingBgTasks 必须随本条 result 一起送达，事后补发
-      // 的 status 事件到达时卡片可能已定稿轮换，提示会被静默吞掉。
-      let suspectTruncatedTail: string | undefined;
-      const sdkUsage = finalResult.usage
-        ? { input_tokens: finalResult.usage.inputTokens, output_tokens: finalResult.usage.outputTokens }
-        : undefined;
-      const suspectTruncated =
-        emitOutput && !!finalText && isSuspectTruncatedStreamResult(sdkUsage, finalText.length);
-      const pendingBgTasks = emitOutput ? (finalResult.pendingBgTasks ?? 0) : 0;
-      if (suspectTruncated && finalText) {
-        log(`Result #${resultCount} suspected truncated stream (zero-usage success, ${finalText.length} chars), will auto-continue`);
-        suspectTruncatedTail = finalText.slice(-200);
-      }
-      resultReceivedAt = Date.now();
-
-      if (finalText || finalResult.finishReason === 'stop') {
-        emit({
-          status: 'success',
-          result: finalText,
-          newSessionId,
-          sdkMessageUuid: lastAssistantUuid,
-          sourceKind: sourceKindOverride ?? 'sdk_final',
-          finalizationReason: suspectTruncated ? 'truncated' : 'completed',
-          pendingBgTasks,
-        });
-        // turnId 轮转（与原逻辑一致）
-        containerInput.turnId = generateTurnId();
-      }
+      // ClaudeEngine reports every SDK turn through onResult so a Workflow can
+      // remain alive between its intermediate and final summaries. OpenAI (and
+      // direct engine callers) still use the generator's ordinary return value.
+      if (!finalResult.reported) publishEngineResult(finalResult);
 
       return {
         newSessionId,
@@ -1522,14 +1953,16 @@ async function runQuery(
         closedDuringQuery,
         interruptedDuringQuery,
         pipedMessagesDuringQuery,
-        suspectTruncatedTail,
+        suspectTruncatedTail: latestSuspectTruncatedTail,
       };
     }
 
     // 无 finalResult
     return {
       newSessionId,
-      lastAssistantUuid: engineSession.engineState.lastAssistantUuid as string | undefined,
+      lastAssistantUuid: engineSession.engineState.lastAssistantUuid as
+        | string
+        | undefined,
       closedDuringQuery,
       interruptedDuringQuery,
       pipedMessagesDuringQuery,
@@ -1540,9 +1973,11 @@ async function runQuery(
     // 上下文溢出
     if (isContextOverflowError(errorMessage)) {
       log(`Context overflow detected: ${errorMessage}`);
-      const partialText = engine.getActiveFullText?.() ?? "";
+      const partialText = engine.getActiveFullText?.() ?? '';
       if (partialText.trim()) {
-        log(`Emitting overflow_partial (catch) with ${partialText.length} chars`);
+        log(
+          `Emitting overflow_partial (catch) with ${partialText.length} chars`,
+        );
         emit({
           status: 'success',
           result: partialText,
@@ -1551,38 +1986,86 @@ async function runQuery(
           finalizationReason: 'error',
         });
       }
-      return { newSessionId, lastAssistantUuid: engineSession.engineState.lastAssistantUuid as string | undefined, closedDuringQuery, contextOverflow: true, interruptedDuringQuery, pipedMessagesDuringQuery };
+      return {
+        newSessionId,
+        lastAssistantUuid: engineSession.engineState.lastAssistantUuid as
+          | string
+          | undefined,
+        closedDuringQuery,
+        contextOverflow: true,
+        interruptedDuringQuery,
+        pipedMessagesDuringQuery,
+      };
     }
 
     // 不可恢复转录错误
     if (isUnrecoverableTranscriptError(errorMessage)) {
       log(`Unrecoverable transcript error: ${errorMessage}`);
-      return { newSessionId, lastAssistantUuid: engineSession.engineState.lastAssistantUuid as string | undefined, closedDuringQuery, unrecoverableTranscriptError: true, interruptedDuringQuery, pipedMessagesDuringQuery };
+      return {
+        newSessionId,
+        lastAssistantUuid: engineSession.engineState.lastAssistantUuid as
+          | string
+          | undefined,
+        closedDuringQuery,
+        unrecoverableTranscriptError: true,
+        interruptedDuringQuery,
+        pipedMessagesDuringQuery,
+      };
     }
 
     // 中断导致的错误（non-fatal）
     if (interruptedDuringQuery) {
       log(`runQuery error during interrupt (non-fatal): ${errorMessage}`);
-      return { newSessionId, lastAssistantUuid: engineSession.engineState.lastAssistantUuid as string | undefined, closedDuringQuery, interruptedDuringQuery, pipedMessagesDuringQuery };
+      return {
+        newSessionId,
+        lastAssistantUuid: engineSession.engineState.lastAssistantUuid as
+          | string
+          | undefined,
+        closedDuringQuery,
+        interruptedDuringQuery,
+        pipedMessagesDuringQuery,
+      };
     }
 
     // Shutdown 触发的 interrupt
     if (postResultInterruptRequested) {
-      log(`runQuery error after shutdown interrupt (non-fatal): ${errorMessage}`);
-      return { newSessionId, lastAssistantUuid: engineSession.engineState.lastAssistantUuid as string | undefined, closedDuringQuery, interruptedDuringQuery, pipedMessagesDuringQuery };
+      log(
+        `runQuery error after shutdown interrupt (non-fatal): ${errorMessage}`,
+      );
+      return {
+        newSessionId,
+        lastAssistantUuid: engineSession.engineState.lastAssistantUuid as
+          | string
+          | undefined,
+        closedDuringQuery,
+        interruptedDuringQuery,
+        pipedMessagesDuringQuery,
+      };
     }
 
     // 已发射结果后的 SDK 异常
     if (resultCount > 0) {
-      log(`runQuery post-result SDK error (non-fatal, ${resultCount} result(s) already emitted): ${errorMessage}`);
+      log(
+        `runQuery post-result SDK error (non-fatal, ${resultCount} result(s) already emitted): ${errorMessage}`,
+      );
       if (err instanceof Error && err.stack) {
         log(`runQuery post-result error stack:\n${err.stack}`);
       }
-      return { newSessionId, lastAssistantUuid: engineSession.engineState.lastAssistantUuid as string | undefined, closedDuringQuery, interruptedDuringQuery, pipedMessagesDuringQuery };
+      return {
+        newSessionId,
+        lastAssistantUuid: engineSession.engineState.lastAssistantUuid as
+          | string
+          | undefined,
+        closedDuringQuery,
+        interruptedDuringQuery,
+        pipedMessagesDuringQuery,
+      };
     }
 
     // 其他错误
-    log(`runQuery error [${(err as NodeJS.ErrnoException).code ?? 'unknown'}]: ${errorMessage}`);
+    log(
+      `runQuery error [${(err as NodeJS.ErrnoException).code ?? 'unknown'}]: ${errorMessage}`,
+    );
     if (err instanceof Error && err.stack) {
       log(`runQuery error stack:\n${err.stack}`);
     }
@@ -1596,7 +2079,9 @@ async function runQuery(
 function forceExitWithSafetyNet(code: number): never {
   log(`Exiting with code ${code}, SIGKILL safety net in 5s`);
   setTimeout(() => {
-    console.error('[agent-runner] process.exit() did not terminate, forcing SIGKILL');
+    console.error(
+      '[agent-runner] process.exit() did not terminate, forcing SIGKILL',
+    );
     process.kill(process.pid, 'SIGKILL');
   }, 5000);
   process.exit(code);
@@ -1613,7 +2098,7 @@ async function main(): Promise<void> {
     writeOutput({
       status: 'error',
       result: null,
-      error: `Failed to parse input: ${err instanceof Error ? err.message : String(err)}`
+      error: `Failed to parse input: ${err instanceof Error ? err.message : String(err)}`,
     });
     process.exit(1);
   }
@@ -1623,7 +2108,8 @@ async function main(): Promise<void> {
   const { isHome, isAdminHome } = normalizeHomeFlags(containerInput);
 
   // 禁用 HappyClaw 记忆层：不注册 memory MCP 工具，让 Agent 按用户本机 Playbook 行事
-  const disableMemoryLayer = process.env.HAPPYCLAW_DISABLE_MEMORY_LAYER === 'true';
+  const disableMemoryLayer =
+    process.env.HAPPYCLAW_DISABLE_MEMORY_LAYER === 'true';
 
   // Create in-process SDK MCP server (replaces the stdio subprocess)
   // NOTE: chatJid and currentTaskId are mutated in-place by the main loop
@@ -1650,8 +2136,13 @@ async function main(): Promise<void> {
   // ── AgentEngine: 根据 HAPPYCLAW_ENGINE_TYPE 环境变量选择引擎 + 转换 MCP 工具为通用格式 ──
   // 主服务 (src/container-runner.ts) 会根据选中 Provider 的 engineType 注入该 env,
   // 缺省或 anthropic 走 ClaudeEngine, openai 走 OpenAIEngine.
-  const engine = createEngine({ claudeOptions: { logFn: log }, openaiOptions: { logFn: log } });
-  log(`AgentEngine 选择: ${engine.engineType} (env HAPPYCLAW_ENGINE_TYPE=${process.env.HAPPYCLAW_ENGINE_TYPE || '(none)'})`);
+  const engine = createEngine({
+    claudeOptions: { logFn: log },
+    openaiOptions: { logFn: log },
+  });
+  log(
+    `AgentEngine 选择: ${engine.engineType} (env HAPPYCLAW_ENGINE_TYPE=${process.env.HAPPYCLAW_ENGINE_TYPE || '(none)'})`,
+  );
 
   // 将 SDK MCP 工具转换为 EngineToolDefinition 通用格式
   const buildEngineTools = (): EngineToolDefinition[] => {
@@ -1662,7 +2153,11 @@ async function main(): Promise<void> {
       inputSchema: t.inputSchema,
       handler: async (input: Record<string, unknown>) => {
         const result = await t.handler(input);
-        const text = result.content?.filter((c: any) => c.type === 'text').map((c: any) => c.text).join('') ?? '';
+        const text =
+          result.content
+            ?.filter((c: any) => c.type === 'text')
+            .map((c: any) => c.text)
+            .join('') ?? '';
         return { content: text, isError: result.isError };
       },
     }));
@@ -1690,7 +2185,10 @@ async function main(): Promise<void> {
       .filter((n) => !MEMORY_FLUSH_KEEP_MCP.has(n)),
   ];
 
-  const memoryRecallPrompt = buildMemoryRecallPrompt(isHome, disableMemoryLayer);
+  const memoryRecallPrompt = buildMemoryRecallPrompt(
+    isHome,
+    disableMemoryLayer,
+  );
   fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
 
   // Clean up stale sentinels from previous container runs.
@@ -1699,7 +2197,11 @@ async function main(): Promise<void> {
   // A _drain present at startup was written by registerProcess() for the
   // CURRENT run (indicating pending messages arrived during container boot).
   // Deleting it here causes those messages to be silently lost (#xxx).
-  try { fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL); } catch { /* ignore */ }
+  try {
+    fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL);
+  } catch {
+    /* ignore */
+  }
   cleanupStartupInterruptSentinel();
 
   // Build initial prompt (drain any pending IPC messages too)
@@ -1720,7 +2222,9 @@ async function main(): Promise<void> {
   }
   const pendingDrain = drainIpcInput();
   if (pendingDrain.messages.length > 0) {
-    log(`Draining ${pendingDrain.messages.length} pending IPC messages into initial prompt`);
+    log(
+      `Draining ${pendingDrain.messages.length} pending IPC messages into initial prompt`,
+    );
     prompt += '\n' + pendingDrain.messages.map((m) => m.text).join('\n');
     const pendingImages = pendingDrain.messages.flatMap((m) => m.images || []);
     if (pendingImages.length > 0) {
@@ -1730,7 +2234,24 @@ async function main(): Promise<void> {
     // override the startup chatJid so per-channel MCP tools see it correctly.
     for (let i = pendingDrain.messages.length - 1; i >= 0; i--) {
       const sj = pendingDrain.messages[i].sourceJid;
-      if (sj) { mcpToolsConfig.chatJid = sj; break; }
+      if (sj) {
+        mcpToolsConfig.chatJid = sj;
+        break;
+      }
+    }
+    // Likewise carry the task identity. A group-mode scheduled task injected
+    // into this cold-start window (process registered, SDK transport not yet
+    // ready) arrives via IPC with a taskId; without propagating it here the
+    // first query's send_message would route as a non-task message and the task
+    // notify would be lost (#559, on the boot-drain path the piped-message
+    // taskId plumbing doesn't cover). Only override when a taskId is present so
+    // a plain message in the batch doesn't wipe the startup messageTaskId.
+    for (let i = pendingDrain.messages.length - 1; i >= 0; i--) {
+      const tid = pendingDrain.messages[i].taskId;
+      if (tid) {
+        mcpToolsConfig.currentTaskId = tid;
+        break;
+      }
     }
   }
 
@@ -1751,7 +2272,11 @@ async function main(): Promise<void> {
       // 清理残留的 _interrupt sentinel（空闲期间写入的中断信号不应影响下一次 query）。
       // 注意：_drain 不在此处清理 — 如果 _drain 存在，说明有待处理的消息，
       // pollIpcDuringQuery 会在查询结果后检测到并正确退出容器。
-      try { fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL); } catch { /* ignore */ }
+      try {
+        fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL);
+      } catch {
+        /* ignore */
+      }
       clearInterruptRequested();
 
       // 消费 auto-continue 阶段暂存的 history context（如果存在）。
@@ -1760,11 +2285,15 @@ async function main(): Promise<void> {
       // 提取的最近对话历史，需在 fresh session 启动前注入到 prompt 前面。
       if (pendingHistoryContext) {
         prompt = pendingHistoryContext + prompt;
-        log('Injected pending session history context (from auto-continue resume failure) into prompt');
+        log(
+          'Injected pending session history context (from auto-continue resume failure) into prompt',
+        );
         pendingHistoryContext = null;
       }
 
-      log(`Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`);
+      log(
+        `Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`,
+      );
 
       const queryResult = await runQuery(
         prompt,
@@ -1792,13 +2321,17 @@ async function main(): Promise<void> {
       // 同时从旧会话的 JSONL 转录中提取最近对话历史，注入到 prompt 中，
       // 避免新会话完全丢失上下文（类似 recoveryGroups 机制）。
       if (queryResult.sessionResumeFailed) {
-        log(`Session resume failed, retrying with fresh session (old: ${sessionId})`);
+        log(
+          `Session resume failed, retrying with fresh session (old: ${sessionId})`,
+        );
         // Extract recent history from the old session transcript before clearing
         if (sessionId) {
           const historyContext = extractSessionHistory(sessionId);
           if (historyContext) {
             prompt = historyContext + prompt;
-            log(`Injected session history context into prompt for fresh session retry`);
+            log(
+              `Injected session history context into prompt for fresh session retry`,
+            );
           }
         }
         sessionId = undefined;
@@ -1808,7 +2341,12 @@ async function main(): Promise<void> {
         // Rebuild MCP server to avoid "Already connected to a transport" error
         engineTools = buildEngineTools();
         engineSession = await engine.createSession(
-          { model: CLAUDE_MODEL, baseUrl: '', apiKey: '', cwd: WORKSPACE_GROUP },
+          {
+            model: CLAUDE_MODEL,
+            baseUrl: '',
+            apiKey: '',
+            cwd: WORKSPACE_GROUP,
+          },
           undefined,
         );
         continue;
@@ -1818,7 +2356,8 @@ async function main(): Promise<void> {
 
       // 不可恢复的转录错误（如超大图片或 MIME 错配被固化在会话历史中）
       if (queryResult.unrecoverableTranscriptError) {
-        const errorMsg = '会话历史中包含无法处理的数据（如超大图片或图片 MIME 错配），会话需要重置。';
+        const errorMsg =
+          '会话历史中包含无法处理的数据（如超大图片或图片 MIME 错配），会话需要重置。';
         log(`Unrecoverable transcript error, signaling session reset`);
         writeOutput({
           status: 'error',
@@ -1832,7 +2371,9 @@ async function main(): Promise<void> {
       // 检查上下文溢出
       if (queryResult.contextOverflow) {
         overflowRetryCount++;
-        log(`Context overflow detected, retry ${overflowRetryCount}/${MAX_OVERFLOW_RETRIES}`);
+        log(
+          `Context overflow detected, retry ${overflowRetryCount}/${MAX_OVERFLOW_RETRIES}`,
+        );
 
         if (overflowRetryCount >= MAX_OVERFLOW_RETRIES) {
           const errorMsg = `上下文溢出错误：已重试 ${MAX_OVERFLOW_RETRIES} 次仍失败。请联系管理员检查 CLAUDE.md 大小或减少会话历史。`;
@@ -1847,8 +2388,10 @@ async function main(): Promise<void> {
         }
 
         // 未超过重试次数，等待后继续下一轮循环（会触发自动压缩）
-        log('Retrying query after context overflow (will trigger auto-compaction)...');
-        await new Promise(r => setTimeout(r, 3000));
+        log(
+          'Retrying query after context overflow (will trigger auto-compaction)...',
+        );
+        await new Promise((r) => setTimeout(r, 3000));
         continue;
       }
 
@@ -1877,11 +2420,19 @@ async function main(): Promise<void> {
           status: 'stream',
           result: null,
           streamEvent: { eventType: 'status', statusText: 'interrupted' },
-          newSessionId: sessionId,  // 确保主进程持久化 session ID
+          newSessionId: sessionId, // 确保主进程持久化 session ID
         });
         // 清理可能残留的 _interrupt / _drain 文件
-        try { fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL); } catch { /* ignore */ }
-        try { fs.unlinkSync(IPC_INPUT_DRAIN_SENTINEL); } catch { /* ignore */ }
+        try {
+          fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL);
+        } catch {
+          /* ignore */
+        }
+        try {
+          fs.unlinkSync(IPC_INPUT_DRAIN_SENTINEL);
+        } catch {
+          /* ignore */
+        }
         clearInterruptRequested();
         consecutiveCompactions = 0;
 
@@ -1890,13 +2441,24 @@ async function main(): Promise<void> {
         // 正常路径走下一个 query，避免 MCP server "Already connected" 问题 (#421)。
         if (queryResult.pipedMessagesDuringQuery.length > 0) {
           const piped = queryResult.pipedMessagesDuringQuery;
-          log(`Query interrupted; re-enqueueing ${piped.length} queued message(s) to IPC`);
+          log(
+            `Query interrupted; re-enqueueing ${piped.length} queued message(s) to IPC`,
+          );
           for (const msg of piped) {
             const filename = `${Date.now()}-requeue-${Math.random().toString(36).slice(2, 8)}.json`;
             const filepath = path.join(IPC_INPUT_DIR, filename);
             const tempPath = `${filepath}.tmp`;
             try {
-              fs.writeFileSync(tempPath, JSON.stringify({ type: 'message', text: msg.text, images: msg.images }));
+              fs.writeFileSync(
+                tempPath,
+                JSON.stringify({
+                  type: 'message',
+                  text: msg.text,
+                  images: msg.images,
+                  taskId: msg.taskId,
+                  sourceJid: msg.sourceJid,
+                }),
+              );
               fs.renameSync(tempPath, filepath);
             } catch (err) {
               log(`Failed to re-enqueue piped message: ${err}`);
@@ -1910,7 +2472,11 @@ async function main(): Promise<void> {
         if (nextMessage === null) {
           log('Close sentinel received after interrupt, exiting');
           // 退出前发送 session 更新，确保主进程持久化最新 session ID
-          writeOutput({ status: 'success', result: null, newSessionId: sessionId });
+          writeOutput({
+            status: 'success',
+            result: null,
+            newSessionId: sessionId,
+          });
           break;
         }
         prompt = nextMessage.text;
@@ -1919,12 +2485,18 @@ async function main(): Promise<void> {
         // See main-loop comment: reset task attribution for this new turn.
         mcpToolsConfig.currentTaskId = nextMessage.taskId ?? null;
         // Update chatJid so per-channel MCP tools see the correct incoming chat.
-        if (nextMessage.sourceJid) mcpToolsConfig.chatJid = nextMessage.sourceJid;
+        if (nextMessage.sourceJid)
+          mcpToolsConfig.chatJid = nextMessage.sourceJid;
         // Rebuild MCP server to avoid "Already connected to a transport" error
         // when the previous query was aborted mid-stream (#421).
         engineTools = buildEngineTools();
         engineSession = await engine.createSession(
-          { model: CLAUDE_MODEL, baseUrl: '', apiKey: '', cwd: WORKSPACE_GROUP },
+          {
+            model: CLAUDE_MODEL,
+            baseUrl: '',
+            apiKey: '',
+            cwd: WORKSPACE_GROUP,
+          },
           undefined,
         );
         continue;
@@ -1959,8 +2531,12 @@ async function main(): Promise<void> {
           MEMORY_FLUSH_ALLOWED_TOOLS,
           memoryFlushDisallowedTools,
         );
-        if (flushResult.newSessionId) { sessionId = flushResult.newSessionId; latestSessionId = sessionId; }
-        if (flushResult.lastAssistantUuid) resumeAt = flushResult.lastAssistantUuid;
+        if (flushResult.newSessionId) {
+          sessionId = flushResult.newSessionId;
+          latestSessionId = sessionId;
+        }
+        if (flushResult.lastAssistantUuid)
+          resumeAt = flushResult.lastAssistantUuid;
         log('Memory flush completed');
 
         if (flushResult.closedDuringQuery) {
@@ -1991,7 +2567,9 @@ async function main(): Promise<void> {
         consecutiveCompactions++;
         if (consecutiveCompactions <= MAX_CONSECUTIVE_COMPACTIONS) {
           ranCompactionContinue = true;
-          log(`Auto-continuing after compaction (${consecutiveCompactions}/${MAX_CONSECUTIVE_COMPACTIONS})`);
+          log(
+            `Auto-continuing after compaction (${consecutiveCompactions}/${MAX_CONSECUTIVE_COMPACTIONS})`,
+          );
           const autoContinuePrompt = [
             '继续。',
             '注意：刚刚发生了上下文压缩，系统已自动执行了记忆刷新和 CLAUDE.md 更新（这些是内部维护操作）。',
@@ -2030,12 +2608,16 @@ async function main(): Promise<void> {
             break;
           }
           if (autoContResult.sessionResumeFailed) {
-            log('WARN: Session resume failed during auto-continue, clearing session');
+            log(
+              'WARN: Session resume failed during auto-continue, clearing session',
+            );
             if (sessionId) {
               const historyContext = extractSessionHistory(sessionId);
               if (historyContext) {
                 pendingHistoryContext = historyContext;
-                log('Stashed session history context for next user-initiated query');
+                log(
+                  'Stashed session history context for next user-initiated query',
+                );
               }
             }
             sessionId = undefined;
@@ -2043,33 +2625,49 @@ async function main(): Promise<void> {
             resumeAt = undefined;
             engineTools = buildEngineTools();
             engineSession = await engine.createSession(
-              { model: CLAUDE_MODEL, baseUrl: '', apiKey: '', cwd: WORKSPACE_GROUP },
+              {
+                model: CLAUDE_MODEL,
+                baseUrl: '',
+                apiKey: '',
+                cwd: WORKSPACE_GROUP,
+              },
               undefined,
             );
           }
           if (autoContResult.unrecoverableTranscriptError) {
-            log('WARN: Unrecoverable transcript error during auto-continue, signaling reset');
+            log(
+              'WARN: Unrecoverable transcript error during auto-continue, signaling reset',
+            );
             writeOutput({
               status: 'error',
               result: null,
-              error: 'unrecoverable_transcript: 会话历史中包含无法处理的数据，会话需要重置。',
+              error:
+                'unrecoverable_transcript: 会话历史中包含无法处理的数据，会话需要重置。',
               newSessionId: sessionId,
             });
             process.exit(1);
           }
           if (autoContResult.contextOverflow) {
-            log('WARN: Context overflow during auto-continue, will be handled on next query');
+            log(
+              'WARN: Context overflow during auto-continue, will be handled on next query',
+            );
             // Don't retry here — the main loop's overflow-retry logic will
             // kick in on the next user-initiated query.
           }
           if (autoContResult.interruptedDuringQuery) {
             log('WARN: Auto-continue query was interrupted by user');
             resumeAt = undefined;
-            try { fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL); } catch { /* ignore */ }
+            try {
+              fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL);
+            } catch {
+              /* ignore */
+            }
           }
           // After auto-continue, fall through to wait for next IPC message.
         } else {
-          log(`Compaction loop detected (${consecutiveCompactions} consecutive), stopping auto-continue and waiting for user input`);
+          log(
+            `Compaction loop detected (${consecutiveCompactions} consecutive), stopping auto-continue and waiting for user input`,
+          );
           consecutiveCompactions = 0;
         }
       } else {
@@ -2083,13 +2681,17 @@ async function main(): Promise<void> {
       // 半截回复会被当成完整回复交付，TG/Web 只见半截。
       // 上限 2 次防止网关持续断流时无限烧 token；压缩 auto-continue 本轮已跑过
       // 新 query 时跳过（模型已经继续过了）。
-      let truncatedTail = ranCompactionContinue ? undefined : queryResult.suspectTruncatedTail;
+      let truncatedTail = ranCompactionContinue
+        ? undefined
+        : queryResult.suspectTruncatedTail;
       let truncationContinues = 0;
       const MAX_TRUNCATION_CONTINUES = 2;
       let closedDuringTruncationContinue = false;
       while (truncatedTail && truncationContinues < MAX_TRUNCATION_CONTINUES) {
         truncationContinues++;
-        log(`Auto-continuing after suspected truncated stream (${truncationContinues}/${MAX_TRUNCATION_CONTINUES})`);
+        log(
+          `Auto-continuing after suspected truncated stream (${truncationContinues}/${MAX_TRUNCATION_CONTINUES})`,
+        );
         const truncationContinuePrompt = [
           '你的上一条回复在生成过程中被上游截断，用户看到的内容在以下结尾处戛然而止：',
           '```',
@@ -2117,19 +2719,24 @@ async function main(): Promise<void> {
           sessionId = contResult.newSessionId;
           latestSessionId = sessionId;
         }
-        if (contResult.lastAssistantUuid) resumeAt = contResult.lastAssistantUuid;
+        if (contResult.lastAssistantUuid)
+          resumeAt = contResult.lastAssistantUuid;
         if (contResult.closedDuringQuery) {
           closedDuringTruncationContinue = true;
           break;
         }
         if (contResult.sessionResumeFailed) {
           // 同压缩 auto-continue 的处理：清 session 暂存历史，停止续写等下一条消息
-          log('WARN: Session resume failed during truncation-continue, clearing session');
+          log(
+            'WARN: Session resume failed during truncation-continue, clearing session',
+          );
           if (sessionId) {
             const historyContext = extractSessionHistory(sessionId);
             if (historyContext) {
               pendingHistoryContext = historyContext;
-              log('Stashed session history context for next user-initiated query');
+              log(
+                'Stashed session history context for next user-initiated query',
+              );
             }
           }
           sessionId = undefined;
@@ -2137,17 +2744,25 @@ async function main(): Promise<void> {
           resumeAt = undefined;
           engineTools = buildEngineTools();
           engineSession = await engine.createSession(
-            { model: CLAUDE_MODEL, baseUrl: '', apiKey: '', cwd: WORKSPACE_GROUP },
+            {
+              model: CLAUDE_MODEL,
+              baseUrl: '',
+              apiKey: '',
+              cwd: WORKSPACE_GROUP,
+            },
             undefined,
           );
           break;
         }
         if (contResult.unrecoverableTranscriptError) {
-          log('WARN: Unrecoverable transcript error during truncation-continue, signaling reset');
+          log(
+            'WARN: Unrecoverable transcript error during truncation-continue, signaling reset',
+          );
           writeOutput({
             status: 'error',
             result: null,
-            error: 'unrecoverable_transcript: 会话历史中包含无法处理的数据，会话需要重置。',
+            error:
+              'unrecoverable_transcript: 会话历史中包含无法处理的数据，会话需要重置。',
             newSessionId: sessionId,
           });
           process.exit(1);
@@ -2155,7 +2770,11 @@ async function main(): Promise<void> {
         if (contResult.interruptedDuringQuery) {
           log('WARN: Truncation-continue query was interrupted by user');
           resumeAt = undefined;
-          try { fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL); } catch { /* ignore */ }
+          try {
+            fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL);
+          } catch {
+            /* ignore */
+          }
           break;
         }
         // 续写本身又被截断 → 带新结尾再续，直到写完或触顶
@@ -2169,7 +2788,9 @@ async function main(): Promise<void> {
       if (truncatedTail) {
         // 续写触顶仍被断流 / 会话恢复失败等无法继续 → 发出机器状态标记，
         // 主进程据此把挂起中的卡片收口，不再等一个不会来的 healthy result。
-        log('Truncation-continue exhausted, signaling host to finalize held card');
+        log(
+          'Truncation-continue exhausted, signaling host to finalize held card',
+        );
         writeOutput({
           status: 'stream',
           result: null,
@@ -2190,7 +2811,9 @@ async function main(): Promise<void> {
         break;
       }
 
-      log(`Got new message (${nextMessage.text.length} chars, ${nextMessage.images?.length || 0} images), starting new query`);
+      log(
+        `Got new message (${nextMessage.text.length} chars, ${nextMessage.images?.length || 0} images), starting new query`,
+      );
       prompt = nextMessage.text;
       promptImages = nextMessage.images;
       containerInput.turnId = generateTurnId();
@@ -2210,19 +2833,25 @@ async function main(): Promise<void> {
       log(`Agent error stack:\n${err.stack}`);
     }
     // Log cause chain for SDK-wrapped errors (e.g. EPIPE from internal claude CLI)
-    const cause = err instanceof Error ? (err as NodeJS.ErrnoException & { cause?: unknown }).cause : undefined;
+    const cause =
+      err instanceof Error
+        ? (err as NodeJS.ErrnoException & { cause?: unknown }).cause
+        : undefined;
     if (cause) {
-      const causeMsg = cause instanceof Error ? cause.stack || cause.message : String(cause);
+      const causeMsg =
+        cause instanceof Error ? cause.stack || cause.message : String(cause);
       log(`Agent error cause:\n${causeMsg}`);
     }
-    log(`Agent error errno: ${(err as NodeJS.ErrnoException).code ?? 'none'} exitCode: ${process.exitCode ?? 'none'}`);
+    log(
+      `Agent error errno: ${(err as NodeJS.ErrnoException).code ?? 'none'} exitCode: ${process.exitCode ?? 'none'}`,
+    );
     // 不在 error output 中携带 sessionId：
     // 流式输出已通过 onOutput 回调传递了有效的 session 更新。
     // 如果这里携带的是 throw 前的旧 sessionId，会覆盖中间成功产生的新 session。
     writeOutput({
       status: 'error',
       result: null,
-      error: errorMessage
+      error: errorMessage,
     });
     forceExitWithSafetyNet(1);
   }
@@ -2239,12 +2868,18 @@ async function main(): Promise<void> {
 }
 
 // 处理管道断开（EPIPE）：父进程关闭管道后仍有写入时，静默退出避免 code 1 错误输出
-(process.stdout as NodeJS.WriteStream & NodeJS.EventEmitter).on('error', (err: NodeJS.ErrnoException) => {
-  if (err.code === 'EPIPE') process.exit(0);
-});
-(process.stderr as NodeJS.WriteStream & NodeJS.EventEmitter).on('error', (err: NodeJS.ErrnoException) => {
-  if (err.code === 'EPIPE') process.exit(0);
-});
+(process.stdout as NodeJS.WriteStream & NodeJS.EventEmitter).on(
+  'error',
+  (err: NodeJS.ErrnoException) => {
+    if (err.code === 'EPIPE') process.exit(0);
+  },
+);
+(process.stderr as NodeJS.WriteStream & NodeJS.EventEmitter).on(
+  'error',
+  (err: NodeJS.ErrnoException) => {
+    if (err.code === 'EPIPE') process.exit(0);
+  },
+);
 
 /**
  * 某些 SDK/底层 socket 会在管道断开后触发未捕获 EPIPE。
@@ -2257,8 +2892,14 @@ process.on('SIGTERM', () => {
   // Without this, the host starts a fresh session on restart, losing context.
   if (latestSessionId) {
     try {
-      writeOutput({ status: 'success', result: null, newSessionId: latestSessionId });
-    } catch { /* stdout may be closed */ }
+      writeOutput({
+        status: 'success',
+        result: null,
+        newSessionId: latestSessionId,
+      });
+    } catch {
+      /* stdout may be closed */
+    }
   }
   forceExitWithSafetyNet(0);
 });
@@ -2279,7 +2920,11 @@ process.on('uncaughtException', (err: unknown) => {
   }
   console.error('Uncaught exception:', err);
   // 尝试输出结构化错误，让主进程能收到错误信息而非仅看到 exit code 1
-  try { writeOutput({ status: 'error', result: null, error: String(err) }); } catch { /* ignore */ }
+  try {
+    writeOutput({ status: 'error', result: null, error: String(err) });
+  } catch {
+    /* ignore */
+  }
   process.exit(1);
 });
 

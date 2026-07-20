@@ -95,6 +95,7 @@ import { parseOAuthUsageBucket } from '../runtime-config.js';
 import type { AuthUser, RegisteredGroup } from '../types.js';
 import { hasPermission } from '../permissions.js';
 import { logger } from '../logger.js';
+import { testFeishuCredentials } from '../feishu-connectivity.js';
 import {
   checkImChannelLimit,
   isBillingEnabled,
@@ -443,7 +444,8 @@ configRoutes.patch(
           (validation.data.anthropicModel !== undefined &&
             validation.data.anthropicModel !== previous.anthropicModel) ||
           (validation.data.engineType !== undefined &&
-            validation.data.engineType !== (previous.engineType || 'anthropic')))
+            validation.data.engineType !==
+              (previous.engineType || 'anthropic')))
       );
       appendClaudeConfigAudit(actor, 'update_provider', [
         `id:${id}`,
@@ -461,9 +463,7 @@ configRoutes.patch(
             providerId: id,
             protocolFieldChanged,
           },
-          protocolFieldChanged
-            ? { clearSessionsForProviderId: id }
-            : undefined,
+          protocolFieldChanged ? { clearSessionsForProviderId: id } : undefined,
         );
       }
 
@@ -566,8 +566,7 @@ configRoutes.delete(
       // Sessions sticky-bound to a now-gone provider can never resume cleanly
       // (their transcripts belong to that upstream). Drop the bindings and evict
       // the in-memory session cache so the next turn starts fresh on a live one.
-      const { deletedCount, affectedFolders } =
-        deleteSessionsByProviderId(id);
+      const { deletedCount, affectedFolders } = deleteSessionsByProviderId(id);
       if (deps) {
         for (const folder of affectedFolders) delete deps.sessions[folder];
       }
@@ -1330,70 +1329,91 @@ configRoutes.put(
 
 // ─── External Claude resources (admin only) ─────────────────────────
 
-configRoutes.get('/external-resources', authMiddleware, systemConfigMiddleware, (c) => {
-  // 仅 admin 可查看宿主机资源，普通用户不允许看到宿主机任何内容
-  const user = c.get('user') as AuthUser;
-  if (user.role !== 'admin') {
-    return c.json({ dir: '', rules: [], claudeMd: null });
-  }
-  const effectiveDir = getEffectiveExternalDir();
+configRoutes.get(
+  '/external-resources',
+  authMiddleware,
+  systemConfigMiddleware,
+  (c) => {
+    // 仅 admin 可查看宿主机资源，普通用户不允许看到宿主机任何内容
+    const user = c.get('user') as AuthUser;
+    if (user.role !== 'admin') {
+      return c.json({ dir: '', rules: [], claudeMd: null });
+    }
+    const effectiveDir = getEffectiveExternalDir();
 
-  const result: {
-    dir: string;
-    rules: Array<{ name: string; size: number }>;
-    claudeMd: string | null;
-  } = { dir: effectiveDir, rules: [], claudeMd: null };
+    const result: {
+      dir: string;
+      rules: Array<{ name: string; size: number }>;
+      claudeMd: string | null;
+    } = { dir: effectiveDir, rules: [], claudeMd: null };
 
-  // Rules
-  const rulesDir = path.join(effectiveDir, 'rules');
-  try {
-    if (fs.existsSync(rulesDir)) {
-      for (const entry of fs.readdirSync(rulesDir, { withFileTypes: true })) {
-        if (!entry.isFile() && !entry.isSymbolicLink()) continue;
-        try {
-          const st = fs.statSync(path.join(rulesDir, entry.name));
-          result.rules.push({ name: entry.name, size: st.size });
-        } catch { /* skip */ }
+    // Rules
+    const rulesDir = path.join(effectiveDir, 'rules');
+    try {
+      if (fs.existsSync(rulesDir)) {
+        for (const entry of fs.readdirSync(rulesDir, { withFileTypes: true })) {
+          if (!entry.isFile() && !entry.isSymbolicLink()) continue;
+          try {
+            const st = fs.statSync(path.join(rulesDir, entry.name));
+            result.rules.push({ name: entry.name, size: st.size });
+          } catch {
+            /* skip */
+          }
+        }
       }
+    } catch {
+      /* ignore */
     }
-  } catch { /* ignore */ }
 
-  // CLAUDE.md
-  const claudeMdPath = path.join(effectiveDir, 'CLAUDE.md');
-  try {
-    if (fs.existsSync(claudeMdPath)) {
-      const content = fs.readFileSync(claudeMdPath, 'utf-8');
-      result.claudeMd = content.length > 10000 ? content.slice(0, 10000) + '\n...(截断)' : content;
+    // CLAUDE.md
+    const claudeMdPath = path.join(effectiveDir, 'CLAUDE.md');
+    try {
+      if (fs.existsSync(claudeMdPath)) {
+        const content = fs.readFileSync(claudeMdPath, 'utf-8');
+        result.claudeMd =
+          content.length > 10000
+            ? content.slice(0, 10000) + '\n...(截断)'
+            : content;
+      }
+    } catch {
+      /* ignore */
     }
-  } catch { /* ignore */ }
 
-  return c.json(result);
-});
+    return c.json(result);
+  },
+);
 
 // Read a single rule file content (admin only)
-configRoutes.get('/external-resources/rule', authMiddleware, systemConfigMiddleware, (c) => {
-  const user = c.get('user') as AuthUser;
-  if (user.role !== 'admin') {
-    return c.text('Forbidden', 403);
-  }
-  const name = c.req.query('name');
-  if (!name || name.includes('/') || name.includes('..')) {
-    return c.text('Invalid name', 400);
-  }
-  const effectiveDir = getEffectiveExternalDir();
-  const filePath = path.join(effectiveDir, 'rules', name);
-  try {
-    const resolved = fs.realpathSync(filePath);
-    // 确保解析后的路径仍在 rules 目录内
-    if (!resolved.startsWith(fs.realpathSync(path.join(effectiveDir, 'rules')))) {
+configRoutes.get(
+  '/external-resources/rule',
+  authMiddleware,
+  systemConfigMiddleware,
+  (c) => {
+    const user = c.get('user') as AuthUser;
+    if (user.role !== 'admin') {
       return c.text('Forbidden', 403);
     }
-    const content = fs.readFileSync(resolved, 'utf-8');
-    return c.text(content);
-  } catch {
-    return c.text('Not found', 404);
-  }
-});
+    const name = c.req.query('name');
+    if (!name || name.includes('/') || name.includes('..')) {
+      return c.text('Invalid name', 400);
+    }
+    const effectiveDir = getEffectiveExternalDir();
+    const filePath = path.join(effectiveDir, 'rules', name);
+    try {
+      const resolved = fs.realpathSync(filePath);
+      // 确保解析后的路径仍在 rules 目录内
+      if (
+        !resolved.startsWith(fs.realpathSync(path.join(effectiveDir, 'rules')))
+      ) {
+        return c.text('Forbidden', 403);
+      }
+      const content = fs.readFileSync(resolved, 'utf-8');
+      return c.text(content);
+    } catch {
+      return c.text('Not found', 404);
+    }
+  },
+);
 
 // ─── Per-user IM connection status ──────────────────────────────────
 
@@ -1492,6 +1512,54 @@ configRoutes.put('/user-im/feishu', authMiddleware, async (c) => {
     next.autoIsolateContext = validation.data.autoIsolateContext;
   }
 
+  // Pre-save connectivity test: 启用且有完整凭据,且 (appId 或 appSecret 跟当前
+  // 持久化值不一致) 时,先调一次 tenant_access_token 接口验证凭据真能换出 token。
+  //
+  // 凭据变更守卫(per PR #572 review):仅 autoIsolateContext / enabled 这类与
+  // 凭据无关的设置变更不应触发 8s 飞书 API 测试;否则飞书抖动期间用户改个无关
+  // 开关都会被 400 阻塞。current 在上方已 decrypt 持有明文 appSecret,可直接比较。
+  //
+  // 不可达 / timeout 不强行阻塞:既然连飞书都连不上,自动重连阶段也会失败,
+  // 此时把错误暴露给用户比"成功保存但实际拿不到 token"更体面。
+  const credentialsChanged =
+    next.appId !== (current?.appId ?? '') ||
+    next.appSecret !== (current?.appSecret ?? '');
+  if (
+    next.enabled === true &&
+    typeof next.appId === 'string' &&
+    typeof next.appSecret === 'string' &&
+    next.appId &&
+    next.appSecret &&
+    credentialsChanged
+  ) {
+    const test = await testFeishuCredentials(
+      next.appId as string,
+      next.appSecret as string,
+    );
+    if (!test.ok) {
+      logger.warn(
+        {
+          userId: user.id,
+          appId: next.appId,
+          errorCode: test.errorCode,
+          errorMessage: test.errorMessage,
+        },
+        'Feishu credentials verification failed before save',
+      );
+      return c.json(
+        {
+          error: 'Feishu credentials verification failed',
+          details: {
+            code: test.errorCode,
+            message: test.errorMessage,
+            hint: 'Check appId/appSecret on the Lark/Feishu developer console',
+          },
+        },
+        400,
+      );
+    }
+  }
+
   try {
     const saved = saveUserFeishuConfig(user.id, {
       appId: next.appId as string,
@@ -1499,9 +1567,15 @@ configRoutes.put('/user-im/feishu', authMiddleware, async (c) => {
       enabled: next.enabled as boolean | undefined,
       autoIsolateContext: next.autoIsolateContext as boolean | undefined,
     });
-    appendImConfigAudit(user.username, 'feishu', 'update', Object.keys(validation.data), {
-      userId: user.id,
-    });
+    appendImConfigAudit(
+      user.username,
+      'feishu',
+      'update',
+      Object.keys(validation.data),
+      {
+        userId: user.id,
+      },
+    );
 
     // Migrate existing Feishu chats when autoIsolateContext toggle changes
     const oldAutoIsolate = current?.autoIsolateContext ?? false;
@@ -1629,7 +1703,13 @@ configRoutes.put('/user-im/telegram', authMiddleware, async (c) => {
       proxyUrl: next.proxyUrl || undefined,
       enabled: next.enabled,
     });
-    appendImConfigAudit(user.username, 'telegram', 'update', Object.keys(validation.data), { userId: user.id });
+    appendImConfigAudit(
+      user.username,
+      'telegram',
+      'update',
+      Object.keys(validation.data),
+      { userId: user.id },
+    );
 
     // Hot-reload: reconnect user's Telegram channel
     if (deps?.reloadUserIMConfig) {
@@ -1855,7 +1935,13 @@ configRoutes.put('/user-im/qq', authMiddleware, async (c) => {
       appSecret: next.appSecret,
       enabled: next.enabled,
     });
-    appendImConfigAudit(user.username, 'qq', 'update', Object.keys(validation.data), { userId: user.id });
+    appendImConfigAudit(
+      user.username,
+      'qq',
+      'update',
+      Object.keys(validation.data),
+      { userId: user.id },
+    );
 
     // Hot-reload: reconnect user's QQ channel
     if (deps?.reloadUserIMConfig) {
@@ -2015,7 +2101,7 @@ configRoutes.put('/user-im/qq/paired-chats/:jid', authMiddleware, async (c) => {
 
   const body = await c.req
     .json<{ name?: unknown }>()
-    .catch(() => ({} as { name?: unknown }));
+    .catch(() => ({}) as { name?: unknown });
   const rawName = typeof body.name === 'string' ? body.name : '';
   const name = rawName.trim();
   if (!name) {
@@ -2148,7 +2234,13 @@ configRoutes.put('/user-im/dingtalk', authMiddleware, async (c) => {
 
   try {
     const saved = saveUserDingTalkConfig(user.id, next);
-    appendImConfigAudit(user.username, 'dingtalk', 'update', Object.keys(validation.data), { userId: user.id });
+    appendImConfigAudit(
+      user.username,
+      'dingtalk',
+      'update',
+      Object.keys(validation.data),
+      { userId: user.id },
+    );
 
     // Hot-reload: reconnect user's DingTalk channel
     if (deps?.reloadUserIMConfig) {
@@ -2294,7 +2386,13 @@ configRoutes.put('/user-im/discord', authMiddleware, async (c) => {
 
   try {
     const saved = saveUserDiscordConfig(user.id, next);
-    appendImConfigAudit(user.username, 'discord', 'update', Object.keys(validation.data), { userId: user.id });
+    appendImConfigAudit(
+      user.username,
+      'discord',
+      'update',
+      Object.keys(validation.data),
+      { userId: user.id },
+    );
 
     // Hot-reload: reconnect user's Discord channel
     if (deps?.reloadUserIMConfig) {
@@ -2474,7 +2572,13 @@ configRoutes.put('/user-im/wechat', authMiddleware, async (c) => {
 
   try {
     const saved = saveUserWeChatConfig(user.id, next);
-    appendImConfigAudit(user.username, 'wechat', 'update', Object.keys(validation.data), { userId: user.id });
+    appendImConfigAudit(
+      user.username,
+      'wechat',
+      'update',
+      Object.keys(validation.data),
+      { userId: user.id },
+    );
 
     // Update NO_PROXY based on bypassProxy setting
     updateWeChatNoProxy(saved.bypassProxy ?? true);
@@ -2605,7 +2709,13 @@ configRoutes.get('/user-im/wechat/qrcode-status', authMiddleware, async (c) => {
         baseUrl: data.baseurl || undefined,
         enabled: true,
       });
-    appendImConfigAudit(user.username, 'wechat', 'oauth_qr_confirmed', ['botToken', 'ilinkBotId', 'baseUrl', 'enabled'], { userId: user.id });
+      appendImConfigAudit(
+        user.username,
+        'wechat',
+        'oauth_qr_confirmed',
+        ['botToken', 'ilinkBotId', 'baseUrl', 'enabled'],
+        { userId: user.id },
+      );
 
       // Note: ilink_user_id (the QR scanner) is NOT auto-paired here.
       // The scanner needs to send a message to the bot and use /pair <code>
@@ -2757,7 +2867,13 @@ configRoutes.put('/user-im/whatsapp', authMiddleware, async (c) => {
 
   try {
     const saved = saveUserWhatsAppConfig(user.id, next);
-    appendImConfigAudit(user.username, 'whatsapp', 'update', Object.keys(validation.data), { userId: user.id });
+    appendImConfigAudit(
+      user.username,
+      'whatsapp',
+      'update',
+      Object.keys(validation.data),
+      { userId: user.id },
+    );
 
     // Hot-reload: reconnect user's WhatsApp channel (skeleton always returns false)
     if (deps?.reloadUserIMConfig) {
@@ -2808,10 +2924,7 @@ configRoutes.post('/user-im/whatsapp/logout', authMiddleware, async (c) => {
     try {
       await deps.logoutUserWhatsApp(user.id, accountId);
     } catch (err) {
-      logger.warn(
-        { err, userId: user.id },
-        'WhatsApp logout deps call failed',
-      );
+      logger.warn({ err, userId: user.id }, 'WhatsApp logout deps call failed');
     }
   }
 
@@ -2822,7 +2935,13 @@ configRoutes.post('/user-im/whatsapp/logout', authMiddleware, async (c) => {
       enabled: false,
       paired: false,
     });
-    appendImConfigAudit(user.username, 'whatsapp', 'logout', ['enabled', 'paired'], { userId: user.id, accountId });
+    appendImConfigAudit(
+      user.username,
+      'whatsapp',
+      'logout',
+      ['enabled', 'paired'],
+      { userId: user.id, accountId },
+    );
     const state = deps?.getUserWhatsAppState?.(user.id) ?? {
       status: 'logged_out' as const,
     };
@@ -2933,8 +3052,12 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
   const activationMode =
     typeof rawActivationMode === 'string' &&
     VALID_ACTIVATION_MODES.has(rawActivationMode)
-      ? (rawActivationMode as typeof rawActivationMode &
-          'auto' | 'always' | 'when_mentioned' | 'owner_mentioned' | 'disabled')
+      ? (rawActivationMode as
+          | (typeof rawActivationMode & 'auto')
+          | 'always'
+          | 'when_mentioned'
+          | 'owner_mentioned'
+          | 'disabled')
       : undefined;
 
   // Parse owner_im_id for owner_mentioned mode
@@ -2978,7 +3101,9 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
       target_main_jid: targetMainJid,
       target_agent_id: undefined,
       reply_policy: replyPolicy,
-      ...(activationMode !== undefined ? { activation_mode: activationMode } : {}),
+      ...(activationMode !== undefined
+        ? { activation_mode: activationMode }
+        : {}),
       ...(ownerImId !== undefined ? { owner_im_id: ownerImId } : {}),
     };
     applyBindingUpdate(imJid, updated);
@@ -2993,7 +3118,9 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
   if (activationMode !== undefined || ownerImId !== undefined) {
     const updated: RegisteredGroup = {
       ...imGroup,
-      ...(activationMode !== undefined ? { activation_mode: activationMode } : {}),
+      ...(activationMode !== undefined
+        ? { activation_mode: activationMode }
+        : {}),
       ...(ownerImId !== undefined ? { owner_im_id: ownerImId } : {}),
     };
     applyBindingUpdate(imJid, updated);
@@ -3005,7 +3132,10 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
   }
 
   return c.json(
-    { error: 'Must provide target_main_jid, target_agent_id, activation_mode, or unbind' },
+    {
+      error:
+        'Must provide target_main_jid, target_agent_id, activation_mode, or unbind',
+    },
     400,
   );
 });

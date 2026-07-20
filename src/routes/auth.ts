@@ -51,7 +51,11 @@ import {
 } from '../auth.js';
 import type { AuthUser, User, UserPublic } from '../types.js';
 import { logger } from '../logger.js';
-import { lastActiveCache, invalidateSessionCache, invalidateUserSessions } from '../web-context.js';
+import {
+  lastActiveCache,
+  invalidateSessionCache,
+  invalidateUserSessions,
+} from '../web-context.js';
 import { getSystemSettings } from '../runtime-config.js';
 
 const authRoutes = new Hono<{ Variables: Variables }>();
@@ -106,8 +110,7 @@ function buildSetupStatus() {
       !!p.claudeOAuthCredentials ||
       !!p.anthropicApiKey?.trim();
     const hasThirdParty = !!(
-      p.anthropicBaseUrl?.trim() &&
-      p.anthropicAuthToken?.trim()
+      p.anthropicBaseUrl?.trim() && p.anthropicAuthToken?.trim()
     );
     return hasOfficial || hasThirdParty;
   });
@@ -789,19 +792,19 @@ authRoutes.post('/avatar', authMiddleware, async (c) => {
 
   fs.mkdirSync(AVATARS_DIR, { recursive: true });
 
-  // Delete old avatar files for this user
-  try {
-    const existing = fs
-      .readdirSync(AVATARS_DIR)
-      .filter((f) => f.startsWith(`${user.id}-`));
-    for (const f of existing) {
-      fs.unlinkSync(path.join(AVATARS_DIR, f));
-    }
-  } catch {
-    /* ignore */
-  }
+  // Keep user and AI avatars independent; uploading one must not leave the
+  // other's DB URL pointing at a deleted file.
+  const target = c.req.query('target');
+  const field = target === 'user' ? 'avatar_url' : 'ai_avatar_url';
+  const prefix = target === 'user' ? `${user.id}-user-` : `${user.id}-ai-`;
+  const current = getUserById(user.id);
+  const otherUrl =
+    target === 'user' ? current?.ai_avatar_url : current?.avatar_url;
+  const otherFilename = otherUrl
+    ? otherUrl.replace(/^\/api\/auth\/avatars\//, '')
+    : null;
 
-  const filename = `${user.id}-${crypto.randomBytes(4).toString('hex')}${ext}`;
+  const filename = `${prefix}${crypto.randomBytes(4).toString('hex')}${ext}`;
   const filePath = path.join(AVATARS_DIR, filename);
   const buffer = Buffer.from(await file.arrayBuffer());
   const tmpPath = filePath + '.tmp';
@@ -810,9 +813,23 @@ authRoutes.post('/avatar', authMiddleware, async (c) => {
 
   const avatarUrl = `/api/auth/avatars/${filename}`;
 
-  // Update user profile — target=user stores as avatar_url, otherwise ai_avatar_url
-  const target = c.req.query('target');
-  const field = target === 'user' ? 'avatar_url' : 'ai_avatar_url';
+  // Reap same-target and legacy leftovers. Structurally skip the other target's
+  // prefix so concurrent user/AI uploads cannot delete each other's new file.
+  try {
+    const keep = new Set(
+      [filename, otherFilename].filter((item): item is string => !!item),
+    );
+    const otherPrefix =
+      target === 'user' ? `${user.id}-ai-` : `${user.id}-user-`;
+    for (const candidate of fs.readdirSync(AVATARS_DIR)) {
+      if (!candidate.startsWith(`${user.id}-`) || keep.has(candidate)) continue;
+      if (candidate.startsWith(otherPrefix)) continue;
+      fs.unlinkSync(path.join(AVATARS_DIR, candidate));
+    }
+  } catch {
+    /* ignore stale-file cleanup failures */
+  }
+
   updateUserFields(user.id, { [field]: avatarUrl });
 
   const updated = getUserById(user.id)!;

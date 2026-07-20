@@ -10,10 +10,17 @@ import type { AuthUser } from '../types.js';
 import {
   isHostExecutionGroup,
   hasHostExecutionPermission,
+  canUseHostExecution,
   canAccessGroup,
   getWebDeps,
 } from '../web-context.js';
-import { getAllRegisteredGroups, getRegisteredGroup, getRouterState, getUserById, hasContainerModeGroups } from '../db.js';
+import {
+  getAllRegisteredGroups,
+  getRegisteredGroup,
+  getRouterState,
+  getUserById,
+  hasContainerModeGroups,
+} from '../db.js';
 import { CONTAINER_IMAGE } from '../config.js';
 import { getSystemSettings, getProviders } from '../runtime-config.js';
 import { setProviderOverride } from '../container-runner.js';
@@ -71,7 +78,9 @@ async function getLatestClaudeCodeVersion(): Promise<string | null> {
 /** Get host Claude Code version via global `claude --version` CLI */
 async function getHostClaudeCodeVersion(): Promise<string | null> {
   try {
-    const { stdout } = await execFileAsync('claude', ['--version'], { timeout: 10000 });
+    const { stdout } = await execFileAsync('claude', ['--version'], {
+      timeout: 10000,
+    });
     return stdout.trim() || null;
   } catch {
     return null;
@@ -97,8 +106,12 @@ async function getContainerClaudeCodeVersion(): Promise<string | null> {
     const { stdout } = await execFileAsync(
       'docker',
       [
-        'run', '--rm', '--entrypoint', '/app/node_modules/.bin/claude',
-        CONTAINER_IMAGE, '--version',
+        'run',
+        '--rm',
+        '--entrypoint',
+        '/app/node_modules/.bin/claude',
+        CONTAINER_IMAGE,
+        '--version',
       ],
       { timeout: 30000 },
     );
@@ -236,7 +249,8 @@ monitorRoutes.get('/status', authMiddleware, async (c) => {
     : queueStatus.groups.filter((g) => {
         const group = getRegisteredGroup(g.jid);
         if (!group) return false;
-        if (isHostExecutionGroup(group)) return false;
+        if (isHostExecutionGroup(group) && !canUseHostExecution(authUser))
+          return false;
         return canAccessGroup({ id: authUser.id, role: authUser.role }, group);
       });
 
@@ -255,7 +269,8 @@ monitorRoutes.get('/status', authMiddleware, async (c) => {
     queueLength = queueStatus.waitingGroupJids.filter((jid) => {
       const group = getRegisteredGroup(jid);
       if (!group) return false;
-      if (isHostExecutionGroup(group)) return false;
+      if (isHostExecutionGroup(group) && !canUseHostExecution(authUser))
+        return false;
       return canAccessGroup({ id: authUser.id, role: authUser.role }, group);
     }).length;
   }
@@ -268,7 +283,9 @@ monitorRoutes.get('/status', authMiddleware, async (c) => {
   // Collect unique creator IDs, then batch-resolve usernames
   const creatorIds = new Set<string>();
   for (const g of filteredGroups) {
-    const baseJid = g.jid.includes('#agent:') ? g.jid.split('#agent:')[0] : g.jid;
+    const baseJid = g.jid.includes('#agent:')
+      ? g.jid.split('#agent:')[0]
+      : g.jid;
     const reg = allRegistered[baseJid];
     if (reg?.created_by) creatorIds.add(reg.created_by);
   }
@@ -279,13 +296,17 @@ monitorRoutes.get('/status', authMiddleware, async (c) => {
   }
 
   const enrichedGroups = filteredGroups.map((g) => {
-    const baseJid = g.jid.includes('#agent:') ? g.jid.split('#agent:')[0] : g.jid;
+    const baseJid = g.jid.includes('#agent:')
+      ? g.jid.split('#agent:')[0]
+      : g.jid;
     const reg = allRegistered[baseJid];
     return {
       ...g,
-      ownerUsername: reg?.created_by ? userNameMap.get(reg.created_by) ?? null : null,
+      ownerUsername: reg?.created_by
+        ? (userNameMap.get(reg.created_by) ?? null)
+        : null,
       selectedProviderName: g.selectedProviderId
-        ? providerNameMap.get(g.selectedProviderId) ?? null
+        ? (providerNameMap.get(g.selectedProviderId) ?? null)
         : null,
     };
   });
@@ -364,10 +385,7 @@ monitorRoutes.post(
 
     const restarted = deps.queue.requestGracefulRestart(activeGroup.jid);
 
-    logger.info(
-      { folder, providerId, restarted },
-      'Provider switch requested',
-    );
+    logger.info({ folder, providerId, restarted }, 'Provider switch requested');
 
     return c.json({
       ok: true,

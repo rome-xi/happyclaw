@@ -1,8 +1,10 @@
 import fs from 'fs';
 import path from 'path';
-import { GROUPS_DIR } from './config.js';
+import { GROUPS_DIR, MAX_FILE_SIZE } from './config.js';
 
-export const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50 MB
+// MAX_FILE_SIZE 统一由 config.ts 定义（可通过 MAX_FILE_SIZE_MB 环境变量配置），
+// 此处 re-export 保持既有 import 路径不变。IM 渠道收文件与 Web 上传共用此上限。
+export { MAX_FILE_SIZE };
 
 export class FileTooLargeError extends Error {
   constructor(filename: string, size: number) {
@@ -138,7 +140,11 @@ export async function saveDownloadedFile(
   try {
     fs.writeFileSync(fd, buffer);
   } finally {
-    try { fs.closeSync(fd); } catch { /* ignore */ }
+    try {
+      fs.closeSync(fd);
+    } catch {
+      /* ignore */
+    }
   }
 
   // 返回相对于群组工作区根目录的路径

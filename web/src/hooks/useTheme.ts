@@ -9,24 +9,32 @@ const SCHEME_KEY = 'happyclaw-color-scheme';
 const FONT_KEY = 'happyclaw-font-style';
 const listeners = new Set<() => void>();
 
-function notify() { listeners.forEach((cb) => cb()); }
+function notify() {
+  listeners.forEach((cb) => cb());
+}
 
 function getSystemTheme(): 'light' | 'dark' {
   if (typeof window === 'undefined') return 'light';
-  return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  return window.matchMedia('(prefers-color-scheme: dark)').matches
+    ? 'dark'
+    : 'light';
 }
 
+// 默认浅色：未设置过主题的用户不再跟随系统深色模式。
+// 存储语义与之对称——无 key = light；「深色」「跟随系统」都显式落 key。
 function readTheme(): Theme {
-  if (typeof window === 'undefined') return 'system';
+  if (typeof window === 'undefined') return 'light';
   const stored = window.localStorage.getItem(THEME_KEY);
-  if (stored === 'light' || stored === 'dark' || stored === 'system') return stored;
-  return 'system';
+  if (stored === 'light' || stored === 'dark' || stored === 'system')
+    return stored;
+  return 'light';
 }
 
 function readColorScheme(): ColorScheme {
   if (typeof window === 'undefined') return 'orange';
   const stored = window.localStorage.getItem(SCHEME_KEY);
-  if (stored === 'default' || stored === 'orange' || stored === 'neutral') return stored;
+  if (stored === 'default' || stored === 'orange' || stored === 'neutral')
+    return stored;
   return 'orange';
 }
 
@@ -46,31 +54,47 @@ function syncMetaThemeColor() {
   const meta = document.querySelector('meta[name="theme-color"]');
   if (!meta) return;
   const isDark = document.documentElement.classList.contains('dark');
-  const isNeutral = document.documentElement.classList.contains('theme-neutral');
+  const isNeutral =
+    document.documentElement.classList.contains('theme-neutral');
   const isOrange = document.documentElement.classList.contains('theme-orange');
   if (isDark) {
     meta.setAttribute('content', isNeutral ? '#09090b' : '#0f172a');
   } else {
-    meta.setAttribute('content', isOrange ? '#FAF9F5' : isNeutral ? '#ffffff' : '#ffffff');
+    meta.setAttribute(
+      'content',
+      isOrange ? '#FAF9F5' : isNeutral ? '#ffffff' : '#ffffff',
+    );
   }
 }
 
 export function applyTheme(theme: Theme) {
   if (typeof document === 'undefined') return;
-  document.documentElement.classList.toggle('dark', resolveTheme(theme) === 'dark');
+  document.documentElement.classList.toggle(
+    'dark',
+    resolveTheme(theme) === 'dark',
+  );
   syncMetaThemeColor();
 }
 
 function applyColorScheme(scheme: ColorScheme) {
   if (typeof document === 'undefined') return;
-  document.documentElement.classList.toggle('theme-orange', scheme === 'orange');
-  document.documentElement.classList.toggle('theme-neutral', scheme === 'neutral');
+  document.documentElement.classList.toggle(
+    'theme-orange',
+    scheme === 'orange',
+  );
+  document.documentElement.classList.toggle(
+    'theme-neutral',
+    scheme === 'neutral',
+  );
   syncMetaThemeColor();
 }
 
 function applyFontStyle(style: FontStyle) {
   if (typeof document === 'undefined') return;
-  document.documentElement.classList.toggle('font-anthropic', style === 'anthropic');
+  document.documentElement.classList.toggle(
+    'font-anthropic',
+    style === 'anthropic',
+  );
 }
 
 function subscribe(cb: () => void) {
@@ -79,25 +103,46 @@ function subscribe(cb: () => void) {
 }
 
 export function useTheme() {
-  const theme = useSyncExternalStore(subscribe, readTheme, () => 'system' as Theme);
-  const colorScheme = useSyncExternalStore(subscribe, readColorScheme, () => 'orange' as ColorScheme);
-  const fontStyle = useSyncExternalStore(subscribe, readFontStyle, () => 'default' as FontStyle);
+  const theme = useSyncExternalStore(
+    subscribe,
+    readTheme,
+    () => 'light' as Theme,
+  );
+  const colorScheme = useSyncExternalStore(
+    subscribe,
+    readColorScheme,
+    () => 'orange' as ColorScheme,
+  );
+  const fontStyle = useSyncExternalStore(
+    subscribe,
+    readFontStyle,
+    () => 'default' as FontStyle,
+  );
 
-  useEffect(() => { applyTheme(theme); }, [theme]);
-  useEffect(() => { applyColorScheme(colorScheme); }, [colorScheme]);
-  useEffect(() => { applyFontStyle(fontStyle); }, [fontStyle]);
+  useEffect(() => {
+    applyTheme(theme);
+  }, [theme]);
+  useEffect(() => {
+    applyColorScheme(colorScheme);
+  }, [colorScheme]);
+  useEffect(() => {
+    applyFontStyle(fontStyle);
+  }, [fontStyle]);
 
   useEffect(() => {
     const mq = window.matchMedia('(prefers-color-scheme: dark)');
     const handler = () => {
-      if (readTheme() === 'system') { applyTheme('system'); notify(); }
+      if (readTheme() === 'system') {
+        applyTheme('system');
+        notify();
+      }
     };
     mq.addEventListener('change', handler);
     return () => mq.removeEventListener('change', handler);
   }, []);
 
   const setTheme = useCallback((t: Theme) => {
-    if (t === 'system') window.localStorage.removeItem(THEME_KEY);
+    if (t === 'light') window.localStorage.removeItem(THEME_KEY);
     else window.localStorage.setItem(THEME_KEY, t);
     applyTheme(t);
     notify();
@@ -118,9 +163,19 @@ export function useTheme() {
   }, []);
 
   const toggle = useCallback(() => {
-    const next: Theme = theme === 'light' ? 'dark' : theme === 'dark' ? 'system' : 'light';
+    const next: Theme =
+      theme === 'light' ? 'dark' : theme === 'dark' ? 'system' : 'light';
     setTheme(next);
   }, [theme, setTheme]);
 
-  return { theme, resolvedTheme: resolveTheme(theme), colorScheme, fontStyle, toggle, setTheme, setColorScheme, setFontStyle };
+  return {
+    theme,
+    resolvedTheme: resolveTheme(theme),
+    colorScheme,
+    fontStyle,
+    toggle,
+    setTheme,
+    setColorScheme,
+    setFontStyle,
+  };
 }

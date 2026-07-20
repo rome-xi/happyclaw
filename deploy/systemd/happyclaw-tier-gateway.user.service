@@ -1,0 +1,15 @@
+[Unit]
+Description=HappyClaw four-tier loopback gateway
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/happyclaw
+Environment=NEWAPI_TOKEN_FILE=%h/.config/happyclaw/newapi.token
+ExecStart=/usr/bin/env python3 %h/happyclaw/scripts/claude-tier-gateway.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

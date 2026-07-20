@@ -31,11 +31,11 @@ export const CARD_ELEMENT_IDS = {
 
   // Rich streaming slots (Phase C)
   STATUS_BANNER: 'status_banner',
-    PROGRESS_PANEL: 'progress_panel',
-    PROGRESS_CONTENT: 'progress_md',
-    TASK_PANEL: 'task_live',
-    TASK_CONTENT: 'task_live_md',
-    TOOLS_PANEL: 'tools_live',
+  PROGRESS_PANEL: 'progress_panel',
+  PROGRESS_CONTENT: 'progress_md',
+  TASK_PANEL: 'task_live',
+  TASK_CONTENT: 'task_live_md',
+  TOOLS_PANEL: 'tools_live',
   TOOLS_CONTENT: 'tools_live_md',
   THINKING_PANEL: 'thinking_live',
   THINKING_CONTENT: 'thinking_live_md',
@@ -200,7 +200,8 @@ export function buildMetaRow(meta: CardMeta | undefined): El[] {
       text: { tag: 'lark_md', content: `**${title}**\n${value}` },
     });
   };
-  if (meta.durationMs !== undefined) push('⏱ 耗时', formatDuration(meta.durationMs));
+  if (meta.durationMs !== undefined)
+    push('⏱ 耗时', formatDuration(meta.durationMs));
   if (meta.model) push('🤖 模型', `\`${shortModel(meta.model)}\``);
   if (meta.inputTokens !== undefined || meta.outputTokens !== undefined) {
     const cached = meta.cacheReadInputTokens;
@@ -216,7 +217,8 @@ export function buildMetaRow(meta: CardMeta | undefined): El[] {
   const toolCount = meta.toolCalls?.length
     ? meta.toolCalls.reduce((s, t) => s + t.count, 0)
     : meta.toolCount;
-  if (toolCount !== undefined && toolCount > 0) push('🛠 工具', `${toolCount} 次`);
+  if (toolCount !== undefined && toolCount > 0)
+    push('🛠 工具', `${toolCount} 次`);
   if (fields.length === 0) return [];
   return [{ tag: 'div', fields, element_id: CARD_ELEMENT_IDS.META_ROW }];
 }
@@ -343,6 +345,7 @@ export type StreamingPhase =
   | 'hook'
   | 'streaming'
   | 'waiting'
+  | 'waiting_bg'
   | 'completed'
   | 'aborted'
   | 'error';
@@ -374,6 +377,10 @@ export function buildStatusBannerText(input: {
       return `${tag('生成回复', 'violet')} ✨${detailPart}${elapsed}`;
     case 'waiting':
       return `${tag('等待输入', 'grey')} ⏸${detailPart}`;
+    case 'waiting_bg':
+      // 本 turn 回复已送达，但后台任务（异步 Agent / 截断自动续写）仍在跑，
+      // 卡片保持打开等待追加——不能显示成绿色「已完成」误导用户。
+      return `${tag('后台任务运行中', 'violet')} ⏳${detailPart}${elapsed}`;
     case 'completed':
       return `${tag('已完成', 'green')} ✅${detailPart}${elapsed}`;
     case 'aborted':
@@ -393,7 +400,7 @@ export interface TodoItemView {
 
 /** TodoWrite list with pseudo progress bar. */
 export function buildProgressListText(todos: TodoItemView[]): string {
-  if (todos.length === 0) return '<font color=\'grey\'>暂无任务计划</font>';
+  if (todos.length === 0) return "<font color='grey'>暂无任务计划</font>";
   const total = todos.length;
   const done = todos.filter((t) => t.status === 'completed').length;
   const pct = total > 0 ? Math.round((done / total) * 100) : 0;
@@ -403,7 +410,11 @@ export function buildProgressListText(todos: TodoItemView[]): string {
   const MAX_VISIBLE = 12;
   const items = todos.slice(0, MAX_VISIBLE).map((t) => {
     const icon =
-      t.status === 'completed' ? '✅' : t.status === 'in_progress' ? '🔄' : '⏳';
+      t.status === 'completed'
+        ? '✅'
+        : t.status === 'in_progress'
+          ? '🔄'
+          : '⏳';
     const styled =
       t.status === 'in_progress'
         ? `**${t.content}** <font color='blue'>_(进行中)_</font>`
@@ -459,8 +470,7 @@ export function buildToolsTimelineText(
   tools: ToolCallView[],
   opts: { maxVisible?: number } = {},
 ): string {
-  if (tools.length === 0)
-    return '<font color=\'grey\'>尚未调用任何工具</font>';
+  if (tools.length === 0) return "<font color='grey'>尚未调用任何工具</font>";
   const maxVisible = opts.maxVisible ?? 8;
   const running = tools.filter((t) => t.status === 'running');
   const recent = tools.filter((t) => t.status !== 'running').slice(-maxVisible);
@@ -496,7 +506,7 @@ export function buildToolsTimelineText(
  *  markdown element supports ≤4000 chars; leave headroom for blockquote prefix). */
 export function buildThinkingBlockquote(text: string): string {
   const MAX = 2000;
-  if (!text.trim()) return '<font color=\'grey\'>暂无思考记录</font>';
+  if (!text.trim()) return "<font color='grey'>暂无思考记录</font>";
   const sliced = text.length > MAX ? '…' + text.slice(-(MAX - 1)) : text;
   return sliced
     .split('\n')
@@ -561,15 +571,13 @@ export interface TimelineEventView {
 }
 
 export function buildTimelineText(events: TimelineEventView[]): string {
-  if (events.length === 0) return '<font color=\'grey\'>暂无调用记录</font>';
+  if (events.length === 0) return "<font color='grey'>暂无调用记录</font>";
   const MAX = 20;
   const tail = events.slice(-MAX);
   const hidden = events.length - tail.length;
   const lines = tail.map((e) => `- ${e.text}`);
   const more =
-    hidden > 0
-      ? `\n<font color='grey'>… 较早 ${hidden} 条已省略</font>`
-      : '';
+    hidden > 0 ? `\n<font color='grey'>… 较早 ${hidden} 条已省略</font>` : '';
   return `${lines.join('\n')}${more}`;
 }
 
@@ -618,22 +626,22 @@ export function buildStreamingPanels(init: StreamingPanelsInit): El[] {
       title: '**❓ 等待你的回复**',
       expanded: init.expandAsk ?? true,
       backgroundColor: PANEL_TINT.ask,
-      content:
-        init.askContent ?? "<font color='grey'>暂无提问</font>",
+      content: init.askContent ?? "<font color='grey'>暂无提问</font>",
     }),
     buildRuntimePanel({
       elementId: CARD_ELEMENT_IDS.PROGRESS_PANEL,
       contentElementId: CARD_ELEMENT_IDS.PROGRESS_CONTENT,
       title: '**📋 任务进度**',
       expanded: init.expandProgress ?? false,
-      content: init.progressContent ?? '<font color=\'grey\'>等待任务规划…</font>',
+      content:
+        init.progressContent ?? "<font color='grey'>等待任务规划…</font>",
     }),
     buildRuntimePanel({
       elementId: CARD_ELEMENT_IDS.TASK_PANEL,
       contentElementId: CARD_ELEMENT_IDS.TASK_CONTENT,
       title: '**🤖 子 Agent / Task**',
       expanded: init.expandProgress ?? false,
-      content: init.taskContent ?? '<font color=\'grey\'>暂无子任务…</font>',
+      content: init.taskContent ?? "<font color='grey'>暂无子任务…</font>",
     }),
     buildRuntimePanel({
       elementId: CARD_ELEMENT_IDS.TOOLS_PANEL,
@@ -641,7 +649,7 @@ export function buildStreamingPanels(init: StreamingPanelsInit): El[] {
       title: '**🛠 工具时间轴**',
       expanded: init.expandTools ?? false,
       backgroundColor: PANEL_TINT.tools,
-      content: init.toolsContent ?? '<font color=\'grey\'>尚未调用工具…</font>',
+      content: init.toolsContent ?? "<font color='grey'>尚未调用工具…</font>",
     }),
     buildRuntimePanel({
       elementId: CARD_ELEMENT_IDS.THINKING_PANEL,
@@ -649,15 +657,15 @@ export function buildStreamingPanels(init: StreamingPanelsInit): El[] {
       title: '**💭 思考过程**',
       expanded: init.expandThinking ?? false,
       backgroundColor: PANEL_TINT.thinking,
-      content: init.thinkingContent ?? '<font color=\'grey\'>尚未开始思考…</font>',
+      content:
+        init.thinkingContent ?? "<font color='grey'>尚未开始思考…</font>",
     }),
     buildRuntimePanel({
       elementId: CARD_ELEMENT_IDS.TIMELINE_PANEL,
       contentElementId: CARD_ELEMENT_IDS.TIMELINE_CONTENT,
       title: '**📝 调用轨迹**',
       expanded: init.expandTimeline ?? false,
-      content:
-        init.timelineContent ?? "<font color='grey'>暂无调用记录</font>",
+      content: init.timelineContent ?? "<font color='grey'>暂无调用记录</font>",
     }),
   ];
 }

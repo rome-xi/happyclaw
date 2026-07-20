@@ -17,6 +17,7 @@ import {
   getSessionWithUser,
 } from './db.js';
 import type { WhatsAppConnectionState } from './whatsapp.js';
+import { HOST_ONLY_MODE } from './execution-mode.js';
 
 export interface WsClientInfo {
   sessionId: string;
@@ -77,10 +78,7 @@ export interface WebDeps {
    * which means a clean restart after a no-earlier-pending reply would
    * replay the reply on recovery (the same DB row is still <= the cursor).
    */
-  hasEarlierPendingMessages: (
-    jid: string,
-    candidate: MessageCursor,
-  ) => boolean;
+  hasEarlierPendingMessages: (jid: string, candidate: MessageCursor) => boolean;
   reloadFeishuConnection?: (config: {
     appId: string;
     appSecret: string;
@@ -146,6 +144,10 @@ export interface WebDeps {
    */
   removeImGroupRecord?: (jid: string, reason: string) => void;
   updateReplyRoute?: (folder: string, sourceJid: string | null) => void;
+  /** 用户消息注入运行中 Sub-Agent 时，先把该 agent 挂起中的流式卡片定稿轮换。
+   * key 为 virtualChatJid（`web:{folder}#agent:{id}`）。主会话路径无需调用
+   * ——updateReplyRoute 触发的 route updater 已内置同样的收口。 */
+  finalizeHeldCard?: (key: string) => void;
   triggerTaskRun?: (taskId: string) => { success: boolean; error?: string };
   handleSpawnCommand?: (
     chatJid: string,
@@ -279,8 +281,19 @@ export function isHostExecutionGroup(group: RegisteredGroup): boolean {
   return (group.executionMode || 'container') === 'host';
 }
 
-export function hasHostExecutionPermission(user: AuthUser): boolean {
+export function hasHostExecutionPermission(
+  user: Pick<AuthUser, 'role'>,
+): boolean {
   return user.role === 'admin';
+}
+
+/**
+ * Permission to run an already-authorized workspace in host mode. This is
+ * deliberately separate from admin-only host management operations (browsing
+ * arbitrary server paths, opening the server file manager, etc.).
+ */
+export function canUseHostExecution(user: Pick<AuthUser, 'role'>): boolean {
+  return HOST_ONLY_MODE || hasHostExecutionPermission(user);
 }
 
 /**

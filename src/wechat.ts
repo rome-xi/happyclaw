@@ -13,21 +13,18 @@
  */
 import crypto from 'crypto';
 import fs from 'fs';
-import {
-  storeChatMetadata,
-  storeMessageDirect,
-  updateChatName,
-} from './db.js';
+import { storeChatMetadata, storeMessageDirect, updateChatName } from './db.js';
 import { notifyNewImMessage } from './message-notifier.js';
 import { broadcastNewMessage } from './web.js';
 import { logger } from './logger.js';
 import { saveDownloadedFile, MAX_FILE_SIZE } from './im-downloader.js';
 import { detectImageMimeType } from './image-detector.js';
+import { downloadAndDecryptMedia, uploadMediaBuffer } from './wechat-crypto.js';
 import {
-  downloadAndDecryptMedia,
-  uploadMediaBuffer,
-} from './wechat-crypto.js';
-import { markdownToPlainText, splitTextChunks, createDedupCache } from './im-utils.js';
+  markdownToPlainText,
+  splitTextChunks,
+  createDedupCache,
+} from './im-utils.js';
 
 // ─── Constants ──────────────────────────────────────────────────
 
@@ -106,11 +103,7 @@ export interface WeChatConnection {
     caption?: string,
     fileName?: string,
   ): Promise<void>;
-  sendFile(
-    chatId: string,
-    filePath: string,
-    fileName: string,
-  ): Promise<void>;
+  sendFile(chatId: string, filePath: string, fileName: string): Promise<void>;
   sendTyping(chatId: string, isTyping: boolean): Promise<void>;
   isConnected(): boolean;
   getUpdatesBuf(): string;
@@ -162,7 +155,6 @@ function randomWechatUin(): string {
   const uint32 = crypto.randomBytes(4).readUInt32BE(0);
   return Buffer.from(String(uint32), 'utf-8').toString('base64');
 }
-
 
 /**
  * Extract text content from message item_list.
@@ -238,8 +230,6 @@ export function createWeChatConnection(
   const dedup = createDedupCache({ ttlMs: 30 * 60 * 1000, max: 1000 });
 
   // ─── Deduplication ────────────────────────────────────────
-
-
 
   // ─── HTTP Helpers ─────────────────────────────────────────
 
@@ -321,29 +311,28 @@ export function createWeChatConnection(
     contextToken: string,
     text: string,
   ): Promise<void> {
-    const clientId = String(
-      crypto.randomBytes(4).readUInt32BE(0),
-    );
+    const clientId = String(crypto.randomBytes(4).readUInt32BE(0));
 
-    const resp = await apiPost<{ ret?: number; errcode?: number; errmsg?: string }>(
-      'ilink/bot/sendmessage',
-      {
-        msg: {
-          to_user_id: toUserId,
-          context_token: contextToken,
-          item_list: [
-            {
-              type: MESSAGE_ITEM_TYPE_TEXT,
-              text_item: { text },
-            },
-          ],
-          message_type: MESSAGE_TYPE_BOT,
-          message_state: MESSAGE_STATE_FINISH,
-          client_id: clientId,
-        },
-        base_info: baseInfo(),
+    const resp = await apiPost<{
+      ret?: number;
+      errcode?: number;
+      errmsg?: string;
+    }>('ilink/bot/sendmessage', {
+      msg: {
+        to_user_id: toUserId,
+        context_token: contextToken,
+        item_list: [
+          {
+            type: MESSAGE_ITEM_TYPE_TEXT,
+            text_item: { text },
+          },
+        ],
+        message_type: MESSAGE_TYPE_BOT,
+        message_state: MESSAGE_STATE_FINISH,
+        client_id: clientId,
       },
-    );
+      base_info: baseInfo(),
+    });
 
     if (resp.ret !== undefined && resp.ret !== 0) {
       throw new Error(
@@ -531,7 +520,11 @@ export function createWeChatConnection(
 
       // Skip stale messages — if no timestamp available, skip as well (can't verify freshness)
       if (opts.ignoreMessagesBefore) {
-        if (!msg.create_time_ms || msg.create_time_ms < opts.ignoreMessagesBefore) return;
+        if (
+          !msg.create_time_ms ||
+          msg.create_time_ms < opts.ignoreMessagesBefore
+        )
+          return;
       }
 
       // Cache context_token for replies
@@ -566,11 +559,7 @@ export function createWeChatConnection(
           if (reply) {
             const ct = contextTokenCache.get(fromUserId);
             if (ct) {
-              await sendMessageApi(
-                fromUserId,
-                ct,
-                markdownToPlainText(reply),
-              );
+              await sendMessageApi(fromUserId, ct, markdownToPlainText(reply));
             }
             return;
           }
@@ -625,11 +614,14 @@ export function createWeChatConnection(
           await Promise.allSettled(mediaPromises);
         }
 
+        // Merge file/media labels into content independently of images: a
+        // file-only message (no imageAttachments) would otherwise drop its
+        // textPrefixes and hit `if (!content) return` below → silently lost.
+        if (textPrefixes.length > 0) {
+          content = `${textPrefixes.join('\n')}\n${content}`.trim();
+        }
         if (imageAttachments.length > 0) {
           attachmentsJson = JSON.stringify(imageAttachments);
-          if (textPrefixes.length > 0) {
-            content = `${textPrefixes.join('\n')}\n${content}`.trim();
-          }
         }
 
         if (!content && imageAttachments.length > 0) {
@@ -650,10 +642,19 @@ export function createWeChatConnection(
       const senderId = `wechat:${fromUserId}`;
 
       if (targetJid !== jid) storeChatMetadata(targetJid, timestamp);
-      storeMessageDirect(id, targetJid, senderId, senderName, content, timestamp, false, {
-        attachments: attachmentsJson,
-        sourceJid: jid,
-      });
+      storeMessageDirect(
+        id,
+        targetJid,
+        senderId,
+        senderName,
+        content,
+        timestamp,
+        false,
+        {
+          attachments: attachmentsJson,
+          sourceJid: jid,
+        },
+      );
 
       broadcastNewMessage(
         targetJid,
@@ -685,7 +686,10 @@ export function createWeChatConnection(
         );
       }
     } catch (err) {
-      logger.error({ err, msgId: msg.message_id }, 'Error handling WeChat message');
+      logger.error(
+        { err, msgId: msg.message_id },
+        'Error handling WeChat message',
+      );
     }
   }
 
@@ -705,7 +709,9 @@ export function createWeChatConnection(
 
         // Check for session expiry
         if (response.ret === ERRCODE_SESSION_EXPIRED) {
-          logger.warn('WeChat session expired (errcode -14), stopping poll loop');
+          logger.warn(
+            'WeChat session expired (errcode -14), stopping poll loop',
+          );
           connected = false;
           break;
         }
@@ -739,7 +745,8 @@ export function createWeChatConnection(
         if (stopping) break;
 
         // Long-poll timeout is expected when no new messages arrive — just retry immediately.
-        const isTimeout = err instanceof Error && err.message.includes('timed out');
+        const isTimeout =
+          err instanceof Error && err.message.includes('timed out');
         if (isTimeout) {
           logger.debug({ err }, 'WeChat poll timeout (normal, retrying)');
           continue;
@@ -1012,10 +1019,7 @@ export function createWeChatConnection(
           );
         }
 
-        logger.info(
-          { chatId, size: buf.length, fileName },
-          'WeChat file sent',
-        );
+        logger.info({ chatId, size: buf.length, fileName }, 'WeChat file sent');
       } catch (err) {
         logger.error({ err, chatId, fileName }, 'Failed to send WeChat file');
         throw err;

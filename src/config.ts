@@ -8,6 +8,8 @@ export const ASSISTANT_NAME = process.env.ASSISTANT_NAME || 'HappyClaw';
 export const POLL_INTERVAL = 2000;
 export const SCHEDULER_POLL_INTERVAL = 60000;
 
+export { HOST_ONLY_MODE } from './execution-mode.js';
+
 // Absolute paths needed for container mounts
 const PROJECT_ROOT = process.cwd();
 
@@ -28,12 +30,23 @@ export const STORE_DIR = path.join(DATA_DIR, 'db');
 export const GROUPS_DIR = path.join(DATA_DIR, 'groups');
 export const MAIN_GROUP_FOLDER = 'main';
 
+// 文件大小上限（MB）。Web 文件面板上传与 IM 渠道收文件（feishu/telegram/qq/
+// dingtalk/discord/wechat inbound）共用此上限。注意：Web 下载是流式返回已存在
+// 的文件，不受此上限约束。通过 MAX_FILE_SIZE_MB 环境变量调整（默认 50MB）；
+// 非法值回退到 50。
+const _maxFileSizeMb = parseInt(process.env.MAX_FILE_SIZE_MB || '50', 10);
+export const MAX_FILE_SIZE_MB =
+  Number.isFinite(_maxFileSizeMb) && _maxFileSizeMb > 0 ? _maxFileSizeMb : 50;
+export const MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024;
+
 export const CONTAINER_IMAGE =
   process.env.CONTAINER_IMAGE || 'happyclaw-agent:latest';
 // Timezone for scheduled tasks (cron expressions, etc.)
 // Uses TZ env var with Asia/Shanghai fallback
 export const TIMEZONE =
-  process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Shanghai';
+  process.env.TZ ||
+  Intl.DateTimeFormat().resolvedOptions().timeZone ||
+  'Asia/Shanghai';
 
 // Web server configuration
 export const WEB_PORT = parseInt(process.env.WEB_PORT || '3000', 10);
@@ -88,12 +101,19 @@ const WECHAT_NO_PROXY_DOMAINS = [
 /** Add or remove WeChat domains from NO_PROXY based on bypassProxy flag. */
 export function updateWeChatNoProxy(bypassProxy: boolean): void {
   const current = process.env.NO_PROXY || process.env.no_proxy || '';
-  const existing = new Set(current.split(',').map((s) => s.trim()).filter(Boolean));
+  const existing = new Set(
+    current
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean),
+  );
 
   if (bypassProxy) {
     const toAdd = WECHAT_NO_PROXY_DOMAINS.filter((d) => !existing.has(d));
     if (toAdd.length) {
-      const updated = current ? `${current},${toAdd.join(',')}` : toAdd.join(',');
+      const updated = current
+        ? `${current},${toAdd.join(',')}`
+        : toAdd.join(',');
       process.env.NO_PROXY = updated;
       process.env.no_proxy = updated;
     }
@@ -108,7 +128,12 @@ export function updateWeChatNoProxy(bypassProxy: boolean): void {
 /** Check if WeChat domains are currently in NO_PROXY. */
 export function isWeChatBypassingProxy(): boolean {
   const current = process.env.NO_PROXY || process.env.no_proxy || '';
-  const existing = new Set(current.split(',').map((s) => s.trim()).filter(Boolean));
+  const existing = new Set(
+    current
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean),
+  );
   return WECHAT_NO_PROXY_DOMAINS.every((d) => existing.has(d));
 }
 

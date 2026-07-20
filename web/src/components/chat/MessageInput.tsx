@@ -1,4 +1,10 @@
-import { useState, useRef, useEffect, useLayoutEffect, useCallback } from 'react';
+import {
+  useState,
+  useRef,
+  useEffect,
+  useLayoutEffect,
+  useCallback,
+} from 'react';
 import { useKeyboardHeight } from '@/hooks/useKeyboardHeight';
 import { successTap } from '../../hooks/useHaptic';
 import {
@@ -11,6 +17,7 @@ import {
   Image as ImageIcon,
   TerminalSquare,
   Loader2,
+  Upload,
 } from 'lucide-react';
 import { useFileStore } from '../../stores/files';
 import { useChatStore } from '../../stores/chat';
@@ -61,18 +68,46 @@ export function MessageInput({
   const [pendingImages, setPendingImages] = useState<PendingImage[]>([]);
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
+  const [isDragOver, setIsDragOver] = useState(false);
+  const dragCounterRef = useRef(0);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
-  const draftTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const sendErrorTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(
+    undefined,
+  );
+  const draftTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(
+    undefined,
+  );
   const prevGroupJidRef = useRef<string | undefined>(groupJid);
+  const groupJidRef = useRef(groupJid);
+  groupJidRef.current = groupJid;
 
   const { uploadFiles, uploading, uploadProgress } = useFileStore();
   const { drafts, saveDraft, clearDraft } = useChatStore();
   const { mode: displayMode } = useDisplayMode();
   const isCompact = displayMode === 'compact';
   const isMobile = useMediaQuery('(max-width: 1023px)');
+
+  const showTransientError = useCallback((message: string) => {
+    if (sendErrorTimerRef.current) {
+      clearTimeout(sendErrorTimerRef.current);
+    }
+    setSendError(message);
+    sendErrorTimerRef.current = setTimeout(() => {
+      setSendError(null);
+      sendErrorTimerRef.current = undefined;
+    }, 5000);
+  }, []);
+
+  const showAttachmentError = useCallback(
+    (error: unknown) => {
+      const detail = error instanceof Error ? error.message : '无法读取附件';
+      showTransientError(`附件未添加：${detail}`);
+    },
+    [showTransientError],
+  );
 
   // iOS keyboard adaptation
   useKeyboardHeight();
@@ -93,6 +128,19 @@ export function MessageInput({
     // Load draft for new group
     const draft = groupJid ? drafts[groupJid] || '' : '';
     setContent(draft);
+    // Drop pending attachments staged for the previous group — they must not
+    // leak into the newly-selected conversation (会话隔离). Release image
+    // preview object URLs to avoid a memory leak.
+    setPendingImages((prev) => {
+      prev.forEach((img) => URL.revokeObjectURL(img.preview));
+      return [];
+    });
+    setPendingFiles([]);
+    setSendError(null);
+    if (sendErrorTimerRef.current) {
+      clearTimeout(sendErrorTimerRef.current);
+      sendErrorTimerRef.current = undefined;
+    }
     // Clear any pending debounce timer
     if (draftTimerRef.current) {
       clearTimeout(draftTimerRef.current);
@@ -106,6 +154,9 @@ export function MessageInput({
     return () => {
       if (draftTimerRef.current) {
         clearTimeout(draftTimerRef.current);
+      }
+      if (sendErrorTimerRef.current) {
+        clearTimeout(sendErrorTimerRef.current);
       }
     };
   }, []);
@@ -140,7 +191,8 @@ export function MessageInput({
     const maxHeight = lineHeight * 6;
     const newHeight = Math.max(lineHeight, Math.min(scrollHeight, maxHeight));
     textarea.style.height = `${newHeight}px`;
-    textarea.style.overflow = newHeight >= maxHeight ? 'auto' : prevOverflow || '';
+    textarea.style.overflow =
+      newHeight >= maxHeight ? 'auto' : prevOverflow || '';
   }, [content]);
 
   // IME composition state — prevent Enter from sending while composing (e.g. Chinese input)
@@ -204,8 +256,7 @@ export function MessageInput({
     } else {
       // 失败：保留输入、保留附件；同步保存草稿，刷新/崩溃也能恢复。
       if (groupJid && trimmed) saveDraft(groupJid, trimmed);
-      setSendError('发送失败，输入已保留，请重试');
-      setTimeout(() => setSendError(null), 4000);
+      showTransientError('发送失败，输入和附件已保留，请重试');
     }
     setSending(false);
   };
@@ -240,8 +291,8 @@ export function MessageInput({
               mimeType: file.type,
               preview: URL.createObjectURL(file),
             });
-          } catch {
-            // Skip failed images
+          } catch (err) {
+            showAttachmentError(err);
           }
         }
         setPendingImages((prev) => [...prev, ...newImages]);
@@ -255,6 +306,10 @@ export function MessageInput({
             label: f.webkitRelativePath || f.name,
           }));
           setPendingFiles((prev) => [...prev, ...newPending]);
+        } else {
+          showTransientError(
+            useFileStore.getState().error || '文件上传失败，请重试',
+          );
         }
       }
 
@@ -279,8 +334,8 @@ export function MessageInput({
               mimeType: file.type,
               preview: URL.createObjectURL(file),
             });
-          } catch {
-            // Skip failed images
+          } catch (err) {
+            showAttachmentError(err);
           }
         }
       }
@@ -292,7 +347,11 @@ export function MessageInput({
 
   const readFileAsBase64 = (file: File): Promise<string> => {
     if (file.size > MAX_IMAGE_SIZE_BYTES) {
-      return Promise.reject(new Error(`图片 ${file.name} 超过 5MB 限制 (${(file.size / 1024 / 1024).toFixed(1)}MB)`));
+      return Promise.reject(
+        new Error(
+          `图片 ${file.name} 超过 5MB 限制 (${(file.size / 1024 / 1024).toFixed(1)}MB)`,
+        ),
+      );
     }
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
@@ -302,7 +361,8 @@ export function MessageInput({
         const base64 = result.split(',')[1];
         resolve(base64);
       };
-      reader.onerror = reject;
+      reader.onerror = () =>
+        reject(reader.error || new Error(`读取图片 ${file.name} 失败`));
       reader.readAsDataURL(file);
     });
   };
@@ -333,8 +393,8 @@ export function MessageInput({
               mimeType: file.type,
               preview: URL.createObjectURL(file),
             });
-          } catch {
-            // Skip failed images
+          } catch (err) {
+            showAttachmentError(err);
           }
         }
       }
@@ -342,6 +402,210 @@ export function MessageInput({
       setPendingImages((prev) => [...prev, ...newImages]);
     }
   };
+
+  // --- Drag and drop helpers ---
+
+  /** Recursively traverse a dropped directory entry and collect all files */
+  const readEntriesRecursively = (
+    entry: FileSystemDirectoryEntry,
+  ): Promise<File[]> => {
+    return new Promise((resolve, reject) => {
+      const reader = entry.createReader();
+      const allFiles: File[] = [];
+
+      const readBatch = () => {
+        reader.readEntries(
+          async (entries) => {
+            if (entries.length === 0) {
+              resolve(allFiles);
+              return;
+            }
+            for (const e of entries) {
+              if (e.isFile) {
+                const file = await new Promise<File>((res, rej) =>
+                  (e as FileSystemFileEntry).file(res, (err) => rej(err)),
+                );
+                // Attach relative path for display
+                Object.defineProperty(file, 'webkitRelativePath', {
+                  value: e.fullPath.slice(1), // remove leading "/"
+                  writable: false,
+                });
+                allFiles.push(file);
+              } else if (e.isDirectory) {
+                const subFiles = await readEntriesRecursively(
+                  e as FileSystemDirectoryEntry,
+                );
+                allFiles.push(...subFiles);
+              }
+            }
+            // readEntries may return partial results; keep reading until empty
+            readBatch();
+          },
+          (err) => reject(err),
+        );
+      };
+      readBatch();
+    });
+  };
+
+  // --- Drag and drop handlers ---
+  const handleDragEnter = useCallback((e: React.DragEvent) => {
+    if (!e.dataTransfer.types.includes('Files')) return;
+    e.preventDefault();
+    e.stopPropagation();
+    dragCounterRef.current += 1;
+    setIsDragOver(true);
+  }, []);
+
+  const handleDragOver = useCallback((e: React.DragEvent) => {
+    if (!e.dataTransfer.types.includes('Files')) return;
+    e.preventDefault();
+    e.stopPropagation();
+  }, []);
+
+  const handleDragLeave = useCallback((e: React.DragEvent) => {
+    if (!e.dataTransfer.types.includes('Files')) return;
+    e.preventDefault();
+    e.stopPropagation();
+    dragCounterRef.current -= 1;
+    if (dragCounterRef.current === 0) {
+      setIsDragOver(false);
+    }
+  }, []);
+
+  const handleDrop = useCallback(
+    async (e: React.DragEvent) => {
+      // Only handle file drops; let text/URL drops through to the textarea
+      if (!e.dataTransfer.types.includes('Files')) return;
+
+      e.preventDefault();
+      e.stopPropagation();
+      dragCounterRef.current = 0;
+      setIsDragOver(false);
+
+      // Guard: respect disabled/sending/uploading state
+      if (!groupJid || disabled || sending || uploading) return;
+
+      // Capture groupJid at drop time to prevent stale-chat attachment
+      const targetGroupJid = groupJid;
+
+      // Collect files, expanding directories via webkitGetAsEntry.
+      // 同步提取所有 item 的 entry/file，避免 drop 事件结束后 DataTransferItemList
+      // 被浏览器清理（Firefox/Safari）导致后续 item 返回 null 而静默丢失。
+      const items = Array.from(e.dataTransfer.items);
+      const collected: Array<{
+        entry: FileSystemEntry | null;
+        file: File | null;
+      }> = [];
+      for (const item of items) {
+        collected.push({
+          entry: item.webkitGetAsEntry?.() ?? null,
+          file: item.getAsFile(),
+        });
+      }
+
+      const allFiles: File[] = [];
+      let hasDirectory = false;
+
+      for (const { entry, file } of collected) {
+        if (entry?.isDirectory) {
+          hasDirectory = true;
+          try {
+            const dirFiles = await readEntriesRecursively(
+              entry as FileSystemDirectoryEntry,
+            );
+            allFiles.push(...dirFiles);
+          } catch (err) {
+            showTransientError('读取文件夹失败，请重试或改用“上传文件夹”按钮');
+            console.warn('读取文件夹失败:', err);
+            return;
+          }
+        } else if (file) {
+          allFiles.push(file);
+        }
+      }
+
+      if (allFiles.length === 0) return;
+
+      // If a directory was dropped, upload ALL files to workspace (including images)
+      // to match the button-based folder upload behavior.
+      if (hasDirectory) {
+        const ok = await uploadFiles(targetGroupJid, allFiles);
+        if (ok && targetGroupJid === groupJidRef.current) {
+          const newPending = allFiles.map((f) => ({
+            label:
+              (f as unknown as { webkitRelativePath?: string })
+                .webkitRelativePath || f.name,
+          }));
+          setPendingFiles((prev) => [...prev, ...newPending]);
+        } else if (!ok) {
+          showTransientError(
+            useFileStore.getState().error || '文件夹上传失败，请重试',
+          );
+        }
+        return;
+      }
+
+      // For individual files: split images (inline) from regular files (workspace)
+      const imageFiles: File[] = [];
+      const regularFiles: File[] = [];
+      allFiles.forEach((file) => {
+        if (file.type.startsWith('image/')) {
+          imageFiles.push(file);
+        } else {
+          regularFiles.push(file);
+        }
+      });
+
+      // Process images inline (same as handleImageSelect)
+      if (imageFiles.length > 0) {
+        const newImages: PendingImage[] = [];
+        for (const file of imageFiles) {
+          try {
+            const base64 = await readFileAsBase64(file);
+            newImages.push({
+              name: file.name,
+              data: base64,
+              mimeType: file.type,
+              preview: URL.createObjectURL(file),
+            });
+          } catch (err) {
+            showAttachmentError(err);
+            console.warn('跳过图片:', err instanceof Error ? err.message : err);
+          }
+        }
+        // Verify groupJid hasn't changed during async processing (use ref for live value)
+        if (targetGroupJid === groupJidRef.current) {
+          setPendingImages((prev) => [...prev, ...newImages]);
+        } else {
+          // Conversation switched — revoke preview URLs to avoid memory leak
+          newImages.forEach((img) => URL.revokeObjectURL(img.preview));
+        }
+      }
+
+      // Upload non-image files to workspace (same as handleFileSelect)
+      if (regularFiles.length > 0) {
+        const ok = await uploadFiles(targetGroupJid, regularFiles);
+        if (ok && targetGroupJid === groupJidRef.current) {
+          const newPending = regularFiles.map((f) => ({ label: f.name }));
+          setPendingFiles((prev) => [...prev, ...newPending]);
+        } else if (!ok) {
+          showTransientError(
+            useFileStore.getState().error || '文件上传失败，请重试',
+          );
+        }
+      }
+    },
+    [
+      groupJid,
+      disabled,
+      sending,
+      uploading,
+      uploadFiles,
+      showAttachmentError,
+      showTransientError,
+    ],
+  );
 
   const handleFolderSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (!groupJid) return;
@@ -355,6 +619,10 @@ export function MessageInput({
           label: f.webkitRelativePath || f.name,
         }));
         setPendingFiles((prev) => [...prev, ...newPending]);
+      } else {
+        showTransientError(
+          useFileStore.getState().error || '文件夹上传失败，请重试',
+        );
       }
       if (folderInputRef.current) folderInputRef.current.value = '';
     }
@@ -382,29 +650,55 @@ export function MessageInput({
   };
 
   const hasContent = content.trim().length > 0;
-  const canSend = (hasContent || pendingFiles.length > 0 || pendingImages.length > 0) && !sending;
+  const canSend =
+    (hasContent || pendingFiles.length > 0 || pendingImages.length > 0) &&
+    !sending;
 
   const progressPercent =
     uploadProgress && uploadProgress.totalBytes > 0
-      ? Math.round((uploadProgress.uploadedBytes / uploadProgress.totalBytes) * 100)
+      ? Math.round(
+          (uploadProgress.uploadedBytes / uploadProgress.totalBytes) * 100,
+        )
       : 0;
 
   return (
     <div
-      className="pt-1 pb-3 bg-surface dark:bg-background max-lg:bg-background/60 max-lg:backdrop-blur-xl max-lg:saturate-[1.8] max-lg:border-t max-lg:border-border/40"
-      style={{ paddingBottom: `max(0.75rem, env(safe-area-inset-bottom, 0px), var(--keyboard-height, 0px))` }}
+      className="pt-1 pb-3 bg-surface dark:bg-background max-lg:bg-background/60 max-lg:backdrop-blur-xl max-lg:saturate-[1.8] max-lg:border-t max-lg:border-border/40 relative"
+      style={{
+        paddingBottom: `max(0.75rem, env(safe-area-inset-bottom, 0px), var(--keyboard-height, 0px))`,
+      }}
+      onDragEnter={handleDragEnter}
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
     >
+      {/* Drag overlay */}
+      {isDragOver && (
+        <div className="absolute inset-0 z-50 flex items-center justify-center bg-primary/5 dark:bg-primary/10 backdrop-blur-[2px] border-2 border-dashed border-primary rounded-xl pointer-events-none">
+          <div className="flex flex-col items-center gap-2 text-primary">
+            <Upload className="w-8 h-8" />
+            <span className="text-sm font-medium">松开上传文件</span>
+          </div>
+        </div>
+      )}
       {/* lg:pl-[60px] = avatar w-8 (32px) + gap-3 (12px) + visual balance (16px), aligns input left edge with message card content */}
-      <div className={isCompact ? 'mx-auto px-4' : 'max-w-4xl mx-auto px-4 lg:pl-[60px]'}>
+      <div
+        className={
+          isCompact ? 'mx-auto px-4' : 'max-w-4xl mx-auto px-4 lg:pl-[60px]'
+        }
+      >
         {/* Upload progress bar */}
         {uploading && uploadProgress && (
-          <div className={`mb-2 px-4 py-2.5 ${isCompact ? 'bg-surface border border-border' : 'bg-surface rounded-xl border border-border shadow-sm'}`}>
+          <div
+            className={`mb-2 px-4 py-2.5 ${isCompact ? 'bg-surface border border-border' : 'bg-surface rounded-xl border border-border shadow-sm'}`}
+          >
             <div className="flex items-center justify-between mb-1.5">
               <span className="text-xs text-foreground/70 truncate max-w-[65%]">
                 {uploadProgress.currentFile || '完成'}
               </span>
               <span className="text-xs text-muted-foreground">
-                {uploadProgress.completed}/{uploadProgress.total} · {progressPercent}%
+                {uploadProgress.completed}/{uploadProgress.total} ·{' '}
+                {progressPercent}%
               </span>
             </div>
             <div className="w-full h-1.5 bg-muted rounded-full overflow-hidden">
@@ -417,11 +711,35 @@ export function MessageInput({
         )}
 
         {/* Main input card */}
-        <div className={isCompact ? 'bg-surface border border-border rounded-lg' : 'bg-surface rounded-2xl border border-border shadow-sm'}>
+        <div
+          className={
+            isCompact
+              ? 'bg-surface border border-border rounded-lg'
+              : 'bg-surface rounded-2xl border border-border shadow-sm'
+          }
+        >
           {/* Send error banner */}
           {sendError && (
-            <div className={`px-4 py-2 bg-red-50 dark:bg-red-950/40 text-red-600 dark:text-red-400 text-xs font-medium border-b border-red-100 dark:border-red-800 flex items-center gap-2 ${isCompact ? 'rounded-t-lg' : 'rounded-t-2xl'}`}>
-              <span>{sendError}</span>
+            <div
+              role="alert"
+              aria-live="polite"
+              className={`px-4 py-2 bg-red-50 dark:bg-red-950/40 text-red-600 dark:text-red-400 text-xs font-medium border-b border-red-100 dark:border-red-800 flex items-center gap-2 ${isCompact ? 'rounded-t-lg' : 'rounded-t-2xl'}`}
+            >
+              <span className="flex-1">{sendError}</span>
+              <button
+                type="button"
+                aria-label="关闭错误提示"
+                className="p-1 rounded hover:bg-red-100 dark:hover:bg-red-900/50"
+                onClick={() => {
+                  if (sendErrorTimerRef.current) {
+                    clearTimeout(sendErrorTimerRef.current);
+                    sendErrorTimerRef.current = undefined;
+                  }
+                  setSendError(null);
+                }}
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
             </div>
           )}
 
@@ -535,8 +853,13 @@ export function MessageInput({
                 debouncedSaveDraft(e.target.value);
               }}
               onKeyDown={handleKeyDown}
-              onCompositionStart={() => { composingRef.current = true; }}
-              onCompositionEnd={() => { composingRef.current = false; compositionEndTimeRef.current = Date.now(); }}
+              onCompositionStart={() => {
+                composingRef.current = true;
+              }}
+              onCompositionEnd={() => {
+                composingRef.current = false;
+                compositionEndTimeRef.current = Date.now();
+              }}
               onPaste={handlePaste}
               placeholder="输入消息..."
               disabled={disabled}
@@ -602,7 +925,11 @@ export function MessageInput({
                   : 'bg-muted text-muted-foreground'
               }`}
             >
-              {sending ? <Loader2 className="w-4.5 h-4.5 animate-spin" /> : <ArrowUp className="w-4.5 h-4.5" />}
+              {sending ? (
+                <Loader2 className="w-4.5 h-4.5 animate-spin" />
+              ) : (
+                <ArrowUp className="w-4.5 h-4.5" />
+              )}
             </button>
           </div>
         </div>

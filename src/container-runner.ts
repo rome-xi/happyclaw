@@ -13,7 +13,13 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { CONTAINER_IMAGE, DATA_DIR, GROUPS_DIR, SPOOF_DIR, TIMEZONE } from './config.js';
+import {
+  CONTAINER_IMAGE,
+  DATA_DIR,
+  GROUPS_DIR,
+  SPOOF_DIR,
+  TIMEZONE,
+} from './config.js';
 import { logger } from './logger.js';
 import { getArkMashupEnv } from './ark-mashup.js';
 import { resolveHostNodeBinary } from './node-resolver.js';
@@ -109,17 +115,30 @@ function ensureHostClaudeJson(): string {
 function getContainerClaudeJsonPath(): string {
   const containerJsonDir = path.join(DATA_DIR, 'config');
   fs.mkdirSync(containerJsonDir, { recursive: true });
-  const containerJsonPath = path.join(containerJsonDir, 'container-claude-json.json');
+  const containerJsonPath = path.join(
+    containerJsonDir,
+    'container-claude-json.json',
+  );
 
   try {
-    const hostJson = JSON.parse(fs.readFileSync(getHostClaudeJsonPath(), 'utf-8'));
+    const hostJson = JSON.parse(
+      fs.readFileSync(getHostClaudeJsonPath(), 'utf-8'),
+    );
     const stripped = { ...hostJson };
     delete stripped.cachedGrowthBookFeatures;
     delete stripped.oauthAccount;
     stripped.autoUpdates = false;
-    fs.writeFileSync(containerJsonPath, JSON.stringify(stripped, null, 2) + '\n', { mode: 0o644 });
+    fs.writeFileSync(
+      containerJsonPath,
+      JSON.stringify(stripped, null, 2) + '\n',
+      { mode: 0o644 },
+    );
   } catch {
-    fs.writeFileSync(containerJsonPath, '{"hasCompletedOnboarding":true,"autoUpdates":false}\n', { mode: 0o644 });
+    fs.writeFileSync(
+      containerJsonPath,
+      '{"hasCompletedOnboarding":true,"autoUpdates":false}\n',
+      { mode: 0o644 },
+    );
   }
 
   return containerJsonPath;
@@ -142,7 +161,10 @@ function ensureSymlinkTo(localPath: string, targetPath: string): void {
   try {
     fs.symlinkSync(targetPath, localPath);
   } catch (err) {
-    logger.warn({ err, localPath, targetPath }, 'Failed to create symlink for .claude.json, deviceId may differ');
+    logger.warn(
+      { err, localPath, targetPath },
+      'Failed to create symlink for .claude.json, deviceId may differ',
+    );
   }
 }
 
@@ -284,7 +306,10 @@ interface ResolvedProvider {
  */
 const providerOverrides = new Map<string, string>();
 
-export function setProviderOverride(groupFolder: string, providerId: string): void {
+export function setProviderOverride(
+  groupFolder: string,
+  providerId: string,
+): void {
   providerOverrides.set(groupFolder, providerId);
 }
 
@@ -501,7 +526,9 @@ function trySelectPoolProvider(
  * even when the user has plugins enabled. Failure is logged, never thrown —
  * the agent simply starts with whatever subset is already materialized.
  */
-export function prepareHostPlugins(ownerId: string | null | undefined): SdkPluginConfig[] {
+export function prepareHostPlugins(
+  ownerId: string | null | undefined,
+): SdkPluginConfig[] {
   if (!ownerId) return [];
   try {
     materializeUserRuntime(ownerId);
@@ -630,7 +657,9 @@ export function buildVolumeMounts(
     if (!st.isSymbolicLink() && st.size > STRIPPED_CLAUDE_JSON_MAX_SIZE) {
       fs.unlinkSync(sessionClaudeJson);
     }
-  } catch { /* not found, ok */ }
+  } catch {
+    /* not found, ok */
+  }
 
   // 挂载精简版 .claude.json（剥离 cachedGrowthBookFeatures），保留 deviceId 一致性
   const containerJson = getContainerClaudeJsonPath();
@@ -779,7 +808,8 @@ export function buildVolumeMounts(
   const providerEngineType = resolvedProvider?.engineType || 'anthropic';
   if (providerEngineType === 'openai') {
     const openaiBaseUrl = globalConfig.anthropicBaseUrl;
-    const openaiApiKey = globalConfig.anthropicAuthToken || globalConfig.anthropicApiKey;
+    const openaiApiKey =
+      globalConfig.anthropicAuthToken || globalConfig.anthropicApiKey;
     if (openaiBaseUrl) {
       envLines.push(`OPENAI_BASE_URL=${openaiBaseUrl}`);
     }
@@ -832,7 +862,9 @@ export function buildVolumeMounts(
     try {
       const staleCreds = path.join(groupSessionsDir, '.credentials.json');
       if (fs.existsSync(staleCreds)) fs.unlinkSync(staleCreds);
-    } catch { /* ignore */ }
+    } catch {
+      /* ignore */
+    }
   }
 
   // Mount agent-runner source from host — recompiled on container startup.
@@ -868,21 +900,30 @@ export function buildVolumeMounts(
   // so the SDK's directory traversal (cwd → root) discovers them at /workspace/ level.
   // Only for admin-created workspaces; ordinary users must not inherit host-global config.
   if (claudeContextPlan.isAdminOwned) {
-    if (claudeContextPlan.claudeMdSource && fs.existsSync(claudeContextPlan.claudeMdSource)) {
+    if (
+      claudeContextPlan.claudeMdSource &&
+      fs.existsSync(claudeContextPlan.claudeMdSource)
+    ) {
       mounts.push({
         hostPath: claudeContextPlan.claudeMdSource,
         containerPath: '/workspace/CLAUDE.md',
         readonly: true,
       });
     }
-    if (claudeContextPlan.rulesSourceDir && fs.existsSync(claudeContextPlan.rulesSourceDir)) {
+    if (
+      claudeContextPlan.rulesSourceDir &&
+      fs.existsSync(claudeContextPlan.rulesSourceDir)
+    ) {
       mounts.push({
         hostPath: claudeContextPlan.rulesSourceDir,
         containerPath: '/workspace/.claude/rules',
         readonly: true,
       });
     }
-    if (claudeContextPlan.externalSkillsDir && fs.existsSync(claudeContextPlan.externalSkillsDir)) {
+    if (
+      claudeContextPlan.externalSkillsDir &&
+      fs.existsSync(claudeContextPlan.externalSkillsDir)
+    ) {
       mounts.push({
         hostPath: claudeContextPlan.externalSkillsDir,
         containerPath: '/workspace/external-skills',
@@ -942,7 +983,11 @@ function buildContainerArgs(
 export async function runContainerAgent(
   group: RegisteredGroup,
   input: ContainerInput,
-  onProcess: (proc: ChildProcess, containerName: string, selectedProviderId: string | null) => void,
+  onProcess: (
+    proc: ChildProcess,
+    containerName: string,
+    selectedProviderId: string | null,
+  ) => void,
   onOutput?: (output: ContainerOutput) => Promise<void>,
   ownerHomeFolder?: string,
 ): Promise<ContainerOutput> {
@@ -1057,7 +1102,14 @@ export async function runContainerAgent(
           projectRoot: process.cwd(),
           dataDir: DATA_DIR,
           groupSessionsDir: input.agentId
-            ? path.join(DATA_DIR, 'sessions', group.folder, 'agents', input.agentId, '.claude')
+            ? path.join(
+                DATA_DIR,
+                'sessions',
+                group.folder,
+                'agents',
+                input.agentId,
+                '.claude',
+              )
             : path.join(DATA_DIR, 'sessions', group.folder, '.claude'),
           mountUserSkills: shouldMountUserSkills,
         }).audit,
@@ -1325,7 +1377,11 @@ export function killProcessTree(
 export async function runHostAgent(
   group: RegisteredGroup,
   input: ContainerInput,
-  onProcess: (proc: ChildProcess, identifier: string, selectedProviderId: string | null) => void,
+  onProcess: (
+    proc: ChildProcess,
+    identifier: string,
+    selectedProviderId: string | null,
+  ) => void,
   onOutput?: (output: ContainerOutput) => Promise<void>,
   ownerHomeFolder?: string,
 ): Promise<ContainerOutput> {
@@ -1469,7 +1525,9 @@ export async function runHostAgent(
   // 3. 写入 settings.json（合并模式，不覆盖已有用户配置）
   // Load user's global MCP servers (same logic as Docker mode).
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
-  const hostMcpServers = group.created_by ? loadUserMcpServers(group.created_by) : {};
+  const hostMcpServers = group.created_by
+    ? loadUserMcpServers(group.created_by)
+    : {};
   ensureSettingsJson(settingsFile, hostMcpServers);
 
   // 4. Skills / Rules / CLAUDE.md 自动链接到 session 目录
@@ -1486,7 +1544,8 @@ export async function runHostAgent(
     hostClaudeContextPlan,
     groupSessionsDir,
   );
-  hostClaudeContextPlan.audit.claudeMd.status = hostClaudeContextSync.claudeMdStatus;
+  hostClaudeContextPlan.audit.claudeMd.status =
+    hostClaudeContextSync.claudeMdStatus;
   hostClaudeContextPlan.audit.warnings = hostClaudeContextSync.warnings;
 
   // 5. 构建环境变量
@@ -1510,7 +1569,8 @@ export async function runHostAgent(
   const containerOverride = getContainerEnvConfig(group.folder);
   const hostPoolResult = trySelectPoolProvider(group.folder, input.agentId);
   const hostSelectedProfileId = hostPoolResult?.profileId ?? null;
-  const globalConfig = hostPoolResult?.resolved.config ?? getClaudeProviderConfig();
+  const globalConfig =
+    hostPoolResult?.resolved.config ?? getClaudeProviderConfig();
   let hostProviderFailureReported = false;
   if (hostPoolResult?.resetSession && input.sessionId) {
     logger.info(
@@ -1538,6 +1598,9 @@ export async function runHostAgent(
       globalConfig,
       containerOverride,
       hostPoolResult?.resolved.customEnv,
+    );
+    const injectsAnthropicAuthToken = envLines.some((line) =>
+      line.startsWith('ANTHROPIC_AUTH_TOKEN='),
     );
     for (const line of envLines) {
       const eqIdx = line.indexOf('=');
@@ -1571,7 +1634,8 @@ export async function runHostAgent(
         // ARK_FOREGROUND_TIER) overridable without recompile.
         const isForegroundLane = !input.agentId && !input.taskRunId;
         if (!group.is_home && isForegroundLane && !hostEnv['ANTHROPIC_MODEL']) {
-          hostEnv['ANTHROPIC_MODEL'] = process.env.ARK_FOREGROUND_TIER || 'high';
+          hostEnv['ANTHROPIC_MODEL'] =
+            process.env.ARK_FOREGROUND_TIER || 'high';
         }
         logger.info(
           {
@@ -1599,10 +1663,18 @@ export async function runHostAgent(
     const ENABLE_SPOOF = true;
     const spoofScript = path.join(SPOOF_DIR, 'spoof-fingerprint.js');
     const dnsGuardScript = path.join(SPOOF_DIR, 'dns-guard.js');
-    if (ENABLE_SPOOF && fs.existsSync(spoofScript) && fs.existsSync(dnsGuardScript)) {
-      const folderTag = group.folder.replace(/[^a-zA-Z0-9]/g, '').slice(-6).toLowerCase();
+    if (
+      ENABLE_SPOOF &&
+      fs.existsSync(spoofScript) &&
+      fs.existsSync(dnsGuardScript)
+    ) {
+      const folderTag = group.folder
+        .replace(/[^a-zA-Z0-9]/g, '')
+        .slice(-6)
+        .toLowerCase();
       hostEnv['SPOOF_HOSTNAME'] = `desktop-${folderTag || 'pc'}`;
-      hostEnv['BUN_OPTIONS'] = `--preload ${spoofScript} --preload ${dnsGuardScript}${hostEnv['BUN_OPTIONS'] ? ' ' + hostEnv['BUN_OPTIONS'] : ''}`;
+      hostEnv['BUN_OPTIONS'] =
+        `--preload ${spoofScript} --preload ${dnsGuardScript}${hostEnv['BUN_OPTIONS'] ? ' ' + hostEnv['BUN_OPTIONS'] : ''}`;
       // 强制东部时区：出口 IP 实测在华盛顿特区(D.C.)，America/New_York (EST/EDT)。
       // 不用 || 兜底——前面链路已把 TZ 设成 Asia/Shanghai，必须覆盖才能和美国 IP 一致。
       hostEnv['TZ'] = 'America/New_York';
@@ -1620,7 +1692,10 @@ export async function runHostAgent(
         'claude-spoof: injected US persona (Bun --preload)',
       );
     } else {
-      logger.warn({ folder: group.folder, SPOOF_DIR }, 'claude-spoof: scripts missing, skipping');
+      logger.warn(
+        { folder: group.folder, SPOOF_DIR },
+        'claude-spoof: scripts missing, skipping',
+      );
     }
 
     // Relay passthrough mode: ANTHROPIC_BASE_URL points at a relay that forwards
@@ -1636,11 +1711,13 @@ export async function runHostAgent(
         'x-relay-passthrough',
       ) && !hostEnv['ANTHROPIC_API_KEY'];
 
-    // Third-party provider: ANTHROPIC_AUTH_TOKEN inherited from the host
-    // (~/.claude/settings.json) forces the SDK down the OAuth code path,
-    // which skips the standard Bearer header and causes 404 on non-Anthropic
-    // endpoints. Unset it so the injected ANTHROPIC_API_KEY takes effect.
-    if (hostEnv['ANTHROPIC_BASE_URL'] && !isRelayPassthrough) {
+    // Unless the provider explicitly injects a Bearer token, remove an
+    // inherited host OAuth token so third-party API-key mode takes effect.
+    if (
+      hostEnv['ANTHROPIC_BASE_URL'] &&
+      !isRelayPassthrough &&
+      !injectsAnthropicAuthToken
+    ) {
       delete hostEnv['ANTHROPIC_AUTH_TOKEN'];
 
       // Also strip oauthAccount from session .claude.json: the SDK detects
@@ -1650,13 +1727,25 @@ export async function runHostAgent(
       // .claude.json without oauthAccount so the SDK falls back to API key mode.
       try {
         const sessionClaudeJson = path.join(groupSessionsDir, '.claude.json');
-        try { fs.unlinkSync(sessionClaudeJson); } catch { /* ignore */ }
+        try {
+          fs.unlinkSync(sessionClaudeJson);
+        } catch {
+          /* ignore */
+        }
         let claudeJson: Record<string, unknown> = {};
         try {
-          claudeJson = JSON.parse(fs.readFileSync(getHostClaudeJsonPath(), 'utf-8'));
-        } catch { /* ignore */ }
+          claudeJson = JSON.parse(
+            fs.readFileSync(getHostClaudeJsonPath(), 'utf-8'),
+          );
+        } catch {
+          /* ignore */
+        }
         delete claudeJson.oauthAccount;
-        fs.writeFileSync(sessionClaudeJson, JSON.stringify(claudeJson, null, 2) + '\n', { mode: 0o600 });
+        fs.writeFileSync(
+          sessionClaudeJson,
+          JSON.stringify(claudeJson, null, 2) + '\n',
+          { mode: 0o600 },
+        );
       } catch (err) {
         logger.warn(
           { folder: group.folder, err },
@@ -1693,16 +1782,23 @@ export async function runHostAgent(
     // SystemSettings.autoCompactWindow > 0 时注入到 host 进程，agent-runner 通过 query() settings 传给 SDK
     const hostSysSettings = getSystemSettings();
     if (hostSysSettings.autoCompactWindow > 0) {
-      hostEnv['AUTO_COMPACT_WINDOW'] = String(hostSysSettings.autoCompactWindow);
+      hostEnv['AUTO_COMPACT_WINDOW'] = String(
+        hostSysSettings.autoCompactWindow,
+      );
     }
     // SubAgent 模型：仅非默认 'inherit' 时注入，避免覆盖 customEnv 同名值。
-    if (hostSysSettings.subagentModel && hostSysSettings.subagentModel !== 'inherit') {
+    if (
+      hostSysSettings.subagentModel &&
+      hostSysSettings.subagentModel !== 'inherit'
+    ) {
       hostEnv['SUBAGENT_MODEL'] = hostSysSettings.subagentModel;
     }
 
     // 引擎类型：根据选中的 Provider 的 engineType 注入
     if (hostSelectedProfileId) {
-      const providerDef = getProviders().find((p) => p.id === hostSelectedProfileId);
+      const providerDef = getProviders().find(
+        (p) => p.id === hostSelectedProfileId,
+      );
       if (providerDef?.engineType && providerDef.engineType !== 'anthropic') {
         hostEnv['HAPPYCLAW_ENGINE_TYPE'] = providerDef.engineType;
         if (providerDef.engineType === 'openai') {
@@ -1710,13 +1806,18 @@ export async function runHostAgent(
           if (providerDef.anthropicBaseUrl) {
             hostEnv['OPENAI_BASE_URL'] = providerDef.anthropicBaseUrl;
           }
-          const openaiKey = providerDef.anthropicAuthToken || providerDef.anthropicApiKey;
+          const openaiKey =
+            providerDef.anthropicAuthToken || providerDef.anthropicApiKey;
           if (openaiKey) {
             hostEnv['OPENAI_API_KEY'] = openaiKey;
           }
         }
         logger.info(
-          { folder: group.folder, providerId: hostSelectedProfileId, engineType: providerDef.engineType },
+          {
+            folder: group.folder,
+            providerId: hostSelectedProfileId,
+            engineType: providerDef.engineType,
+          },
           '注入非默认引擎类型到 host agent',
         );
       }
@@ -1811,7 +1912,11 @@ export async function runHostAgent(
       const currentPath = hostEnv['PATH'] || process.env.PATH || '';
       hostEnv['PATH'] = `${resolvedClaudeDir}:${currentPath}`;
       logger.info(
-        { group: group.name, resolvedClaudeDir, resolvedPath: capResult.resolvedPaths['claude'] },
+        {
+          group: group.name,
+          resolvedClaudeDir,
+          resolvedPath: capResult.resolvedPaths['claude'],
+        },
         'Host preflight: claude binary resolved',
       );
     }

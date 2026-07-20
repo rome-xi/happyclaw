@@ -3,6 +3,7 @@ import type { proto } from '@whiskeysockets/baileys';
 
 import {
   extractMessageText,
+  unwrapMessageContent,
   extFromMime,
   guessMimeType,
   isMentioningBot,
@@ -12,9 +13,9 @@ import {
 
 describe('extractMessageText', () => {
   test('plain conversation', () => {
-    expect(
-      extractMessageText({ conversation: 'hi' } as proto.IMessage),
-    ).toBe('hi');
+    expect(extractMessageText({ conversation: 'hi' } as proto.IMessage)).toBe(
+      'hi',
+    );
   });
 
   test('extendedTextMessage', () => {
@@ -61,6 +62,23 @@ describe('extractMessageText', () => {
 
   test('empty content returns null', () => {
     expect(extractMessageText({} as proto.IMessage)).toBeNull();
+  });
+});
+
+describe('unwrapMessageContent', () => {
+  test('unwraps disappearing and captioned-document envelopes', () => {
+    const document = {
+      documentMessage: { caption: 'report' },
+    } as proto.IMessage;
+    const wrapped = {
+      ephemeralMessage: {
+        message: {
+          documentWithCaptionMessage: { message: document },
+        },
+      },
+    } as proto.IMessage;
+
+    expect(unwrapMessageContent(wrapped)).toBe(document);
   });
 });
 
@@ -134,7 +152,10 @@ describe('isMentioningBot', () => {
 
   test('returns false when mentions empty', () => {
     expect(
-      isMentioningBot({ extendedTextMessage: { text: 'hi' } } as proto.IMessage, SELF),
+      isMentioningBot(
+        { extendedTextMessage: { text: 'hi' } } as proto.IMessage,
+        SELF,
+      ),
     ).toBe(false);
   });
 

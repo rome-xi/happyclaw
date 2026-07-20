@@ -39,6 +39,7 @@ import type { StreamEvent } from '../stream-event.types.js';
 import type { ContainerOutput } from '../types.js';
 import { StreamEventProcessor } from '../stream-processor.js';
 import { PREDEFINED_AGENTS } from '../agent-definitions.js';
+import { AssistantTextTracker } from '../utils.js';
 
 // ── SDK User Message 类型 ──
 
@@ -52,7 +53,14 @@ interface SDKUserMessage {
       | string
       | Array<
           | { type: 'text'; text: string }
-          | { type: 'image'; source: { type: 'base64'; media_type: ImageMediaType; data: string } }
+          | {
+              type: 'image';
+              source: {
+                type: 'base64';
+                media_type: ImageMediaType;
+                data: string;
+              };
+            }
         >;
   };
   parent_tool_use_id: null;
@@ -67,9 +75,14 @@ class MessageStream {
   private waiting: (() => void) | null = null;
   private done = false;
 
-  push(text: string, images?: Array<{ data: string; mimeType: string }>): string[] {
+  push(
+    text: string,
+    images?: Array<{ data: string; mimeType: string }>,
+  ): string[] {
     if (this.done) {
-      return ['Stream already ended, message will be processed in the next query'];
+      return [
+        'Stream already ended, message will be processed in the next query',
+      ];
     }
 
     let content: SDKUserMessage['message']['content'];
@@ -138,12 +151,17 @@ interface ActiveQuery {
 export interface ClaudeEngineOptions {
   /** 日志函数 */
   logFn?: (msg: string) => void;
+  /** Test/embedding seam; production uses the SDK exports above. */
+  queryFn?: typeof query;
+  createMcpServerFn?: typeof createSdkMcpServer;
 }
 
 export class ClaudeEngine implements AgentEngine {
   readonly engineType: EngineType = 'anthropic';
 
   private readonly logFn: (msg: string) => void;
+  private readonly queryFn: typeof query;
+  private readonly createMcpServerFn: typeof createSdkMcpServer;
   private registeredTools: EngineToolDefinition[] = [];
   private registeredAgents: EngineAgentDefinition[] = [];
 
@@ -151,12 +169,18 @@ export class ClaudeEngine implements AgentEngine {
   private activeQueries = new Map<string, ActiveQuery>();
 
   constructor(options: ClaudeEngineOptions = {}) {
-    this.logFn = options.logFn ?? ((msg) => console.error(`[agent-runner] ${msg}`));
+    this.logFn =
+      options.logFn ?? ((msg) => console.error(`[agent-runner] ${msg}`));
+    this.queryFn = options.queryFn ?? query;
+    this.createMcpServerFn = options.createMcpServerFn ?? createSdkMcpServer;
   }
 
   // ── AgentEngine 接口实现 ──
 
-  async createSession(config: EngineConfig, resumeSessionId?: string): Promise<EngineSession> {
+  async createSession(
+    config: EngineConfig,
+    resumeSessionId?: string,
+  ): Promise<EngineSession> {
     return {
       id: resumeSessionId || '',
       engineType: 'anthropic',
@@ -180,7 +204,9 @@ export class ClaudeEngine implements AgentEngine {
       return { finalText: '', newSessionId: session.id, finishReason: 'stop' };
     }
 
-    const config = (session.engineState._config as EngineConfig | undefined) ?? {
+    const config = (session.engineState._config as
+      | EngineConfig
+      | undefined) ?? {
       model: process.env.ANTHROPIC_MODEL || 'opus[1m]',
       baseUrl: '',
       apiKey: '',
@@ -208,7 +234,7 @@ export class ClaudeEngine implements AgentEngine {
         };
       },
     }));
-    const mcpServerConfig = createSdkMcpServer({
+    const mcpServerConfig = this.createMcpServerFn({
       name: 'happyclaw',
       version: '1.0.0',
       tools: sdkTools as any,
@@ -262,50 +288,75 @@ export class ClaudeEngine implements AgentEngine {
     // ── 6. 构建 PreCompact hook ──
     // 优先级：extra.preCompactHook（真实 SDK HookCallback）> hooks.preCompact（简单回调通知）
     const externalPreCompact = extra.preCompactHook as HookCallback | undefined;
-    const hooksConfig = externalPreCompact || hooks?.preCompact
-      ? ({
-          PreCompact: [
-            {
-              hooks: [
-                (async (input: PreCompactHookInput, toolUseId: any, context: any) => {
-                  // 先调用真实的 SDK PreCompact hook（处理归档、trim、flag 设置）
-                  if (externalPreCompact) {
-                    return await externalPreCompact(input, toolUseId, context);
-                  }
-                  // 否则调用简单回调通知
-                  if (hooks?.preCompact) {
-                    await hooks.preCompact({
-                      sessionId: session.id,
-                      agentId: (input as any).agent_id,
-                      transcriptPath: (input as any).transcript_path,
-                    });
-                  }
-                  return {};
-                }) as HookCallback,
-              ],
-            },
-          ],
-        } as any)
-      : undefined;
+    const hooksConfig =
+      externalPreCompact || hooks?.preCompact
+        ? ({
+            PreCompact: [
+              {
+                hooks: [
+                  (async (
+                    input: PreCompactHookInput,
+                    toolUseId: any,
+                    context: any,
+                  ) => {
+                    // 先调用真实的 SDK PreCompact hook（处理归档、trim、flag 设置）
+                    if (externalPreCompact) {
+                      return await externalPreCompact(
+                        input,
+                        toolUseId,
+                        context,
+                      );
+                    }
+                    // 否则调用简单回调通知
+                    if (hooks?.preCompact) {
+                      await hooks.preCompact({
+                        sessionId: session.id,
+                        agentId: (input as any).agent_id,
+                        transcriptPath: (input as any).transcript_path,
+                      });
+                    }
+                    return {};
+                  }) as HookCallback,
+                ],
+              },
+            ],
+          } as any)
+        : undefined;
 
     // ── 7. 构建 query options ──
-    const userMcpServers = (extra.userMcpServers as Record<string, unknown>) ?? {};
+    const userMcpServers =
+      (extra.userMcpServers as Record<string, unknown>) ?? {};
     const allowedTools = (extra.allowedTools as string[]) ?? [
       'Bash',
-      'Read', 'Write', 'Edit', 'Glob', 'Grep',
-      'WebSearch', 'WebFetch',
-      'Task', 'TaskOutput', 'TaskStop',
-      'TeamCreate', 'TeamDelete', 'SendMessage',
-      'TodoWrite', 'ToolSearch',
+      'Read',
+      'Write',
+      'Edit',
+      'Glob',
+      'Grep',
+      'WebSearch',
+      'WebFetch',
+      'Task',
+      'TaskOutput',
+      'TaskStop',
+      'TeamCreate',
+      'TeamDelete',
+      'SendMessage',
+      'TodoWrite',
+      'ToolSearch',
       'NotebookEdit',
       'mcp__happyclaw__*',
     ];
     const disallowedTools = extra.disallowedTools as string[] | undefined;
     const resumeAt = extra.resumeAt as string | undefined;
-    const settingSources = (extra.settingSources as string[]) ?? ['project', 'user'];
-    const plugins = extra.plugins as Array<{ type: 'local'; path: string }> | undefined;
+    const settingSources = (extra.settingSources as string[]) ?? [
+      'project',
+      'user',
+    ];
+    const plugins = extra.plugins as
+      | Array<{ type: 'local'; path: string }>
+      | undefined;
 
-    const q = query({
+    const q = this.queryFn({
       prompt: stream,
       options: {
         ...(pathToClaudeCodeExecutable && { pathToClaudeCodeExecutable }),
@@ -319,9 +370,14 @@ export class ClaudeEngine implements AgentEngine {
           append: config.systemPromptAppend || '',
         },
         allowedTools,
-        ...(disallowedTools && disallowedTools.length > 0 ? { disallowedTools } : {}),
+        ...(disallowedTools && disallowedTools.length > 0
+          ? { disallowedTools }
+          : {}),
         thinking: config.thinking
-          ? { type: config.thinking.type, display: config.thinking.display ?? 'summarized' }
+          ? {
+              type: config.thinking.type,
+              display: config.thinking.display ?? 'summarized',
+            }
           : { type: 'adaptive' as const, display: 'summarized' as const },
         permissionMode: 'bypassPermissions',
         allowDangerouslySkipPermissions: true,
@@ -330,7 +386,9 @@ export class ClaudeEngine implements AgentEngine {
         skills: 'all',
         includePartialMessages: true,
         forwardSubagentText: true,
-        ...(Object.keys(flagSettings).length > 0 ? { settings: flagSettings as any } : {}),
+        ...(Object.keys(flagSettings).length > 0
+          ? { settings: flagSettings as any }
+          : {}),
         ...(plugins && { plugins }),
         additionalDirectories: config.additionalDirectories,
         mcpServers: {
@@ -345,18 +403,15 @@ export class ClaudeEngine implements AgentEngine {
     // ── 8. 事件队列 + StreamEventProcessor ──
     const eventQueue: StreamEvent[] = [];
 
-    const processor = new StreamEventProcessor(
-      (output: ContainerOutput) => {
-        if (output.streamEvent) {
-          eventQueue.push({
-            ...output.streamEvent,
-            turnId: output.turnId ?? output.streamEvent.turnId,
-            sessionId: output.sessionId ?? output.streamEvent.sessionId,
-          });
-        }
-      },
-      this.logFn,
-    );
+    const processor = new StreamEventProcessor((output: ContainerOutput) => {
+      if (output.streamEvent) {
+        eventQueue.push({
+          ...output.streamEvent,
+          turnId: output.turnId ?? output.streamEvent.turnId,
+          sessionId: output.sessionId ?? output.streamEvent.sessionId,
+        });
+      }
+    }, this.logFn);
 
     // ── 9. 存储活动查询句柄 ──
     const sessionKey = session.id || `__pending_${Date.now()}`;
@@ -382,6 +437,27 @@ export class ClaudeEngine implements AgentEngine {
     let lastAssistantUuid: string | undefined;
     let canonicalAssistantText: string | undefined;
     let canonicalAssistantUuid: string | undefined;
+    const assistantTextTracker = new AssistantTextTracker();
+    let reportedAnyResult = false;
+    const lastReportedUsage = {
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadInputTokens: 0,
+      cacheCreationInputTokens: 0,
+      costUSD: 0,
+      durationMs: 0,
+      numTurns: 0,
+    };
+    const lastReportedModelUsage = new Map<
+      string,
+      {
+        inputTokens: number;
+        outputTokens: number;
+        cacheReadInputTokens: number;
+        cacheCreationInputTokens: number;
+        costUSD: number;
+      }
+    >();
     let resultCount = 0;
     let messageCount = 0;
     let sessionResumeFailed = false;
@@ -512,16 +588,17 @@ export class ClaudeEngine implements AgentEngine {
           lastAssistantUuid = (message as { uuid: string }).uuid;
           const assistantMsg = message as Record<string, unknown>;
           if ((assistantMsg.parent_tool_use_id ?? null) === null) {
-            const msgContent = (assistantMsg.message as Record<string, unknown> | undefined)
-              ?.content;
-            const topLevelText = Array.isArray(msgContent)
-              ? (msgContent as Array<{ type: string; text?: string }>)
-                  .filter((block) => block.type === 'text' && typeof block.text === 'string')
-                  .map((block) => block.text!)
-                  .join('')
-              : '';
-            if (topLevelText) {
-              canonicalAssistantText = (canonicalAssistantText || '') + topLevelText;
+            const msgContent = (
+              assistantMsg.message as Record<string, unknown> | undefined
+            )?.content;
+            if (
+              Array.isArray(msgContent) &&
+              assistantTextTracker.addContentBlocks(
+                msgContent as Array<{ type: string; text?: string }>,
+              )
+            ) {
+              canonicalAssistantText =
+                assistantTextTracker.pickFinalText(null) ?? undefined;
               canonicalAssistantUuid = assistantMsg.uuid as string;
             }
           }
@@ -532,19 +609,22 @@ export class ClaudeEngine implements AgentEngine {
         if (message.type === 'result') {
           resultCount++;
           const resultMsg = message as any;
-          const textResult = 'result' in resultMsg ? (resultMsg.result as string | null) : null;
+          const textResult =
+            'result' in resultMsg ? (resultMsg.result as string | null) : null;
           const resultSubtype = (message as any).subtype as string | undefined;
 
           // 错误 subtype 检测
           if (
             typeof resultSubtype === 'string' &&
-            (resultSubtype === 'error_during_execution' || resultSubtype.startsWith('error'))
+            (resultSubtype === 'error_during_execution' ||
+              resultSubtype.startsWith('error'))
           ) {
             if (!newSessionId) {
               sessionResumeFailed = true;
             }
             session.engineState.sessionResumeFailed = sessionResumeFailed;
-            session.engineState.lastAssistantUuid = canonicalAssistantUuid || lastAssistantUuid;
+            session.engineState.lastAssistantUuid =
+              canonicalAssistantUuid || lastAssistantUuid;
             session.engineState.contextOverflow = false;
             session.engineState.unrecoverableTranscriptError = false;
 
@@ -562,7 +642,8 @@ export class ClaudeEngine implements AgentEngine {
           if (textResult && this.isContextOverflowError(textResult)) {
             contextOverflow = true;
             session.engineState.contextOverflow = true;
-            session.engineState.lastAssistantUuid = canonicalAssistantUuid || lastAssistantUuid;
+            session.engineState.lastAssistantUuid =
+              canonicalAssistantUuid || lastAssistantUuid;
 
             processor.cleanup();
             yield* this.drainQueue(eventQueue);
@@ -578,7 +659,8 @@ export class ClaudeEngine implements AgentEngine {
           if (textResult && this.isUnrecoverableTranscriptError(textResult)) {
             unrecoverableTranscriptError = true;
             session.engineState.unrecoverableTranscriptError = true;
-            session.engineState.lastAssistantUuid = canonicalAssistantUuid || lastAssistantUuid;
+            session.engineState.lastAssistantUuid =
+              canonicalAssistantUuid || lastAssistantUuid;
 
             processor.cleanup();
             yield* this.drainQueue(eventQueue);
@@ -592,11 +674,29 @@ export class ClaudeEngine implements AgentEngine {
 
           // 正常 result
           const { effectiveResult } = processor.processResult(textResult);
-          const finalText = canonicalAssistantText || effectiveResult;
+          const finalText =
+            assistantTextTracker.pickFinalText(effectiveResult) || '';
+          canonicalAssistantText = finalText || undefined;
+          const pendingBgTasks = processor.getPendingSdkTaskCount();
 
-          // 发射 usage
-          const sdkUsage = resultMsg.usage as Record<string, number> | undefined;
+          // SDK 的 usage/modelUsage 是会话累计值。一个 Workflow 会在同一
+          // query 中产生多条 result，必须按上一条累计值做 delta，否则每个
+          // 中间结果都会把历史 token 再记一次。
+          const sdkUsage = resultMsg.usage as
+            | Record<string, number>
+            | undefined;
+          let usageEvent: StreamEvent | null = null;
+          let usageDelta:
+            | {
+                inputTokens: number;
+                outputTokens: number;
+                cacheReadInputTokens: number;
+                cacheCreationInputTokens: number;
+              }
+            | undefined;
           if (sdkUsage) {
+            const delta = (current: number | undefined, previous: number) =>
+              Math.max(0, (current || 0) - previous);
             const sdkModelUsage = resultMsg.modelUsage as
               | Record<string, Record<string, number>>
               | undefined;
@@ -613,43 +713,126 @@ export class ClaudeEngine implements AgentEngine {
 
             if (sdkModelUsage && Object.keys(sdkModelUsage).length > 0) {
               for (const [model, mu] of Object.entries(sdkModelUsage)) {
+                const previous = lastReportedModelUsage.get(model);
                 modelUsageSummary[model] = {
+                  inputTokens: delta(
+                    mu.inputTokens,
+                    previous?.inputTokens || 0,
+                  ),
+                  outputTokens: delta(
+                    mu.outputTokens,
+                    previous?.outputTokens || 0,
+                  ),
+                  cacheReadInputTokens: delta(
+                    mu.cacheReadInputTokens,
+                    previous?.cacheReadInputTokens || 0,
+                  ),
+                  cacheCreationInputTokens: delta(
+                    mu.cacheCreationInputTokens,
+                    previous?.cacheCreationInputTokens || 0,
+                  ),
+                  costUSD: delta(mu.costUSD, previous?.costUSD || 0),
+                };
+                lastReportedModelUsage.set(model, {
                   inputTokens: mu.inputTokens || 0,
                   outputTokens: mu.outputTokens || 0,
                   cacheReadInputTokens: mu.cacheReadInputTokens || 0,
                   cacheCreationInputTokens: mu.cacheCreationInputTokens || 0,
                   costUSD: mu.costUSD || 0,
-                };
+                });
               }
             } else {
+              const previous = lastReportedModelUsage.get(config.model);
               modelUsageSummary[config.model] = {
+                inputTokens: delta(
+                  sdkUsage.input_tokens,
+                  previous?.inputTokens || 0,
+                ),
+                outputTokens: delta(
+                  sdkUsage.output_tokens,
+                  previous?.outputTokens || 0,
+                ),
+                cacheReadInputTokens: delta(
+                  sdkUsage.cache_read_input_tokens,
+                  previous?.cacheReadInputTokens || 0,
+                ),
+                cacheCreationInputTokens: delta(
+                  sdkUsage.cache_creation_input_tokens,
+                  previous?.cacheCreationInputTokens || 0,
+                ),
+                costUSD: delta(
+                  resultMsg.total_cost_usd as number,
+                  previous?.costUSD || 0,
+                ),
+              };
+              lastReportedModelUsage.set(config.model, {
                 inputTokens: sdkUsage.input_tokens || 0,
                 outputTokens: sdkUsage.output_tokens || 0,
                 cacheReadInputTokens: sdkUsage.cache_read_input_tokens || 0,
-                cacheCreationInputTokens: sdkUsage.cache_creation_input_tokens || 0,
+                cacheCreationInputTokens:
+                  sdkUsage.cache_creation_input_tokens || 0,
                 costUSD: (resultMsg.total_cost_usd as number) || 0,
-              };
+              });
             }
 
-            yield {
+            usageDelta = {
+              inputTokens: delta(
+                sdkUsage.input_tokens,
+                lastReportedUsage.inputTokens,
+              ),
+              outputTokens: delta(
+                sdkUsage.output_tokens,
+                lastReportedUsage.outputTokens,
+              ),
+              cacheReadInputTokens: delta(
+                sdkUsage.cache_read_input_tokens,
+                lastReportedUsage.cacheReadInputTokens,
+              ),
+              cacheCreationInputTokens: delta(
+                sdkUsage.cache_creation_input_tokens,
+                lastReportedUsage.cacheCreationInputTokens,
+              ),
+            };
+            usageEvent = {
               eventType: 'usage',
               agentScope: 'system',
               displayLevel: 'debug',
               usage: {
-                inputTokens: sdkUsage.input_tokens || 0,
-                outputTokens: sdkUsage.output_tokens || 0,
-                cacheReadInputTokens: sdkUsage.cache_read_input_tokens || 0,
-                cacheCreationInputTokens: sdkUsage.cache_creation_input_tokens || 0,
-                costUSD: (resultMsg.total_cost_usd as number) || 0,
-                durationMs: (resultMsg.duration_ms as number) || 0,
-                numTurns: (resultMsg.num_turns as number) || 0,
-                modelUsage: Object.keys(modelUsageSummary).length > 0 ? modelUsageSummary : undefined,
+                ...usageDelta,
+                costUSD: delta(
+                  resultMsg.total_cost_usd as number,
+                  lastReportedUsage.costUSD,
+                ),
+                durationMs: delta(
+                  resultMsg.duration_ms as number,
+                  lastReportedUsage.durationMs,
+                ),
+                numTurns: delta(
+                  resultMsg.num_turns as number,
+                  lastReportedUsage.numTurns,
+                ),
+                modelUsage:
+                  Object.keys(modelUsageSummary).length > 0
+                    ? modelUsageSummary
+                    : undefined,
               },
             };
+            lastReportedUsage.inputTokens = sdkUsage.input_tokens || 0;
+            lastReportedUsage.outputTokens = sdkUsage.output_tokens || 0;
+            lastReportedUsage.cacheReadInputTokens =
+              sdkUsage.cache_read_input_tokens || 0;
+            lastReportedUsage.cacheCreationInputTokens =
+              sdkUsage.cache_creation_input_tokens || 0;
+            lastReportedUsage.costUSD =
+              (resultMsg.total_cost_usd as number) || 0;
+            lastReportedUsage.durationMs =
+              (resultMsg.duration_ms as number) || 0;
+            lastReportedUsage.numTurns = (resultMsg.num_turns as number) || 0;
           }
 
           // 保存状态到 session
-          session.engineState.lastAssistantUuid = canonicalAssistantUuid || lastAssistantUuid;
+          session.engineState.lastAssistantUuid =
+            canonicalAssistantUuid || lastAssistantUuid;
           session.engineState.canonicalAssistantText = canonicalAssistantText;
           session.engineState.resultCount = resultCount;
           session.engineState.messageCount = messageCount;
@@ -657,23 +840,43 @@ export class ClaudeEngine implements AgentEngine {
           session.engineState.unrecoverableTranscriptError = false;
           session.engineState.sessionResumeFailed = false;
 
+          const sendResult: EngineSendResult = {
+            finalText,
+            newSessionId: newSessionId || session.id,
+            usage: usageDelta,
+            finishReason: 'stop',
+            pendingBgTasks,
+          };
+
+          // Flush the last text delta before publishing the result. With an
+          // onResult hook, the host can display this turn immediately while
+          // the SDK iterator stays open for Workflow task notifications and a
+          // later summary result.
+          yield* this.drainQueue(eventQueue);
+          if (hooks?.onResult) {
+            await hooks.onResult(sendResult);
+            reportedAnyResult = true;
+            if (usageEvent) yield usageEvent;
+            assistantTextTracker.reset();
+            canonicalAssistantText = undefined;
+
+            if (pendingBgTasks > 0) {
+              this.logFn(
+                `Holding Claude query open for ${pendingBgTasks} background task(s): ${processor.describePendingSdkTasks().join(' | ')}`,
+              );
+              continue;
+            }
+
+            processor.cleanup();
+            yield* this.drainQueue(eventQueue);
+            return { ...sendResult, finalText: '', reported: true };
+          }
+
+          if (usageEvent) yield usageEvent;
           processor.cleanup();
           yield* this.drainQueue(eventQueue);
 
-          return {
-            finalText: finalText || '',
-            newSessionId: newSessionId || session.id,
-            usage: sdkUsage
-              ? {
-                  inputTokens: sdkUsage.input_tokens || 0,
-                  outputTokens: sdkUsage.output_tokens || 0,
-                  cacheReadInputTokens: sdkUsage.cache_read_input_tokens,
-                  cacheCreationInputTokens: sdkUsage.cache_creation_input_tokens,
-                }
-              : undefined,
-            finishReason: 'stop',
-            pendingBgTasks: processor.getPendingSdkTaskCount(),
-          };
+          return sendResult;
         }
 
         // 其他未处理的消息
@@ -698,15 +901,20 @@ export class ClaudeEngine implements AgentEngine {
     }
 
     // for-await 正常结束（非 result 退出）
-    session.engineState.lastAssistantUuid = canonicalAssistantUuid || lastAssistantUuid;
+    session.engineState.lastAssistantUuid =
+      canonicalAssistantUuid || lastAssistantUuid;
     session.engineState.contextOverflow = contextOverflow;
-    session.engineState.unrecoverableTranscriptError = unrecoverableTranscriptError;
+    session.engineState.unrecoverableTranscriptError =
+      unrecoverableTranscriptError;
     session.engineState.sessionResumeFailed = sessionResumeFailed;
 
+    const trailingText =
+      assistantTextTracker.pickFinalText(processor.getFullText()) || '';
     return {
-      finalText: canonicalAssistantText || processor.getFullText() || '',
+      finalText: trailingText,
       newSessionId: newSessionId || session.id,
       finishReason: abortRequested ? 'interrupted' : 'stop',
+      reported: reportedAnyResult && !trailingText,
     };
   }
 
@@ -888,7 +1096,9 @@ export class ClaudeEngine implements AgentEngine {
       /image\s+was\s+specified\s+using\s+the\s+image\/[a-z0-9.+-]+\s+media\s+type,\s+but\s+the\s+image\s+appears\s+to\s+be\s+(?:an?\s+)?image\/[a-z0-9.+-]+\s+image/i.test(
         msg,
       ) ||
-      /image\/[a-z0-9.+-]+\s+media\s+type.*appears\s+to\s+be.*image\/[a-z0-9.+-]+/i.test(msg)
+      /image\/[a-z0-9.+-]+\s+media\s+type.*appears\s+to\s+be.*image\/[a-z0-9.+-]+/i.test(
+        msg,
+      )
     );
   }
 

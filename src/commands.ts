@@ -38,6 +38,26 @@ export function isCompactCommand(content: string): boolean {
   return content.trim().toLowerCase() === '/compact';
 }
 
+/**
+ * `/compact <instructions>` 带参数形态 —— **真压缩**入口。
+ *
+ * 裸 `/compact`（无 arg）走假压缩（`executeSessionReset` mode='compact'，删掉
+ * SDK session JSONL + 从 DB 重灌历史）；`/compact <text>` 带 arg 走真压缩：
+ * 不在入口层拦截，让文本以 `/compact <text>` 形态直接进入消息管道 → IPC →
+ * agent-runner 下一轮 runQuery 作为 prompt → SDK/CLI 识别为内建 slash 命令
+ * 执行真压缩（LLM 生成摘要 + `compact_boundary` + `PreCompact` hook trigger='manual'
+ * 且 custom_instructions=<text>）。
+ *
+ * agent-runner 端要求：检测到 slash 命令时必须**跳过 `[当前时间:]` 前缀**
+ * （见 container/agent-runner/src/index.ts runQuery 时间前缀注入），否则消息
+ * 不以 `/` 开头 CLI 就无法识别为内建命令。
+ */
+export function isCompactWithArgsCommand(content: string): boolean {
+  const t = content.trim();
+  // `/compact` 后至少一个空白 + 至少一个非空字符 = 有 instructions
+  return /^\/compact\s+\S/i.test(t);
+}
+
 export const SESSION_RESET_FAILURE_MESSAGE =
   'system_error:清除上下文失败，请稍后重试';
 
@@ -53,9 +73,7 @@ export async function executeSessionReset(
   agentId?: string,
   mode: 'clear' | 'compact' = 'clear',
 ): Promise<void> {
-  const targetJid = agentId
-    ? `${baseChatJid}#agent:${agentId}`
-    : baseChatJid;
+  const targetJid = agentId ? `${baseChatJid}#agent:${agentId}` : baseChatJid;
 
   if (agentId) {
     // Agent-specific reset: only stop the agent's virtual JID process

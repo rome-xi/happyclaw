@@ -64,12 +64,24 @@ describe('ClaudeContextResolver', () => {
     const sync = syncHostClaudeContext(plan, sessionDir);
 
     expect(sync.claudeMdStatus).toBe('linked');
-    expect(fs.readlinkSync(path.join(sessionDir, 'CLAUDE.md'))).toBe(path.join(external, 'CLAUDE.md'));
-    expect(fs.readlinkSync(path.join(sessionDir, 'rules', 'browser.md'))).toBe(path.join(external, 'rules', 'browser.md'));
-    expect(fs.readlinkSync(path.join(sessionDir, 'skills', 'builtin-skill'))).toBe(path.join(dataDir, 'builtin-skills', 'builtin-skill'));
-    expect(fs.readlinkSync(path.join(sessionDir, 'skills', 'external-skill'))).toBe(path.join(external, 'skills', 'external-skill'));
-    expect(fs.readlinkSync(path.join(sessionDir, 'skills', 'project-skill'))).toBe(path.join(projectRoot, 'container', 'skills', 'project-skill'));
-    expect(fs.readlinkSync(path.join(sessionDir, 'skills', 'user-skill'))).toBe(path.join(dataDir, 'skills', 'admin', 'user-skill'));
+    expect(fs.readlinkSync(path.join(sessionDir, 'CLAUDE.md'))).toBe(
+      path.join(external, 'CLAUDE.md'),
+    );
+    expect(fs.readlinkSync(path.join(sessionDir, 'rules', 'browser.md'))).toBe(
+      path.join(external, 'rules', 'browser.md'),
+    );
+    expect(
+      fs.readlinkSync(path.join(sessionDir, 'skills', 'builtin-skill')),
+    ).toBe(path.join(dataDir, 'builtin-skills', 'builtin-skill'));
+    expect(
+      fs.readlinkSync(path.join(sessionDir, 'skills', 'external-skill')),
+    ).toBe(path.join(external, 'skills', 'external-skill'));
+    expect(
+      fs.readlinkSync(path.join(sessionDir, 'skills', 'project-skill')),
+    ).toBe(path.join(projectRoot, 'container', 'skills', 'project-skill'));
+    expect(fs.readlinkSync(path.join(sessionDir, 'skills', 'user-skill'))).toBe(
+      path.join(dataDir, 'skills', 'admin', 'user-skill'),
+    );
   });
 
   test('host sync preserves a real session CLAUDE.md and reports shadowed', () => {
@@ -91,7 +103,9 @@ describe('ClaudeContextResolver', () => {
 
     expect(sync.claudeMdStatus).toBe('shadowed');
     expect(sync.warnings).toContain('CLAUDE.md shadowed by session file');
-    expect(fs.lstatSync(path.join(sessionDir, 'CLAUDE.md')).isSymbolicLink()).toBe(false);
+    expect(
+      fs.lstatSync(path.join(sessionDir, 'CLAUDE.md')).isSymbolicLink(),
+    ).toBe(false);
   });
 
   test('container plan mounts admin triad but does not expose it to ordinary users', () => {
@@ -120,7 +134,11 @@ describe('ClaudeContextResolver', () => {
       status: 'mounted',
       fileCount: 1,
     });
-    expect(adminPlan.audit.skills.sources.some((source) => source.name === 'external')).toBe(true);
+    expect(
+      adminPlan.audit.skills.sources.some(
+        (source) => source.name === 'external',
+      ),
+    ).toBe(true);
 
     const userPlan = buildClaudeContextPlan({
       executionMode: 'container',
@@ -135,6 +153,36 @@ describe('ClaudeContextResolver', () => {
     expect(userPlan.audit.externalClaudeDir).toBeUndefined();
     expect(userPlan.audit.claudeMd.sourcePath).toBeUndefined();
     expect(userPlan.audit.rules.status).toBe('unavailable');
-    expect(userPlan.audit.skills.sources.some((source) => source.name === 'external')).toBe(false);
+    expect(
+      userPlan.audit.skills.sources.some(
+        (source) => source.name === 'external',
+      ),
+    ).toBe(false);
+  });
+
+  test('host sync reports skill-name conflicts and keeps later-source precedence', () => {
+    const external = path.join(tmp, 'external-claude');
+    const dataDir = path.join(tmp, 'data');
+    const sessionDir = path.join(tmp, 'sessions', 'main', '.claude');
+    makeSkill(path.join(dataDir, 'builtin-skills'), 'duplicate');
+    makeSkill(path.join(external, 'skills'), 'duplicate');
+
+    const plan = buildClaudeContextPlan({
+      executionMode: 'host',
+      group: fakeGroup('main', 'admin', true) as any,
+      ownerHomeFolder: 'main',
+      externalClaudeDir: external,
+      projectRoot: path.join(tmp, 'project'),
+      dataDir,
+      groupSessionsDir: sessionDir,
+    });
+    const sync = syncHostClaudeContext(plan, sessionDir);
+
+    expect(sync.warnings).toContain(
+      'skill name conflict: duplicate（后序来源覆盖前序）',
+    );
+    expect(fs.readlinkSync(path.join(sessionDir, 'skills', 'duplicate'))).toBe(
+      path.join(external, 'skills', 'duplicate'),
+    );
   });
 });

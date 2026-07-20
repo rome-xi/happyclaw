@@ -40,6 +40,11 @@ bun.lockb
 .docker-build-sentinel
 *.tsbuildinfo
 
+# Local pre-refactor build snapshots and one-off provider probes
+/dist.pre-*/
+/container/agent-runner/dist.pre-*/
+/probe_*.mjs
+
 # Local tooling metadata
 .claude/
 .mcp.json

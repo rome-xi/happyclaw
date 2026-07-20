@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import fs from 'fs';
+import { isIP } from 'net';
 import path from 'path';
 import os from 'os';
 
@@ -42,7 +43,11 @@ function writeSecretFile(targetPath: string, data: string): void {
   try {
     fs.writeFileSync(fd, data);
   } finally {
-    try { fs.closeSync(fd); } catch { /* ignore */ }
+    try {
+      fs.closeSync(fd);
+    } catch {
+      /* ignore */
+    }
   }
   fs.renameSync(tmp, targetPath);
   try {
@@ -431,10 +436,15 @@ function normalizeSecret(input: unknown, fieldName: string): string {
   if (typeof input !== 'string') {
     throw new Error(`Invalid field: ${fieldName}`);
   }
-  // Strip ALL whitespace and non-ASCII characters — API keys/tokens are always ASCII;
-  // users often paste with accidental spaces, line breaks, or smart quotes (e.g. U+2019).
   // eslint-disable-next-line no-control-regex
-  const value = input.replace(/\s+/g, '').replace(/[^\x00-\x7F]/g, '');
+  const ascii = input.replace(/[^\x00-\x7F]/g, '').trim();
+  // A Bearer auth token intentionally contains one separator. Other secrets,
+  // including bare auth tokens, stay compact so pasted whitespace cannot break
+  // authentication.
+  const value =
+    fieldName === 'anthropicAuthToken' && /^Bearer\s/i.test(ascii)
+      ? ascii.replace(/\s+/g, ' ')
+      : ascii.replace(/\s+/g, '');
   if (value.length > MAX_FIELD_LENGTH) {
     throw new Error(`Field too long: ${fieldName}`);
   }
@@ -555,7 +565,8 @@ function sanitizeCustomEnvMap(
     if (options?.skipReservedClaudeKeys && RESERVED_CLAUDE_ENV_KEYS.has(key)) {
       continue;
     }
-    out[key] = sanitizeEnvValue(
+    out[key] = sanitizeCustomEnvValue(
+      key,
       typeof rawValue === 'string' ? rawValue : String(rawValue),
     );
   }
@@ -1377,9 +1388,7 @@ export function updateProvider(
     ...(patch.weight !== undefined
       ? { weight: Math.max(1, Math.min(100, patch.weight)) }
       : {}),
-    ...(patch.engineType !== undefined
-      ? { engineType: patch.engineType }
-      : {}),
+    ...(patch.engineType !== undefined ? { engineType: patch.engineType } : {}),
     updatedAt: new Date().toISOString(),
   };
 
@@ -1551,7 +1560,12 @@ export function resolveProviderById(providerId: string): {
   engineType: 'anthropic' | 'openai';
 } {
   const state = readStoredStateV4();
-  if (!state) return { config: defaultsFromEnv(), customEnv: {}, engineType: 'anthropic' };
+  if (!state)
+    return {
+      config: defaultsFromEnv(),
+      customEnv: {},
+      engineType: 'anthropic',
+    };
 
   const provider = state.providers.find((p) => p.id === providerId);
   if (!provider) {
@@ -1561,7 +1575,12 @@ export function resolveProviderById(providerId: string): {
     );
     const fallback =
       state.providers.find((p) => p.enabled) || state.providers[0];
-    if (!fallback) return { config: defaultsFromEnv(), customEnv: {}, engineType: 'anthropic' };
+    if (!fallback)
+      return {
+        config: defaultsFromEnv(),
+        customEnv: {},
+        engineType: 'anthropic',
+      };
     return {
       config: providerToConfig(fallback),
       customEnv: fallback.customEnv,
@@ -1831,7 +1850,10 @@ export function saveTelegramProviderConfig(
   };
 
   fs.mkdirSync(CLAUDE_CONFIG_DIR, { recursive: true });
-  writeSecretFile(TELEGRAM_CONFIG_FILE, JSON.stringify(payload, null, 2) + '\n');
+  writeSecretFile(
+    TELEGRAM_CONFIG_FILE,
+    JSON.stringify(payload, null, 2) + '\n',
+  );
   return normalized;
 }
 
@@ -2345,6 +2367,39 @@ function sanitizeEnvValue(value: string): string {
   return value.replace(/[\r\n\0]/g, '');
 }
 
+function sanitizeCustomEnvValue(key: string, value: string): string {
+  if (key === 'ANTHROPIC_CUSTOM_HEADERS') {
+    return value.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/\0/g, '');
+  }
+  return sanitizeEnvValue(value);
+}
+
+/**
+ * Claude Code performs a local login check before sending the first request.
+ * A loopback gateway can legitimately own the upstream credentials and require
+ * no client secret, but the CLI still needs a non-empty API key to get past
+ * that check.  Keep this exception deliberately narrow: never manufacture a
+ * credential for LAN/public providers where a missing key is almost certainly
+ * a configuration error.
+ */
+export function isLoopbackProviderBaseUrl(rawUrl: string): boolean {
+  if (!rawUrl) return false;
+  try {
+    const parsed = new URL(rawUrl);
+    const hostname = parsed.hostname
+      .replace(/^\[|\]$/g, '')
+      .replace(/\.$/, '')
+      .toLowerCase();
+    if (hostname === 'localhost' || hostname === '::1') return true;
+    if (isIP(hostname) !== 4) return false;
+    return hostname.split('.')[0] === '127';
+  } catch {
+    return false;
+  }
+}
+
+export const LOCAL_GATEWAY_API_KEY = 'happyclaw-local-gateway';
+
 /** Convert KEY=value lines to shell-safe format by single-quoting values.
  *  Used when writing env files that are `source`d by bash. */
 export function shellQuoteEnvLines(lines: string[]): string[] {
@@ -2365,6 +2420,13 @@ export function buildClaudeEnvLines(
 ): string[] {
   const lines: string[] = [];
 
+  const hasLocalCredential = !!(
+    config.anthropicApiKey ||
+    config.anthropicAuthToken ||
+    config.claudeCodeOauthToken ||
+    config.claudeOAuthCredentials
+  );
+
   // When full OAuth credentials exist, authentication is handled by .credentials.json file.
   // Only fall back to CLAUDE_CODE_OAUTH_TOKEN env var for legacy single-token mode.
   if (!config.claudeOAuthCredentials && config.claudeCodeOauthToken) {
@@ -2374,6 +2436,17 @@ export function buildClaudeEnvLines(
   }
   if (config.anthropicApiKey) {
     lines.push(`ANTHROPIC_API_KEY=${sanitizeEnvValue(config.anthropicApiKey)}`);
+  } else if (
+    !hasLocalCredential &&
+    isLoopbackProviderBaseUrl(config.anthropicBaseUrl) &&
+    !!config.anthropicModel &&
+    !/^claude(?:-|$)/i.test(config.anthropicModel)
+  ) {
+    // The loopback gateway replaces Authorization with the selected upstream
+    // channel's key. This value is only a local CLI login sentinel. Bare
+    // `claude-*` routes are excluded because a passthrough gateway may need
+    // the user's real OAuth credential instead.
+    lines.push(`ANTHROPIC_API_KEY=${LOCAL_GATEWAY_API_KEY}`);
   }
   if (config.anthropicBaseUrl) {
     lines.push(
@@ -2381,18 +2454,18 @@ export function buildClaudeEnvLines(
     );
   }
   if (config.anthropicAuthToken) {
-    if (config.anthropicBaseUrl) {
-      // Third-party provider: the SDK treats ANTHROPIC_AUTH_TOKEN as an OAuth
-      // legacy token and skips the standard Bearer header, causing 404 on
-      // non-Anthropic endpoints. Use ANTHROPIC_API_KEY instead so the SDK
-      // sends the correct Authorization header.
+    const bearerMatch = /^Bearer\s+(.+)$/i.exec(config.anthropicAuthToken);
+    if (config.anthropicBaseUrl && !bearerMatch) {
+      // Most third-party endpoints expect API-key style auth. Explicit Bearer
+      // values instead use the SDK's Authorization header path.
       lines.push(
         `ANTHROPIC_API_KEY=${sanitizeEnvValue(config.anthropicAuthToken)}`,
       );
     } else {
-      lines.push(
-        `ANTHROPIC_AUTH_TOKEN=${sanitizeEnvValue(config.anthropicAuthToken)}`,
-      );
+      // Claude Code adds "Bearer " itself; remove a user-supplied prefix to
+      // avoid Authorization: Bearer Bearer <token>.
+      const token = bearerMatch ? bearerMatch[1] : config.anthropicAuthToken;
+      lines.push(`ANTHROPIC_AUTH_TOKEN=${sanitizeEnvValue(token)}`);
     }
   }
   if (config.anthropicModel) {
@@ -2403,7 +2476,7 @@ export function buildClaudeEnvLines(
   const customEnv = profileCustomEnv ?? getActiveProfileCustomEnv();
   for (const [key, value] of Object.entries(customEnv)) {
     if (RESERVED_CLAUDE_ENV_KEYS.has(key)) continue;
-    lines.push(`${key}=${sanitizeEnvValue(value)}`);
+    lines.push(`${key}=${sanitizeCustomEnvValue(key, value)}`);
   }
 
   return lines;
@@ -2540,12 +2613,17 @@ export function appendClaudeConfigAudit(
   // 首次落盘 mode = 0o666 & ~umask（实测 0o644），同主机其他本地账号能读
   // 管理员审计轨迹（用户名 / OAuth 登录时点 / IM 凭据轮换时间窗 = 暴力破解
   // 窗口枚举素材）。和 writeSecretFile 同形态强 0o600。
-  const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND;
+  const flags =
+    fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND;
   const fd = fs.openSync(CLAUDE_CONFIG_AUDIT_FILE, flags, 0o600);
   try {
     fs.writeSync(fd, `${JSON.stringify(entry)}\n`);
   } finally {
-    try { fs.closeSync(fd); } catch { /* ignore */ }
+    try {
+      fs.closeSync(fd);
+    } catch {
+      /* ignore */
+    }
   }
   // 自愈历史 0o644 文件：appendFileSync 在升级前已经创建过，单纯切到 fd 路径
   // 只对新文件生效；显式 chmod 保证存量也收紧。
@@ -2673,7 +2751,10 @@ export function saveContainerEnvConfig(
   }
 
   fs.mkdirSync(CONTAINER_ENV_DIR, { recursive: true });
-  writeSecretFile(containerEnvPath(folder), JSON.stringify(sanitized, null, 2) + '\n');
+  writeSecretFile(
+    containerEnvPath(folder),
+    JSON.stringify(sanitized, null, 2) + '\n',
+  );
 }
 
 export function deleteContainerEnvConfig(folder: string): void {
@@ -2831,10 +2912,7 @@ export function buildContainerEnvLines(
       // so newlines must survive. It stays injection-safe because shellQuoteEnvLines
       // single-quotes the value (file path) and host mode sets it via an env dict
       // (no shell parsing); only \r and \0 are stripped here.
-      const sanitized =
-        key === 'ANTHROPIC_CUSTOM_HEADERS'
-          ? value.replace(/[\r\0]/g, '')
-          : value.replace(/[\r\n\0]/g, '');
+      const sanitized = sanitizeCustomEnvValue(key, value);
       lines.push(`${key}=${sanitized}`);
     }
   }
@@ -3614,9 +3692,7 @@ export function saveUserDingTalkConfig(
 
 // ========== Discord User IM Config ==========
 
-export function getUserDiscordConfig(
-  userId: string,
-): UserDiscordConfig | null {
+export function getUserDiscordConfig(userId: string): UserDiscordConfig | null {
   const filePath = path.join(userImDir(userId), 'discord.json');
   try {
     if (!fs.existsSync(filePath)) return null;
@@ -3710,6 +3786,10 @@ export interface SystemSettings {
   taskBackfillGraceMs: number;
 }
 
+// auth.ts reclaims attempt records after 24h; no configured lockout may exceed
+// that TTL or the counter could disappear while the client is still locked.
+const MAX_LOGIN_LOCKOUT_MINUTES = 24 * 60;
+
 const DEFAULT_SYSTEM_SETTINGS: SystemSettings = {
   containerTimeout: 1800000,
   idleTimeout: 1800000,
@@ -3795,7 +3875,7 @@ function readSystemSettingsFromFile(): SystemSettings | null {
         : DEFAULT_SYSTEM_SETTINGS.maxLoginAttempts,
     loginLockoutMinutes:
       typeof raw.loginLockoutMinutes === 'number' && raw.loginLockoutMinutes > 0
-        ? raw.loginLockoutMinutes
+        ? Math.min(raw.loginLockoutMinutes, MAX_LOGIN_LOCKOUT_MINUTES)
         : DEFAULT_SYSTEM_SETTINGS.loginLockoutMinutes,
     maxConcurrentScripts:
       typeof raw.maxConcurrentScripts === 'number' &&
@@ -3875,9 +3955,12 @@ function buildEnvFallbackSettings(): SystemSettings {
       process.env.MAX_LOGIN_ATTEMPTS,
       DEFAULT_SYSTEM_SETTINGS.maxLoginAttempts,
     ),
-    loginLockoutMinutes: parseIntEnv(
-      process.env.LOGIN_LOCKOUT_MINUTES,
-      DEFAULT_SYSTEM_SETTINGS.loginLockoutMinutes,
+    loginLockoutMinutes: Math.min(
+      parseIntEnv(
+        process.env.LOGIN_LOCKOUT_MINUTES,
+        DEFAULT_SYSTEM_SETTINGS.loginLockoutMinutes,
+      ),
+      MAX_LOGIN_LOCKOUT_MINUTES,
     ),
     maxConcurrentScripts: parseIntEnv(
       process.env.MAX_CONCURRENT_SCRIPTS,
@@ -3902,9 +3985,13 @@ function buildEnvFallbackSettings(): SystemSettings {
       DEFAULT_SYSTEM_SETTINGS.billingCurrencyRate,
     ),
     externalClaudeDir:
-      process.env.EXTERNAL_CLAUDE_DIR || DEFAULT_SYSTEM_SETTINGS.externalClaudeDir,
+      process.env.EXTERNAL_CLAUDE_DIR ||
+      DEFAULT_SYSTEM_SETTINGS.externalClaudeDir,
     autoCompactWindow: clampAutoCompactWindow(
-      parseIntEnv(process.env.AUTO_COMPACT_WINDOW, DEFAULT_SYSTEM_SETTINGS.autoCompactWindow),
+      parseIntEnv(
+        process.env.AUTO_COMPACT_WINDOW,
+        DEFAULT_SYSTEM_SETTINGS.autoCompactWindow,
+      ),
     ),
     subagentModel:
       process.env.SUBAGENT_MODEL || DEFAULT_SYSTEM_SETTINGS.subagentModel,
@@ -3992,7 +4079,9 @@ export function saveSystemSettings(
   if (merged.maxLoginAttempts < 1) merged.maxLoginAttempts = 1;
   if (merged.maxLoginAttempts > 100) merged.maxLoginAttempts = 100;
   if (merged.loginLockoutMinutes < 1) merged.loginLockoutMinutes = 1;
-  if (merged.loginLockoutMinutes > 1440) merged.loginLockoutMinutes = 1440; // max 24 hours
+  if (merged.loginLockoutMinutes > MAX_LOGIN_LOCKOUT_MINUTES) {
+    merged.loginLockoutMinutes = MAX_LOGIN_LOCKOUT_MINUTES;
+  }
   if (merged.maxConcurrentScripts < 1) merged.maxConcurrentScripts = 1;
   if (merged.maxConcurrentScripts > 50) merged.maxConcurrentScripts = 50;
   if (merged.scriptTimeout < 5000) merged.scriptTimeout = 5000; // min 5s
@@ -4008,7 +4097,10 @@ export function saveSystemSettings(
   merged.autoCompactWindow = clampAutoCompactWindow(merged.autoCompactWindow);
 
   // subagentModel: 非空字符串（别名或完整 model ID），去空白并限长；空则回退默认。
-  if (typeof merged.subagentModel !== 'string' || !merged.subagentModel.trim()) {
+  if (
+    typeof merged.subagentModel !== 'string' ||
+    !merged.subagentModel.trim()
+  ) {
     merged.subagentModel = DEFAULT_SYSTEM_SETTINGS.subagentModel;
   } else {
     merged.subagentModel = merged.subagentModel.trim().slice(0, 64);
@@ -4033,7 +4125,9 @@ export function saveSystemSettings(
     if (trimmed) {
       try {
         const resolved = fs.realpathSync(trimmed);
-        merged.externalClaudeDir = fs.statSync(resolved).isDirectory() ? resolved : '';
+        merged.externalClaudeDir = fs.statSync(resolved).isDirectory()
+          ? resolved
+          : '';
       } catch {
         merged.externalClaudeDir = '';
       }

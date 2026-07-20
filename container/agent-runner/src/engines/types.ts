@@ -130,6 +130,10 @@ export interface EngineSendResult {
    * >0 时 runner 不启动关流倒计时，保持 query 存活，等任务 settle 后 CLI 唤醒
    * 模型汇总。仅 ClaudeEngine 填充；OpenAIEngine 无此概念（恒 0/undefined）。 */
   pendingBgTasks?: number;
+  /** The engine already delivered this result through EngineHooks.onResult.
+   * The generator return value then carries lifecycle state only and must not
+   * be emitted a second time by the orchestrator. */
+  reported?: boolean;
 }
 
 /** 引擎生命周期钩子 */
@@ -140,6 +144,13 @@ export interface EngineHooks {
    * OpenAI 引擎暂不支持自动压缩。
    */
   preCompact?: (event: PreCompactEvent) => Promise<void>;
+  /**
+   * Deliver a completed SDK turn without closing the underlying query.
+   * Claude uses this for Workflow/background-task turns: an intermediate
+   * result becomes visible immediately, while the SDK stream stays alive for
+   * task notifications and the final summary. OpenAI currently ignores it.
+   */
+  onResult?: (result: EngineSendResult) => Promise<void> | void;
 }
 
 /** PreCompact 事件数据 */
@@ -172,7 +183,10 @@ export interface AgentEngine {
    * OpenAI:    直接创建空 session（id 为空字符串），
    *            首次 API 调用后从 response.id 更新。
    */
-  createSession(config: EngineConfig, resumeSessionId?: string): Promise<EngineSession>;
+  createSession(
+    config: EngineConfig,
+    resumeSessionId?: string,
+  ): Promise<EngineSession>;
 
   /**
    * 发送消息并获取流式响应。
