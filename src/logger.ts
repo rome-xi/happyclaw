@@ -1,18 +1,43 @@
 import pino from 'pino';
+import { redactLogString, sanitizeLogValue } from './log-redaction.js';
 
 export const logger = pino({
   level: process.env.LOG_LEVEL || 'info',
   redact: {
     paths: [
-      'token', 'password', 'secret', 'apiKey', 'api_key',
-      'authorization', 'cookie', 'sessionId',
-      '*.token', '*.password', '*.secret', '*.apiKey', '*.api_key',
-      '*.authorization', '*.cookie', '*.sessionId',
-      '*.appSecret', '*.app_secret', '*.appId',
-      '*.anthropicApiKey', '*.anthropicAuthToken',
-      '*.botToken', '*.bot_token',
+      'token',
+      'password',
+      'secret',
+      'apiKey',
+      'api_key',
+      'authorization',
+      'cookie',
+      'sessionId',
+      '*.token',
+      '*.password',
+      '*.secret',
+      '*.apiKey',
+      '*.api_key',
+      '*.authorization',
+      '*.cookie',
+      '*.sessionId',
+      '*.appSecret',
+      '*.app_secret',
+      '*.appId',
+      '*.anthropicApiKey',
+      '*.anthropicAuthToken',
+      '*.botToken',
+      '*.bot_token',
     ],
     censor: '[REDACTED]',
+  },
+  hooks: {
+    logMethod(args, method) {
+      const sanitized = args.map((arg) =>
+        typeof arg === 'string' ? redactLogString(arg) : sanitizeLogValue(arg),
+      );
+      method.apply(this, sanitized as Parameters<typeof method>);
+    },
   },
   transport: {
     target: 'pino-pretty',

@@ -23,6 +23,13 @@ import Database from 'better-sqlite3';
 import { logger } from './logger.js';
 
 const NEWAPI = process.env.NEWAPI_URL || 'http://127.0.0.1:3010';
+const TIER_GATEWAY =
+  process.env.TIER_GATEWAY_URL ||
+  process.env.ARK_GATEWAY_URL ||
+  'http://127.0.0.1:3011';
+// Loopback-only Claude CLI login sentinel, not an upstream secret. The
+// gateway strips it and injects the new-api token from its 0600 token file.
+const LOCAL_GATEWAY_SENTINEL = 'happyclaw-local-gateway';
 const DEFAULT_TOKEN_FILE = path.join(
   os.homedir(),
   '.config',
@@ -58,6 +65,8 @@ const SRC_AGENTROUTER = 'AgentRouter opus';
 export interface Candidate {
   model: string; // 探测 + 路由用的真实模型名
   src: string; // 服务该模型的 new-api 源渠道名（base_url+key 来源）
+  /** Native protocol behind the source channel. */
+  protocol: 'anthropic-messages' | 'openai-responses-adapter';
 }
 
 interface TierDef {
@@ -91,10 +100,26 @@ const TIERS: Record<string, TierDef> = {
     tierModel: 'max',
     policy: 'speed',
     order: [
-      { model: 'gpt-5.6-sol', src: SRC_CODEX_PRO },
-      { model: 'claude-opus-4-8', src: SRC_AGENTROUTER },
-      { model: 'model_hub/es1_orange_o48', src: SRC_SUPER_RELAY },
-      { model: 'model_hub/es1_orange_o47', src: SRC_SUPER_RELAY },
+      {
+        model: 'gpt-5.6-sol',
+        src: SRC_CODEX_PRO,
+        protocol: 'openai-responses-adapter',
+      },
+      {
+        model: 'claude-opus-4-8',
+        src: SRC_AGENTROUTER,
+        protocol: 'anthropic-messages',
+      },
+      {
+        model: 'model_hub/es1_orange_o48',
+        src: SRC_SUPER_RELAY,
+        protocol: 'anthropic-messages',
+      },
+      {
+        model: 'model_hub/es1_orange_o47',
+        src: SRC_SUPER_RELAY,
+        protocol: 'anthropic-messages',
+      },
     ],
   },
   high: {
@@ -102,11 +127,31 @@ const TIERS: Record<string, TierDef> = {
     tierModel: 'high',
     policy: 'speed',
     order: [
-      { model: 'gpt-5.6-sol', src: SRC_CODEX_PRO },
-      { model: 'claude-opus-4-8', src: SRC_AGENTROUTER },
-      { model: 'auto_model/60b-sota', src: SRC_SUPER_RELAY },
-      { model: 'ark/60b-0614c', src: SRC_SUPER_RELAY },
-      { model: 'model_hub/es1_orange_o48', src: SRC_SUPER_RELAY },
+      {
+        model: 'gpt-5.6-sol',
+        src: SRC_CODEX_PRO,
+        protocol: 'openai-responses-adapter',
+      },
+      {
+        model: 'claude-opus-4-8',
+        src: SRC_AGENTROUTER,
+        protocol: 'anthropic-messages',
+      },
+      {
+        model: 'auto_model/60b-sota',
+        src: SRC_SUPER_RELAY,
+        protocol: 'anthropic-messages',
+      },
+      {
+        model: 'ark/60b-0614c',
+        src: SRC_SUPER_RELAY,
+        protocol: 'anthropic-messages',
+      },
+      {
+        model: 'model_hub/es1_orange_o48',
+        src: SRC_SUPER_RELAY,
+        protocol: 'anthropic-messages',
+      },
     ],
   },
   balance: {
@@ -114,8 +159,16 @@ const TIERS: Record<string, TierDef> = {
     tierModel: 'balance',
     policy: 'speed',
     order: [
-      { model: 'model_api/experimental_0630', src: SRC_SUPER_RELAY },
-      { model: 'auto_model/alwaysday1', src: SRC_SUPER_RELAY },
+      {
+        model: 'model_api/experimental_0630',
+        src: SRC_SUPER_RELAY,
+        protocol: 'anthropic-messages',
+      },
+      {
+        model: 'auto_model/alwaysday1',
+        src: SRC_SUPER_RELAY,
+        protocol: 'anthropic-messages',
+      },
     ],
   },
   fast: {
@@ -123,8 +176,16 @@ const TIERS: Record<string, TierDef> = {
     tierModel: 'fast',
     policy: 'speed',
     order: [
-      { model: 'model_api/experimental_0630', src: SRC_SUPER_RELAY },
-      { model: 'auto_model/alwaysday1', src: SRC_SUPER_RELAY },
+      {
+        model: 'model_api/experimental_0630',
+        src: SRC_SUPER_RELAY,
+        protocol: 'anthropic-messages',
+      },
+      {
+        model: 'auto_model/alwaysday1',
+        src: SRC_SUPER_RELAY,
+        protocol: 'anthropic-messages',
+      },
     ],
   },
 };
@@ -274,26 +335,76 @@ function readAdminCredentials(): { username: string; password: string } | null {
   return null;
 }
 
-/** 给单个真实模型打 canary。429/超时/错误 → ok=false。 */
-async function probeOne(model: string, token: string): Promise<ProbeResult> {
+/**
+ * Build a canary that mirrors the real Claude CLI request shape.
+ *
+ * Current CLI builds append a synthetic role=system message in addition to
+ * top-level system blocks. The local gateway normalises that extension before
+ * an Anthropic-native relay or an OpenAI Responses adapter sees it. Keeping the
+ * extension here prevents a shallow probe from approving a candidate that the
+ * real workspace cannot use.
+ */
+export function buildTierProbeRequest(model: string): Record<string, unknown> {
+  return {
+    model,
+    max_tokens: 20,
+    system: [
+      {
+        type: 'text',
+        text: 'This is a Claude Agent SDK compatibility probe. Do not call tools.',
+      },
+    ],
+    messages: [
+      {
+        role: 'user',
+        content: [{ type: 'text', text: CANARY_Q }],
+      },
+      {
+        role: 'system',
+        content:
+          'Synthetic Claude CLI context. Follow the user instruction exactly.',
+      },
+    ],
+    tools: [
+      {
+        name: 'health_probe_noop',
+        description: 'A no-op tool used only to verify tool schema support.',
+        input_schema: {
+          type: 'object',
+          properties: {},
+          additionalProperties: false,
+        },
+      },
+    ],
+  };
+}
+
+/** 给单个真实模型打 Agent-SDK 兼容 canary。429/超时/错误 → ok=false。 */
+async function probeOne(model: string): Promise<ProbeResult> {
   const t0 = Date.now();
   try {
-    const r = await fetch(`${NEWAPI}/v1/chat/completions`, {
+    const r = await fetch(`${TIER_GATEWAY}/v1/messages?beta=true`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`,
+        'x-api-key': LOCAL_GATEWAY_SENTINEL,
+        'x-relay-passthrough': 'anthropic',
+        'anthropic-version': '2023-06-01',
       },
-      body: JSON.stringify({
-        model,
-        max_tokens: 20,
-        messages: [{ role: 'user', content: CANARY_Q }],
-      }),
+      body: JSON.stringify(buildTierProbeRequest(model)),
       signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
     });
     const latencyMs = Date.now() - t0;
     const body = (await r.json().catch(() => ({}))) as any;
-    const txt = body?.choices?.[0]?.message?.content ?? '';
+    const txt = Array.isArray(body?.content)
+      ? body.content
+          .filter(
+            (part: { type?: string; text?: unknown }) =>
+              part?.type === 'text' && typeof part.text === 'string',
+          )
+          .map((part: { text: string }) => part.text)
+          .join('')
+      : '';
     if (!r.ok || !txt) {
       logger.debug(
         { model, status: r.status },
@@ -539,7 +650,7 @@ export async function runTierProbeOnce(): Promise<void> {
       continue;
     }
     validatedSources.set(`${src}\0${model}`, srcChannel);
-    results[model] = await probeOne(model, token);
+    results[model] = await probeOne(model);
     if (i < uniqueCandidates.length - 1) {
       await new Promise((resolve) => setTimeout(resolve, GAP_MS));
     }
@@ -558,7 +669,7 @@ export async function runTierProbeOnce(): Promise<void> {
         // A small burst is intentional: reject providers that pass one canary
         // but immediately rate-limit normal interactive follow-up messages.
         await new Promise((resolve) => setTimeout(resolve, 500));
-        return probeOne(model, token);
+        return probeOne(model);
       },
       confirmedModels,
     );
@@ -593,7 +704,11 @@ export async function runTierProbeOnce(): Promise<void> {
       cur.key === targetKey
     ) {
       logger.info(
-        { tier, winner: winnerCand.model },
+        {
+          tier,
+          winner: winnerCand.model,
+          protocol: winnerCand.protocol,
+        },
         'tier-prober: winner unchanged',
       );
     } else {
@@ -608,6 +723,7 @@ export async function runTierProbeOnce(): Promise<void> {
         tier,
         winner: winnerCand.model,
         src: winnerCand.src,
+        protocol: winnerCand.protocol,
         was: cur.winner,
         applied: ok,
       };

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Loopback router for HappyClaw's four-tier provider.
 
-`claude-*` model names preserve the caller's Anthropic OAuth Authorization and
-go directly to Anthropic. Tier aliases and every other model go to local
-new-api with its service token. The server binds to 127.0.0.1 only.
+Explicit OAuth passthrough requests for ``claude-*`` models go directly to
+Anthropic. Tier/API-key requests go to local new-api with its service token.
+The server binds to 127.0.0.1 only.
 """
 
 import http.client
@@ -35,6 +35,20 @@ HOP_BY_HOP_HEADERS = {
     "upgrade",
     "content-length",
 }
+CLIENT_AUTH_HEADERS = {
+    "authorization",
+    "x-api-key",
+    "api-key",
+    "anthropic-api-key",
+}
+COUNT_TOKENS_PATHS = {
+    "/v1/messages/count_tokens",
+    "/api/anthropic/v1/messages/count_tokens",
+}
+MESSAGES_PATHS = {
+    "/v1/messages",
+    "/api/anthropic/v1/messages",
+}
 
 
 def read_newapi_token() -> str:
@@ -51,6 +65,111 @@ def read_newapi_token() -> str:
     return ""
 
 
+def estimate_input_tokens(payload: object) -> int:
+    """Return a conservative local estimate for Anthropic's count API.
+
+    new-api does not currently implement ``messages/count_tokens``. Returning
+    an estimate locally prevents Claude Code from falling back to dozens of
+    real completion calls merely to size tool definitions.
+    """
+    serialized = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    ascii_chars = 0
+    unicode_tokens = 0
+    for char in serialized:
+        if ord(char) < 128:
+            ascii_chars += 1
+        else:
+            # CJK is commonly about one token per character; emoji and other
+            # multibyte characters can take more, so round UTF-8 bytes / 2 up.
+            unicode_tokens += max(1, (len(char.encode("utf-8")) + 1) // 2)
+    return max(1, (ascii_chars + 3) // 4 + unicode_tokens)
+
+
+def normalize_anthropic_request(body: bytes) -> bytes:
+    """Move SDK-internal ``role=system`` messages to top-level ``system``.
+
+    Recent Claude CLI builds append a synthetic system-role message even
+    though the public Anthropic Messages schema only permits user/assistant in
+    ``messages``. Anthropic-native relays commonly tolerate it, but an OpenAI
+    Responses adapter correctly rejects the translated system input item.
+    Normalising at the protocol boundary lets both upstream protocols compete
+    behind the same tier aliases without changing the user's workspace engine.
+    """
+    try:
+        payload = json.loads(body or b"{}")
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return body
+    if not isinstance(payload, dict) or not isinstance(
+        payload.get("messages"), list
+    ):
+        return body
+
+    kept_messages = []
+    extracted_blocks = []
+    changed = False
+    for message in payload["messages"]:
+        if not isinstance(message, dict) or message.get("role") != "system":
+            kept_messages.append(message)
+            continue
+        changed = True
+        content = message.get("content")
+        if isinstance(content, str) and content:
+            extracted_blocks.append({"type": "text", "text": content})
+        elif isinstance(content, list):
+            for block in content:
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") == "text"
+                    and isinstance(block.get("text"), str)
+                    and block["text"]
+                ):
+                    extracted_blocks.append(block)
+
+    if not changed:
+        return body
+
+    payload["messages"] = kept_messages
+    existing_system = payload.get("system")
+    if isinstance(existing_system, list):
+        payload["system"] = existing_system + extracted_blocks
+    else:
+        system_texts = []
+        if isinstance(existing_system, str) and existing_system:
+            system_texts.append(existing_system)
+        system_texts.extend(block["text"] for block in extracted_blocks)
+        if system_texts:
+            payload["system"] = "\n\n".join(system_texts)
+        elif "system" in payload:
+            payload.pop("system")
+
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def build_forward_headers(headers: object, passthrough: bool) -> dict[str, str]:
+    """Copy safe request headers without leaking local sentinel credentials."""
+    forwarded: dict[str, str] = {}
+    for key, value in headers.items():
+        lower = key.lower()
+        if (
+            lower in HOP_BY_HOP_HEADERS
+            or lower == "host"
+            or lower.startswith("x-relay-")
+            or (not passthrough and lower in CLIENT_AUTH_HEADERS)
+        ):
+            continue
+        forwarded[key] = value
+    return forwarded
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -64,13 +183,24 @@ class Handler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(body)
 
-    @staticmethod
-    def _is_claude_passthrough(body: bytes) -> bool:
+    def _is_claude_passthrough(self, body: bytes) -> bool:
         try:
             model = (json.loads(body or b"{}") or {}).get("model", "") or ""
         except (json.JSONDecodeError, AttributeError, TypeError):
             return False
-        return str(model).lower().startswith("claude")
+        marker = (self.headers.get("x-relay-passthrough", "") or "").lower()
+        bearer = self.headers.get("Authorization", "") or ""
+        api_key = (
+            self.headers.get("x-api-key", "")
+            or self.headers.get("api-key", "")
+            or self.headers.get("anthropic-api-key", "")
+        )
+        return (
+            str(model).lower().startswith("claude")
+            and marker.strip() == "anthropic"
+            and bearer.lower().startswith("bearer ")
+            and not api_key
+        )
 
     def _relay(self) -> None:
         if self.path.rstrip("/") == "/health":
@@ -92,18 +222,30 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(413, {"error": "request body too large"})
             return
         body = self.rfile.read(length) if length else b""
-        passthrough = self._is_claude_passthrough(body)
+        request_path = self.path.split("?", 1)[0].rstrip("/")
+        if self.command == "POST" and request_path in COUNT_TOKENS_PATHS:
+            try:
+                payload = json.loads(body or b"{}")
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                self._send_json(
+                    400,
+                    {
+                        "type": "error",
+                        "error": {
+                            "type": "invalid_request_error",
+                            "message": "invalid JSON body",
+                        },
+                    },
+                )
+                return
+            self._send_json(200, {"input_tokens": estimate_input_tokens(payload)})
+            return
 
-        forwarded = {}
-        for key, value in self.headers.items():
-            lower = key.lower()
-            if (
-                lower in HOP_BY_HOP_HEADERS
-                or lower == "host"
-                or lower.startswith("x-relay-")
-            ):
-                continue
-            forwarded[key] = value
+        if self.command == "POST" and request_path in MESSAGES_PATHS:
+            body = normalize_anthropic_request(body)
+
+        passthrough = self._is_claude_passthrough(body)
+        forwarded = build_forward_headers(self.headers, passthrough)
 
         connection = None
         try:
@@ -178,7 +320,7 @@ def main() -> None:
     server.daemon_threads = True
     print(
         f"claude-tier-gateway http://127.0.0.1:{PORT} "
-        f"(claude -> {ANTHROPIC_HOST}; tiers -> {NEWAPI_HOST}:{NEWAPI_PORT})",
+        f"(OAuth claude -> {ANTHROPIC_HOST}; tiers -> {NEWAPI_HOST}:{NEWAPI_PORT})",
         flush=True,
     )
     server.serve_forever()

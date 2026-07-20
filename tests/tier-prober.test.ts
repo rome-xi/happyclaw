@@ -5,6 +5,7 @@ import Database from 'better-sqlite3';
 import { describe, expect, test } from 'vitest';
 
 import {
+  buildTierProbeRequest,
   buildTierUpdatePayload,
   currentTierState,
   readChannelKeyFromSqlite,
@@ -16,9 +17,37 @@ import {
 } from '../src/tier-prober.js';
 
 const candidates: Candidate[] = [
-  { model: 'model-a', src: 'source-a' },
-  { model: 'model-b', src: 'source-b' },
+  {
+    model: 'model-a',
+    src: 'source-a',
+    protocol: 'anthropic-messages',
+  },
+  {
+    model: 'model-b',
+    src: 'source-b',
+    protocol: 'openai-responses-adapter',
+  },
 ];
+
+describe('tier compatibility canary', () => {
+  test('exercises Anthropic system prompts and tool schemas', () => {
+    const request = buildTierProbeRequest('model-a') as {
+      model: string;
+      system: Array<{ type: string; text: string }>;
+      messages: Array<{ role: string; content: unknown }>;
+      tools: Array<{ name: string; input_schema: { type: string } }>;
+    };
+
+    expect(request.model).toBe('model-a');
+    expect(request.system[0].text).toContain('Agent SDK');
+    expect(request.messages[0].role).toBe('user');
+    expect(request.messages[1].role).toBe('system');
+    expect(request.tools[0]).toMatchObject({
+      name: 'health_probe_noop',
+      input_schema: { type: 'object' },
+    });
+  });
+});
 
 describe('tier winner selection', () => {
   test('speed policy selects the lowest-latency correct candidate', () => {

@@ -181,6 +181,7 @@ typecheck-agent-runner:
 
 test: ## 运行单元测试
 	$(RUN) vitest run
+	python3 -m unittest tests/test_claude_tier_gateway.py
 
 format: ## 格式化代码
 	$(PKG) run format
