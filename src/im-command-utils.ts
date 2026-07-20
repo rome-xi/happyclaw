@@ -264,7 +264,6 @@ export const OWNER_REQUIRED_IM_COMMANDS: ReadonlySet<string> = new Set([
   'compact',
   'bind',
   'unbind',
-  'new',
   'sw',
   'spawn',
   // release_owner is the reclaim path: only the current owner can release;

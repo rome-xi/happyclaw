@@ -815,6 +815,15 @@ groupRoutes.delete('/:jid', authMiddleware, async (c) => {
     if (!getChannelType(jid)) {
       return c.json({ error: 'This group cannot be deleted' }, 403);
     }
+
+    // If this IM binding points to a dedicated web: workspace (e.g. created
+    // by /new command), check whether that workspace has any OTHER IM bindings.
+    // If not, we'll clean it up too so the user doesn't have to delete two
+    // entries separately.
+    const targetMainJid = existing.target_main_jid;
+    const orphanWorkspaceJid =
+      targetMainJid && targetMainJid.startsWith('web:') ? targetMainJid : null;
+
     // Reuse the shared helper so the manual delete path also resets
     // imSendFailCounts / imHealthCheckFailCounts, matching the auto-cleanup
     // paths (bot removed / health check / send fail).
@@ -825,6 +834,47 @@ groupRoutes.delete('/:jid', authMiddleware, async (c) => {
       delete deps.getRegisteredGroups()[jid];
     }
     deps.setLastAgentTimestamp(jid, { timestamp: '', id: '' });
+
+    // Clean up the now-orphaned web: workspace if it has no other IM bindings
+    // and is not a home workspace.
+    if (orphanWorkspaceJid) {
+      const remainingBindings = getGroupsByTargetMainJid(orphanWorkspaceJid);
+      const orphanGroup = getRegisteredGroup(orphanWorkspaceJid);
+      if (remainingBindings.length === 0 && orphanGroup && !orphanGroup.is_home) {
+        // Stop the container/process before cleaning up files.
+        const stopJids = Array.from(
+          new Set([
+            orphanWorkspaceJid,
+            ...getJidsByFolder(orphanGroup.folder),
+            ...deps.queue.listActiveDescendantJids(orphanWorkspaceJid),
+          ]),
+        );
+        try {
+          await Promise.all(
+            stopJids.map((j) => deps.queue.stopGroup(j, { force: true })),
+          );
+        } catch (err) {
+          logger.error(
+            { jid: orphanWorkspaceJid, stopJids, err },
+            'Failed to stop container before deleting orphan workspace',
+          );
+          // Non-fatal: the IM binding is already gone, report success
+          // and let the user retry the workspace deletion later.
+          return c.json({
+            success: true,
+            warning: 'IM binding removed, but associated workspace could not be fully cleaned up.',
+          });
+        }
+        deleteGroupData(orphanWorkspaceJid, orphanGroup.folder);
+        removeFlowArtifacts(orphanGroup.folder);
+        delete deps.getRegisteredGroups()[orphanWorkspaceJid];
+        delete deps.getSessions()[orphanGroup.folder];
+        deps.setLastAgentTimestamp(orphanWorkspaceJid, { timestamp: '', id: '' });
+        // Also clean up IM context bindings for the deleted workspace.
+        deleteImContextBindingsByWorkspace(orphanWorkspaceJid);
+      }
+    }
+
     return c.json({ success: true });
   }
 

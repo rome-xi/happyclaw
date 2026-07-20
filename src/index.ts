@@ -2034,10 +2034,42 @@ async function handleNewCommandWithFeishuGroup(
     updateChatName(feishuJid, groupName);
     addGroupMember(folder, userId, 'owner', userId);
 
+    // 绑定 happyclaw 标签（best-effort，失败不影响主流程）
+    try {
+      const tagName = 'happyclaw';
+      const tagList = await (client as any).request({
+        method: 'GET',
+        url: '/open-apis/im/v2/tags',
+        params: { page_size: 50 },
+      }) as any;
+      let tagId: string | undefined;
+      const items = tagList?.data?.items || tagList?.items || tagList?.data?.data?.items || [];
+      for (const item of items) {
+        if (item.name === tagName) {
+          tagId = item.tag_id || item.tagId;
+          break;
+        }
+      }
+      if (!tagId) {
+        const createTag = await client.im.v2.tag.create({ data: { name: tagName } } as any) as any;
+        tagId = createTag?.data?.tag?.tag_id || createTag?.tag_id || createTag?.data?.tag_id;
+      }
+      if (tagId) {
+        await (client as any).request({
+          method: 'PUT',
+          url: `/open-apis/im/v1/chats/${chatId}/tags`,
+          data: { tag_ids: [tagId] },
+        });
+        logger.info({ chatId, tagId, tagName }, 'Bound happyclaw tag to Feishu group');
+      }
+    } catch (tagErr) {
+      logger.warn({ err: tagErr, chatId }, 'Failed to bind happyclaw tag (non-fatal)');
+    }
+
     const welcome = `工作区「${name}」已创建并绑定到此群\n📁 ${folder}\n\n直接在这里发消息即可`;
     await imManager.sendMessage(feishuJid, welcome);
 
-    return `飞书群「${groupName}」已创建并绑定工作区\n📁 ${folder}\n👥 已拉你入群\n\n新群里直接发消息即可`;
+    return `飞书群「${groupName}」已创建并绑定工作区\n📁 ${folder}\n👥 已拉你入群\n🏷️ 已绑定 happyclaw 标签\n\n新群里直接发消息即可`;
   } catch (err) {
     logger.error(
       { err, chatJid, name },
@@ -8699,6 +8731,19 @@ async function ensureDockerRunning(): Promise<void> {
  * its original owner as long as that owner still has an active connection on
  * the **same channel type** (feishu/telegram/qq/wechat).
  */
+/**
+ * Generic IM channel default names. These are hardcoded fallbacks used by
+ * IM connection handlers when the real group/chat name is unavailable (e.g.
+ * feishu.ts uses '飞书群聊' / '飞书私聊' before the actual group name is
+ * fetched). They must NOT overwrite a proper name that was already set (e.g.
+ * by /new command or onBotAddedToGroup with the real Feishu group name).
+ */
+const GENERIC_IM_DEFAULT_NAMES = new Set([
+  '飞书群聊',
+  '飞书私聊',
+  '未知群聊',
+]);
+
 function buildOnNewChat(
   userId: string,
   homeFolder: string,
@@ -8710,7 +8755,16 @@ function buildOnNewChat(
       // Already owned by this user — update name if changed (IM channel may now have real group name)
       if (existing.created_by === userId) {
         const trimmed = chatName.trim();
-        if (trimmed && existing.name !== trimmed) {
+        // Don't overwrite a proper existing name with a generic IM default
+        // (e.g. '飞书群聊' from feishu.ts message handler). The proper name
+        // may have been set by /new command or onBotAddedToGroup with the
+        // real Feishu group name. Only overwrite if the incoming name is a
+        // real (non-default) name, or if the existing name is itself empty
+        // or a generic default.
+        const hasProperExisting =
+          !!existing.name && !GENERIC_IM_DEFAULT_NAMES.has(existing.name);
+        const isGenericIncoming = GENERIC_IM_DEFAULT_NAMES.has(trimmed);
+        if (trimmed && existing.name !== trimmed && !(isGenericIncoming && hasProperExisting)) {
           existing.name = trimmed;
           setRegisteredGroup(chatJid, existing);
           registeredGroups[chatJid] = existing;
