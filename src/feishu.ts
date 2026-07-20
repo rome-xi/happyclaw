@@ -7,6 +7,7 @@ import {
   storeChatMetadata,
   storeMessageDirect,
   updateChatName,
+  updateRegisteredGroupName,
 } from './db.js';
 import { logger } from './logger.js';
 import {
@@ -546,6 +547,7 @@ export function createFeishuConnection(
   const knownChatIds = new Set<string>();
   const chatTypeById = new Map<string, string>(); // chatId → 'group' | 'p2p'
   const lastCreateTimeByChat = new Map<string, number>();
+  const fetchedRealChatNames = new Set<string>(); // chatIds whose real name has been fetched (avoid repeated API calls)
 
   let client: lark.Client | null = null;
   let wsClient: lark.WSClient | null = null;
@@ -1007,6 +1009,31 @@ export function createFeishuConnection(
 
     // 先注册会话，确保 resolveGroupFolder 能正确解析 folder（含首条文件消息场景）
     onNewChat?.(chatJid, resolvedChatName);
+
+    // For group chats, fetch the real group name asynchronously so the
+    // workspace list shows the actual group name instead of '飞书群聊'.
+    // Only attempt once per chat (fetchedRealChatNames) to avoid API spam.
+    if (chatType !== 'p2p' && !fetchedRealChatNames.has(chatId)) {
+      fetchedRealChatNames.add(chatId);
+      (async () => {
+        if (!client) return;
+        try {
+          const target = parseFeishuRouteTarget(chatId);
+          const res = await client.im.v1.chat.get({
+            path: { chat_id: target.chatId },
+          });
+          const realName = res.data?.name;
+          if (realName) {
+            updateChatName(chatJid, realName);
+            updateRegisteredGroupName(chatJid, realName);
+          }
+        } catch (err) {
+          logger.debug({ err, chatId }, 'Failed to fetch real Feishu chat name (non-fatal)');
+          // Allow retry on next message by removing from the cache.
+          fetchedRealChatNames.delete(chatId);
+        }
+      })();
+    }
 
     // P2P 消息：通知调用方用于自动检测 owner open_id
     if (chatType === 'p2p' && senderOpenId && onP2pSender) {
@@ -2038,7 +2065,11 @@ export function createFeishuConnection(
           const items = res.data?.items || [];
           for (const chat of items) {
             if (chat.chat_id && chat.name) {
-              updateChatName(`feishu:${chat.chat_id}`, chat.name);
+              const chatJid = `feishu:${chat.chat_id}`;
+              updateChatName(chatJid, chat.name);
+              // Also backfill registered_groups name so the workspace list
+              // shows the real group name instead of the generic '飞书群聊'.
+              updateRegisteredGroupName(chatJid, chat.name);
               knownChatIds.add(chat.chat_id);
             }
           }

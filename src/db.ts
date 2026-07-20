@@ -2743,6 +2743,15 @@ export function deleteRegisteredGroup(jid: string): void {
 }
 
 /**
+ * Update only the display name of a registered group. Used by IM channel
+ * sync (e.g. Feishu syncGroups) to backfill real group names instead of
+ * letting the generic fallback ('飞书群聊') stick forever.
+ */
+export function updateRegisteredGroupName(jid: string, name: string): void {
+  db.prepare('UPDATE registered_groups SET name = ? WHERE jid = ?').run(name, jid);
+}
+
+/**
  * Find groups owned by `userId` whose sender_allowlist is the empty array `[]` —
  * the "owner-locked trap" state where no one (not even the owner) can trigger
  * the bot. Created by buildOnNewChat when a Feishu group is auto-registered
