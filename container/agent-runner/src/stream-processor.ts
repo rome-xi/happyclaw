@@ -16,6 +16,12 @@ import {
   summarizeToolInput,
   summarizeToolResult,
 } from './utils.js';
+import {
+  workflowRunFromOutputFile,
+  workflowRunFromTaskProgress,
+  workflowRunFromToolInput,
+} from './workflow-run.js';
+import type { WorkflowRunSnapshot } from './stream-event.types.js';
 
 // SDK 任务终态（task_updated.patch.status 语义下"不会再有后续信号"的状态）。
 // web/src/stores/chat.ts、src/web.ts、src/index.ts 各有等价映射——SDK 新增
@@ -147,6 +153,14 @@ export class StreamEventProcessor {
   // task_notification (which carries SDK task_id) can be translated
   // back to the tool_use_id used at creation time.
   private readonly sdkTaskIdToToolUseId = new Map<string, string>();
+
+  // Keep the parsed Workflow plan so cumulative SDK progress can update its
+  // Agent rows and the final notification can replace it with authoritative
+  // output from Claude Code.
+  private readonly workflowRunsByToolUseId = new Map<
+    string,
+    WorkflowRunSnapshot
+  >();
 
   // 尚未 settle 的 SDK 任务（task_id → description）。
   // task_started 时登记；settle 走两条互补路径（缺一不可，不是重复防御）：
@@ -1001,6 +1015,8 @@ export class StreamEventProcessor {
         taskDescription: desc,
         summary: message.summary,
         detail: message.prompt,
+        taskType: message.task_type,
+        workflowName: message.workflow_name,
         subagentType: message.subagent_type,
         displayLevel: message.skip_transcript ? 'detail' : 'primary',
       });
@@ -1016,6 +1032,17 @@ export class StreamEventProcessor {
         message.task_id;
       if (message.summary)
         this.taskSummariesByToolUseId.set(effectiveToolUseId, message.summary);
+      const liveWorkflow = this.workflowRunsByToolUseId.get(effectiveToolUseId);
+      const workflowRun = liveWorkflow
+        ? workflowRunFromTaskProgress(liveWorkflow, {
+            label: message.last_tool_name,
+            summary: message.summary,
+            usage: message.usage,
+          })
+        : undefined;
+      if (workflowRun) {
+        this.workflowRunsByToolUseId.set(effectiveToolUseId, workflowRun);
+      }
       this.emitStreamEvent({
         eventType: 'task_progress',
         agentScope: 'task',
@@ -1027,6 +1054,7 @@ export class StreamEventProcessor {
         subagentType: message.subagent_type,
         lastToolName: message.last_tool_name,
         sdkTaskUsage: this.normalizeTaskUsage(message.usage),
+        workflowRun,
         displayLevel: 'primary',
       });
       return true;
@@ -1577,6 +1605,41 @@ export class StreamEventProcessor {
       }
     }
 
+    // Workflow is an SDK background task with a richer plan than a generic
+    // Task. Surface that plan as soon as the complete tool input is available.
+    for (const block of content) {
+      if (
+        block.type === 'tool_use' &&
+        block.name === 'Workflow' &&
+        block.id &&
+        block.input &&
+        typeof block.input === 'object'
+      ) {
+        this.registerTaskToolUse(block.id);
+        const workflowRun = workflowRunFromToolInput(
+          block.id,
+          block.input as Record<string, unknown>,
+        );
+        this.workflowRunsByToolUseId.set(block.id, workflowRun);
+        this.emit({
+          status: 'stream',
+          result: null,
+          streamEvent: {
+            eventType: 'task_start',
+            agentScope: 'task',
+            taskId: block.id,
+            toolUseId: block.id,
+            toolName: 'Workflow',
+            taskType: 'local_workflow',
+            workflowName: workflowRun.workflowName,
+            taskDescription: workflowRun.summary,
+            workflowRun,
+            displayLevel: 'primary',
+          },
+        });
+      }
+    }
+
     // Fallback: extract AskUserQuestion input from complete assistant message
     for (const block of content) {
       if (
@@ -1666,6 +1729,39 @@ export class StreamEventProcessor {
         `Task notification: task=${message.task_id} status=${message.status} summary=${message.summary}`,
       );
     }
+    const liveWorkflowRun =
+      this.workflowRunsByToolUseId.get(effectiveToolUseId);
+    const normalizedUsage = this.normalizeTaskUsage(message.usage);
+    const authoritativeWorkflowRun = workflowRunFromOutputFile({
+      taskId: effectiveToolUseId,
+      outputFile: message.output_file,
+      status: message.status,
+      summary: message.summary,
+      workflowName: liveWorkflowRun?.workflowName,
+      usage: message.usage,
+    });
+    // Output files are authoritative, but keep the live plan usable when an
+    // SDK/provider omits or races cleanup of that file.
+    const completedWorkflowRun =
+      authoritativeWorkflowRun ??
+      (liveWorkflowRun
+        ? {
+            ...liveWorkflowRun,
+            status:
+              message.status === 'completed'
+                ? ('completed' as const)
+                : message.status === 'stopped'
+                  ? ('stopped' as const)
+                  : ('failed' as const),
+            completedAt: Date.now(),
+            durationMs:
+              normalizedUsage?.durationMs ?? liveWorkflowRun.durationMs,
+            totalTokens:
+              normalizedUsage?.totalTokens ?? liveWorkflowRun.totalTokens,
+            totalToolCalls:
+              normalizedUsage?.toolUses ?? liveWorkflowRun.totalToolCalls,
+          }
+        : undefined);
     this.emit({
       status: 'stream',
       result: null,
@@ -1678,7 +1774,8 @@ export class StreamEventProcessor {
         taskSummary: message.summary,
         summary: message.summary,
         outputFile: message.output_file,
-        sdkTaskUsage: this.normalizeTaskUsage(message.usage),
+        sdkTaskUsage: normalizedUsage,
+        workflowRun: completedWorkflowRun,
         isBackground: true,
         displayLevel: 'primary',
       },
@@ -1687,6 +1784,7 @@ export class StreamEventProcessor {
       this.taskSummariesByToolUseId.set(effectiveToolUseId, message.summary);
     this.cleanupTaskTools(effectiveToolUseId);
     this.backgroundTaskToolUseIds.delete(effectiveToolUseId);
+    this.workflowRunsByToolUseId.delete(effectiveToolUseId);
     if (this.taskToolUseIds.has(effectiveToolUseId)) {
       this.taskToolUseIds.delete(effectiveToolUseId);
       this.emit({

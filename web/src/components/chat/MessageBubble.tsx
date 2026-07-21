@@ -11,6 +11,7 @@ import { ImageLightbox } from './ImageLightbox';
 import { mediumTap } from '../../hooks/useHaptic';
 import { useDisplayMode } from '../../hooks/useDisplayMode';
 import { formatThinkingDuration } from '../../utils/thinking-duration';
+import { WorkflowRunCard } from './WorkflowRunCard';
 
 const ShareImageDialog = lazy(() => import('./ShareImageDialog').then(m => ({ default: m.ShareImageDialog })));
 
@@ -173,6 +174,9 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
 
   // Check if content is empty (only whitespace) and we have images
   const hasOnlyImages = !message.content.trim() && images.length > 0;
+  const completedWorkflowRuns = (message.workflow_runs ?? []).filter(
+    (run) => run.status !== 'running',
+  );
 
   const handleCopy = async () => {
     try {
@@ -319,6 +323,10 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
             </button>
           )}
         </div>
+
+        {isAI && completedWorkflowRuns.map((run) => (
+          <WorkflowRunCard key={run.runId ?? run.taskId} run={run} />
+        ))}
 
         {/* Reasoning */}
         {thinkingContent && <ReasoningBlock content={thinkingContent} durationMs={thinkingDurationMs} />}
@@ -554,6 +562,10 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
 
           {/* Claude-style: no card container, direct content */}
           <div className="overflow-hidden font-serif">
+            {completedWorkflowRuns.map((run) => (
+              <WorkflowRunCard key={run.runId ?? run.taskId} run={run} />
+            ))}
+
             {/* Reasoning block — muted left border style */}
             {thinkingContent && <ReasoningBlock content={thinkingContent} durationMs={thinkingDurationMs} />}
 
@@ -646,6 +658,8 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
   prev.message.id === next.message.id &&
   prev.message.content === next.message.content &&
   prev.message.token_usage === next.message.token_usage &&
+  JSON.stringify(prev.message.workflow_runs ?? []) ===
+    JSON.stringify(next.message.workflow_runs ?? []) &&
   prev.showTime === next.showTime &&
   prev.thinkingContent === next.thinkingContent &&
   prev.thinkingDurationMs === next.thinkingDurationMs &&

@@ -40,6 +40,75 @@ describe('StreamEventProcessor observability mapping', () => {
     });
   });
 
+  test('keeps a structured Workflow projection through completion without an output file', () => {
+    const { processor, outputs } = makeProcessor();
+
+    processor.processAssistantMessage({
+      parent_tool_use_id: null,
+      message: {
+        content: [
+          {
+            type: 'tool_use',
+            name: 'Workflow',
+            id: 'workflow-tool-1',
+            input: {
+              script: `
+                export const meta = {
+                  name: 'mixed-lab',
+                  description: '并行比较模型',
+                  phases: [{ title: '比较' }],
+                }
+                await agent('比较结果', { label: 'review', phase: '比较' })
+              `,
+            },
+          },
+        ],
+      },
+    });
+    processor.processSystemMessage({
+      type: 'system',
+      subtype: 'task_started',
+      task_id: 'sdk-workflow-1',
+      tool_use_id: 'workflow-tool-1',
+      task_type: 'local_workflow',
+      workflow_name: 'mixed-lab',
+      description: '并行比较模型',
+    });
+    processor.processSystemMessage({
+      type: 'system',
+      subtype: 'task_progress',
+      task_id: 'sdk-workflow-1',
+      tool_use_id: 'workflow-tool-1',
+      last_tool_name: 'review',
+      summary: '比较完成',
+      usage: { total_tokens: 321, tool_uses: 1, duration_ms: 1200 },
+    });
+    processor.processTaskNotification({
+      task_id: 'sdk-workflow-1',
+      tool_use_id: 'workflow-tool-1',
+      status: 'completed',
+      summary: '工作流完成',
+      usage: { total_tokens: 321, tool_uses: 1, duration_ms: 1200 },
+    });
+
+    const workflowEvents = outputs
+      .map((output) => output.streamEvent)
+      .filter((event) => event?.workflowRun);
+    expect(workflowEvents[0]?.workflowRun).toMatchObject({
+      taskId: 'workflow-tool-1',
+      workflowName: 'mixed-lab',
+      status: 'running',
+      agentCount: 1,
+    });
+    expect(workflowEvents.at(-1)?.workflowRun).toMatchObject({
+      taskId: 'workflow-tool-1',
+      status: 'completed',
+      totalTokens: 321,
+      totalToolCalls: 1,
+      agents: [{ label: 'review', state: 'done' }],
+    });
+  });
+
   test('uses tool_use_summary.summary for foreground Task completion', () => {
     const { processor, outputs } = makeProcessor();
 

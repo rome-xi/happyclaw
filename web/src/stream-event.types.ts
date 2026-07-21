@@ -24,6 +24,51 @@ export type StreamEventType =
 export type StreamAgentScope = 'main' | 'task' | 'subagent' | 'system';
 export type StreamDisplayLevel = 'primary' | 'detail' | 'debug';
 
+export interface WorkflowPhaseSnapshot {
+  index: number;
+  title: string;
+  detail?: string;
+}
+
+export interface WorkflowAgentSnapshot {
+  index: number;
+  label: string;
+  phaseIndex?: number;
+  phaseTitle?: string;
+  agentId?: string;
+  model?: string;
+  fallbackModel?: string;
+  state: 'queued' | 'running' | 'done' | 'failed' | 'stopped' | 'unknown';
+  queuedAt?: number;
+  startedAt?: number;
+  completedAt?: number;
+  attempt?: number;
+  lastToolName?: string;
+  lastToolSummary?: string;
+  promptPreview?: string;
+  resultPreview?: string;
+  tokens?: number;
+  toolCalls?: number;
+  durationMs?: number;
+}
+
+/** Persistable, user-facing projection of one Claude Code dynamic Workflow. */
+export interface WorkflowRunSnapshot {
+  taskId: string;
+  runId?: string;
+  workflowName?: string;
+  summary: string;
+  status: 'running' | 'completed' | 'failed' | 'stopped' | 'unknown';
+  startTime?: number;
+  completedAt?: number;
+  durationMs?: number;
+  agentCount?: number;
+  totalTokens?: number;
+  totalToolCalls?: number;
+  phases: WorkflowPhaseSnapshot[];
+  agents: WorkflowAgentSnapshot[];
+}
+
 export interface ClaudeContextFileAudit {
   sourcePath?: string;
   runtimePath?: string;
@@ -111,6 +156,12 @@ export interface StreamEvent {
   taskId?: string;
   taskStatus?: string;
   taskSummary?: string;
+  /** SDK task discriminant, e.g. `local_workflow` or `subagent`. */
+  taskType?: string;
+  /** Claude Code Workflow meta.name (only present for workflow tasks). */
+  workflowName?: string;
+  /** Live/completed dynamic Workflow projection for first-class UI rendering. */
+  workflowRun?: WorkflowRunSnapshot;
   taskPatch?: {
     status?: string;
     description?: string;

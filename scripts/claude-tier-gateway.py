@@ -9,7 +9,10 @@ The server binds to 127.0.0.1 only.
 import http.client
 import json
 import os
+import sqlite3
 import ssl
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -23,6 +26,16 @@ TOKEN_FILE = os.path.expanduser(
     os.environ.get("NEWAPI_TOKEN_FILE", DEFAULT_TOKEN_FILE)
 )
 MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", str(32 * 1024 * 1024)))
+NEWAPI_SQLITE = os.path.expanduser(
+    os.environ.get(
+        "NEWAPI_SQLITE_DB",
+        "~/new-api-data/one-api.db",
+    )
+)
+TIER_CIRCUIT_SECONDS = int(os.environ.get("TIER_CIRCUIT_SECONDS", "1800"))
+MAX_UPSTREAM_ERROR_BYTES = int(
+    os.environ.get("MAX_UPSTREAM_ERROR_BYTES", str(1024 * 1024))
+)
 
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -49,6 +62,55 @@ MESSAGES_PATHS = {
     "/v1/messages",
     "/api/anthropic/v1/messages",
 }
+
+# The probe remains the primary selector. These are only tried after the
+# selected route fails a real request, so a short canary can never strand an
+# entire long-running workspace. Every quality tier intentionally crosses the
+# Anthropic/OpenAI protocol boundary before giving up.
+TIER_FALLBACKS = {
+    "max": (
+        "gpt-5.6-sol",
+        "claude-opus-4-8",
+        "model_hub/es1_orange_o48",
+        "model_hub/es1_orange_o47",
+    ),
+    "high": (
+        "gpt-5.6-sol",
+        "claude-opus-4-8",
+        "model_hub/es1_orange_o48",
+        "auto_model/60b-sota",
+        "ark/60b-0614c",
+    ),
+    "balance": (
+        "auto_model/alwaysday1",
+        "model_api/experimental_0630",
+        "gpt-5.6-sol",
+        "claude-opus-4-8",
+    ),
+    "fast": (
+        "auto_model/alwaysday1",
+        "model_api/experimental_0630",
+        "gpt-5.6-sol",
+        "claude-opus-4-8",
+    ),
+}
+RETRYABLE_TIER_STATUSES = {
+    400,
+    401,
+    403,
+    404,
+    408,
+    409,
+    422,
+    429,
+    500,
+    502,
+    503,
+    504,
+}
+
+_tier_circuit_lock = threading.Lock()
+_tier_unhealthy_until: dict[tuple[str, str], float] = {}
 
 
 def read_newapi_token() -> str:
@@ -154,6 +216,121 @@ def normalize_anthropic_request(body: bytes) -> bytes:
     ).encode("utf-8")
 
 
+def request_model(body: bytes) -> str:
+    """Return the request model without exposing any other payload field."""
+    try:
+        payload = json.loads(body or b"{}")
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    model = payload.get("model")
+    return model.strip() if isinstance(model, str) else ""
+
+
+def replace_request_model(body: bytes, model: str) -> bytes:
+    """Clone an Anthropic JSON request with only its model changed."""
+    try:
+        payload = json.loads(body or b"{}")
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return body
+    if not isinstance(payload, dict):
+        return body
+    payload["model"] = model
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def read_tier_mapping(tier: str, database_path: str = NEWAPI_SQLITE) -> str:
+    """Read the selected real model from new-api's local control-plane DB."""
+    if tier not in TIER_FALLBACKS or not database_path:
+        return ""
+    connection = None
+    try:
+        uri = f"file:{os.path.abspath(database_path)}?mode=ro"
+        connection = sqlite3.connect(uri, uri=True, timeout=1)
+        row = connection.execute(
+            "SELECT model_mapping FROM channels WHERE name = ? LIMIT 1",
+            (f"tier-{tier}",),
+        ).fetchone()
+        mapping = json.loads(row[0] if row and row[0] else "{}")
+        selected = mapping.get(tier) if isinstance(mapping, dict) else ""
+        return selected.strip() if isinstance(selected, str) else ""
+    except (OSError, sqlite3.Error, json.JSONDecodeError, TypeError):
+        return ""
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def mark_tier_model_unhealthy(
+    tier: str,
+    model: str,
+    *,
+    now: float | None = None,
+) -> None:
+    if tier not in TIER_FALLBACKS or not model:
+        return
+    current = time.monotonic() if now is None else now
+    with _tier_circuit_lock:
+        _tier_unhealthy_until[(tier, model)] = (
+            current + max(1, TIER_CIRCUIT_SECONDS)
+        )
+
+
+def clear_tier_model_unhealthy(tier: str, model: str) -> None:
+    if not model:
+        return
+    with _tier_circuit_lock:
+        _tier_unhealthy_until.pop((tier, model), None)
+
+
+def is_tier_model_unhealthy(
+    tier: str,
+    model: str,
+    *,
+    now: float | None = None,
+) -> bool:
+    if not model:
+        return False
+    current = time.monotonic() if now is None else now
+    with _tier_circuit_lock:
+        deadline = _tier_unhealthy_until.get((tier, model), 0)
+        if deadline <= current:
+            _tier_unhealthy_until.pop((tier, model), None)
+            return False
+        return True
+
+
+def tier_attempt_models(
+    tier: str,
+    selected_model: str,
+    *,
+    now: float | None = None,
+) -> list[str]:
+    """Return alias-first attempts, bypassing a selected model in circuit."""
+    if tier not in TIER_FALLBACKS:
+        return [tier]
+    attempts: list[str] = []
+    selected_unhealthy = is_tier_model_unhealthy(
+        tier,
+        selected_model,
+        now=now,
+    )
+    if not selected_unhealthy:
+        attempts.append(tier)
+    for model in TIER_FALLBACKS[tier]:
+        if model == selected_model or is_tier_model_unhealthy(tier, model, now=now):
+            continue
+        attempts.append(model)
+    # If every route is in circuit, let the probe-selected alias have one last
+    # chance rather than returning a locally fabricated outage.
+    return attempts or [tier]
+
+
 def build_forward_headers(headers: object, passthrough: bool) -> dict[str, str]:
     """Copy safe request headers without leaking local sentinel credentials."""
     forwarded: dict[str, str] = {}
@@ -184,10 +361,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def _is_claude_passthrough(self, body: bytes) -> bool:
-        try:
-            model = (json.loads(body or b"{}") or {}).get("model", "") or ""
-        except (json.JSONDecodeError, AttributeError, TypeError):
-            return False
+        model = request_model(body)
         marker = (self.headers.get("x-relay-passthrough", "") or "").lower()
         bearer = self.headers.get("Authorization", "") or ""
         api_key = (
@@ -247,45 +421,120 @@ class Handler(BaseHTTPRequestHandler):
         passthrough = self._is_claude_passthrough(body)
         forwarded = build_forward_headers(self.headers, passthrough)
 
+        if not passthrough:
+            token = read_newapi_token()
+            if not token:
+                self._send_json(
+                    503,
+                    {"error": f"new-api token missing: {TOKEN_FILE}"},
+                )
+                return
+            forwarded["Host"] = f"{NEWAPI_HOST}:{NEWAPI_PORT}"
+            forwarded["Authorization"] = f"Bearer {token}"
+
+        requested_model = request_model(body)
+        selected_model = (
+            read_tier_mapping(requested_model)
+            if not passthrough and requested_model in TIER_FALLBACKS
+            else ""
+        )
+        attempt_models = (
+            tier_attempt_models(requested_model, selected_model)
+            if selected_model or requested_model in TIER_FALLBACKS
+            else [requested_model]
+        )
+        response = None
         connection = None
-        try:
-            if passthrough:
-                connection = http.client.HTTPSConnection(
-                    ANTHROPIC_HOST,
-                    443,
-                    timeout=600,
-                    context=ssl.create_default_context(),
-                )
-                forwarded["Host"] = ANTHROPIC_HOST
-            else:
-                token = read_newapi_token()
-                if not token:
-                    self._send_json(
-                        503,
-                        {"error": f"new-api token missing: {TOKEN_FILE}"},
+        served_model = requested_model
+        last_error: Exception | None = None
+        for attempt_index, attempt_model in enumerate(attempt_models):
+            attempt_body = (
+                body
+                if attempt_model == requested_model
+                else replace_request_model(body, attempt_model)
+            )
+            attempt_headers = dict(forwarded)
+            if attempt_body:
+                attempt_headers["Content-Length"] = str(len(attempt_body))
+            try:
+                if passthrough:
+                    connection = http.client.HTTPSConnection(
+                        ANTHROPIC_HOST,
+                        443,
+                        timeout=600,
+                        context=ssl.create_default_context(),
                     )
-                    return
-                connection = http.client.HTTPConnection(
-                    NEWAPI_HOST,
-                    NEWAPI_PORT,
-                    timeout=600,
+                    attempt_headers["Host"] = ANTHROPIC_HOST
+                else:
+                    connection = http.client.HTTPConnection(
+                        NEWAPI_HOST,
+                        NEWAPI_PORT,
+                        timeout=600,
+                    )
+                connection.request(
+                    self.command,
+                    self.path,
+                    body=attempt_body,
+                    headers=attempt_headers,
                 )
-                forwarded["Host"] = f"{NEWAPI_HOST}:{NEWAPI_PORT}"
-                forwarded["Authorization"] = f"Bearer {token}"
-            if body:
-                forwarded["Content-Length"] = str(len(body))
-            connection.request(self.command, self.path, body=body, headers=forwarded)
-            response = connection.getresponse()
-        except Exception as exc:  # noqa: BLE001 - gateway must return a bounded 502
-            self._send_json(502, {"error": f"gateway upstream error: {exc}"})
-            if connection:
+                response = connection.getresponse()
+            except Exception as exc:  # noqa: BLE001 - bounded fallback below
+                last_error = exc
+                failed_model = (
+                    selected_model
+                    if attempt_model == requested_model
+                    else attempt_model
+                )
+                if connection:
+                    connection.close()
+                connection = None
+                if attempt_index < len(attempt_models) - 1:
+                    mark_tier_model_unhealthy(requested_model, failed_model)
+                    continue
+                break
+
+            failed_model = (
+                selected_model if attempt_model == requested_model else attempt_model
+            )
+            should_retry = (
+                requested_model in TIER_FALLBACKS
+                and response.status in RETRYABLE_TIER_STATUSES
+                and attempt_index < len(attempt_models) - 1
+            )
+            if should_retry:
+                # Never copy an upstream error body into logs. Consume at most
+                # a bounded amount, close it, and retry the untouched request.
+                response.read(MAX_UPSTREAM_ERROR_BYTES + 1)
                 connection.close()
+                response = None
+                connection = None
+                mark_tier_model_unhealthy(requested_model, failed_model)
+                continue
+
+            served_model = attempt_model
+            if response.status < 400:
+                clear_tier_model_unhealthy(requested_model, failed_model)
+            break
+
+        if response is None or connection is None:
+            self._send_json(
+                502,
+                {
+                    "error": (
+                        f"gateway upstream error: {last_error}"
+                        if last_error
+                        else "gateway upstream error: no healthy tier route"
+                    )
+                },
+            )
             return
 
         self.send_response(response.status)
         for key, value in response.getheaders():
             if key.lower() not in HOP_BY_HOP_HEADERS:
                 self.send_header(key, value)
+        if served_model != requested_model:
+            self.send_header("X-HappyClaw-Fallback-Model", served_model)
         self.send_header("Connection", "close")
         self.end_headers()
         if self.command != "HEAD":

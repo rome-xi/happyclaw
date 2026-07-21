@@ -2919,6 +2919,8 @@ interface SendMessageOptions {
   localImagePaths?: string[];
   /** Message source identifier (e.g. 'scheduled_task') for frontend routing. */
   source?: string;
+  /** Claude Code Workflow snapshots associated with this logical reply. */
+  workflowRuns?: NonNullable<StreamEvent['workflowRun']>[];
   /** Metadata used to preserve Claude SDK turn semantics for persisted messages. */
   messageMeta?: {
     turnId?: string;
@@ -3687,6 +3689,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // 任务 settle 后的 healthy result 才用累积全文定稿「已完成」——对齐
   // Claude Code "一次委托 = 一个完整回合" 的体验，不再分段发多张卡。
   let heldCardParts: string[] = [];
+  let activeWorkflowRuns: NonNullable<StreamEvent['workflowRun']>[] = [];
+  let completedWorkflowRuns: NonNullable<StreamEvent['workflowRun']>[] = [];
   // 挂起期间各 turn 的 usage 增量累计，定稿后与最终 turn 的 usage 合并
   // 补到卡片 usage note（否则卡片只显示最后一个 turn 的用量）。
   let heldCardUsage: HeldUsageTotals | null = null;
@@ -3946,6 +3950,23 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           }
           // 流式事件处理 - 广播 WebSocket + 持久化 SDK Task 生命周期到 DB
           if (result.status === 'stream' && result.streamEvent) {
+            if (result.streamEvent.workflowRun) {
+              const run = result.streamEvent.workflowRun;
+              activeWorkflowRuns = [
+                ...activeWorkflowRuns.filter(
+                  (item) => item.taskId !== run.taskId,
+                ),
+                run,
+              ];
+              if (run.status !== 'running') {
+                completedWorkflowRuns = [
+                  ...completedWorkflowRuns.filter(
+                    (item) => item.taskId !== run.taskId,
+                  ),
+                  run,
+                ];
+              }
+            }
             // ── 截断续写触顶信号（机器标记，不广播不展示）──
             // runner 连续续写仍被断流、放弃后发出。挂起中的卡片不能再等一个
             // 永远不会来的 healthy result，就地收口为「已中断」。
@@ -4603,6 +4624,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                 sendToIM: directImReply && !skipImSend,
                 imTextOverride: dbText !== text ? text : undefined,
                 localImagePaths,
+                workflowRuns: holdReason
+                  ? activeWorkflowRuns
+                  : completedWorkflowRuns,
                 messageMeta: {
                   turnId: turnIdForDb,
                   sessionId: result.sessionId || activeSessionId,
@@ -4611,6 +4635,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                   finalizationReason: result.finalizationReason || 'completed',
                 },
               });
+              if (!holdReason) {
+                activeWorkflowRuns = [];
+                completedWorkflowRuns = [];
+              }
               lastSavedTurnId = effectiveTurnId;
 
               // Routed IM normally receives only the first substantive result,
@@ -5426,6 +5454,7 @@ async function sendMessage(
         sdk_message_uuid: options.messageMeta?.sdkMessageUuid ?? null,
         source_kind: options.messageMeta?.sourceKind ?? null,
         finalization_reason: options.messageMeta?.finalizationReason ?? null,
+        workflow_runs: options.workflowRuns,
       },
       undefined,
       options.source,
@@ -7828,6 +7857,8 @@ async function processAgentConversation(
   // Sub-Agent 路径首条回复后本就不再向 IM 发消息（isFirstReply 门控），挂起
   // 机制在这里同时修复了"后台任务汇总只入库、飞书永远看不到"的消息丢失。
   let heldAgentParts: string[] = [];
+  let activeAgentWorkflowRuns: NonNullable<StreamEvent['workflowRun']>[] = [];
+  let completedAgentWorkflowRuns: NonNullable<StreamEvent['workflowRun']>[] = [];
   let heldAgentUsage: HeldUsageTotals | null = null;
   // 定稿后等待最终 usage 事件做合并补丁（Sub 路径 session 不轮换，引用即当前卡）
   let heldAgentUsagePatchPending = false;
@@ -8014,6 +8045,23 @@ async function processAgentConversation(
 
     // Stream events
     if (output.status === 'stream' && output.streamEvent) {
+      if (output.streamEvent.workflowRun) {
+        const run = output.streamEvent.workflowRun;
+        activeAgentWorkflowRuns = [
+          ...activeAgentWorkflowRuns.filter(
+            (item) => item.taskId !== run.taskId,
+          ),
+          run,
+        ];
+        if (run.status !== 'running') {
+          completedAgentWorkflowRuns = [
+            ...completedAgentWorkflowRuns.filter(
+              (item) => item.taskId !== run.taskId,
+            ),
+            run,
+          ];
+        }
+      }
       // ── 截断续写触顶信号（机器标记，不广播不展示）──
       if (
         output.streamEvent.eventType === 'status' &&
@@ -8342,9 +8390,16 @@ async function processAgentConversation(
             sdk_message_uuid: output.sdkMessageUuid ?? null,
             source_kind: output.sourceKind || 'sdk_final',
             finalization_reason: output.finalizationReason || 'completed',
+            workflow_runs: holdReason
+              ? activeAgentWorkflowRuns
+              : completedAgentWorkflowRuns,
           },
           agentId,
         );
+        if (!holdReason) {
+          activeAgentWorkflowRuns = [];
+          completedAgentWorkflowRuns = [];
+        }
 
         // Async LLM title upgrade after the first substantive reply.
         if (isFirstReply && agent.kind === 'conversation') {

@@ -1,6 +1,8 @@
 import importlib.util
 import json
 import pathlib
+import sqlite3
+import tempfile
 import unittest
 
 
@@ -107,6 +109,67 @@ class GatewayCompatibilityTests(unittest.TestCase):
         self.assertEqual(
             normalized["messages"], [{"role": "user", "content": "hello"}]
         )
+
+    def test_replaces_only_the_request_model(self) -> None:
+        body = json.dumps(
+            {
+                "model": "max",
+                "messages": [{"role": "user", "content": "keep me"}],
+            }
+        ).encode()
+
+        replaced = json.loads(GATEWAY.replace_request_model(body, "gpt-safe"))
+
+        self.assertEqual(replaced["model"], "gpt-safe")
+        self.assertEqual(
+            replaced["messages"],
+            [{"role": "user", "content": "keep me"}],
+        )
+
+    def test_reads_exact_tier_mapping_from_sqlite(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = pathlib.Path(directory) / "one-api.db"
+            connection = sqlite3.connect(database_path)
+            try:
+                connection.execute(
+                    "CREATE TABLE channels (name TEXT, model_mapping TEXT)"
+                )
+                connection.execute(
+                    "INSERT INTO channels VALUES (?, ?)",
+                    ("tier-max", json.dumps({"other": "wrong", "max": "right"})),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            self.assertEqual(
+                GATEWAY.read_tier_mapping("max", str(database_path)),
+                "right",
+            )
+
+    def test_circuit_bypasses_failed_probe_winner_across_protocols(self) -> None:
+        original_ttl = GATEWAY.TIER_CIRCUIT_SECONDS
+        GATEWAY.TIER_CIRCUIT_SECONDS = 30
+        try:
+            GATEWAY.mark_tier_model_unhealthy("max", "probe-winner", now=10)
+
+            attempts = GATEWAY.tier_attempt_models(
+                "max",
+                "probe-winner",
+                now=11,
+            )
+
+            self.assertNotIn("max", attempts)
+            self.assertNotIn("probe-winner", attempts)
+            self.assertEqual(attempts[0], "gpt-5.6-sol")
+            self.assertIn("claude-opus-4-8", attempts)
+            self.assertEqual(
+                GATEWAY.tier_attempt_models("max", "probe-winner", now=41)[0],
+                "max",
+            )
+        finally:
+            GATEWAY.TIER_CIRCUIT_SECONDS = original_ttl
+            GATEWAY.clear_tier_model_unhealthy("max", "probe-winner")
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ import { TodoProgressPanel } from './TodoProgressPanel';
 import { ToolActivityCard } from './ToolActivityCard';
 import { useDisplayMode } from '../../hooks/useDisplayMode';
 import { formatThinkingDuration } from '../../utils/thinking-duration';
+import { WorkflowRunCard } from './WorkflowRunCard';
 
 /** Render AskUserQuestion options as a visual card (read-only). */
 function AskUserQuestionCard({ toolInput }: { toolInput: Record<string, unknown> }) {
@@ -480,17 +481,25 @@ function StreamingContent({
   const askUserTools = streaming.activeTools.filter(
     t => t.toolName === 'AskUserQuestion' && t.toolInput
   );
+  const hasWorkflowTasks = Object.values(streaming.taskStates).some(
+    (task) => task.workflowRun || task.taskType === 'local_workflow',
+  );
+  const showSystemStatus =
+    streaming.systemStatus &&
+    !(hasWorkflowTasks && /后台任务运行中|完成后将继续汇总/u.test(streaming.systemStatus))
+      ? streaming.systemStatus
+      : null;
 
   return (
     <>
       {/* System status */}
-      {streaming.systemStatus && (
+      {showSystemStatus && (
         <div className="flex items-center gap-2 text-[13px] text-muted-foreground mb-2">
           <svg className="w-3.5 h-3.5 animate-spin text-primary" viewBox="0 0 24 24" fill="none">
             <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
             <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
           </svg>
-          <span>{streaming.systemStatus === 'compacting' ? '上下文压缩中...' : streaming.systemStatus}</span>
+          <span>{showSystemStatus === 'compacting' ? '上下文压缩中...' : showSystemStatus}</span>
         </div>
       )}
 
@@ -572,9 +581,30 @@ function StreamingContent({
         <div className="mb-2 space-y-1.5">
           {Object.values(streaming.taskStates)
             .sort((a, b) => a.updatedAt - b.updatedAt)
-            .map((task) => (
-              <SdkTaskRuntimeBlock key={task.id} task={task} groupJid={groupJid} />
-            ))}
+            .map((task) =>
+              task.workflowRun || task.taskType === 'local_workflow' ? (
+                <WorkflowRunCard
+                  key={task.id}
+                  run={task.workflowRun ?? {
+                    taskId: task.id,
+                    workflowName: task.workflowName,
+                    summary: task.title,
+                    status: task.status === 'completed'
+                      ? 'completed'
+                      : task.status === 'error'
+                        ? 'failed'
+                        : 'running',
+                    durationMs: task.usage?.durationMs,
+                    totalTokens: task.usage?.totalTokens,
+                    totalToolCalls: task.usage?.toolUses,
+                    phases: [],
+                    agents: [],
+                  }}
+                />
+              ) : (
+                <SdkTaskRuntimeBlock key={task.id} task={task} groupJid={groupJid} />
+              ),
+            )}
         </div>
       )}
 
@@ -806,6 +836,12 @@ export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNamePr
     Object.keys(streaming.taskStates).length > 0 ||
     (streaming.todos && streaming.todos.length > 0)
   )) || hasTaskAgents;
+  const hasWorkflowCards = Boolean(
+    streaming &&
+    Object.values(streaming.taskStates).some(
+      (task) => task.workflowRun || task.taskType === 'local_workflow',
+    ),
+  );
 
   // 仅在既不等待也无冻结数据时才隐藏
   if (!isWaiting && !hasStreamData) return null;
@@ -937,8 +973,10 @@ export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNamePr
             )}
           </div>
 
-          {/* Card */}
-          <div className="bg-surface rounded-xl border border-border/60 px-5 py-4 overflow-hidden font-serif shadow-card">
+          {/* Workflow owns the primary card surface; keep the shell flat. */}
+          <div className={hasWorkflowCards
+            ? 'overflow-hidden font-serif'
+            : 'bg-surface rounded-xl border border-border/60 px-5 py-4 overflow-hidden font-serif shadow-card'}>
             {streaming && (
               <StreamingContent
                 streaming={streaming}

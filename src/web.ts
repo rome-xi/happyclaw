@@ -2021,6 +2021,10 @@ interface StreamingSnapshotEntry {
       id: string;
       title: string;
       status: 'running' | 'completed' | 'error' | 'backgrounded';
+      taskType?: string;
+      workflowName?: string;
+      workflowRun?: StreamEvent['workflowRun'];
+      usage?: StreamEvent['sdkTaskUsage'];
       subagentType?: string;
       latestSummary?: string;
       lastToolName?: string;
@@ -2164,6 +2168,10 @@ function updateSnapshotTask(
       event.summary ||
       'Task',
     status: 'running' as const,
+    taskType: event.taskType,
+    workflowName: event.workflowName,
+    workflowRun: event.workflowRun,
+    usage: event.sdkTaskUsage,
     subagentType: event.subagentType,
     thinkingTail: '',
     textTail: '',
@@ -2174,6 +2182,23 @@ function updateSnapshotTask(
   task.updatedAt = Date.now();
   if (event.taskDescription && (!task.title || task.title === 'Task'))
     task.title = event.taskDescription;
+  if (event.taskType) task.taskType = event.taskType;
+  if (event.workflowName) task.workflowName = event.workflowName;
+  if (event.workflowRun) {
+    task.workflowRun = {
+      ...task.workflowRun,
+      ...event.workflowRun,
+      phases:
+        event.workflowRun.phases.length > 0
+          ? event.workflowRun.phases
+          : task.workflowRun?.phases || [],
+      agents:
+        event.workflowRun.agents.length > 0
+          ? event.workflowRun.agents
+          : task.workflowRun?.agents || [],
+    };
+  }
+  if (event.sdkTaskUsage) task.usage = event.sdkTaskUsage;
   if (event.subagentType) task.subagentType = event.subagentType;
   if (event.eventType === 'text_delta') {
     task.textTail = tailText(

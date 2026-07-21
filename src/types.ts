@@ -1,4 +1,4 @@
-import type { StreamEvent } from './stream-event.types.js';
+import type { StreamEvent, WorkflowRunSnapshot } from './stream-event.types.js';
 
 export interface AdditionalMount {
   hostPath: string; // Absolute path on host (supports ~ for home)
@@ -97,6 +97,9 @@ export interface NewMessage {
   content: string;
   timestamp: string;
   attachments?: string;
+  token_usage?: string;
+  /** Session-derived Claude Code Workflow snapshots for historical replay. */
+  workflow_runs?: WorkflowRunSnapshot[];
   turn_id?: string | null;
   session_id?: string | null;
   sdk_message_uuid?: string | null;
