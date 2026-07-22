@@ -12,7 +12,7 @@
  *
  * 设计要点：
  *   - 顺序、低频、出错跳过不崩，对上游限流友好（沿用 py 版策略）。
- *   - 候选名单 / 策略集中在此文件（TIERS），改这里即改档位，无需碰 new-api UI。
+ *   - 候选名单 / 策略集中在 tier-catalog.ts，改那里即改档位，无需碰 new-api UI。
  *   - 与 provider-pool 解耦：这是「档位内选真实模型」，pool 是「选哪个 provider」，两层正交。
  *   - 全程 best-effort：任何异常都只 log、不抛，绝不影响主进程。
  */
@@ -21,6 +21,13 @@ import os from 'os';
 import path from 'path';
 import Database from 'better-sqlite3';
 import { logger } from './logger.js';
+import {
+  TIER_DEFINITIONS as TIERS,
+  type TierCandidate as Candidate,
+  type TierPolicy as Policy,
+} from './tier-catalog.js';
+
+export type { TierCandidate as Candidate } from './tier-catalog.js';
 
 const NEWAPI = process.env.NEWAPI_URL || 'http://127.0.0.1:3010';
 const TIER_GATEWAY =
@@ -53,31 +60,9 @@ const PROBE_TIMEOUT_MS = 45_000;
 const GAP_MS = 4_000; // 候选间隔，限流友好
 const DEFAULT_INTERVAL_MS = 20 * 60 * 1000; // 每 20 分钟一轮
 
-type Policy = 'capability' | 'speed';
 /**
- * 服务某候选模型的 new-api 源渠道名。探针选中赢家后，把 tier 渠道的 base_url+key
- * 整体切到该源渠道，实现跨上游路由（new-api 的 model_mapping 不跨渠道，见下方 applyTierUpstream）。
- */
-const SRC_SUPER_RELAY = 'super-relay (字节内部)';
-const SRC_CODEX_PRO = 'codex-pro';
-const SRC_AGENTROUTER = 'AgentRouter opus';
-
-export interface Candidate {
-  model: string; // 探测 + 路由用的真实模型名
-  src: string; // 服务该模型的 new-api 源渠道名（base_url+key 来源）
-  /** Native protocol behind the source channel. */
-  protocol: 'anthropic-messages' | 'openai-responses-adapter';
-}
-
-interface TierDef {
-  channel: string; // new-api 渠道名
-  tierModel: string; // 该渠道对外暴露的档位虚拟名
-  order: Candidate[]; // 候选（capability 档按此为强→弱优先序）
-  policy: Policy;
-}
-
-/**
- * 档位候选名单。每个候选标注其源渠道；探针选中后把 tier 渠道整体切到源渠道上游。
+ * 档位候选名单集中在 tier-catalog.ts。每个候选显式登记源渠道、协议和上下文长度；
+ * 探针选中后把 tier 渠道整体切到源渠道上游。
  *
  * 选优模型（Clash 式，2026-07-20 定稿）：**人工定池子的能力档次，机器选延迟**。
  *   - 候选名单由人工把关能力档次（如 gpt-5.6 / claude-4.6+ 这类强模型才放 max/high），
@@ -94,102 +79,6 @@ interface TierDef {
  * 关键约束：new-api 的 model_mapping 不能跨渠道（tier 渠道 base 若不匹配赢家上游会 500/403），
  * 故探针用 applyTierUpstream：选中赢家后切 tier 渠道的 base_url+key+mapping 到源渠道。
  */
-const TIERS: Record<string, TierDef> = {
-  max: {
-    channel: 'tier-max',
-    tierModel: 'max',
-    policy: 'speed',
-    order: [
-      {
-        model: 'gpt-5.6-sol',
-        src: SRC_CODEX_PRO,
-        protocol: 'openai-responses-adapter',
-      },
-      {
-        model: 'claude-opus-4-8',
-        src: SRC_AGENTROUTER,
-        protocol: 'anthropic-messages',
-      },
-      {
-        model: 'model_hub/es1_orange_o48',
-        src: SRC_SUPER_RELAY,
-        protocol: 'anthropic-messages',
-      },
-      {
-        model: 'model_hub/es1_orange_o47',
-        src: SRC_SUPER_RELAY,
-        protocol: 'anthropic-messages',
-      },
-    ],
-  },
-  high: {
-    channel: 'tier-high',
-    tierModel: 'high',
-    policy: 'speed',
-    order: [
-      {
-        model: 'gpt-5.6-sol',
-        src: SRC_CODEX_PRO,
-        protocol: 'openai-responses-adapter',
-      },
-      {
-        model: 'claude-opus-4-8',
-        src: SRC_AGENTROUTER,
-        protocol: 'anthropic-messages',
-      },
-      {
-        model: 'auto_model/60b-sota',
-        src: SRC_SUPER_RELAY,
-        protocol: 'anthropic-messages',
-      },
-      {
-        model: 'ark/60b-0614c',
-        src: SRC_SUPER_RELAY,
-        protocol: 'anthropic-messages',
-      },
-      {
-        model: 'model_hub/es1_orange_o48',
-        src: SRC_SUPER_RELAY,
-        protocol: 'anthropic-messages',
-      },
-    ],
-  },
-  balance: {
-    channel: 'tier-balance',
-    tierModel: 'balance',
-    policy: 'speed',
-    order: [
-      {
-        model: 'model_api/experimental_0630',
-        src: SRC_SUPER_RELAY,
-        protocol: 'anthropic-messages',
-      },
-      {
-        model: 'auto_model/alwaysday1',
-        src: SRC_SUPER_RELAY,
-        protocol: 'anthropic-messages',
-      },
-    ],
-  },
-  fast: {
-    channel: 'tier-fast',
-    tierModel: 'fast',
-    policy: 'speed',
-    order: [
-      {
-        model: 'model_api/experimental_0630',
-        src: SRC_SUPER_RELAY,
-        protocol: 'anthropic-messages',
-      },
-      {
-        model: 'auto_model/alwaysday1',
-        src: SRC_SUPER_RELAY,
-        protocol: 'anthropic-messages',
-      },
-    ],
-  },
-};
-
 export interface ProbeResult {
   ok: boolean;
   latencyMs: number;

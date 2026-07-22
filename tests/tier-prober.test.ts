@@ -21,11 +21,13 @@ const candidates: Candidate[] = [
     model: 'model-a',
     src: 'source-a',
     protocol: 'anthropic-messages',
+    contextWindowTokens: 200_000,
   },
   {
     model: 'model-b',
     src: 'source-b',
     protocol: 'openai-responses-adapter',
+    contextWindowTokens: 200_000,
   },
 ];
 
