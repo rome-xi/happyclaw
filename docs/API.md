@@ -18,7 +18,7 @@
 - `PATCH /api/groups/:jid`（重命名） · `DELETE /api/groups/:jid`
 - `POST /api/groups/:jid/reset-session`（重建工作区）
 - `GET /api/groups/:jid/messages`（分页 + 轮询，支持多 JID 查询）
-- `POST /api/messages`（向工作区发送消息；首字符 `/clear` 触发会话重置，返回 `{ success: true, cleared: true }`）
+- `POST /api/messages`（向工作区发送消息；`/clear` 触发会话重置；`/model ...` 返回 `modelCommand/changed/model/reply` 并广播系统回执）
 - `GET|PUT /api/groups/:jid/env`（群组级容器环境变量）
 
 ## 文件

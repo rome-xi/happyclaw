@@ -440,6 +440,8 @@ export HAPPYCLAW_HOST_ONLY=false
 | `/unbind` | - | 解绑回默认工作区 |
 | `/new <名称>` | - | 创建新工作区并绑定当前群组 |
 | `/recall` | `/rc` | AI 总结最近对话记录 |
+| `/model [status\|list\|auto\|档位\|模型\|别名]` | - | 查看或切换整个工作区的模型；如 `/model grok`、`/model max`、`/model auto` |
+| `/compact [重点保留说明]` | - | 压缩上下文；可附带摘要重点 |
 | `/clear` | - | 清除当前对话的会话上下文 |
 | `/require_mention` | - | 切换群聊响应模式：`true`（需要 @）或 `false`（全量响应） |
 

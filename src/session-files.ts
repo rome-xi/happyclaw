@@ -34,3 +34,19 @@ export function clearSessionFiles(folder: string, agentId?: string): void {
     }
   }
 }
+
+/**
+ * Clear every Claude SDK session in a workspace (main + conversation/background
+ * agent directories). A workspace-level model switch uses this because the new
+ * model is inherited by every lane and old thinking signatures are not safely
+ * portable across providers/models.
+ */
+export function clearAllSessionFiles(folder: string): void {
+  clearSessionFiles(folder);
+  const agentsDir = path.join(DATA_DIR, 'sessions', folder, 'agents');
+  if (!fs.existsSync(agentsDir)) return;
+  for (const entry of fs.readdirSync(agentsDir, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    clearSessionFiles(folder, entry.name);
+  }
+}

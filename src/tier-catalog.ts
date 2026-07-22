@@ -1,15 +1,19 @@
 /**
- * Tier model catalog.
+ * Configuration-driven model catalog and tier routing.
  *
- * Context capacity belongs to the real model, not to whichever provider or
- * protocol happens to serve it. Keeping that metadata beside every candidate
- * lets the Claude runtime derive the safe auto-compaction window for a tier
- * alias after probe-driven model switches.
+ * `config/model-routing.json` is deliberately secret-free. Adding a model,
+ * alias, context window, source channel, or tier candidate only requires a
+ * config edit; the TypeScript prober and Python gateway both reload it.
  */
+import fs from 'fs';
+import path from 'path';
+
+import { logger } from './logger.js';
 
 export const ONE_MILLION_CONTEXT_TOKENS = 1_000_000;
 
 export type TierPolicy = 'capability' | 'speed';
+export type ModelProtocol = 'anthropic-messages' | 'openai-responses-adapter';
 
 export interface TierCandidate {
   /** Real model name used for probing and routing. */
@@ -17,9 +21,17 @@ export interface TierCandidate {
   /** new-api source channel whose base URL and key serve this model. */
   src: string;
   /** Native protocol behind the source channel. */
-  protocol: 'anthropic-messages' | 'openai-responses-adapter';
-  /** Maximum supported input context, in tokens. Required for every model. */
+  protocol: ModelProtocol;
+  /** Maximum supported input context, in tokens. */
   contextWindowTokens: number;
+}
+
+export interface ModelCatalogEntry extends TierCandidate {
+  displayName: string;
+  aliases: string[];
+  traits: string[];
+  enabled: boolean;
+  manual: boolean;
 }
 
 export interface TierDefinition {
@@ -27,145 +39,369 @@ export interface TierDefinition {
   tierModel: string;
   order: TierCandidate[];
   policy: TierPolicy;
-  /** Reject the catalog at startup if any candidate falls below this value. */
+  /** Reject the catalog if any candidate falls below this value. */
   minimumContextWindowTokens?: number;
 }
 
-const SRC_SUPER_RELAY = 'super-relay (字节内部)';
-const SRC_CODEX_PRO = 'codex-pro';
-const SRC_AGENTROUTER = 'AgentRouter opus';
+export interface ModelSourceDefinition {
+  syncModels: boolean;
+}
 
-/**
- * Register a model here before adding it to a tier. The required context field
- * prevents a new model from silently inheriting the old 200K default.
- */
-export const TIER_MODEL_CATALOG: Record<string, TierCandidate> = {
-  'gpt-5.6-sol': {
-    model: 'gpt-5.6-sol',
-    src: SRC_CODEX_PRO,
-    protocol: 'openai-responses-adapter',
-    contextWindowTokens: ONE_MILLION_CONTEXT_TOKENS,
-  },
-  'claude-opus-4-8': {
-    model: 'claude-opus-4-8',
-    src: SRC_AGENTROUTER,
-    protocol: 'anthropic-messages',
-    contextWindowTokens: ONE_MILLION_CONTEXT_TOKENS,
-  },
-  'model_hub/es1_orange_o48': {
-    model: 'model_hub/es1_orange_o48',
-    src: SRC_SUPER_RELAY,
-    protocol: 'anthropic-messages',
-    contextWindowTokens: ONE_MILLION_CONTEXT_TOKENS,
-  },
-  'model_hub/es1_orange_o47': {
-    model: 'model_hub/es1_orange_o47',
-    src: SRC_SUPER_RELAY,
-    protocol: 'anthropic-messages',
-    contextWindowTokens: ONE_MILLION_CONTEXT_TOKENS,
-  },
-  'auto_model/60b-sota': {
-    model: 'auto_model/60b-sota',
-    src: SRC_SUPER_RELAY,
-    protocol: 'anthropic-messages',
-    contextWindowTokens: 200_000,
-  },
-  'ark/60b-0614c': {
-    model: 'ark/60b-0614c',
-    src: SRC_SUPER_RELAY,
-    protocol: 'anthropic-messages',
-    contextWindowTokens: 200_000,
-  },
-  'model_api/experimental_0630': {
-    model: 'model_api/experimental_0630',
-    src: SRC_SUPER_RELAY,
-    protocol: 'anthropic-messages',
-    contextWindowTokens: 200_000,
-  },
-  'auto_model/alwaysday1': {
-    model: 'auto_model/alwaysday1',
-    src: SRC_SUPER_RELAY,
-    protocol: 'anthropic-messages',
-    contextWindowTokens: 200_000,
-  },
-};
+export interface RoutingProviderSelector {
+  ids: string[];
+  names: string[];
+  baseUrls: string[];
+}
 
-const candidate = (model: string): TierCandidate => {
-  const value = TIER_MODEL_CATALOG[model];
-  if (!value) throw new Error(`Tier model is not registered: ${model}`);
-  return value;
-};
+export interface ModelRoutingConfig {
+  version: 1;
+  path: string;
+  models: ModelCatalogEntry[];
+  tiers: Record<string, TierDefinition>;
+  sources: Record<string, ModelSourceDefinition>;
+  routingProvider: RoutingProviderSelector;
+}
 
-/**
- * Probe pools and their context contracts. `max` deliberately accepts only
- * one-million-token candidates; a lower-context addition fails fast instead
- * of causing surprise early compaction after the probe selects it.
- */
-export const TIER_DEFINITIONS: Record<string, TierDefinition> = {
-  max: {
-    channel: 'tier-max',
-    tierModel: 'max',
-    policy: 'speed',
-    minimumContextWindowTokens: ONE_MILLION_CONTEXT_TOKENS,
-    order: [
-      candidate('gpt-5.6-sol'),
-      candidate('claude-opus-4-8'),
-      candidate('model_hub/es1_orange_o48'),
-      candidate('model_hub/es1_orange_o47'),
-    ],
-  },
-  high: {
-    channel: 'tier-high',
-    tierModel: 'high',
-    policy: 'speed',
-    order: [
-      candidate('gpt-5.6-sol'),
-      candidate('claude-opus-4-8'),
-      candidate('auto_model/60b-sota'),
-      candidate('ark/60b-0614c'),
-      candidate('model_hub/es1_orange_o48'),
-    ],
-  },
-  balance: {
-    channel: 'tier-balance',
-    tierModel: 'balance',
-    policy: 'speed',
-    order: [
-      candidate('model_api/experimental_0630'),
-      candidate('auto_model/alwaysday1'),
-    ],
-  },
-  fast: {
-    channel: 'tier-fast',
-    tierModel: 'fast',
-    policy: 'speed',
-    order: [
-      candidate('model_api/experimental_0630'),
-      candidate('auto_model/alwaysday1'),
-    ],
-  },
-};
+export interface ResolvedModelSelection {
+  kind: 'tier' | 'model';
+  model: string;
+  displayName: string;
+  contextWindowTokens: number;
+  aliases: string[];
+  traits: string[];
+}
+
+interface RawModel {
+  id?: unknown;
+  displayName?: unknown;
+  source?: unknown;
+  protocol?: unknown;
+  contextWindowTokens?: unknown;
+  aliases?: unknown;
+  traits?: unknown;
+  enabled?: unknown;
+  manual?: unknown;
+}
+
+interface RawTier {
+  channel?: unknown;
+  tierModel?: unknown;
+  policy?: unknown;
+  minimumContextWindowTokens?: unknown;
+  models?: unknown;
+}
+
+const DEFAULT_CONFIG_PATH = path.resolve(
+  process.cwd(),
+  'config',
+  'model-routing.json',
+);
+
+let cachedConfig: ModelRoutingConfig | null = null;
+let cachedPath = '';
+let cachedMtimeMs = -1;
+let lastReloadWarning = '';
+
+function routingConfigPath(): string {
+  return path.resolve(
+    process.env.HAPPYCLAW_MODEL_ROUTING_CONFIG || DEFAULT_CONFIG_PATH,
+  );
+}
+
+function nonEmptyString(value: unknown, label: string): string {
+  if (typeof value !== 'string' || !value.trim()) {
+    throw new Error(`${label} must be a non-empty string`);
+  }
+  const normalized = value.trim();
+  if (normalized.length > 256 || /[\0\r\n,]/.test(normalized)) {
+    throw new Error(`${label} contains unsupported characters`);
+  }
+  return normalized;
+}
+
+function optionalStringArray(value: unknown, label: string): string[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new Error(`${label} must be an array`);
+  return value.map((item, index) => nonEmptyString(item, `${label}[${index}]`));
+}
+
+function normalizeBaseUrl(value: string): string {
+  const parsed = new URL(value);
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error(`routingProvider base URL must be HTTP(S): ${value}`);
+  }
+  return parsed.toString().replace(/\/$/, '');
+}
+
+export function parseModelRoutingConfig(
+  raw: unknown,
+  sourcePath = '<memory>',
+): ModelRoutingConfig {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error('model routing config must be an object');
+  }
+  const input = raw as Record<string, unknown>;
+  if (input.version !== 1) {
+    throw new Error(
+      `unsupported model routing config version: ${input.version}`,
+    );
+  }
+  if (!Array.isArray(input.models) || input.models.length === 0) {
+    throw new Error('models must be a non-empty array');
+  }
+
+  const models = input.models.map((item, index): ModelCatalogEntry => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      throw new Error(`models[${index}] must be an object`);
+    }
+    const model = item as RawModel;
+    const id = nonEmptyString(model.id, `models[${index}].id`);
+    const protocol = model.protocol;
+    if (
+      protocol !== 'anthropic-messages' &&
+      protocol !== 'openai-responses-adapter'
+    ) {
+      throw new Error(`${id}: unsupported protocol`);
+    }
+    if (
+      !Number.isSafeInteger(model.contextWindowTokens) ||
+      Number(model.contextWindowTokens) <= 0
+    ) {
+      throw new Error(`${id}: invalid contextWindowTokens`);
+    }
+    return {
+      model: id,
+      displayName:
+        model.displayName === undefined
+          ? id
+          : nonEmptyString(model.displayName, `${id}.displayName`),
+      src: nonEmptyString(model.source, `${id}.source`),
+      protocol,
+      contextWindowTokens: Number(model.contextWindowTokens),
+      aliases: optionalStringArray(model.aliases, `${id}.aliases`),
+      traits: optionalStringArray(model.traits, `${id}.traits`),
+      enabled: model.enabled !== false,
+      manual: model.manual !== false,
+    };
+  });
+
+  const modelById = new Map<string, ModelCatalogEntry>();
+  const selectionNames = new Map<string, string>();
+  for (const model of models) {
+    const idKey = model.model.toLowerCase();
+    if (modelById.has(idKey))
+      throw new Error(`duplicate model: ${model.model}`);
+    modelById.set(idKey, model);
+    for (const name of [model.model, ...model.aliases]) {
+      const key = name.toLowerCase();
+      const previous = selectionNames.get(key);
+      if (previous && previous !== model.model) {
+        throw new Error(`model alias collision: ${name}`);
+      }
+      selectionNames.set(key, model.model);
+    }
+  }
+
+  const rawSources = input.sources;
+  if (
+    !rawSources ||
+    typeof rawSources !== 'object' ||
+    Array.isArray(rawSources)
+  ) {
+    throw new Error('sources must be an object');
+  }
+  const sources: Record<string, ModelSourceDefinition> = {};
+  for (const [name, value] of Object.entries(rawSources)) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error(`source ${name} must be an object`);
+    }
+    sources[nonEmptyString(name, 'source name')] = {
+      syncModels: (value as Record<string, unknown>).syncModels === true,
+    };
+  }
+  for (const model of models) {
+    if (!sources[model.src]) {
+      throw new Error(`${model.model}: unknown source channel ${model.src}`);
+    }
+  }
+
+  const rawTiers = input.tiers;
+  if (!rawTiers || typeof rawTiers !== 'object' || Array.isArray(rawTiers)) {
+    throw new Error('tiers must be an object');
+  }
+  const tiers: Record<string, TierDefinition> = {};
+  for (const [tierNameRaw, value] of Object.entries(rawTiers)) {
+    const tierName = nonEmptyString(tierNameRaw, 'tier name');
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error(`${tierName}: tier must be an object`);
+    }
+    const tier = value as RawTier;
+    const policy = tier.policy;
+    if (policy !== 'capability' && policy !== 'speed') {
+      throw new Error(`${tierName}: invalid policy`);
+    }
+    if (!Array.isArray(tier.models) || tier.models.length === 0) {
+      throw new Error(`${tierName}: candidate pool is empty`);
+    }
+    const order = tier.models.map((modelName, index) => {
+      const id = nonEmptyString(modelName, `${tierName}.models[${index}]`);
+      const model = modelById.get(id.toLowerCase());
+      if (!model) throw new Error(`${tierName}: unknown model ${id}`);
+      if (!model.enabled) throw new Error(`${tierName}: disabled model ${id}`);
+      return {
+        model: model.model,
+        src: model.src,
+        protocol: model.protocol,
+        contextWindowTokens: model.contextWindowTokens,
+      } satisfies TierCandidate;
+    });
+    const minimum = tier.minimumContextWindowTokens;
+    if (
+      minimum !== undefined &&
+      (!Number.isSafeInteger(minimum) || Number(minimum) <= 0)
+    ) {
+      throw new Error(`${tierName}: invalid minimumContextWindowTokens`);
+    }
+    tiers[tierName] = {
+      channel: nonEmptyString(tier.channel, `${tierName}.channel`),
+      tierModel: nonEmptyString(tier.tierModel, `${tierName}.tierModel`),
+      policy,
+      order,
+      ...(minimum === undefined
+        ? {}
+        : { minimumContextWindowTokens: Number(minimum) }),
+    };
+  }
+
+  const validationErrors = validateTierCatalog(tiers);
+  if (validationErrors.length > 0) {
+    throw new Error(validationErrors.join('; '));
+  }
+
+  // Tier names and tierModel aliases share the same command namespace as
+  // model aliases. Ambiguity would make `/model foo` non-deterministic.
+  const tierAliases = new Map<string, string>();
+  for (const [tierName, tier] of Object.entries(tiers)) {
+    for (const alias of [tierName, tier.tierModel]) {
+      const key = alias.toLowerCase();
+      if (selectionNames.has(key)) {
+        throw new Error(`tier alias collides with model alias: ${alias}`);
+      }
+      const previous = tierAliases.get(key);
+      if (previous && previous !== tierName) {
+        throw new Error(`tier alias collision: ${alias}`);
+      }
+      tierAliases.set(key, tierName);
+    }
+  }
+
+  const providerRaw =
+    input.routingProvider &&
+    typeof input.routingProvider === 'object' &&
+    !Array.isArray(input.routingProvider)
+      ? (input.routingProvider as Record<string, unknown>)
+      : {};
+  const routingProvider: RoutingProviderSelector = {
+    ids: optionalStringArray(providerRaw.ids, 'routingProvider.ids'),
+    names: optionalStringArray(providerRaw.names, 'routingProvider.names'),
+    baseUrls: optionalStringArray(
+      providerRaw.baseUrls,
+      'routingProvider.baseUrls',
+    ).map(normalizeBaseUrl),
+  };
+  if (
+    routingProvider.ids.length === 0 &&
+    routingProvider.names.length === 0 &&
+    routingProvider.baseUrls.length === 0
+  ) {
+    throw new Error('routingProvider needs at least one id, name, or baseUrl');
+  }
+
+  return {
+    version: 1,
+    path: sourcePath,
+    models,
+    tiers,
+    sources,
+    routingProvider,
+  };
+}
+
+export function loadModelRoutingConfigFromFile(
+  filePath: string,
+): ModelRoutingConfig {
+  const absolute = path.resolve(filePath);
+  return parseModelRoutingConfig(
+    JSON.parse(fs.readFileSync(absolute, 'utf8')),
+    absolute,
+  );
+}
+
+/** Reload on mtime change; retain the last known-good config on bad edits. */
+export function getModelRoutingConfig(): ModelRoutingConfig {
+  const filePath = routingConfigPath();
+  let mtimeMs: number;
+  try {
+    mtimeMs = fs.statSync(filePath).mtimeMs;
+  } catch (error) {
+    if (cachedConfig) return cachedConfig;
+    throw new Error(`Cannot read model routing config ${filePath}: ${error}`);
+  }
+  if (cachedConfig && cachedPath === filePath && cachedMtimeMs === mtimeMs) {
+    return cachedConfig;
+  }
+  try {
+    const next = loadModelRoutingConfigFromFile(filePath);
+    cachedConfig = next;
+    cachedPath = filePath;
+    cachedMtimeMs = mtimeMs;
+    lastReloadWarning = '';
+    return next;
+  } catch (error) {
+    if (!cachedConfig) throw error;
+    const warning = error instanceof Error ? error.message : String(error);
+    if (warning !== lastReloadWarning) {
+      lastReloadWarning = warning;
+      logger.warn(
+        { filePath, error: warning },
+        'Invalid model routing edit; keeping last known-good config',
+      );
+    }
+    return cachedConfig;
+  }
+}
+
+export function getTierDefinitions(): Record<string, TierDefinition> {
+  return getModelRoutingConfig().tiers;
+}
+
+export function getModelCatalog(): ModelCatalogEntry[] {
+  return getModelRoutingConfig().models;
+}
+
+/** Backward-compatible startup snapshots; dynamic callers use getters above. */
+export const TIER_DEFINITIONS = getTierDefinitions();
+export const TIER_MODEL_CATALOG: Record<string, TierCandidate> =
+  Object.fromEntries(
+    getModelCatalog().map((entry) => [entry.model, { ...entry }]),
+  );
 
 export function validateTierCatalog(
   tiers: Record<string, TierDefinition>,
 ): string[] {
   const errors: string[] = [];
-
   for (const [tierName, tier] of Object.entries(tiers)) {
     if (tier.order.length === 0) {
       errors.push(`${tierName}: candidate pool is empty`);
       continue;
     }
-
     for (const model of tier.order) {
       if (
         !Number.isSafeInteger(model.contextWindowTokens) ||
         model.contextWindowTokens <= 0
       ) {
         errors.push(`${tierName}/${model.model}: invalid context window`);
-        continue;
-      }
-      if (
+      } else if (
         tier.minimumContextWindowTokens !== undefined &&
         model.contextWindowTokens < tier.minimumContextWindowTokens
       ) {
@@ -175,12 +411,11 @@ export function validateTierCatalog(
       }
     }
   }
-
   return errors;
 }
 
 export function assertTierCatalog(
-  tiers: Record<string, TierDefinition> = TIER_DEFINITIONS,
+  tiers: Record<string, TierDefinition> = getTierDefinitions(),
 ): void {
   const errors = validateTierCatalog(tiers);
   if (errors.length > 0) {
@@ -188,28 +423,58 @@ export function assertTierCatalog(
   }
 }
 
-/**
- * Resolve either a real model name or a tier alias to its safe context size.
- * A tier alias uses the smallest candidate window so probe switching can never
- * select a model with less context than the runtime advertised.
- */
+export function resolveModelSelection(
+  input: string,
+): ResolvedModelSelection | undefined {
+  const normalized = input.trim().toLowerCase();
+  if (!normalized) return undefined;
+  const config = getModelRoutingConfig();
+
+  for (const [tierName, tier] of Object.entries(config.tiers)) {
+    if (
+      tierName.toLowerCase() === normalized ||
+      tier.tierModel.toLowerCase() === normalized
+    ) {
+      return {
+        kind: 'tier',
+        model: tier.tierModel,
+        displayName: `${tierName}（自动选优）`,
+        contextWindowTokens: Math.min(
+          ...tier.order.map((entry) => entry.contextWindowTokens),
+        ),
+        aliases: tierName === tier.tierModel ? [] : [tierName],
+        traits: ['auto-probe', tier.policy],
+      };
+    }
+  }
+
+  const model = config.models.find(
+    (entry) =>
+      entry.enabled &&
+      entry.manual &&
+      [entry.model, ...entry.aliases].some(
+        (name) => name.toLowerCase() === normalized,
+      ),
+  );
+  if (!model) return undefined;
+  return {
+    kind: 'model',
+    model: model.model,
+    displayName: model.displayName,
+    contextWindowTokens: model.contextWindowTokens,
+    aliases: model.aliases,
+    traits: model.traits,
+  };
+}
+
+/** Resolve a real model or tier alias to a safe compaction window. */
 export function resolveModelContextWindowTokens(
   modelOrTier: string,
 ): number | undefined {
   const normalized = modelOrTier.trim().toLowerCase();
   if (!normalized) return undefined;
   if (/\[1m\]$/.test(normalized)) return ONE_MILLION_CONTEXT_TOKENS;
-
-  const direct = Object.values(TIER_MODEL_CATALOG).find(
-    (entry) => entry.model.toLowerCase() === normalized,
-  );
-  if (direct) return direct.contextWindowTokens;
-
-  const tier = Object.values(TIER_DEFINITIONS).find(
-    (entry) => entry.tierModel.toLowerCase() === normalized,
-  );
-  if (!tier || tier.order.length === 0) return undefined;
-  return Math.min(...tier.order.map((entry) => entry.contextWindowTokens));
+  return resolveModelSelection(modelOrTier)?.contextWindowTokens;
 }
 
 assertTierCatalog();

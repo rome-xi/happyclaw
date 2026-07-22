@@ -16,6 +16,28 @@ SPEC.loader.exec_module(GATEWAY)
 
 
 class GatewayCompatibilityTests(unittest.TestCase):
+    def test_loads_fallbacks_from_shared_model_config(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = pathlib.Path(directory) / "routing.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "tiers": {
+                            "custom": {
+                                "models": ["anthropic-model", "openai-model"]
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                GATEWAY.load_tier_fallbacks(str(config_path)),
+                {"custom": ("anthropic-model", "openai-model")},
+            )
+
     def test_strips_client_credentials_for_new_api(self) -> None:
         headers = {
             "Host": "127.0.0.1:3011",

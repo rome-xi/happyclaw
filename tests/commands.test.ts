@@ -9,21 +9,33 @@ import {
 // Hoisted so mock factories below can reference these before module evaluation.
 const {
   deleteSessionMock,
+  deleteAllSessionsForFolderMock,
   getJidsByFolderMock,
   storeMessageDirectMock,
   ensureChatExistsMock,
+  getRouterStateMock,
+  setRouterStateMock,
+  deleteRouterStateMock,
 } = vi.hoisted(() => ({
   deleteSessionMock: vi.fn(),
+  deleteAllSessionsForFolderMock: vi.fn(),
   getJidsByFolderMock: vi.fn(),
   storeMessageDirectMock: vi.fn(),
   ensureChatExistsMock: vi.fn(),
+  getRouterStateMock: vi.fn(),
+  setRouterStateMock: vi.fn(),
+  deleteRouterStateMock: vi.fn(),
 }));
 
 vi.mock('../src/db.js', () => ({
   deleteSession: deleteSessionMock,
+  deleteAllSessionsForFolder: deleteAllSessionsForFolderMock,
   getJidsByFolder: getJidsByFolderMock,
   storeMessageDirect: storeMessageDirectMock,
   ensureChatExists: ensureChatExistsMock,
+  getRouterState: getRouterStateMock,
+  setRouterState: setRouterStateMock,
+  deleteRouterState: deleteRouterStateMock,
 }));
 
 vi.mock('../src/config.js', () => ({
@@ -94,6 +106,90 @@ describe('isCompactWithArgsCommand', () => {
   test('rejects lookalikes', () => {
     expect(isCompactWithArgsCommand('/compactor keep this')).toBe(false);
     expect(isCompactWithArgsCommand('please /compact this')).toBe(false);
+  });
+});
+
+describe('/model command', () => {
+  beforeEach(() => {
+    deleteAllSessionsForFolderMock.mockReset();
+    getJidsByFolderMock.mockReset();
+    getRouterStateMock.mockReset();
+    setRouterStateMock.mockReset();
+    deleteRouterStateMock.mockReset();
+  });
+
+  test('recognizes only the dedicated slash command', async () => {
+    const { isModelCommand } = await import('../src/commands.js');
+    expect(isModelCommand('/model')).toBe(true);
+    expect(isModelCommand('/MODEL grok')).toBe(true);
+    expect(isModelCommand('/models')).toBe(false);
+    expect(isModelCommand('use /model grok')).toBe(false);
+  });
+
+  test('pins an alias workspace-wide and prepares history recovery', async () => {
+    const { executeModelCommand } = await import('../src/commands.js');
+    getRouterStateMock.mockReturnValue(undefined);
+    getJidsByFolderMock.mockReturnValue(['web:main', 'telegram:42']);
+    const stopGroup = vi.fn(async () => {});
+    const markForRecovery = vi.fn();
+    const sessions = { laboratory: 'sdk-session' };
+
+    const result = await executeModelCommand(
+      'web:main',
+      'laboratory',
+      '/model grok',
+      {
+        queue: { stopGroup },
+        sessions,
+        broadcast: vi.fn(),
+        setLastAgentTimestamp: vi.fn(),
+        markForRecovery,
+      },
+    );
+
+    expect(result).toMatchObject({
+      changed: true,
+      model: 'grok/grok-4.5',
+    });
+    expect(setRouterStateMock).toHaveBeenCalledWith(
+      'workspace_model_override:laboratory',
+      'grok/grok-4.5',
+    );
+    expect(deleteAllSessionsForFolderMock).toHaveBeenCalledWith('laboratory');
+    expect(sessions).not.toHaveProperty('laboratory');
+    expect(stopGroup).toHaveBeenCalledTimes(2);
+    expect(markForRecovery).toHaveBeenCalledWith('web:main');
+    expect(markForRecovery).toHaveBeenCalledWith('telegram:42');
+  });
+
+  test('status and list are read-only', async () => {
+    const { executeModelCommand } = await import('../src/commands.js');
+    getRouterStateMock.mockReturnValue('grok/grok-4.5');
+    const stopGroup = vi.fn(async () => {});
+    const deps = {
+      queue: { stopGroup },
+      sessions: {},
+      broadcast: vi.fn(),
+      setLastAgentTimestamp: vi.fn(),
+    };
+
+    const status = await executeModelCommand(
+      'web:main',
+      'laboratory',
+      '/model status',
+      deps,
+    );
+    const list = await executeModelCommand(
+      'web:main',
+      'laboratory',
+      '/model list',
+      deps,
+    );
+
+    expect(status.reply).toContain('Grok 4.5');
+    expect(list.reply).toContain('low-refusal');
+    expect(list.reply).toContain('model_api/experimental_0717');
+    expect(stopGroup).not.toHaveBeenCalled();
   });
 });
 

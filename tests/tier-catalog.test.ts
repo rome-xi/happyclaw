@@ -3,6 +3,9 @@ import { describe, expect, test } from 'vitest';
 import {
   ONE_MILLION_CONTEXT_TOKENS,
   TIER_DEFINITIONS,
+  getModelCatalog,
+  getModelRoutingConfig,
+  resolveModelSelection,
   resolveModelContextWindowTokens,
   validateTierCatalog,
   type TierDefinition,
@@ -49,5 +52,40 @@ describe('tier context catalog', () => {
       ONE_MILLION_CONTEXT_TOKENS,
     );
     expect(resolveModelContextWindowTokens('unknown-model')).toBeUndefined();
+  });
+
+  test('loads every current super-relay model from config', () => {
+    const relayModels = getModelCatalog().filter(
+      (model) => model.src === 'super-relay (字节内部)',
+    );
+    expect(relayModels).toHaveLength(14);
+    expect(relayModels.map((model) => model.model)).toEqual(
+      expect.arrayContaining([
+        'grok/grok-4.5',
+        'auto_model/alwaysday1_max',
+        'model_api/experimental_0717',
+        'model_api/seed-code-dogfooding-fast',
+        'opensource/glm5.2',
+      ]),
+    );
+    expect(
+      getModelRoutingConfig().sources['super-relay (字节内部)'].syncModels,
+    ).toBe(true);
+  });
+
+  test('resolves tier, exact model, and human-friendly alias uniformly', () => {
+    expect(resolveModelSelection('max')).toMatchObject({
+      kind: 'tier',
+      model: 'max',
+      contextWindowTokens: ONE_MILLION_CONTEXT_TOKENS,
+    });
+    expect(resolveModelSelection('grok')).toMatchObject({
+      kind: 'model',
+      model: 'grok/grok-4.5',
+      contextWindowTokens: 256_000,
+    });
+    expect(resolveModelSelection('model_api/experimental_0717')?.model).toBe(
+      'model_api/experimental_0717',
+    );
   });
 });

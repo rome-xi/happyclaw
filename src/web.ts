@@ -107,9 +107,11 @@ import { resolvePerMessageRuntimeOwner } from './runtime-owner.js';
 import { persistPluginExpansion } from './plugin-expander-store.js';
 import { logger } from './logger.js';
 import {
+  executeModelCommand,
   executeSessionReset,
   isClearCommand,
   isCompactCommand,
+  isModelCommand,
   SESSION_RESET_FAILURE_MESSAGE,
   SESSION_COMPACT_FAILURE_MESSAGE,
 } from './commands.js';
@@ -239,6 +241,30 @@ app.use(
 
 let deps: WebDeps | null = null;
 
+function publishSystemCommandReply(chatJid: string, content: string): void {
+  const id = crypto.randomUUID();
+  const timestamp = new Date().toISOString();
+  ensureChatExists(chatJid);
+  storeMessageDirect(
+    id,
+    chatJid,
+    '__system__',
+    'system',
+    content,
+    timestamp,
+    true,
+  );
+  broadcastNewMessage(chatJid, {
+    id,
+    chat_jid: chatJid,
+    sender: '__system__',
+    sender_name: 'system',
+    content,
+    timestamp,
+    is_from_me: true,
+  });
+}
+
 // --- Route Mounting ---
 
 app.route('/api/auth', authRoutes);
@@ -333,6 +359,38 @@ app.post('/api/messages', authMiddleware, async (c) => {
         is_from_me: true,
       });
       return c.json({ error: '清除上下文失败' }, 500);
+    }
+  }
+
+  if (isModelCommand(content)) {
+    if (
+      !canModifyGroup(
+        { id: authUser.id, role: authUser.role },
+        { ...group, jid: chatJid },
+      )
+    ) {
+      return c.json({ error: 'Only the workspace owner can run /model' }, 403);
+    }
+    if (!deps) return c.json({ error: 'Server not initialized' }, 500);
+    try {
+      const result = await executeModelCommand(chatJid, group.folder, content, {
+        queue: deps.queue,
+        sessions: deps.getSessions(),
+        broadcast: broadcastNewMessage,
+        setLastAgentTimestamp: deps.setLastAgentTimestamp,
+        markForRecovery: deps.markForRecovery,
+      });
+      publishSystemCommandReply(chatJid, result.reply);
+      return c.json({
+        success: true,
+        modelCommand: true,
+        changed: result.changed,
+        model: result.model,
+        reply: result.reply,
+      });
+    } catch (err) {
+      logger.error({ chatJid, err }, '/model command failed');
+      return c.json({ error: '切换模型失败' }, 500);
     }
   }
 
@@ -1238,6 +1296,46 @@ function setupWebSocket(server: any): WebSocketServer {
                 return;
               }
             }
+          }
+
+          // ── /sw or /spawn command: spawn parallel task (checked before agent routing) ──
+          if (isModelCommand(content) && deps && targetGroup) {
+            if (
+              !canModifyGroup(
+                { id: session.user_id, role: session.role },
+                { ...targetGroup, jid: chatJid },
+              )
+            ) {
+              sendWsError('Only the workspace owner can run /model', chatJid);
+              return;
+            }
+            if (agentId) {
+              const agent = getAgent(agentId);
+              if (!agent || agent.chat_jid !== chatJid) {
+                sendWsError('Agent not found', chatJid);
+                return;
+              }
+            }
+            const replyJid = agentId ? `${chatJid}#agent:${agentId}` : chatJid;
+            try {
+              const result = await executeModelCommand(
+                chatJid,
+                targetGroup.folder,
+                content,
+                {
+                  queue: deps.queue,
+                  sessions: deps.getSessions(),
+                  broadcast: broadcastNewMessage,
+                  setLastAgentTimestamp: deps.setLastAgentTimestamp,
+                  markForRecovery: deps.markForRecovery,
+                },
+              );
+              publishSystemCommandReply(replyJid, result.reply);
+            } catch (err) {
+              logger.error({ chatJid, agentId, err }, '/model command failed');
+              sendWsError('切换模型失败，请稍后重试', chatJid);
+            }
+            return;
           }
 
           // ── /sw or /spawn command: spawn parallel task (checked before agent routing) ──

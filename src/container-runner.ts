@@ -44,6 +44,11 @@ import {
 } from './runtime-config.js';
 import { providerPool } from './provider-pool.js';
 import {
+  findConfiguredRoutingProvider,
+  resolveWorkspaceModel,
+} from './workspace-model.js';
+import type { ResolvedModelSelection } from './tier-catalog.js';
+import {
   deleteSession,
   getSessionProviderId,
   setSessionProviderId,
@@ -397,6 +402,44 @@ function trySelectPoolProvider(
   previousProviderId?: string;
   resetSession?: boolean;
 } | null {
+  const manualModel = resolveWorkspaceModel(groupFolder);
+  if (manualModel) {
+    const routingProvider = findConfiguredRoutingProvider(getProviders());
+    if (routingProvider) {
+      const existingBoundId = getSessionProviderId(groupFolder, agentId);
+      try {
+        const resolved = resolveProviderById(routingProvider.id);
+        providerPool.acquireSession(routingProvider.id);
+        setSessionProviderId(groupFolder, agentId, routingProvider.id);
+        logger.info(
+          {
+            groupFolder,
+            providerId: routingProvider.id,
+            model: manualModel.model,
+          },
+          'Using configured routing provider for manual model selection',
+        );
+        return {
+          profileId: routingProvider.id,
+          resolved,
+          previousProviderId: existingBoundId,
+          resetSession:
+            !!existingBoundId && existingBoundId !== routingProvider.id,
+        };
+      } catch (err) {
+        logger.warn(
+          { err, providerId: routingProvider.id, model: manualModel.model },
+          'Configured routing provider failed, falling back to provider pool',
+        );
+      }
+    } else {
+      logger.warn(
+        { groupFolder, model: manualModel.model },
+        'Manual model is selected but no configured routing provider is enabled',
+      );
+    }
+  }
+
   const override = getContainerEnvConfig(groupFolder);
   const hasOverride = !!(
     override.anthropicApiKey ||
@@ -518,6 +561,25 @@ function trySelectPoolProvider(
   }
 }
 
+/** Append last-wins Claude env values for a workspace model selection. */
+export function appendWorkspaceModelEnv(
+  envLines: string[],
+  selection: ResolvedModelSelection | undefined,
+): void {
+  if (!selection) return;
+  for (const key of [
+    'ANTHROPIC_MODEL',
+    'ANTHROPIC_DEFAULT_OPUS_MODEL',
+    'ANTHROPIC_DEFAULT_SONNET_MODEL',
+    'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+  ]) {
+    envLines.push(`${key}=${selection.model}`);
+  }
+  envLines.push(
+    `CLAUDE_CODE_AUTO_COMPACT_WINDOW=${selection.contextWindowTokens}`,
+  );
+}
+
 /**
  * Best-effort pre-spawn materialize for host-mode plugins. Mirrors the docker
  * path's behaviour in `buildVolumeMounts`: v2 config can exist before the
@@ -555,6 +617,7 @@ export function buildVolumeMounts(
   ownerHomeFolder?: string,
   taskRunId?: string,
   resolvedProvider?: ResolvedProvider,
+  workspaceModel?: ResolvedModelSelection,
 ): VolumeMount[] {
   const mounts: VolumeMount[] = [];
   const projectRoot = process.cwd();
@@ -791,6 +854,7 @@ export function buildVolumeMounts(
     containerOverride,
     resolvedProvider?.customEnv,
   );
+  appendWorkspaceModelEnv(envLines, workspaceModel);
   // SystemSettings.autoCompactWindow > 0 时注入到容器，让 agent-runner 通过 query() settings 传给 SDK
   const sysSettings = getSystemSettings();
   if (sysSettings.autoCompactWindow > 0) {
@@ -1036,6 +1100,7 @@ export async function runContainerAgent(
       ownerHomeFolder,
       input.taskRunId,
       resolvedProvider,
+      resolveWorkspaceModel(group.folder),
     );
     const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
     const agentSuffix = input.agentId
@@ -1607,6 +1672,15 @@ export async function runHostAgent(
     for (const line of envLines) {
       const eqIdx = line.indexOf('=');
       if (eqIdx > 0) {
+        hostEnv[line.slice(0, eqIdx)] = line.slice(eqIdx + 1);
+      }
+    }
+    const manualModel = resolveWorkspaceModel(group.folder);
+    if (manualModel) {
+      const manualEnv: string[] = [];
+      appendWorkspaceModelEnv(manualEnv, manualModel);
+      for (const line of manualEnv) {
+        const eqIdx = line.indexOf('=');
         hostEnv[line.slice(0, eqIdx)] = line.slice(eqIdx + 1);
       }
     }

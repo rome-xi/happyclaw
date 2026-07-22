@@ -1,0 +1,221 @@
+{
+  "version": 1,
+  "routingProvider": {
+    "names": ["四档 Clash 自动选优"],
+    "baseUrls": ["http://127.0.0.1:3011"]
+  },
+  "sources": {
+    "super-relay (字节内部)": {
+      "syncModels": true
+    },
+    "codex-pro": {
+      "syncModels": false
+    },
+    "AgentRouter opus": {
+      "syncModels": false
+    }
+  },
+  "models": [
+    {
+      "id": "gpt-5.6-sol",
+      "displayName": "GPT 5.6 Sol（Codex Pro）",
+      "source": "codex-pro",
+      "protocol": "openai-responses-adapter",
+      "contextWindowTokens": 1000000,
+      "aliases": ["pro-sol", "codex-sol"],
+      "traits": ["frontier", "coding", "openai-wire"]
+    },
+    {
+      "id": "claude-opus-4-8",
+      "displayName": "Claude Opus 4.8",
+      "source": "AgentRouter opus",
+      "protocol": "anthropic-messages",
+      "contextWindowTokens": 1000000,
+      "aliases": ["opus48", "opus-4.8"],
+      "traits": ["frontier", "reasoning", "anthropic-wire"]
+    },
+    {
+      "id": "model_hub/es1_orange_o48",
+      "displayName": "Orange O48",
+      "source": "super-relay (字节内部)",
+      "protocol": "anthropic-messages",
+      "contextWindowTokens": 1000000,
+      "aliases": ["o48", "orange48"],
+      "traits": ["frontier", "long-context"]
+    },
+    {
+      "id": "model_hub/es1_orange_o47",
+      "displayName": "Orange O47",
+      "source": "super-relay (字节内部)",
+      "protocol": "anthropic-messages",
+      "contextWindowTokens": 1000000,
+      "aliases": ["o47", "orange47"],
+      "traits": ["frontier", "long-context"]
+    },
+    {
+      "id": "openai/gpt-5.6-sol",
+      "displayName": "GPT 5.6 Sol（Super Relay）",
+      "source": "super-relay (字节内部)",
+      "protocol": "anthropic-messages",
+      "contextWindowTokens": 1000000,
+      "aliases": ["relay-sol", "super-sol"],
+      "traits": ["frontier", "long-context", "openai-model"]
+    },
+    {
+      "id": "openai/gpt-5.6-terra",
+      "displayName": "GPT 5.6 Terra",
+      "source": "super-relay (字节内部)",
+      "protocol": "anthropic-messages",
+      "contextWindowTokens": 300000,
+      "aliases": ["terra", "gpt-terra"],
+      "traits": ["strong", "openai-model"]
+    },
+    {
+      "id": "opensource/glm5.2",
+      "displayName": "GLM 5.2 Open Source",
+      "source": "super-relay (字节内部)",
+      "protocol": "anthropic-messages",
+      "contextWindowTokens": 1000000,
+      "aliases": ["glm52", "relay-glm"],
+      "traits": ["strong", "long-context", "open-source"]
+    },
+    {
+      "id": "grok/grok-4.5",
+      "displayName": "Grok 4.5",
+      "source": "super-relay (字节内部)",
+      "protocol": "anthropic-messages",
+      "contextWindowTokens": 256000,
+      "aliases": ["grok", "grok45", "low-refusal"],
+      "traits": ["balanced", "permissive", "low-refusal"]
+    },
+    {
+      "id": "auto_model/alwaysday1_max",
+      "displayName": "AlwaysDay1 Max",
+      "source": "super-relay (字节内部)",
+      "protocol": "anthropic-messages",
+      "contextWindowTokens": 200000,
+      "aliases": ["day1-max", "alwaysday-max"],
+      "traits": ["strong", "auto-route"]
+    },
+    {
+      "id": "model_api/seed-code-dogfooding",
+      "displayName": "Seed Code Dogfooding",
+      "source": "super-relay (字节内部)",
+      "protocol": "anthropic-messages",
+      "contextWindowTokens": 262144,
+      "aliases": ["seed-code", "dogfood"],
+      "traits": ["strong", "coding", "experimental"]
+    },
+    {
+      "id": "model_api/seed-code-dogfooding-fast",
+      "displayName": "Seed Code Dogfooding Fast",
+      "source": "super-relay (字节内部)",
+      "protocol": "anthropic-messages",
+      "contextWindowTokens": 262144,
+      "aliases": ["seed-fast", "dogfood-fast"],
+      "traits": ["fast", "coding", "experimental"]
+    },
+    {
+      "id": "auto_model/60b-sota",
+      "displayName": "Auto 60B SOTA",
+      "source": "super-relay (字节内部)",
+      "protocol": "anthropic-messages",
+      "contextWindowTokens": 200000,
+      "aliases": ["60b", "60b-sota"],
+      "traits": ["balanced", "auto-route"]
+    },
+    {
+      "id": "ark/60b-0614c",
+      "displayName": "Ark 60B 0614c",
+      "source": "super-relay (字节内部)",
+      "protocol": "anthropic-messages",
+      "contextWindowTokens": 200000,
+      "aliases": ["ark60b", "60b-0614c"],
+      "traits": ["balanced"]
+    },
+    {
+      "id": "auto_model/alwaysday1",
+      "displayName": "AlwaysDay1",
+      "source": "super-relay (字节内部)",
+      "protocol": "anthropic-messages",
+      "contextWindowTokens": 200000,
+      "aliases": ["day1", "alwaysday"],
+      "traits": ["balanced", "auto-route"]
+    },
+    {
+      "id": "model_api/experimental_0630",
+      "displayName": "Experimental 0630",
+      "source": "super-relay (字节内部)",
+      "protocol": "anthropic-messages",
+      "contextWindowTokens": 256000,
+      "aliases": ["exp630", "experimental630"],
+      "traits": ["balanced", "experimental"]
+    },
+    {
+      "id": "model_api/experimental_0717",
+      "displayName": "Experimental 0717",
+      "source": "super-relay (字节内部)",
+      "protocol": "anthropic-messages",
+      "contextWindowTokens": 256000,
+      "aliases": ["exp717", "experimental717"],
+      "traits": ["fast", "experimental"]
+    }
+  ],
+  "tiers": {
+    "max": {
+      "channel": "tier-max",
+      "tierModel": "max",
+      "policy": "speed",
+      "minimumContextWindowTokens": 1000000,
+      "models": [
+        "gpt-5.6-sol",
+        "claude-opus-4-8",
+        "model_hub/es1_orange_o48",
+        "model_hub/es1_orange_o47",
+        "openai/gpt-5.6-sol"
+      ]
+    },
+    "high": {
+      "channel": "tier-high",
+      "tierModel": "high",
+      "policy": "speed",
+      "models": [
+        "gpt-5.6-sol",
+        "claude-opus-4-8",
+        "model_hub/es1_orange_o48",
+        "model_hub/es1_orange_o47",
+        "openai/gpt-5.6-sol",
+        "openai/gpt-5.6-terra",
+        "opensource/glm5.2",
+        "auto_model/alwaysday1_max",
+        "model_api/seed-code-dogfooding"
+      ]
+    },
+    "balance": {
+      "channel": "tier-balance",
+      "tierModel": "balance",
+      "policy": "speed",
+      "models": [
+        "grok/grok-4.5",
+        "auto_model/60b-sota",
+        "ark/60b-0614c",
+        "auto_model/alwaysday1",
+        "model_api/experimental_0630",
+        "model_api/experimental_0717",
+        "model_api/seed-code-dogfooding",
+        "opensource/glm5.2"
+      ]
+    },
+    "fast": {
+      "channel": "tier-fast",
+      "tierModel": "fast",
+      "policy": "speed",
+      "models": [
+        "model_api/seed-code-dogfooding-fast",
+        "model_api/experimental_0717",
+        "auto_model/alwaysday1",
+        "auto_model/60b-sota"
+      ]
+    }
+  }
+}

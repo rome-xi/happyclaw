@@ -15,7 +15,7 @@
  *   - Each `commands/{name}.md` registers two aliases:
  *       /{name}              short
  *       /{plugin}:{name}     namespaced
- *   - When `{name}` collides with one of the 13 hardcoded built-in command
+ *   - When `{name}` collides with a hardcoded built-in command
  *     names (clear / status / list / etc), we drop the short form so the
  *     built-in handler still wins on bare `/status`. The namespaced form
  *     remains addressable.
@@ -39,10 +39,7 @@ import path from 'path';
 import yaml from 'yaml';
 
 import { logger } from './logger.js';
-import {
-  readUserPluginsV2,
-  getUserPluginRuntimePath,
-} from './plugin-utils.js';
+import { readUserPluginsV2, getUserPluginRuntimePath } from './plugin-utils.js';
 import { isValidNameSegment } from './plugin-manifest.js';
 
 // --- Built-in command names ------------------------------------------------
@@ -52,6 +49,8 @@ import { isValidNameSegment } from './plugin-manifest.js';
 // resolveCommand is the boundary.
 const BUILTIN_COMMAND_NAMES: ReadonlySet<string> = new Set([
   'clear',
+  'compact',
+  'model',
   'list',
   'ls',
   'status',
@@ -63,6 +62,7 @@ const BUILTIN_COMMAND_NAMES: ReadonlySet<string> = new Set([
   'new',
   'require_mention',
   'owner_mention',
+  'release_owner',
   'sw',
   'spawn',
   'allow',
@@ -145,7 +145,10 @@ function parseCommandFile(raw: string, commandFile: string): ParsedCommandFile {
   }
   if (typeof parsed !== 'object' || Array.isArray(parsed)) {
     logger.warn(
-      { commandFile, parsedType: Array.isArray(parsed) ? 'array' : typeof parsed },
+      {
+        commandFile,
+        parsedType: Array.isArray(parsed) ? 'array' : typeof parsed,
+      },
       'plugin-command-index: frontmatter is not a mapping; treating as no-frontmatter',
     );
     return { frontmatter: {}, body };
@@ -274,9 +277,7 @@ async function buildCommandIndexUncached(
  * Pure helper that turns a list of entries into a `CommandIndex`. Exposed for
  * unit tests that want to verify alias rules without hitting disk.
  */
-export function indexEntries(
-  entries: PluginCommandIndexEntry[],
-): CommandIndex {
+export function indexEntries(entries: PluginCommandIndexEntry[]): CommandIndex {
   const byNamespaced = new Map<string, PluginCommandIndexEntry[]>();
   const byShort = new Map<string, PluginCommandIndexEntry[]>();
 
@@ -308,9 +309,7 @@ export function indexEntries(
  * Cached entry point. Rebuild on first call after invalidate, otherwise
  * return the memoized snapshot.
  */
-export async function buildCommandIndex(
-  userId: string,
-): Promise<CommandIndex> {
+export async function buildCommandIndex(userId: string): Promise<CommandIndex> {
   const hit = cache.get(userId);
   if (hit) return hit;
   const fresh = await buildCommandIndexUncached(userId);
@@ -343,10 +342,7 @@ export function _resetCommandIndexCacheForTests(): void {
  * No argument parsing happens here — callers should split on whitespace and
  * pass only the head token.
  */
-export function resolveCommand(
-  idx: CommandIndex,
-  slash: string,
-): Resolution {
+export function resolveCommand(idx: CommandIndex, slash: string): Resolution {
   if (typeof slash !== 'string') return { kind: 'miss' };
   let token = slash.trim();
   if (token.startsWith('/')) token = token.slice(1);

@@ -4,19 +4,33 @@
  */
 import crypto from 'crypto';
 import {
+  deleteAllSessionsForFolder,
   deleteSession,
   getJidsByFolder,
   storeMessageDirect,
   ensureChatExists,
 } from './db.js';
 import { logger } from './logger.js';
-import { clearSessionFiles } from './session-files.js';
+import { clearAllSessionFiles, clearSessionFiles } from './session-files.js';
+import {
+  clearWorkspaceModelOverride,
+  formatModelCatalog,
+  formatWorkspaceModelStatus,
+  getWorkspaceModelOverride,
+  setWorkspaceModelOverride,
+} from './workspace-model.js';
+import { resolveModelSelection } from './tier-catalog.js';
 import type { NewMessage, MessageCursor } from './types.js';
 
 // ─── Types ──────────────────────────────────────────────────────
 
 export interface CommandDeps {
-  queue: { stopGroup(jid: string, opts?: { force?: boolean }): Promise<void> };
+  queue: {
+    stopGroup(jid: string, opts?: { force?: boolean }): Promise<void>;
+    getStatus?: () => {
+      groups: Array<{ jid: string; groupFolder: string | null }>;
+    };
+  };
   sessions: Record<string, string>;
   broadcast: (jid: string, msg: NewMessage & { is_from_me: boolean }) => void;
   setLastAgentTimestamp: (jid: string, cursor: MessageCursor) => void;
@@ -36,6 +50,99 @@ export function isClearCommand(content: string): boolean {
 
 export function isCompactCommand(content: string): boolean {
   return content.trim().toLowerCase() === '/compact';
+}
+
+export function isModelCommand(content: string): boolean {
+  return /^\/model(?:\s|$)/i.test(content.trim());
+}
+
+export interface ModelCommandResult {
+  reply: string;
+  changed: boolean;
+  model: string | null;
+}
+
+/**
+ * Handle `/model` for a whole workspace. The selection is shared by Web and
+ * every IM/account bound to the folder. A real selection change drops all SDK
+ * sessions but preserves HappyClaw DB history for recovery on the next turn.
+ */
+export async function executeModelCommand(
+  baseChatJid: string,
+  folder: string,
+  command: string,
+  deps: CommandDeps,
+): Promise<ModelCommandResult> {
+  const trimmed = command.trim();
+  const args = trimmed.replace(/^\/model(?:\s+|$)/i, '').trim();
+  const normalized = args.toLowerCase();
+  if (!args || normalized === 'status' || normalized === 'current') {
+    return {
+      reply: `${formatWorkspaceModelStatus(folder)}\n发送 /model list 查看全部模型。`,
+      changed: false,
+      model: getWorkspaceModelOverride(folder) ?? null,
+    };
+  }
+  if (normalized === 'list' || normalized === 'ls') {
+    return {
+      reply: formatModelCatalog(folder),
+      changed: false,
+      model: getWorkspaceModelOverride(folder) ?? null,
+    };
+  }
+
+  const wantsAuto = ['auto', 'default', '自动'].includes(normalized);
+  const selection = wantsAuto ? undefined : resolveModelSelection(args);
+  if (!wantsAuto && !selection) {
+    const displayArgs = args.length > 120 ? `${args.slice(0, 117)}...` : args;
+    return {
+      reply: `没有找到模型或档位“${displayArgs}”。发送 /model list 查看可用项。`,
+      changed: false,
+      model: getWorkspaceModelOverride(folder) ?? null,
+    };
+  }
+  const current = getWorkspaceModelOverride(folder);
+  const next = selection?.model;
+  if (current === next || (!current && wantsAuto)) {
+    return {
+      reply: wantsAuto
+        ? '当前已经是 auto（实时探针自动选优）。'
+        : `当前已经固定为 ${selection!.displayName}（${selection!.model}）。`,
+      changed: false,
+      model: current ?? null,
+    };
+  }
+
+  const runtimeJids =
+    deps.queue
+      .getStatus?.()
+      .groups.filter((group) => group.groupFolder === folder)
+      .map((group) => group.jid) ?? [];
+  const siblingJids = [
+    ...new Set([baseChatJid, ...getJidsByFolder(folder), ...runtimeJids]),
+  ];
+  await Promise.all(
+    siblingJids.map((jid) => deps.queue.stopGroup(jid, { force: true })),
+  );
+  clearAllSessionFiles(folder);
+  deleteAllSessionsForFolder(folder);
+  delete deps.sessions[folder];
+  for (const jid of siblingJids) deps.markForRecovery?.(jid);
+
+  if (selection) setWorkspaceModelOverride(folder, selection.model);
+  else clearWorkspaceModelOverride(folder);
+
+  logger.info(
+    { folder, model: selection?.model ?? 'auto' },
+    'Workspace model selection changed',
+  );
+  return {
+    reply: selection
+      ? `已将整个工作区固定为 ${selection.displayName}（${selection.model}，上下文 ${selection.contextWindowTokens}）。下一条消息会在新 session 中恢复历史。`
+      : '已恢复 auto：由 provider 与实时探针自动选择。下一条消息会在新 session 中恢复历史。',
+    changed: true,
+    model: selection?.model ?? null,
+  };
 }
 
 /**

@@ -6,6 +6,7 @@ import { describe, expect, test } from 'vitest';
 
 import {
   buildTierProbeRequest,
+  buildSourceModelsUpdatePayload,
   buildTierUpdatePayload,
   currentTierState,
   readChannelKeyFromSqlite,
@@ -152,6 +153,27 @@ describe('tier source key loading', () => {
 });
 
 describe('tier channel updates', () => {
+  test('syncs a configured source allow-list without touching credentials', () => {
+    const source = {
+      id: 1,
+      name: 'relay',
+      key: 'secret-kept-in-memory',
+      models: 'old-model',
+      base_url: 'https://relay.example',
+    };
+    const payload = buildSourceModelsUpdatePayload(source, [
+      'new-b',
+      'new-a',
+      'new-a',
+    ]);
+
+    expect(payload).toEqual({
+      ...source,
+      models: 'new-a,new-b,old-model',
+    });
+    expect(source.models).toBe('old-model');
+  });
+
   test('reads the exact virtual tier mapping instead of the first value', () => {
     expect(
       currentTierState(

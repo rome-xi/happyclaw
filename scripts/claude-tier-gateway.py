@@ -36,6 +36,19 @@ TIER_CIRCUIT_SECONDS = int(os.environ.get("TIER_CIRCUIT_SECONDS", "1800"))
 MAX_UPSTREAM_ERROR_BYTES = int(
     os.environ.get("MAX_UPSTREAM_ERROR_BYTES", str(1024 * 1024))
 )
+DEFAULT_MODEL_ROUTING_CONFIG = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "config",
+    "model-routing.json",
+)
+MODEL_ROUTING_CONFIG = os.path.abspath(
+    os.path.expanduser(
+        os.environ.get(
+            "HAPPYCLAW_MODEL_ROUTING_CONFIG",
+            DEFAULT_MODEL_ROUTING_CONFIG,
+        )
+    )
+)
 
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -67,7 +80,7 @@ MESSAGES_PATHS = {
 # selected route fails a real request, so a short canary can never strand an
 # entire long-running workspace. Every quality tier intentionally crosses the
 # Anthropic/OpenAI protocol boundary before giving up.
-TIER_FALLBACKS = {
+DEFAULT_TIER_FALLBACKS = {
     "max": (
         "gpt-5.6-sol",
         "claude-opus-4-8",
@@ -94,6 +107,12 @@ TIER_FALLBACKS = {
         "claude-opus-4-8",
     ),
 }
+# Last known-good snapshot. `get_tier_fallbacks()` hot-reloads the shared JSON
+# config by mtime; these defaults only keep older/minimal installations usable
+# when the shipped config is temporarily unavailable.
+TIER_FALLBACKS = DEFAULT_TIER_FALLBACKS
+_tier_config_mtime_ns = -1
+_tier_config_path = ""
 RETRYABLE_TIER_STATUSES = {
     400,
     401,
@@ -111,6 +130,51 @@ RETRYABLE_TIER_STATUSES = {
 
 _tier_circuit_lock = threading.Lock()
 _tier_unhealthy_until: dict[tuple[str, str], float] = {}
+
+
+def load_tier_fallbacks(config_path: str) -> dict[str, tuple[str, ...]]:
+    """Parse the same secret-free tier config used by the TS prober."""
+    with open(config_path, encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        raise ValueError("unsupported model routing config")
+    raw_tiers = payload.get("tiers")
+    if not isinstance(raw_tiers, dict) or not raw_tiers:
+        raise ValueError("model routing tiers are missing")
+    parsed: dict[str, tuple[str, ...]] = {}
+    for tier_name, tier in raw_tiers.items():
+        if not isinstance(tier_name, str) or not tier_name.strip():
+            raise ValueError("invalid tier name")
+        if not isinstance(tier, dict) or not isinstance(tier.get("models"), list):
+            raise ValueError(f"invalid tier: {tier_name}")
+        models = tuple(
+            model.strip()
+            for model in tier["models"]
+            if isinstance(model, str) and model.strip()
+        )
+        if not models or len(models) != len(tier["models"]):
+            raise ValueError(f"empty or invalid tier: {tier_name}")
+        parsed[tier_name.strip()] = models
+    return parsed
+
+
+def get_tier_fallbacks() -> dict[str, tuple[str, ...]]:
+    """Hot-reload tier fallback order, retaining the last good edit on error."""
+    global TIER_FALLBACKS, _tier_config_mtime_ns, _tier_config_path
+    try:
+        stat = os.stat(MODEL_ROUTING_CONFIG)
+        if (
+            _tier_config_path == MODEL_ROUTING_CONFIG
+            and _tier_config_mtime_ns == stat.st_mtime_ns
+        ):
+            return TIER_FALLBACKS
+        parsed = load_tier_fallbacks(MODEL_ROUTING_CONFIG)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return TIER_FALLBACKS
+    TIER_FALLBACKS = parsed
+    _tier_config_path = MODEL_ROUTING_CONFIG
+    _tier_config_mtime_ns = stat.st_mtime_ns
+    return TIER_FALLBACKS
 
 
 def read_newapi_token() -> str:
@@ -246,7 +310,7 @@ def replace_request_model(body: bytes, model: str) -> bytes:
 
 def read_tier_mapping(tier: str, database_path: str = NEWAPI_SQLITE) -> str:
     """Read the selected real model from new-api's local control-plane DB."""
-    if tier not in TIER_FALLBACKS or not database_path:
+    if tier not in get_tier_fallbacks() or not database_path:
         return ""
     connection = None
     try:
@@ -272,7 +336,7 @@ def mark_tier_model_unhealthy(
     *,
     now: float | None = None,
 ) -> None:
-    if tier not in TIER_FALLBACKS or not model:
+    if tier not in get_tier_fallbacks() or not model:
         return
     current = time.monotonic() if now is None else now
     with _tier_circuit_lock:
@@ -312,7 +376,8 @@ def tier_attempt_models(
     now: float | None = None,
 ) -> list[str]:
     """Return alias-first attempts, bypassing a selected model in circuit."""
-    if tier not in TIER_FALLBACKS:
+    tier_fallbacks = get_tier_fallbacks()
+    if tier not in tier_fallbacks:
         return [tier]
     attempts: list[str] = []
     selected_unhealthy = is_tier_model_unhealthy(
@@ -322,7 +387,7 @@ def tier_attempt_models(
     )
     if not selected_unhealthy:
         attempts.append(tier)
-    for model in TIER_FALLBACKS[tier]:
+    for model in tier_fallbacks[tier]:
         if model == selected_model or is_tier_model_unhealthy(tier, model, now=now):
             continue
         attempts.append(model)
@@ -433,14 +498,15 @@ class Handler(BaseHTTPRequestHandler):
             forwarded["Authorization"] = f"Bearer {token}"
 
         requested_model = request_model(body)
+        tier_fallbacks = get_tier_fallbacks()
         selected_model = (
             read_tier_mapping(requested_model)
-            if not passthrough and requested_model in TIER_FALLBACKS
+            if not passthrough and requested_model in tier_fallbacks
             else ""
         )
         attempt_models = (
             tier_attempt_models(requested_model, selected_model)
-            if selected_model or requested_model in TIER_FALLBACKS
+            if selected_model or requested_model in tier_fallbacks
             else [requested_model]
         )
         response = None
@@ -497,7 +563,7 @@ class Handler(BaseHTTPRequestHandler):
                 selected_model if attempt_model == requested_model else attempt_model
             )
             should_retry = (
-                requested_model in TIER_FALLBACKS
+                requested_model in tier_fallbacks
                 and response.status in RETRYABLE_TIER_STATUSES
                 and attempt_index < len(attempt_models) - 1
             )

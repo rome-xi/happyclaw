@@ -22,7 +22,7 @@ import path from 'path';
 import Database from 'better-sqlite3';
 import { logger } from './logger.js';
 import {
-  TIER_DEFINITIONS as TIERS,
+  getModelRoutingConfig,
   type TierCandidate as Candidate,
   type TierPolicy as Policy,
 } from './tier-catalog.js';
@@ -442,6 +442,67 @@ async function applyTierUpstream(
   }
 }
 
+/**
+ * Build an additive source-channel update from the secret-free routing config.
+ * The channel key, operator-managed model names, and all unrelated new-api
+ * fields are preserved verbatim.
+ */
+export function buildSourceModelsUpdatePayload(
+  sourceChannel: Record<string, unknown>,
+  configuredModels: string[],
+): Record<string, unknown> {
+  const rawExisting = sourceChannel['models'];
+  const existingModels = Array.isArray(rawExisting)
+    ? rawExisting.map(String)
+    : String(rawExisting || '').split(',');
+  return {
+    ...sourceChannel,
+    models: [
+      ...new Set(
+        [...existingModels, ...configuredModels].map((model) => model.trim()),
+      ),
+    ]
+      .filter(Boolean)
+      .sort()
+      .join(','),
+  };
+}
+
+async function applySourceModels(
+  adminHeaders: AdminHeaders,
+  sourceChannel: Record<string, unknown>,
+  configuredModels: string[],
+): Promise<Record<string, unknown> | null> {
+  const payload = buildSourceModelsUpdatePayload(
+    sourceChannel,
+    configuredModels,
+  );
+  const current = String(sourceChannel['models'] || '')
+    .split(',')
+    .map((model) => model.trim())
+    .filter(Boolean)
+    .sort();
+  const desired = String(payload['models'] || '')
+    .split(',')
+    .filter(Boolean);
+  if (JSON.stringify(current) === JSON.stringify(desired)) return payload;
+  try {
+    const response = await fetch(`${NEWAPI}/api/channel/`, {
+      method: 'PUT',
+      headers: {
+        ...adminHeaders,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(15_000),
+    });
+    const body = (await response.json().catch(() => null)) as any;
+    return response.ok && body?.success === true ? payload : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Build a PUT payload without mutating either cached channel object. */
 export function buildTierUpdatePayload(
   tierChannel: Record<string, unknown>,
@@ -477,7 +538,7 @@ export function currentTierState(
 }
 
 /** 跑一轮：探测所有档、更新映射。best-effort，不抛。 */
-export async function runTierProbeOnce(): Promise<void> {
+async function runTierProbeRound(): Promise<void> {
   const token = readToken();
   if (!token) {
     logger.warn('tier-prober: new-api token unavailable, skip');
@@ -489,6 +550,11 @@ export async function runTierProbeOnce(): Promise<void> {
     return;
   }
 
+  // Read this round's snapshot only once. A config edit is picked up on the
+  // next round, so candidate selection cannot change halfway through probing.
+  const routingConfig = getModelRoutingConfig();
+  const tiers = routingConfig.tiers;
+
   // 源渠道缓存（按名取一次，复用其 base_url+key）
   const srcCache: Record<string, Record<string, unknown> | null> = {};
   const getSrc = async (
@@ -499,12 +565,50 @@ export async function runTierProbeOnce(): Promise<void> {
     return srcCache[name];
   };
 
+  // Keep selected new-api source channels aligned with the config catalog.
+  // This is what makes a newly configured relay model usable by exact name —
+  // operators do not need a second manual edit in the new-api UI.
+  for (const [sourceName, sourceConfig] of Object.entries(
+    routingConfig.sources,
+  )) {
+    if (!sourceConfig.syncModels) continue;
+    const configuredModels = routingConfig.models
+      .filter((model) => model.enabled && model.src === sourceName)
+      .map((model) => model.model);
+    if (configuredModels.length === 0) continue;
+    const sourceChannel = await getSrc(sourceName);
+    if (!sourceChannel) {
+      logger.warn(
+        { source: sourceName },
+        'tier-prober: source channel for model sync not found',
+      );
+      continue;
+    }
+    const updated = await applySourceModels(
+      adminHeaders,
+      sourceChannel,
+      configuredModels,
+    );
+    if (!updated) {
+      logger.warn(
+        { source: sourceName, modelCount: configuredModels.length },
+        'tier-prober: source model catalog sync failed',
+      );
+      continue;
+    }
+    srcCache[sourceName] = updated;
+    logger.info(
+      { source: sourceName, modelCount: configuredModels.length },
+      'tier-prober: source model catalog synchronized',
+    );
+  }
+
   // A raw model request can only identify its new-api channel by model name.
   // Refuse ambiguous declarations instead of probing one source and later
   // copying credentials from another. Duplicate use of the same model+source
   // across max/high is valid and is probed only once per round.
   const modelSources = new Map<string, Set<string>>();
-  for (const cfg of Object.values(TIERS)) {
+  for (const cfg of Object.values(tiers)) {
     for (const candidate of cfg.order) {
       const sources = modelSources.get(candidate.model) ?? new Set<string>();
       sources.add(candidate.src);
@@ -546,7 +650,7 @@ export async function runTierProbeOnce(): Promise<void> {
   }
 
   const confirmedModels = new Set<string>();
-  for (const [tier, cfg] of Object.entries(TIERS)) {
+  for (const [tier, cfg] of Object.entries(tiers)) {
     const eligible = cfg.order.filter((candidate) =>
       validatedSources.has(`${candidate.src}\0${candidate.model}`),
     );
@@ -622,7 +726,38 @@ export async function runTierProbeOnce(): Promise<void> {
   }
 }
 
+let probeInFlight: Promise<void> | null = null;
+let probeRerunRequested = false;
+
+/**
+ * Serialize probe rounds. A catalog edit while a long round is running queues
+ * exactly one follow-up, avoiding overlapping canaries/admin writes while
+ * still applying the newest config promptly.
+ */
+export function runTierProbeOnce(): Promise<void> {
+  if (probeInFlight) {
+    probeRerunRequested = true;
+    return probeInFlight;
+  }
+  probeInFlight = runTierProbeRound()
+    .catch((err) => {
+      logger.warn(
+        { err: err instanceof Error ? err.message : String(err) },
+        'tier-prober: unexpected round failure',
+      );
+    })
+    .finally(() => {
+      probeInFlight = null;
+      if (probeRerunRequested) {
+        probeRerunRequested = false;
+        void runTierProbeOnce();
+      }
+    });
+  return probeInFlight;
+}
+
 let timer: NodeJS.Timeout | null = null;
+let watchedRoutingConfigPath: string | null = null;
 
 /**
  * 启动定时探针。host 进程调用一次。gateway/new-api 不在时静默 no-op（探测失败只 log）。
@@ -638,9 +773,23 @@ export function startTierProber(): void {
     return;
   }
   if (timer) return;
+  const routingConfig = getModelRoutingConfig();
   logger.info(
-    { intervalMs: interval, tiers: Object.keys(TIERS) },
+    { intervalMs: interval, tiers: Object.keys(routingConfig.tiers) },
     'tier-prober: starting',
+  );
+  watchedRoutingConfigPath = routingConfig.path;
+  fs.watchFile(
+    watchedRoutingConfigPath,
+    { interval: 5_000, persistent: false },
+    (current, previous) => {
+      if (current.mtimeMs === previous.mtimeMs) return;
+      logger.info(
+        { config: watchedRoutingConfigPath },
+        'tier-prober: model routing config changed, queueing refresh',
+      );
+      void runTierProbeOnce();
+    },
   );
   // 首轮延迟 30s，避开启动高峰
   setTimeout(() => {
@@ -656,5 +805,9 @@ export function stopTierProber(): void {
   if (timer) {
     clearInterval(timer);
     timer = null;
+  }
+  if (watchedRoutingConfigPath) {
+    fs.unwatchFile(watchedRoutingConfigPath);
+    watchedRoutingConfigPath = null;
   }
 }

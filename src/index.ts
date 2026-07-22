@@ -232,7 +232,7 @@ import {
 import { installSkillForUser, deleteSkillForUser } from './routes/skills.js';
 import { verifyPairingCode } from './telegram-pairing.js';
 import { sdkQuery } from './sdk-query.js';
-import { executeSessionReset } from './commands.js';
+import { executeModelCommand, executeSessionReset } from './commands.js';
 import {
   claimOwner,
   releaseOwner,
@@ -1520,6 +1520,8 @@ async function handleCommand(
       // container/agent-runner/src/index.ts runQuery 时间前缀注入处。
       if (rawArgs.length > 0) return null;
       return handleCompactCommand(chatJid);
+    case 'model':
+      return handleModelCommand(chatJid, rawArgs);
     case 'list':
     case 'ls':
       return handleListCommand(chatJid);
@@ -1635,6 +1637,43 @@ async function handleCompactCommand(chatJid: string): Promise<string> {
       'handleCommand /compact failed',
     );
     return '压缩上下文失败，请稍后重试';
+  }
+}
+
+async function handleModelCommand(
+  chatJid: string,
+  rawArgs: string,
+): Promise<string> {
+  const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
+  if (!group) return '未找到当前工作区';
+
+  const target = resolveBoundChatTarget(
+    chatJid,
+    group,
+    (jid) => registeredGroups[jid] ?? getRegisteredGroup(jid),
+    getAgent,
+    findGroupNameByFolder,
+  );
+  try {
+    const result = await executeModelCommand(
+      target.baseChatJid,
+      target.folder,
+      `/model${rawArgs ? ` ${rawArgs}` : ''}`,
+      {
+        queue,
+        sessions,
+        broadcast: broadcastNewMessage,
+        setLastAgentTimestamp: setCursors,
+        markForRecovery: (jid) => recoveryGroups.add(jid),
+      },
+    );
+    return result.reply;
+  } catch (err) {
+    logger.error(
+      { chatJid, targetFolder: target.folder, err },
+      'handleCommand /model failed',
+    );
+    return '切换模型失败，请稍后重试';
   }
 }
 
@@ -1921,7 +1960,13 @@ async function handleNewCommand(
   // bot is automatically a member), pull the sender in, bind a fresh workspace
   // to it, and announce in the new group.
   if (chatJid.startsWith('feishu:')) {
-    return handleNewCommandWithFeishuGroup(chatJid, name, userId, group, senderImId);
+    return handleNewCommandWithFeishuGroup(
+      chatJid,
+      name,
+      userId,
+      group,
+      senderImId,
+    );
   }
 
   // Non-Telegram/non-Feishu channels: create the workspace and bind the current chat to it.
@@ -2126,13 +2171,17 @@ async function handleNewCommandWithFeishuGroup(
     // 绑定 happyclaw 标签（best-effort，失败不影响主流程）
     try {
       const tagName = 'happyclaw';
-      const tagList = await (client as any).request({
+      const tagList = (await (client as any).request({
         method: 'GET',
         url: '/open-apis/im/v2/tags',
         params: { page_size: 50 },
-      }) as any;
+      })) as any;
       let tagId: string | undefined;
-      const items = tagList?.data?.items || tagList?.items || tagList?.data?.data?.items || [];
+      const items =
+        tagList?.data?.items ||
+        tagList?.items ||
+        tagList?.data?.data?.items ||
+        [];
       for (const item of items) {
         if (item.name === tagName) {
           tagId = item.tag_id || item.tagId;
@@ -2140,8 +2189,13 @@ async function handleNewCommandWithFeishuGroup(
         }
       }
       if (!tagId) {
-        const createTag = await client.im.v2.tag.create({ data: { name: tagName } } as any) as any;
-        tagId = createTag?.data?.tag?.tag_id || createTag?.tag_id || createTag?.data?.tag_id;
+        const createTag = (await client.im.v2.tag.create({
+          data: { name: tagName },
+        } as any)) as any;
+        tagId =
+          createTag?.data?.tag?.tag_id ||
+          createTag?.tag_id ||
+          createTag?.data?.tag_id;
       }
       if (tagId) {
         await (client as any).request({
@@ -2149,10 +2203,16 @@ async function handleNewCommandWithFeishuGroup(
           url: `/open-apis/im/v1/chats/${chatId}/tags`,
           data: { tag_ids: [tagId] },
         });
-        logger.info({ chatId, tagId, tagName }, 'Bound happyclaw tag to Feishu group');
+        logger.info(
+          { chatId, tagId, tagName },
+          'Bound happyclaw tag to Feishu group',
+        );
       }
     } catch (tagErr) {
-      logger.warn({ err: tagErr, chatId }, 'Failed to bind happyclaw tag (non-fatal)');
+      logger.warn(
+        { err: tagErr, chatId },
+        'Failed to bind happyclaw tag (non-fatal)',
+      );
     }
 
     const welcome = `工作区「${name}」已创建并绑定到此群\n📁 ${folder}\n\n直接在这里发消息即可`;
@@ -7858,7 +7918,8 @@ async function processAgentConversation(
   // 机制在这里同时修复了"后台任务汇总只入库、飞书永远看不到"的消息丢失。
   let heldAgentParts: string[] = [];
   let activeAgentWorkflowRuns: NonNullable<StreamEvent['workflowRun']>[] = [];
-  let completedAgentWorkflowRuns: NonNullable<StreamEvent['workflowRun']>[] = [];
+  let completedAgentWorkflowRuns: NonNullable<StreamEvent['workflowRun']>[] =
+    [];
   let heldAgentUsage: HeldUsageTotals | null = null;
   // 定稿后等待最终 usage 事件做合并补丁（Sub 路径 session 不轮换，引用即当前卡）
   let heldAgentUsagePatchPending = false;
@@ -9579,11 +9640,7 @@ async function ensureDockerRunning(): Promise<void> {
  * fetched). They must NOT overwrite a proper name that was already set (e.g.
  * by /new command or onBotAddedToGroup with the real Feishu group name).
  */
-const GENERIC_IM_DEFAULT_NAMES = new Set([
-  '飞书群聊',
-  '飞书私聊',
-  '未知群聊',
-]);
+const GENERIC_IM_DEFAULT_NAMES = new Set(['飞书群聊', '飞书私聊', '未知群聊']);
 
 function buildOnNewChat(
   userId: string,
@@ -9605,7 +9662,11 @@ function buildOnNewChat(
         const hasProperExisting =
           !!existing.name && !GENERIC_IM_DEFAULT_NAMES.has(existing.name);
         const isGenericIncoming = GENERIC_IM_DEFAULT_NAMES.has(trimmed);
-        if (trimmed && existing.name !== trimmed && !(isGenericIncoming && hasProperExisting)) {
+        if (
+          trimmed &&
+          existing.name !== trimmed &&
+          !(isGenericIncoming && hasProperExisting)
+        ) {
           existing.name = trimmed;
           setRegisteredGroup(chatJid, existing);
           registeredGroups[chatJid] = existing;
