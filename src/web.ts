@@ -351,6 +351,52 @@ app.post('/api/messages', authMiddleware, async (c) => {
   });
 });
 
+// HTTP fallback for browsers whose WebSocket upgrade is unavailable or rejected.
+// The payload is the exact same bounded in-memory snapshot used for WS reconnects;
+// no transcript/database content is exposed through this route.
+app.get('/api/streaming-snapshot', authMiddleware, (c) => {
+  c.header('Cache-Control', 'no-store');
+  const chatJid = c.req.query('chatJid')?.trim();
+  const agentId = c.req.query('agentId')?.trim();
+  if (!chatJid || chatJid.length > 512 || (agentId && agentId.length > 512)) {
+    return c.json({ error: 'Invalid chatJid or agentId' }, 400);
+  }
+
+  const requestedGroup = getRegisteredGroup(chatJid);
+  if (!requestedGroup) return c.json({ error: 'Group not found' }, 404);
+  const authUser = c.get('user') as AuthUser;
+  if (!canAccessGroup(authUser, requestedGroup)) {
+    return c.json({ error: 'Access denied' }, 403);
+  }
+
+  const normalizedJid = normalizeHomeJid(chatJid);
+  const targetGroup = getRegisteredGroup(normalizedJid);
+  if (!targetGroup) return c.json({ error: 'Group not found' }, 404);
+  if (!canAccessGroup(authUser, targetGroup)) {
+    return c.json({ error: 'Access denied' }, 403);
+  }
+  if (agentId) {
+    const agent = getAgent(agentId);
+    if (!agent || normalizeHomeJid(agent.chat_jid) !== normalizedJid) {
+      return c.json({ error: 'Agent not found' }, 404);
+    }
+  }
+  const snapshotJid = agentId
+    ? `${normalizedJid}#agent:${agentId}`
+    : normalizedJid;
+  const snapshot = streamingSnapshots.get(snapshotJid);
+  if (!snapshot) return c.json({ active: false, snapshot: null });
+
+  // Match the WS reconnect freshness policy and eagerly remove stale entries.
+  if (Date.now() - snapshot.updatedAt > 30 * 60 * 1000) {
+    streamingSnapshots.delete(snapshotJid);
+    streamingFullTexts.delete(snapshotJid);
+    return c.json({ active: false, snapshot: null });
+  }
+
+  return c.json({ active: true, snapshot });
+});
+
 // --- handleWebUserMessage ---
 
 async function handleWebUserMessage(
@@ -964,8 +1010,39 @@ function setupWebSocket(server: any): WebSocketServer {
   server.on('upgrade', (request: any, socket: any, head: any) => {
     const { pathname } = new URL(request.url, `http://${request.headers.host}`);
 
-    if (pathname !== '/ws') {
+    const rejectUpgrade = (
+      reason:
+        | 'unexpected_path'
+        | 'origin_rejected'
+        | 'missing_cookie'
+        | 'invalid_cookie'
+        | 'session_missing'
+        | 'session_expired'
+        | 'user_inactive'
+        | 'password_change_required',
+      statusLine = '401 Unauthorized',
+    ) => {
+      const origin = request.headers.origin as string | undefined;
+      let originHost: string | undefined;
+      if (origin) {
+        try {
+          originHost = new URL(origin).host;
+        } catch {
+          originHost = 'invalid';
+        }
+      }
+      // Deliberately exclude Cookie values, session IDs, query strings and
+      // message content. These reason-only diagnostics are safe for support logs.
+      logger.warn(
+        { reason, pathname, hasOrigin: !!origin, originHost },
+        'WebSocket upgrade rejected',
+      );
+      socket.write(`HTTP/1.1 ${statusLine}\r\n\r\n`);
       socket.destroy();
+    };
+
+    if (pathname !== '/ws') {
+      rejectUpgrade('unexpected_path', '404 Not Found');
       return;
     }
 
@@ -978,8 +1055,7 @@ function setupWebSocket(server: any): WebSocketServer {
     if (origin) {
       const allowed = isAllowedOrigin(origin);
       if (!allowed) {
-        socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
-        socket.destroy();
+        rejectUpgrade('origin_rejected', '403 Forbidden');
         return;
       }
     }
@@ -999,14 +1075,12 @@ function setupWebSocket(server: any): WebSocketServer {
       );
     }
     if (allCookieValues.length === 0) {
-      socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
-      socket.destroy();
+      rejectUpgrade('missing_cookie');
       return;
     }
     const verifyResult = tryVerifyAny(allCookieValues);
     if (!verifyResult) {
-      socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
-      socket.destroy();
+      rejectUpgrade('invalid_cookie');
       return;
     }
     const token = verifyResult.token;
@@ -1014,20 +1088,17 @@ function setupWebSocket(server: any): WebSocketServer {
     const session = getCachedSessionWithUser(token);
     if (!session) {
       invalidateSessionCache(token);
-      socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
-      socket.destroy();
+      rejectUpgrade('session_missing');
       return;
     }
     if (isSessionExpired(session.expires_at)) {
       deleteUserSession(token);
       invalidateSessionCache(token);
-      socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
-      socket.destroy();
+      rejectUpgrade('session_expired');
       return;
     }
     if (session.status !== 'active') {
-      socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
-      socket.destroy();
+      rejectUpgrade('user_inactive');
       return;
     }
     // 强制改密码用户不能通过 WebSocket 发指令 / 操作终端，否则 HTTP 中
@@ -1035,8 +1106,7 @@ function setupWebSocket(server: any): WebSocketServer {
     // agent 交互、开容器终端。HTTP 仍允许 /api/auth/me / /password / /sessions
     // 完成强制改密流程。
     if (session.must_change_password) {
-      socket.write('HTTP/1.1 403 Password Change Required\r\n\r\n');
-      socket.destroy();
+      rejectUpgrade('password_change_required', '403 Password Change Required');
       return;
     }
     request.__happyclawSessionId = token;
@@ -1103,6 +1173,7 @@ function setupWebSocket(server: any): WebSocketServer {
                 isThinking: snap.isThinking,
                 activeHook: snap.activeHook,
                 turnId: snap.turnId,
+                updatedAt: snap.updatedAt,
               },
             } satisfies WsMessageOut),
           );

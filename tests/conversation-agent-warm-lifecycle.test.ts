@@ -31,6 +31,8 @@ function seedRunner(q: GroupQueue, jid: string, opts: SeedOpts = {}) {
     activeRunnerIsTask: opts.activeRunnerIsTask ?? false,
     lastActivityAt: opts.lastActivityAt ?? null,
     queryInFlight: opts.queryInFlight ?? false,
+    pendingIpcMessageIds: new Set<string>(),
+    ipcAwaitingAckSince: null,
     pendingMessages: false,
     pendingTasks: [],
     process: null,
@@ -97,6 +99,151 @@ describe('PR #547: conversation agent stays warm after final reply', () => {
     const inputDir = path.join(ipcDir, 'input');
     const files = fs.readdirSync(inputDir).filter((f) => f.endsWith('.json'));
     expect(files.length).toBe(1);
+    const payload = JSON.parse(
+      fs.readFileSync(path.join(inputDir, files[0]), 'utf8'),
+    );
+    expect(payload.messageId).toBe(files[0].replace(/\.json$/, ''));
+    expect(
+      (getState(q, jid).pendingIpcMessageIds as Set<string>).has(
+        payload.messageId,
+      ),
+    ).toBe(true);
+  });
+
+  test('unacknowledged warm-runner IPC is watchdog-visible and clears on SDK start ack', () => {
+    const q = new GroupQueue();
+    const jid = `web:${folder}`;
+    seedRunner(q, jid, { groupFolder: folder, queryInFlight: false });
+
+    expect(q.sendMessage(jid, 'must not be swallowed')).toBe('sent');
+    const state = getState(q, jid);
+    const ids = [...(state.pendingIpcMessageIds as Set<string>)];
+    expect(ids).toHaveLength(1);
+
+    // Simulate an IPC claim that has produced no SDK event beyond the 30s ACK
+    // deadline. This state used to be invisible because pendingMessages=false.
+    state.ipcAwaitingAckSince = Date.now() - 31_000;
+    expect(q.getStuckPendingGroups(180_000, 30_000)).toEqual([
+      expect.objectContaining({ jid }),
+    ]);
+
+    q.markIpcMessagesStarted(jid, ids);
+    expect(state.ipcAwaitingAckSince).toBeNull();
+    expect(q.getStuckPendingGroups(180_000, 30_000)).toEqual([]);
+  });
+
+  test('conversation-agent task lane is watchdog-visible, while scheduled tasks remain excluded', () => {
+    const q = new GroupQueue();
+    const conversationJid = `web:${folder}#agent:conversation-1`;
+    seedRunner(q, conversationJid, {
+      groupFolder: folder,
+      agentId: 'conversation-1',
+      activeRunnerIsTask: true,
+    });
+    const conversationState = getState(q, conversationJid);
+    conversationState.pendingIpcMessageIds = new Set(['agent-follow-up']);
+    conversationState.ipcAwaitingAckSince = Date.now() - 31_000;
+
+    const scheduledJid = `web:${folder}#task:scheduled-1`;
+    seedRunner(q, scheduledJid, {
+      groupFolder: folder,
+      activeRunnerIsTask: true,
+    });
+    const scheduledState = getState(q, scheduledJid);
+    scheduledState.pendingIpcMessageIds = new Set(['not-a-user-lane']);
+    scheduledState.ipcAwaitingAckSince = Date.now() - 31_000;
+
+    expect(q.getStuckPendingGroups(180_000, 30_000)).toEqual([
+      expect.objectContaining({ jid: conversationJid }),
+    ]);
+  });
+
+  test('conversation-agent teardown clears stale ACK state before queued recovery can start', async () => {
+    const q = new GroupQueue();
+    const jid = `web:${folder}#agent:replacement-agent`;
+    let resolveReplacement!: (state: {
+      pendingIds: string[];
+      awaitingSince: unknown;
+      injected: unknown;
+    }) => void;
+    const replacementStarted = new Promise<{
+      pendingIds: string[];
+      awaitingSince: unknown;
+      injected: unknown;
+    }>((resolve) => {
+      resolveReplacement = resolve;
+    });
+
+    q.setOnUnconsumedAgentIpc((recoveryJid) => {
+      const state = getState(q, recoveryJid);
+      // The production callback enqueues a replacement task. Observe on the
+      // next microtask, after runTask's synchronous finally cleanup but before
+      // any replacement runner could process an SDK event.
+      queueMicrotask(() => {
+        resolveReplacement({
+          pendingIds: [...(state.pendingIpcMessageIds as Set<string>)],
+          awaitingSince: state.ipcAwaitingAckSince,
+          injected: state.hasIpcInjectedMessages,
+        });
+      });
+    });
+
+    q.enqueueTask(jid, 'original', async () => {
+      const state = getState(q, jid);
+      state.groupFolder = folder;
+      state.agentId = 'replacement-agent';
+      expect(q.sendMessage(jid, 'replay from durable DB')).toBe('sent');
+      state.hasIpcInjectedMessages = true;
+      state.ipcAwaitingAckSince = Date.now() - 31_000;
+    });
+
+    await expect(replacementStarted).resolves.toEqual({
+      pendingIds: [],
+      awaitingSince: null,
+      injected: false,
+    });
+  });
+
+  test('inflight IPC claims remain discoverable for crash recovery', () => {
+    const q = new GroupQueue();
+    const inflightDir = path.join(ipcDir, 'input', 'inflight');
+    fs.mkdirSync(inflightDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(inflightDir, 'claim-1.json'),
+      JSON.stringify({ type: 'message', messageId: 'claim-1', text: 'hello' }),
+    );
+
+    expect(q.hasUnconsumedIpcInput(folder)).toBe(true);
+  });
+
+  test('DB recovery discards duplicate queued and inflight IPC envelopes only', () => {
+    const q = new GroupQueue();
+    const inputDir = path.join(ipcDir, 'input');
+    const inflightDir = path.join(inputDir, 'inflight');
+    fs.mkdirSync(inflightDir, { recursive: true });
+    fs.writeFileSync(path.join(inputDir, 'queued.json'), '{}');
+    fs.writeFileSync(path.join(inflightDir, 'claimed.json'), '{}');
+    fs.writeFileSync(path.join(inputDir, '_close'), '');
+
+    expect(q.discardRecoveredIpcInput(folder)).toBe(2);
+    expect(q.hasUnconsumedIpcInput(folder)).toBe(false);
+    expect(fs.existsSync(path.join(inputDir, '_close'))).toBe(true);
+  });
+
+  test('conversation-agent DB recovery uses its isolated IPC lane', () => {
+    const q = new GroupQueue();
+    const agentId = 'recover-agent';
+    const agentInputDir = path.join(ipcDir, 'agents', agentId, 'input');
+    fs.mkdirSync(path.join(agentInputDir, 'inflight'), { recursive: true });
+    fs.writeFileSync(path.join(agentInputDir, 'queued.json'), '{}');
+    fs.writeFileSync(
+      path.join(agentInputDir, 'inflight', 'claimed.json'),
+      '{}',
+    );
+
+    expect(q.hasUnconsumedAgentIpcInput(folder, agentId)).toBe(true);
+    expect(q.discardRecoveredAgentIpcInput(folder, agentId)).toBe(2);
+    expect(q.hasUnconsumedAgentIpcInput(folder, agentId)).toBe(false);
   });
 
   test('markRunnerActivity refreshes lastActivityAt so IDLE_TIMEOUT reclaims the warm runner', () => {

@@ -273,6 +273,8 @@ export interface ContainerOutput {
   /** 本 result 发出时仍未 settle 的后台任务数（异步 Agent / backgrounded Bash）。
    * >0 时主进程把流式卡片保持在「后台任务运行中」而非定稿。 */
   pendingBgTasks?: number;
+  /** Internal acknowledgement emitted after the SDK query has actually begun. */
+  ipcMessageIds?: string[];
 }
 
 interface VolumeMount {

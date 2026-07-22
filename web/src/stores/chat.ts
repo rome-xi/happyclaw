@@ -102,6 +102,8 @@ export interface StreamSnapshotData {
   isThinking?: boolean;
   activeHook?: { hookName: string; hookEvent: string } | null;
   turnId?: string;
+  /** Server-side wall-clock marker used to dedupe HTTP fallback polls. */
+  updatedAt?: number;
 }
 
 export interface StreamingState {
@@ -133,6 +135,8 @@ export interface StreamingState {
   contextAudit?: StreamEvent['contextAudit'];
   todos?: Array<{ id: string; content: string; status: string }>;
   interrupted?: boolean;
+  /** Last server snapshot applied while recovering a disconnected stream. */
+  snapshotUpdatedAt?: number;
 }
 
 function mergeMessagesChronologically(
@@ -276,6 +280,7 @@ interface ChatState {
     chatJid: string,
     options?: { preserveThinking?: boolean },
   ) => void;
+  clearAgentStreaming: (agentId: string) => void;
   restoreActiveState: () => Promise<void>;
   handleStreamSnapshot: (chatJid: string, snapshot: StreamSnapshotData, agentId?: string) => void;
   // Sub-agent actions
@@ -2995,12 +3000,18 @@ export const useChatStore = create<ChatState>((set, get) => ({
       isThinking: snapshot.isThinking ?? false,
       activeHook: snapshot.activeHook ?? null,
       turnId: snapshot.turnId,
+      snapshotUpdatedAt: snapshot.updatedAt,
     };
 
     if (agentId) {
       // Agent-specific snapshot → restore agentStreaming + agentWaiting
       set((s) => {
-        if (s.agentStreaming[agentId]?.partialText) return s;
+        const existing = s.agentStreaming[agentId];
+        if (
+          snapshot.updatedAt &&
+          existing?.snapshotUpdatedAt &&
+          existing.snapshotUpdatedAt >= snapshot.updatedAt
+        ) return s;
         return {
           agentWaiting: { ...s.agentWaiting, [agentId]: true },
           agentStreaming: { ...s.agentStreaming, [agentId]: restored },
@@ -3009,7 +3020,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
     } else {
       // Main conversation snapshot
       set((s) => {
-        if (s.streaming[chatJid]?.partialText) return s;
+        const existing = s.streaming[chatJid];
+        if (
+          snapshot.updatedAt &&
+          existing?.snapshotUpdatedAt &&
+          existing.snapshotUpdatedAt >= snapshot.updatedAt
+        ) return s;
         return {
           waiting: { ...s.waiting, [chatJid]: true },
           streaming: { ...s.streaming, [chatJid]: restored },
@@ -3112,6 +3128,23 @@ export const useChatStore = create<ChatState>((set, get) => ({
         pendingThinking: nextPendingThinking,
         pendingThinkingDuration: nextPendingThinkingDuration,
         ...(agentStreamingChanged ? { agentStreaming: nextAgentStreaming } : {}),
+      };
+    });
+  },
+
+  clearAgentStreaming: (agentId) => {
+    const key = `agent:${agentId}`;
+    const pendingEntry = pendingDeltas.get(key);
+    if (pendingEntry) {
+      cancelAnimationFrame(pendingEntry.raf);
+      pendingDeltas.delete(key);
+    }
+    set((s) => {
+      const nextAgentStreaming = { ...s.agentStreaming };
+      delete nextAgentStreaming[agentId];
+      return {
+        agentStreaming: nextAgentStreaming,
+        agentWaiting: { ...s.agentWaiting, [agentId]: false },
       };
     });
   },

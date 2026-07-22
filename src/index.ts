@@ -731,6 +731,10 @@ const EMPTY_CURSOR: MessageCursor = { timestamp: '', id: '' };
 const terminalWarmupInFlight = new Set<string>();
 const STUCK_RUNNER_CHECK_INTERVAL_POLLS = 15;
 const STUCK_RUNNER_IDLE_MS = 3 * 60 * 1000;
+// IPC delivery normally acknowledges on the first SDK event within seconds.
+// A shorter deadline catches the warm-runner/no-child failure without imposing
+// a duration limit on legitimate long-running queries after they have started.
+const STUCK_IPC_ACK_MS = 30 * 1000;
 let stuckRunnerCheckCounter = 0;
 
 // OOM auto-recovery: track consecutive OOM (exit code 137) exits per folder.
@@ -1921,7 +1925,13 @@ async function handleNewCommand(
   // bot is automatically a member), pull the sender in, bind a fresh workspace
   // to it, and announce in the new group.
   if (chatJid.startsWith('feishu:')) {
-    return handleNewCommandWithFeishuGroup(chatJid, name, userId, group, senderImId);
+    return handleNewCommandWithFeishuGroup(
+      chatJid,
+      name,
+      userId,
+      group,
+      senderImId,
+    );
   }
 
   // Non-Telegram/non-Feishu channels: create the workspace and bind the current chat to it.
@@ -2126,13 +2136,17 @@ async function handleNewCommandWithFeishuGroup(
     // 绑定 happyclaw 标签（best-effort，失败不影响主流程）
     try {
       const tagName = 'happyclaw';
-      const tagList = await (client as any).request({
+      const tagList = (await (client as any).request({
         method: 'GET',
         url: '/open-apis/im/v2/tags',
         params: { page_size: 50 },
-      }) as any;
+      })) as any;
       let tagId: string | undefined;
-      const items = tagList?.data?.items || tagList?.items || tagList?.data?.data?.items || [];
+      const items =
+        tagList?.data?.items ||
+        tagList?.items ||
+        tagList?.data?.data?.items ||
+        [];
       for (const item of items) {
         if (item.name === tagName) {
           tagId = item.tag_id || item.tagId;
@@ -2140,8 +2154,13 @@ async function handleNewCommandWithFeishuGroup(
         }
       }
       if (!tagId) {
-        const createTag = await client.im.v2.tag.create({ data: { name: tagName } } as any) as any;
-        tagId = createTag?.data?.tag?.tag_id || createTag?.tag_id || createTag?.data?.tag_id;
+        const createTag = (await client.im.v2.tag.create({
+          data: { name: tagName },
+        } as any)) as any;
+        tagId =
+          createTag?.data?.tag?.tag_id ||
+          createTag?.tag_id ||
+          createTag?.data?.tag_id;
       }
       if (tagId) {
         await (client as any).request({
@@ -2149,10 +2168,16 @@ async function handleNewCommandWithFeishuGroup(
           url: `/open-apis/im/v1/chats/${chatId}/tags`,
           data: { tag_ids: [tagId] },
         });
-        logger.info({ chatId, tagId, tagName }, 'Bound happyclaw tag to Feishu group');
+        logger.info(
+          { chatId, tagId, tagName },
+          'Bound happyclaw tag to Feishu group',
+        );
       }
     } catch (tagErr) {
-      logger.warn({ err: tagErr, chatId }, 'Failed to bind happyclaw tag (non-fatal)');
+      logger.warn(
+        { err: tagErr, chatId },
+        'Failed to bind happyclaw tag (non-fatal)',
+      );
     }
 
     const welcome = `工作区「${name}」已创建并绑定到此群\n📁 ${folder}\n\n直接在这里发消息即可`;
@@ -3426,26 +3451,26 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   const sinceCursor = lastAgentTimestamp[chatJid] || EMPTY_CURSOR;
   let missedMessages = getMessagesSince(chatJid, sinceCursor);
 
-  if (missedMessages.length === 0) {
-    // The normal cursor found nothing — but an IPC message injected into a
-    // now-exited agent may still sit orphaned in the input dir. In that case
-    // lastAgentTimestamp was already advanced past it ('sent' path), so the
-    // re-read above misses it. Fall back to the un-advanced lastCommittedCursor
-    // so we re-pull it and spawn a runner whose boot drainIpcInput consumes the
-    // orphan. Without this the message is lost forever (see #inflight-message-drop).
-    if (group.folder && queue.hasUnconsumedIpcInput(group.folder)) {
-      const committed = lastCommittedCursor[chatJid] || EMPTY_CURSOR;
-      missedMessages = getMessagesSince(chatJid, committed);
-      if (missedMessages.length > 0) {
-        logger.warn(
-          { chatJid, folder: group.folder, count: missedMessages.length },
-          'Orphaned IPC input found with 0 rows from lastAgentTimestamp; ' +
-            'recovering via lastCommittedCursor',
-        );
-      }
-    }
-    if (missedMessages.length === 0) return true;
+  // A previous runner may have claimed an IPC envelope and crashed before the
+  // host observed its SDK-start acknowledgement. Recover from the durable DB
+  // cursor regardless of lastAgentTimestamp, then remove those duplicate IPC
+  // envelopes before booting the replacement. Otherwise the same follow-up is
+  // present once in the initial prompt and again in runner boot drainIpcInput.
+  if (group.folder && queue.hasUnconsumedIpcInput(group.folder)) {
+    const committed = lastCommittedCursor[chatJid] || EMPTY_CURSOR;
+    missedMessages = getMessagesSince(chatJid, committed);
+    const discarded = queue.discardRecoveredIpcInput(group.folder);
+    logger.warn(
+      {
+        chatJid,
+        folder: group.folder,
+        count: missedMessages.length,
+        discardedIpcEnvelopes: discarded,
+      },
+      'Recovering orphaned IPC input from lastCommittedCursor',
+    );
   }
+  if (missedMessages.length === 0) return true;
 
   // Admin home is shared as web:main, so select runtime owner from the latest
   // active admin sender to avoid writing global memory into another admin's
@@ -5273,6 +5298,9 @@ async function runAgent(
   const wrappedOnOutput = onOutput
     ? async (output: ContainerOutput) => {
         queue.markRunnerActivity(chatJid);
+        if (output.ipcMessageIds?.length) {
+          queue.markIpcMessagesStarted(chatJid, output.ipcMessageIds);
+        }
         if (
           (output.status === 'success' && output.result !== null) ||
           (output.status === 'stream' &&
@@ -7609,6 +7637,27 @@ async function processAgentConversation(
   const sinceCursor = lastAgentTimestamp[virtualChatJid] || EMPTY_CURSOR;
   let missedMessages = getMessagesSince(virtualChatJid, sinceCursor);
 
+  // Match main-conversation recovery: after a warm conversation runner
+  // crashes, replay from the durable DB cursor and remove its old IPC claim so
+  // the replacement runner cannot append the same follow-up a second time.
+  if (group.folder && queue.hasUnconsumedAgentIpcInput(group.folder, agentId)) {
+    const committed = lastCommittedCursor[virtualChatJid] || EMPTY_CURSOR;
+    missedMessages = getMessagesSince(virtualChatJid, committed);
+    const discarded = queue.discardRecoveredAgentIpcInput(
+      group.folder,
+      agentId,
+    );
+    logger.warn(
+      {
+        chatJid,
+        agentId,
+        count: missedMessages.length,
+        discardedIpcEnvelopes: discarded,
+      },
+      'Recovering orphaned agent IPC input from lastCommittedCursor',
+    );
+  }
+
   // Owner gate (single chokepoint for all 5 call sites: normal dispatch,
   // IM-restart recovery, unconsumed-IPC recovery, /spawn). The main message
   // loop's owner gate is bypassed for target_agent_id groups (they `continue`
@@ -7858,7 +7907,8 @@ async function processAgentConversation(
   // 机制在这里同时修复了"后台任务汇总只入库、飞书永远看不到"的消息丢失。
   let heldAgentParts: string[] = [];
   let activeAgentWorkflowRuns: NonNullable<StreamEvent['workflowRun']>[] = [];
-  let completedAgentWorkflowRuns: NonNullable<StreamEvent['workflowRun']>[] = [];
+  let completedAgentWorkflowRuns: NonNullable<StreamEvent['workflowRun']>[] =
+    [];
   let heldAgentUsage: HeldUsageTotals | null = null;
   // 定稿后等待最终 usage 事件做合并补丁（Sub 路径 session 不轮换，引用即当前卡）
   let heldAgentUsagePatchPending = false;
@@ -8005,6 +8055,9 @@ async function processAgentConversation(
     // #547: warm-lifecycle bookkeeping — mark activity, and flag query-idle on
     // a substantive result / interruption so the runner can be kept warm.
     queue.markRunnerActivity(virtualJid);
+    if (output.ipcMessageIds?.length) {
+      queue.markIpcMessagesStarted(virtualJid, output.ipcMessageIds);
+    }
     if (
       (output.status === 'success' && output.result !== null) ||
       (output.status === 'stream' &&
@@ -9325,7 +9378,10 @@ async function hasActiveCpuDescendants(pid: number): Promise<boolean> {
 }
 
 async function recoverStuckPendingGroups(): Promise<void> {
-  const stuckGroups = queue.getStuckPendingGroups(STUCK_RUNNER_IDLE_MS);
+  const stuckGroups = queue.getStuckPendingGroups(
+    STUCK_RUNNER_IDLE_MS,
+    STUCK_IPC_ACK_MS,
+  );
   for (const { jid, idleMs } of stuckGroups) {
     const pid = queue.getRunnerPid(jid);
     if (pid && (await hasActiveCpuDescendants(pid))) {
@@ -9579,11 +9635,7 @@ async function ensureDockerRunning(): Promise<void> {
  * fetched). They must NOT overwrite a proper name that was already set (e.g.
  * by /new command or onBotAddedToGroup with the real Feishu group name).
  */
-const GENERIC_IM_DEFAULT_NAMES = new Set([
-  '飞书群聊',
-  '飞书私聊',
-  '未知群聊',
-]);
+const GENERIC_IM_DEFAULT_NAMES = new Set(['飞书群聊', '飞书私聊', '未知群聊']);
 
 function buildOnNewChat(
   userId: string,
@@ -9605,7 +9657,11 @@ function buildOnNewChat(
         const hasProperExisting =
           !!existing.name && !GENERIC_IM_DEFAULT_NAMES.has(existing.name);
         const isGenericIncoming = GENERIC_IM_DEFAULT_NAMES.has(trimmed);
-        if (trimmed && existing.name !== trimmed && !(isGenericIncoming && hasProperExisting)) {
+        if (
+          trimmed &&
+          existing.name !== trimmed &&
+          !(isGenericIncoming && hasProperExisting)
+        ) {
           existing.name = trimmed;
           setRegisteredGroup(chatJid, existing);
           registeredGroups[chatJid] = existing;

@@ -59,6 +59,9 @@ export interface ContainerOutput {
    * >0 时主进程应把流式卡片保持在「后台任务运行中」而非定稿，后续 turn 的
    * 内容会继续追加到同一张卡。仅 sdk_final 类 result 携带。 */
   pendingBgTasks?: number;
+  /** Internal host acknowledgement: these IPC messages reached a real SDK
+   * query event. Never forwarded as user-visible content. */
+  ipcMessageIds?: string[];
 }
 
 export interface SessionEntry {

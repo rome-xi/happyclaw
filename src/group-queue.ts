@@ -26,6 +26,11 @@ interface GroupState {
   lastActivityAt: number | null;
   /** True while the runner is inside an active query turn. */
   queryInFlight: boolean;
+  /** IPC messages written by the host but not yet acknowledged by a real SDK
+   * query event. Kept separate from pendingMessages because the warm runner is
+   * expected to consume these without spawning a second process. */
+  pendingIpcMessageIds: Set<string>;
+  ipcAwaitingAckSince: number | null;
   pendingMessages: boolean;
   pendingTasks: QueuedTask[];
   process: ChildProcess | null;
@@ -101,6 +106,8 @@ export class GroupQueue {
         activeRunnerIsTask: false,
         lastActivityAt: null,
         queryInFlight: false,
+        pendingIpcMessageIds: new Set(),
+        ipcAwaitingAckSince: null,
         pendingMessages: false,
         pendingTasks: [],
         process: null,
@@ -411,6 +418,23 @@ export class GroupQueue {
     state.hasIpcInjectedMessages = true;
   }
 
+  /**
+   * Acknowledge IPC messages only after agent-runner has observed the first SDK
+   * event for the query that owns them. This closes the consume-before-start
+   * hole without changing the warm-runner lifecycle.
+   */
+  markIpcMessagesStarted(groupJid: string, messageIds: string[]): void {
+    const state = this.resolveActiveState(groupJid);
+    if (!state?.active || messageIds.length === 0) return;
+    state.pendingIpcMessageIds ??= new Set<string>();
+    for (const messageId of messageIds) {
+      state.pendingIpcMessageIds.delete(messageId);
+    }
+    if (state.pendingIpcMessageIds.size === 0) {
+      state.ipcAwaitingAckSince = null;
+    }
+  }
+
   markRunnerQueryIdle(groupJid: string): void {
     const state = this.resolveActiveState(groupJid);
     if (!state?.active) return;
@@ -430,21 +454,89 @@ export class GroupQueue {
     return this.hasRemainingIpcMessages(groupFolder, null, null);
   }
 
+  hasUnconsumedAgentIpcInput(groupFolder: string, agentId: string): boolean {
+    if (!groupFolder || !agentId) return false;
+    return this.hasRemainingIpcMessages(groupFolder, agentId, null);
+  }
+
+  /**
+   * Remove main-conversation IPC envelopes after their durable DB rows have
+   * been selected for crash recovery. The database is the recovery source of
+   * truth; leaving the same envelopes for the new runner would append the
+   * follow-up a second time during its boot drain.
+   */
+  discardRecoveredIpcInput(groupFolder: string): number {
+    if (!groupFolder) return 0;
+    const inputDir = path.join(DATA_DIR, 'ipc', groupFolder, 'input');
+    return this.discardIpcEnvelopes(inputDir, { groupFolder });
+  }
+
+  discardRecoveredAgentIpcInput(groupFolder: string, agentId: string): number {
+    if (!groupFolder || !agentId) return 0;
+    const inputDir = path.join(
+      DATA_DIR,
+      'ipc',
+      groupFolder,
+      'agents',
+      agentId,
+      'input',
+    );
+    return this.discardIpcEnvelopes(inputDir, { groupFolder, agentId });
+  }
+
+  private discardIpcEnvelopes(
+    inputDir: string,
+    context: { groupFolder: string; agentId?: string },
+  ): number {
+    let removed = 0;
+    for (const dir of [inputDir, path.join(inputDir, 'inflight')]) {
+      let files: string[];
+      try {
+        files = fs.readdirSync(dir);
+      } catch {
+        continue;
+      }
+      for (const file of files) {
+        if (!file.endsWith('.json')) continue;
+        try {
+          fs.unlinkSync(path.join(dir, file));
+          removed++;
+        } catch (err) {
+          logger.warn(
+            { ...context, file, err },
+            'Failed to discard DB-recovered IPC envelope',
+          );
+        }
+      }
+    }
+    return removed;
+  }
+
   getStuckPendingGroups(
     idleThresholdMs: number,
+    ipcAckThresholdMs = idleThresholdMs,
   ): Array<{ jid: string; idleMs: number }> {
     const now = Date.now();
     const stuck: Array<{ jid: string; idleMs: number }> = [];
     for (const [jid, state] of this.groups.entries()) {
       if (!state.active) continue;
-      if (state.activeRunnerIsTask) continue;
-      if (!state.pendingMessages) continue;
-      if (state.agentId !== null) continue;
+      // Scheduled tasks are not user-message consumers. Conversation agents
+      // are implemented on the task lane, however, and must remain visible to
+      // the IPC ACK watchdog when a warm follow-up stalls.
+      const isConversationAgent =
+        state.activeRunnerIsTask && state.agentId !== null;
+      if (state.activeRunnerIsTask && !isConversationAgent) continue;
+      const awaitingIpcAck = (state.pendingIpcMessageIds?.size ?? 0) > 0;
+      if (!state.pendingMessages && !awaitingIpcAck) continue;
+      if (state.agentId !== null && !isConversationAgent) continue;
       if (state.restarting) continue;
-      const lastActivityAt = state.lastActivityAt ?? 0;
-      if (lastActivityAt <= 0) continue;
-      const idleMs = now - lastActivityAt;
-      if (idleMs < idleThresholdMs) continue;
+      const referenceTime = awaitingIpcAck
+        ? state.ipcAwaitingAckSince
+        : state.lastActivityAt;
+      if (!referenceTime || referenceTime <= 0) continue;
+      const idleMs = now - referenceTime;
+      const threshold = awaitingIpcAck ? ipcAckThresholdMs : idleThresholdMs;
+      if (idleMs < threshold) continue;
       stuck.push({ jid, idleMs });
     }
     return stuck;
@@ -693,15 +785,26 @@ export class GroupQueue {
     const inputDir = this.resolveIpcInputDir(state);
     try {
       fs.mkdirSync(inputDir, { recursive: true });
-      const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}.json`;
+      const messageId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+      const filename = `${messageId}.json`;
       const filepath = path.join(inputDir, filename);
       const tempPath = `${filepath}.tmp`;
       fs.writeFileSync(
         tempPath,
-        JSON.stringify({ type: 'message', text, images, sourceJid }),
+        JSON.stringify({
+          type: 'message',
+          messageId,
+          createdAt: Date.now(),
+          text,
+          images,
+          sourceJid,
+        }),
       );
       fs.renameSync(tempPath, filepath);
       state.queryInFlight = true;
+      state.pendingIpcMessageIds ??= new Set<string>();
+      state.pendingIpcMessageIds.add(messageId);
+      state.ipcAwaitingAckSince ??= Date.now();
       onInjected?.();
       return 'sent';
     } catch (err) {
@@ -774,6 +877,11 @@ export class GroupQueue {
     context: string,
   ): void {
     if (!state.groupFolder) return;
+    // restartGroup owns recovery while a watchdog/administrator restart is in
+    // progress. Re-enqueuing from the exiting runner's finally block would
+    // start a replacement before restartGroup has finished waiting, causing
+    // the replacement to be mistaken for the old process and killed again.
+    if (state.restarting) return;
     // 与 runForGroup finally 的逻辑保持一致：刚被 stopGroup 标记的 folder 不
     // 应该在这里重新点亮 pendingMessages，否则 stopGroup 之后的 drainGroup 路径
     // 会拉起一个新 runner。
@@ -820,7 +928,9 @@ export class GroupQueue {
         : path.join(DATA_DIR, 'ipc', groupFolder, 'input');
     try {
       const files = fs.readdirSync(inputDir);
-      return files.some((f) => f.endsWith('.json'));
+      if (files.some((f) => f.endsWith('.json'))) return true;
+      const inflightDir = path.join(inputDir, 'inflight');
+      return fs.readdirSync(inflightDir).some((f) => f.endsWith('.json'));
     } catch {
       return false;
     }
@@ -1052,6 +1162,7 @@ export class GroupQueue {
     const activeRunner = this.findActiveRunnerFor(groupJid);
     const targetJid = activeRunner || groupJid;
     const state = this.getGroup(targetJid);
+    const restartingAgentId = state.agentId;
 
     if (state.restarting) {
       logger.warn(
@@ -1131,12 +1242,22 @@ export class GroupQueue {
         );
         throw new Error(`Failed to restart container for group ${targetJid}`);
       }
-
-      // Trigger a fresh container start
-      logger.info({ groupJid: targetJid }, 'Restarting container');
-      this.enqueueMessageCheck(groupJid);
     } finally {
       state.restarting = false;
+    }
+
+    // Trigger recovery only after the old runner is fully inactive and the
+    // restart guard has been released. Conversation-agent runners are task
+    // lane jobs, so they must be re-enqueued through their dedicated callback
+    // rather than the main-message queue.
+    logger.info(
+      { groupJid: targetJid, conversationAgent: !!restartingAgentId },
+      'Restarting runner',
+    );
+    if (restartingAgentId) {
+      this.onUnconsumedAgentIpcFn?.(targetJid, restartingAgentId);
+    } else {
+      this.enqueueMessageCheck(groupJid);
     }
   }
 
@@ -1243,6 +1364,8 @@ export class GroupQueue {
       state.active = false;
       state.drainSentinelWritten = false;
       state.hasIpcInjectedMessages = false;
+      state.pendingIpcMessageIds?.clear();
+      state.ipcAwaitingAckSince = null;
       state.lastActivityAt = null;
       state.queryInFlight = false;
       state.process = null;
@@ -1349,6 +1472,9 @@ export class GroupQueue {
       state.active = false;
       state.activeRunnerIsTask = false;
       state.drainSentinelWritten = false;
+      state.hasIpcInjectedMessages = false;
+      state.pendingIpcMessageIds?.clear();
+      state.ipcAwaitingAckSince = null;
       state.lastActivityAt = null;
       state.queryInFlight = false;
       state.process = null;
@@ -1431,6 +1557,7 @@ export class GroupQueue {
     if (this.shuttingDown) return;
 
     const state = this.getGroup(groupJid);
+    if (state.restarting) return;
     const activeRunner = this.findActiveRunnerFor(groupJid);
     if (activeRunner && activeRunner !== groupJid) {
       this.waitingGroups.add(groupJid);

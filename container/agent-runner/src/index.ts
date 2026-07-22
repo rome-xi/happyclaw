@@ -49,6 +49,11 @@ import {
 import { PREDEFINED_AGENTS } from './agent-definitions.js';
 import { createMcpTools } from './mcp-tools.js';
 import { resolveClaudeProviderRuntime } from './provider-runtime.js';
+import {
+  IpcInbox,
+  shouldStartFreshIpcTurn,
+  type IpcMessage,
+} from './ipc-inbox.js';
 
 // ── AgentEngine 引擎层 ──
 import { ClaudeEngine } from './engines/claude-engine.js';
@@ -78,6 +83,8 @@ const CLAUDE_PROVIDER_RUNTIME = resolveClaudeProviderRuntime(process.env);
 const CLAUDE_MODEL = CLAUDE_PROVIDER_RUNTIME.model;
 
 const IPC_INPUT_DIR = path.join(WORKSPACE_IPC, 'input');
+const IPC_INFLIGHT_DIR = path.join(IPC_INPUT_DIR, 'inflight');
+const ipcInbox = new IpcInbox(IPC_INPUT_DIR, (message) => log(message));
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_FALLBACK_POLL_MS = 5000; // 后备轮询间隔（仅防止 inotify 事件丢失）
 
@@ -1020,51 +1027,34 @@ function shouldDrain(): boolean {
  * Returns messages found (with optional images), or empty array.
  */
 interface IpcDrainResult {
-  messages: Array<{
-    text: string;
-    images?: Array<{ data: string; mimeType?: string }>;
-    taskId?: string;
-    sourceJid?: string;
-  }>;
+  messages: IpcMessage[];
+}
+
+/** Recover claims left by a crashed previous runner before accepting new work. */
+function recoverIpcInflight(): void {
+  const recovered = ipcInbox.recoverInflight();
+  if (recovered > 0)
+    log(`Recovered ${recovered} unacknowledged IPC message(s)`);
+}
+
+function hasQueuedIpcMessages(): boolean {
+  return ipcInbox.hasQueuedMessages();
+}
+
+function acknowledgeIpcMessages(messages: IpcMessage[]): void {
+  const messageIds = ipcInbox.acknowledge(messages);
+  if (messageIds.length > 0) {
+    writeOutput({ status: 'stream', result: null, ipcMessageIds: messageIds });
+  }
+}
+
+/** Put an unaccepted/interrupted claim back into the watcher-visible queue. */
+function requeueIpcMessage(message: IpcMessage): void {
+  ipcInbox.requeue(message);
 }
 
 function drainIpcInput(): IpcDrainResult {
-  const result: IpcDrainResult = { messages: [] };
-  try {
-    const files = fs
-      .readdirSync(IPC_INPUT_DIR)
-      .filter((f) => f.endsWith('.json'))
-      .sort();
-
-    for (const file of files) {
-      const filePath = path.join(IPC_INPUT_DIR, file);
-      try {
-        const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-        fs.unlinkSync(filePath);
-        if (data.type === 'message' && data.text) {
-          result.messages.push({
-            text: data.text,
-            images: data.images,
-            taskId: typeof data.taskId === 'string' ? data.taskId : undefined,
-            sourceJid:
-              typeof data.sourceJid === 'string' ? data.sourceJid : undefined,
-          });
-        }
-      } catch (err) {
-        log(
-          `Failed to process input file ${file}: ${err instanceof Error ? err.message : String(err)}`,
-        );
-        try {
-          fs.unlinkSync(filePath);
-        } catch {
-          /* ignore */
-        }
-      }
-    }
-  } catch (err) {
-    log(`IPC drain error: ${err instanceof Error ? err.message : String(err)}`);
-  }
-  return result;
+  return { messages: ipcInbox.claimAll() };
 }
 
 /**
@@ -1142,6 +1132,7 @@ function waitForIpcMessage(): Promise<{
   images?: Array<{ data: string; mimeType?: string }>;
   taskId?: string;
   sourceJid?: string;
+  ipcMessages: IpcMessage[];
 } | null> {
   return new Promise((resolve) => {
     let resolved = false;
@@ -1198,6 +1189,7 @@ function waitForIpcMessage(): Promise<{
           images: allImages.length > 0 ? allImages : undefined,
           taskId: combinedTaskId,
           sourceJid: combinedSourceJid,
+          ipcMessages: messages,
         });
         return;
       }
@@ -1297,6 +1289,7 @@ async function runQuery(
   disallowedTools?: string[],
   images?: Array<{ data: string; mimeType?: string }>,
   sourceKindOverride?: ContainerOutput['sourceKind'],
+  initialIpcMessages: IpcMessage[] = [],
 ): Promise<{
   newSessionId?: string;
   lastAssistantUuid?: string;
@@ -1305,27 +1298,29 @@ async function runQuery(
   unrecoverableTranscriptError?: boolean;
   interruptedDuringQuery: boolean;
   sessionResumeFailed?: boolean;
-  pipedMessagesDuringQuery: Array<{
-    text: string;
-    images?: Array<{ data: string; mimeType?: string }>;
-    taskId?: string;
-    sourceJid?: string;
-  }>;
+  pipedMessagesDuringQuery: IpcMessage[];
   suspectTruncatedTail?: string;
 }> {
   // Track messages piped into this query.
-  const pipedMessagesDuringQuery: Array<{
-    text: string;
-    images?: Array<{ data: string; mimeType?: string }>;
-    taskId?: string;
-    sourceJid?: string;
-  }> = [];
+  const pipedMessagesDuringQuery: IpcMessage[] = [];
+  const unacknowledgedIpcMessages = new Map<string, IpcMessage>(
+    initialIpcMessages.map((message) => [message.claimPath, message]),
+  );
+  const acknowledgeQueryStart = () => {
+    const messages = [...unacknowledgedIpcMessages.values()];
+    if (messages.length === 0) return;
+    acknowledgeIpcMessages(messages);
+    for (const message of messages) {
+      unacknowledgedIpcMessages.delete(message.claimPath);
+    }
+  };
   let newSessionId: string | undefined;
   let closedDuringQuery = false;
   let interruptedDuringQuery = false;
   let suppressOutputAfterInterrupt = false;
   let visibleOutputStarted = false;
   let resultCount = 0;
+  let pendingBackgroundTasks = 0;
   let postResultInterruptRequested = false;
 
   // ── 图片预处理（过滤超大图 + 解析 MIME）──
@@ -1619,6 +1614,23 @@ async function runQuery(
       ipcQueryWatcher.close();
       return;
     }
+    // Once a result has been emitted, a newly-arrived user message belongs to
+    // the next turn. Do not claim/unlink it into a stream that is already
+    // winding down; close the stream and let waitForIpcMessage start a fresh
+    // query immediately.
+    if (
+      shouldStartFreshIpcTurn(
+        resultCount,
+        pendingBackgroundTasks,
+        hasQueuedIpcMessages(),
+      )
+    ) {
+      log('IPC message arrived after result; closing stream for next query');
+      engine.endActiveStream?.();
+      ipcPolling = false;
+      ipcQueryWatcher.close();
+      return;
+    }
     // Side-queries (emitOutput=false) 不消费用户 IPC 消息
     if (!emitOutput) return;
 
@@ -1641,7 +1653,6 @@ async function runQuery(
       log(
         `Piping IPC message into active query (${msg.text.length} chars, ${msg.images?.length || 0} images)`,
       );
-      pipedMessagesDuringQuery.push(msg);
       const pipeImages = msg.images?.map((img) => ({
         data: img.data,
         mimeType: img.mimeType || 'image/jpeg',
@@ -1661,6 +1672,16 @@ async function runQuery(
         );
       }
       const rejected = engine.pushToActive(pipeText, pipeImages);
+      if (rejected.length > 0) {
+        requeueIpcMessage(msg);
+      } else {
+        pipedMessagesDuringQuery.push(msg);
+        // pushToActive's empty rejection list is the engine's synchronous
+        // acceptance into its live MessageStream. Acknowledge now so a valid
+        // long-running tool (including idle/sleep) is not mistaken for a warm
+        // runner that never started a query.
+        acknowledgeIpcMessages([msg]);
+      }
       for (const reason of rejected) {
         emit({
           status: 'success',
@@ -1681,6 +1702,9 @@ async function runQuery(
     log('Interrupt sentinel detected before query start, skipping query');
     interruptedDuringQuery = true;
     suppressOutputAfterInterrupt = true;
+    // The user explicitly cancelled this turn before SDK startup. Retire its
+    // durable claims so the host does not watchdog-restart and replay it.
+    acknowledgeQueryStart();
     ipcPolling = false;
     ipcQueryWatcher.close();
     return {
@@ -1698,6 +1722,7 @@ async function runQuery(
   let latestSuspectTruncatedTail: string | undefined;
 
   const publishEngineResult = (engineResult: EngineSendResult): void => {
+    acknowledgeQueryStart();
     if (engineResult.newSessionId) newSessionId = engineResult.newSessionId;
     resultCount++;
 
@@ -1713,6 +1738,7 @@ async function runQuery(
       !!finalText &&
       isSuspectTruncatedStreamResult(sdkUsage, finalText.length);
     const pendingBgTasks = emitOutput ? (engineResult.pendingBgTasks ?? 0) : 0;
+    pendingBackgroundTasks = pendingBgTasks;
 
     if (suspectTruncated) {
       latestSuspectTruncatedTail = finalText.slice(-200);
@@ -1768,6 +1794,10 @@ async function runQuery(
     let finalResult: EngineSendResult | undefined;
     while (true) {
       const { value, done } = await generator.next();
+
+      // A resolved SDK iterator step (event or final return) is the positive
+      // evidence the host needs before considering claimed IPC durable work.
+      acknowledgeQueryStart();
 
       if (done) {
         finalResult = value as EngineSendResult;
@@ -2203,6 +2233,7 @@ async function main(): Promise<void> {
     disableMemoryLayer,
   );
   fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
+  fs.mkdirSync(IPC_INFLIGHT_DIR, { recursive: true });
 
   // Clean up stale sentinels from previous container runs.
   // Note: _drain is NOT cleaned here — the host's cleanupIpcSentinels() in
@@ -2216,6 +2247,7 @@ async function main(): Promise<void> {
     /* ignore */
   }
   cleanupStartupInterruptSentinel();
+  recoverIpcInflight();
 
   // Build initial prompt (drain any pending IPC messages too)
   let prompt = containerInput.prompt;
@@ -2234,6 +2266,7 @@ async function main(): Promise<void> {
     prompt = scheduledTaskPrefix + '\n\n' + prompt;
   }
   const pendingDrain = drainIpcInput();
+  let promptIpcMessages = pendingDrain.messages;
   if (pendingDrain.messages.length > 0) {
     log(
       `Draining ${pendingDrain.messages.length} pending IPC messages into initial prompt`,
@@ -2308,6 +2341,23 @@ async function main(): Promise<void> {
         `Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`,
       );
 
+      if (promptIpcMessages.length > 0) {
+        // Make the new turn visible immediately (including Feishu card setup),
+        // while the durable claim remains unacknowledged until the first SDK
+        // iterator event below.
+        writeOutput({
+          status: 'stream',
+          result: null,
+          streamEvent: {
+            eventType: 'status',
+            agentScope: 'system',
+            statusText: '生成中',
+          },
+          newSessionId: sessionId,
+          turnId: containerInput.turnId,
+        });
+      }
+
       const queryResult = await runQuery(
         prompt,
         sessionId,
@@ -2321,6 +2371,8 @@ async function main(): Promise<void> {
         DEFAULT_ALLOWED_TOOLS,
         undefined,
         promptImages,
+        undefined,
+        promptIpcMessages,
       );
       if (queryResult.newSessionId) {
         sessionId = queryResult.newSessionId;
@@ -2410,6 +2462,7 @@ async function main(): Promise<void> {
 
       // 成功执行后重置溢出重试计数器
       overflowRetryCount = 0;
+      promptIpcMessages = [];
 
       // If _close was consumed during the query, exit immediately.
       // Don't emit a session-update marker (it would reset the host's
@@ -2457,26 +2510,7 @@ async function main(): Promise<void> {
           log(
             `Query interrupted; re-enqueueing ${piped.length} queued message(s) to IPC`,
           );
-          for (const msg of piped) {
-            const filename = `${Date.now()}-requeue-${Math.random().toString(36).slice(2, 8)}.json`;
-            const filepath = path.join(IPC_INPUT_DIR, filename);
-            const tempPath = `${filepath}.tmp`;
-            try {
-              fs.writeFileSync(
-                tempPath,
-                JSON.stringify({
-                  type: 'message',
-                  text: msg.text,
-                  images: msg.images,
-                  taskId: msg.taskId,
-                  sourceJid: msg.sourceJid,
-                }),
-              );
-              fs.renameSync(tempPath, filepath);
-            } catch (err) {
-              log(`Failed to re-enqueue piped message: ${err}`);
-            }
-          }
+          for (const msg of piped) requeueIpcMessage(msg);
         }
 
         // 等待下一条消息（包括刚重新入队的 piped 消息）
@@ -2494,6 +2528,7 @@ async function main(): Promise<void> {
         }
         prompt = nextMessage.text;
         promptImages = nextMessage.images;
+        promptIpcMessages = nextMessage.ipcMessages;
         containerInput.turnId = generateTurnId();
         // See main-loop comment: reset task attribution for this new turn.
         mcpToolsConfig.currentTaskId = nextMessage.taskId ?? null;
@@ -2829,6 +2864,7 @@ async function main(): Promise<void> {
       );
       prompt = nextMessage.text;
       promptImages = nextMessage.images;
+      promptIpcMessages = nextMessage.ipcMessages;
       containerInput.turnId = generateTurnId();
       // Clear per-turn task attribution: the previous query may have been a
       // scheduled-task turn, but this new IPC message is a regular follow-up
