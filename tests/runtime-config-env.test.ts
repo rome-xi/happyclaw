@@ -75,6 +75,31 @@ describe('buildClaudeEnvLines provider compatibility', () => {
     expect(lines).toContain('ANTHROPIC_DEFAULT_OPUS_MODEL=max');
     expect(lines).toContain('ANTHROPIC_DEFAULT_SONNET_MODEL=high');
     expect(lines).toContain('ANTHROPIC_DEFAULT_HAIKU_MODEL=fast');
+    expect(lines).toContain('CLAUDE_CODE_AUTO_COMPACT_WINDOW=1000000');
+    expect(lines).not.toContain('ANTHROPIC_MODEL=max[1m]');
+  });
+
+  test('does not assume every tier alias has a one-million context window', () => {
+    const lines = buildClaudeEnvLines(
+      config({ anthropicModel: 'high' }),
+      NO_CUSTOM_ENV,
+    );
+
+    expect(lines).toContain('CLAUDE_CODE_AUTO_COMPACT_WINDOW=200000');
+  });
+
+  test.each([
+    'gpt-5.6-sol',
+    'claude-opus-4-8',
+    'model_hub/es1_orange_o48',
+    'model_hub/es1_orange_o47',
+  ])('recognizes max candidate %s as one-million context', (model) => {
+    const lines = buildClaudeEnvLines(
+      config({ anthropicModel: model }),
+      NO_CUSTOM_ENV,
+    );
+
+    expect(lines).toContain('CLAUDE_CODE_AUTO_COMPACT_WINDOW=1000000');
   });
 
   test('marks official and custom endpoints for the runner', () => {

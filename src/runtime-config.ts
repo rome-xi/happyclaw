@@ -139,8 +139,27 @@ const THIRD_PARTY_RUNTIME_DEFAULTS = {
   API_TIMEOUT_MS: '3000000',
 } as const;
 
+/**
+ * Model names and front-door aliases known to expose a one-million-token
+ * context window. Keep the `max` alias itself unchanged: adding Claude
+ * Code's `[1m]` suffix would turn it into a different model name and bypass
+ * the local tier gateway's probe-selected routing and fallbacks.
+ */
+const ONE_MILLION_CONTEXT_MODELS_AND_ALIASES = new Set([
+  // `max` is safe at 1M only while every candidate below supports 1M.
+  'max',
+  'gpt-5.6-sol',
+  'claude-opus-4-8',
+  'model_hub/es1_orange_o48',
+  'model_hub/es1_orange_o47',
+]);
+
 function isOneMillionContextModel(model: string): boolean {
-  return /\[1m\]$/i.test(model.trim());
+  const normalized = model.trim().toLowerCase();
+  return (
+    /\[1m\]$/.test(normalized) ||
+    ONE_MILLION_CONTEXT_MODELS_AND_ALIASES.has(normalized)
+  );
 }
 const DANGEROUS_ENV_VARS = new Set([
   // Code execution / preload attacks
