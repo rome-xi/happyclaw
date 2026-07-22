@@ -63,6 +63,7 @@ import {
   setLastGroupSync,
   setRegisteredGroup,
   setRouterState,
+  setRouterStateBatch,
   setSession,
   deleteSession,
   storeMessageDirect,
@@ -136,7 +137,13 @@ import {
   resolveBroadcastFolder,
   resolveTaskRoutingDecision,
 } from './task-routing.js';
-import { mergeCompletedIpcCursor } from './ipc-cursor.js';
+import {
+  initializeCommittedCursorMap,
+  messageCursorForRead,
+  mergeCompletedIpcCursor,
+  recoveryAnchorBeforeNextPull,
+  shouldCommitDeliveryResult,
+} from './ipc-cursor.js';
 import { resolveImGroupDefaults } from './im-group-defaults.js';
 import {
   applyAutoIsolateContextForGroups,
@@ -549,6 +556,13 @@ function advanceNextPullCursorOnly(
   candidate: MessageCursor,
 ): void {
   const current = lastAgentTimestamp[jid];
+  // Establish the durable baseline before advancing a new lane. Without this,
+  // a restart could see only the newer next-pull cursor and have no safe point
+  // from which to replay an ACKed-but-uncommitted IPC delivery.
+  lastCommittedCursor[jid] = recoveryAnchorBeforeNextPull(
+    lastCommittedCursor[jid],
+    current,
+  );
   const target =
     current && isCursorAfter(current, candidate) ? current : candidate;
   lastAgentTimestamp[jid] = target;
@@ -855,6 +869,65 @@ const IM_SEND_FAIL_THRESHOLD = 3;
 // processGroupMessages injects recent conversation history for these groups
 // so the fresh session has context despite the session being cleared.
 const recoveryGroups = new Set<string>();
+const agentDeliveryRetryAttempts = new Map<string, number>();
+const agentDeliveryRetryTimers = new Map<
+  string,
+  ReturnType<typeof setTimeout>
+>();
+const AGENT_DELIVERY_MAX_RETRIES = 5;
+const AGENT_DELIVERY_BASE_DELAY_MS = 5_000;
+
+function clearAgentDeliveryRetry(virtualChatJid: string): void {
+  const timer = agentDeliveryRetryTimers.get(virtualChatJid);
+  if (timer) clearTimeout(timer);
+  agentDeliveryRetryTimers.delete(virtualChatJid);
+  agentDeliveryRetryAttempts.delete(virtualChatJid);
+}
+
+function scheduleAgentDeliveryRetry(
+  chatJid: string,
+  agentId: string,
+  virtualChatJid: string,
+): void {
+  if (
+    shuttingDown ||
+    queue.isShuttingDown() ||
+    agentDeliveryRetryTimers.has(virtualChatJid)
+  ) {
+    return;
+  }
+
+  const attempt = (agentDeliveryRetryAttempts.get(virtualChatJid) ?? 0) + 1;
+  if (attempt > AGENT_DELIVERY_MAX_RETRIES) {
+    logger.error(
+      { chatJid, agentId, attempts: attempt - 1 },
+      'Conversation-agent delivery exhausted automatic retries',
+    );
+    return;
+  }
+  agentDeliveryRetryAttempts.set(virtualChatJid, attempt);
+  const delayMs = Math.min(
+    AGENT_DELIVERY_BASE_DELAY_MS * 2 ** (attempt - 1),
+    60_000,
+  );
+  const timer = setTimeout(() => {
+    agentDeliveryRetryTimers.delete(virtualChatJid);
+    if (shuttingDown || queue.isShuttingDown()) return;
+    queue.enqueueTask(
+      virtualChatJid,
+      `agent-delivery-retry:${agentId}`,
+      async () => {
+        await processAgentConversation(chatJid, agentId);
+      },
+    );
+  }, delayMs);
+  timer.unref();
+  agentDeliveryRetryTimers.set(virtualChatJid, timer);
+  logger.warn(
+    { chatJid, agentId, attempt, delayMs },
+    'Conversation-agent incomplete delivery will retry',
+  );
+}
 
 // Track consecutive IM health check failures per JID for safe auto-unbind
 const imHealthCheckFailCounts = new Map<string, number>();
@@ -3073,23 +3146,21 @@ function loadState(): void {
     }
   };
   lastAgentTimestamp = loadCursorMap('last_agent_timestamp');
+  const persistedCommittedCursorMap = getRouterState('last_committed_cursor');
   lastCommittedCursor = loadCursorMap('last_committed_cursor');
 
-  // Migration: fill in missing lastCommittedCursor entries from lastAgentTimestamp.
-  // The original migration only triggered when lastCommittedCursor was completely empty,
-  // missing the case where some keys exist but others don't (e.g. new IM groups).
-  {
-    let migrated = false;
-    for (const [jid, cursor] of Object.entries(lastAgentTimestamp)) {
-      if (!lastCommittedCursor[jid]) {
-        lastCommittedCursor[jid] = cursor;
-        migrated = true;
-      }
-    }
-    if (migrated) {
-      logger.info(
-        'Migrated missing lastCommittedCursor entries from lastAgentTimestamp',
-      );
+  // One-time compatibility migration for databases that predate the committed
+  // cursor map entirely. Never fill individual missing JIDs in an existing
+  // map: a new lane can legitimately be missing because its next-pull cursor
+  // was persisted before its first delivery completed.
+  if (persistedCommittedCursorMap === undefined) {
+    lastCommittedCursor = initializeCommittedCursorMap(
+      persistedCommittedCursorMap,
+      lastAgentTimestamp,
+      lastCommittedCursor,
+    );
+    if (Object.keys(lastCommittedCursor).length > 0) {
+      logger.info('Initialized legacy lastCommittedCursor state');
       saveState();
     }
   }
@@ -3276,10 +3347,21 @@ function loadState(): void {
 }
 
 function saveState(): void {
-  setRouterState('last_timestamp', globalMessageCursor.timestamp);
-  setRouterState('last_timestamp_id', globalMessageCursor.id);
-  setRouterState('last_agent_timestamp', JSON.stringify(lastAgentTimestamp));
-  setRouterState('last_committed_cursor', JSON.stringify(lastCommittedCursor));
+  // next-pull and committed cursors form one crash-consistency unit. Writing
+  // them as separate autocommit statements can expose the newer pull cursor
+  // without its older recovery anchor after a process crash.
+  setRouterStateBatch([
+    { key: 'last_timestamp', value: globalMessageCursor.timestamp },
+    { key: 'last_timestamp_id', value: globalMessageCursor.id },
+    {
+      key: 'last_committed_cursor',
+      value: JSON.stringify(lastCommittedCursor),
+    },
+    {
+      key: 'last_agent_timestamp',
+      value: JSON.stringify(lastAgentTimestamp),
+    },
+  ]);
 }
 
 function registerGroup(jid: string, group: RegisteredGroup): void {
@@ -3465,7 +3547,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let isHome = resolved.isHome;
 
   // Get all messages since last agent interaction
-  const sinceCursor = lastAgentTimestamp[chatJid] || EMPTY_CURSOR;
+  const sinceCursor = messageCursorForRead(
+    lastAgentTimestamp[chatJid],
+    lastCommittedCursor[chatJid],
+    false,
+  );
   let missedMessages = getMessagesSince(chatJid, sinceCursor);
 
   // A previous runner may have claimed an IPC envelope and crashed before the
@@ -3473,12 +3559,18 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // cursor regardless of lastAgentTimestamp, then remove those duplicate IPC
   // envelopes before booting the replacement. Otherwise the same follow-up is
   // present once in the initial prompt and again in runner boot drainIpcInput.
-  const requiresIpcRecovery = queue.needsIpcRecoveryReplay(chatJid);
+  const requiresStartupRecovery = recoveryGroups.has(chatJid);
+  const requiresIpcRecovery =
+    requiresStartupRecovery || queue.needsIpcRecoveryReplay(chatJid);
   const hasIpcRecoveryInput =
     !!group.folder &&
     queue.getUnconsumedIpcDatabaseJids(group.folder, chatJid).has(chatJid);
   if (requiresIpcRecovery || hasIpcRecoveryInput) {
-    const committed = lastCommittedCursor[chatJid] || EMPTY_CURSOR;
+    const committed = messageCursorForRead(
+      lastAgentTimestamp[chatJid],
+      lastCommittedCursor[chatJid],
+      true,
+    );
     missedMessages = getMessagesSince(chatJid, committed);
     const discarded = queue.discardRecoveredIpcInput(
       group.folder,
@@ -3499,6 +3591,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     );
   }
   if (missedMessages.length === 0) {
+    recoveryGroups.delete(chatJid);
     queue.clearIpcRecoveryReplay(chatJid);
     return true;
   }
@@ -3615,6 +3708,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         // route here. Otherwise a stale entry leaks across batches and the
         // next IPC send_message/send_file mirrors to the wrong IM chat.
         activeImReplyRoutes.delete(effectiveGroup.folder);
+        recoveryGroups.delete(chatJid);
         queue.clearIpcRecoveryReplay(chatJid);
         return true;
       }
@@ -3627,7 +3721,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   // Recovery mode: session was cleared to prevent session ghost, so inject
   // recent conversation history to give the fresh session context.
-  const isRecovery = recoveryGroups.delete(chatJid);
+  const isRecovery = recoveryGroups.has(chatJid);
   if (isRecovery) {
     const historyContext = buildRecentConversationHistoryContext(
       chatJid,
@@ -3746,6 +3840,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // 任务 settle 后的 healthy result 才用累积全文定稿「已完成」——对齐
   // Claude Code "一次委托 = 一个完整回合" 的体验，不再分段发多张卡。
   let heldCardParts: string[] = [];
+  let deliveryAwaitingContinuation = false;
   let activeWorkflowRuns: NonNullable<StreamEvent['workflowRun']>[] = [];
   let completedWorkflowRuns: NonNullable<StreamEvent['workflowRun']>[] = [];
   // 挂起期间各 turn 的 usage 增量累计，定稿后与最终 turn 的 usage 合并
@@ -3941,6 +4036,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       };
       advanceNextPullCursorOnly(chatJid, processedCursor);
       advanceCommittedCursorOnly(chatJid, processedCursor);
+      recoveryGroups.delete(chatJid);
       queue.clearIpcRecoveryReplay(chatJid);
       cursorCommitted = true;
     }
@@ -3950,6 +4046,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       for (const cursor of delivery.messageCursors) {
         advanceCommittedCursorOnly(delivery.databaseJid, cursor);
       }
+      recoveryGroups.delete(delivery.databaseJid);
       queue.clearIpcRecoveryReplay(delivery.databaseJid);
     }
   };
@@ -4441,6 +4538,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             return;
           }
 
+          // A successful result may legitimately contain an empty string. Move
+          // the delivery gate before the truthy-text branch so Workflow and
+          // continuation-only results cannot fall through to a cursor commit.
+          if (result.status === 'success' && result.result !== null) {
+            deliveryAwaitingContinuation = !shouldCommitDeliveryResult(result);
+          }
+
           // Provider quota/limit notice surfaced as a "successful" result.
           // The switch is silent to the user (decided in #549): never deliver
           // the English limit text to IM/web — only log for admin/monitoring.
@@ -4758,10 +4862,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               clearStreamingSnapshot(chatJid);
               streamingAccumulatedText = '';
               streamingAccumulatedThinking = '';
-              // Persist cursor as soon as a visible reply is emitted.
-              // Long-lived runners may stay alive for idleTimeout, and waiting
-              // until process exit would cause duplicate replay after restart.
-              commitCursor();
+              // Held output is visible but not final. Keep both cold-start and
+              // warm IPC delivery cursors replayable until the healthy result.
+              if (!deliveryAwaitingContinuation) commitCursor();
             }
             // Only reset idle timer on actual results, not session-update markers (result: null)
             resetIdleTimer();
@@ -4919,7 +5022,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           },
         });
         sentReply = true;
-        commitCursor();
+        // A crash partial is observable but not a completed answer. Keep the
+        // durable cursor behind and let GroupQueue replay the original turn.
+        deliveryAwaitingContinuation = true;
       } catch (err) {
         logger.warn({ err, chatJid }, 'Failed to save overflow partial text');
       }
@@ -4930,7 +5035,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // If a reply was already sent, commit the cursor so we don't re-process.
   // Otherwise return false to allow retry (H-1 audit fix).
   if (!output) {
-    if (sentReply) {
+    if (sentReply && !deliveryAwaitingContinuation) {
       commitCursor();
       return true;
     }
@@ -4979,7 +5084,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       { group: group.name, chatJid },
       'Container closed during query without reply, keeping cursor for retry',
     );
-    return true;
+    // User Stop and service shutdown are terminal control actions. Every other
+    // close is a system-side drain/idle close and must enter queue backoff.
+    return queue.isRecentlyStopped(effectiveGroup.folder) || shuttingDown;
   }
 
   // Query 出错时，将残留 running task 标记为 error，避免长期僵尸状态。
@@ -5193,8 +5300,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       sessionId: activeSessionId,
     });
   }
+  if (deliveryAwaitingContinuation) return false;
   commitCursor();
-
   return true;
 }
 
@@ -7692,20 +7799,30 @@ async function processAgentConversation(
   const virtualJid = virtualChatJid; // used as queue key
 
   // Get pending messages
-  const sinceCursor = lastAgentTimestamp[virtualChatJid] || EMPTY_CURSOR;
+  const sinceCursor = messageCursorForRead(
+    lastAgentTimestamp[virtualChatJid],
+    lastCommittedCursor[virtualChatJid],
+    false,
+  );
   let missedMessages = getMessagesSince(virtualChatJid, sinceCursor);
 
   // Match main-conversation recovery: after a warm conversation runner
   // crashes, replay from the durable DB cursor and remove its old IPC claim so
   // the replacement runner cannot append the same follow-up a second time.
-  const requiresIpcRecovery = queue.needsIpcRecoveryReplay(virtualChatJid);
+  const requiresStartupRecovery = recoveryGroups.has(virtualChatJid);
+  const requiresIpcRecovery =
+    requiresStartupRecovery || queue.needsIpcRecoveryReplay(virtualChatJid);
   const hasIpcRecoveryInput =
     !!group.folder &&
     queue
       .getUnconsumedIpcDatabaseJids(group.folder, virtualChatJid, agentId)
       .has(virtualChatJid);
   if (requiresIpcRecovery || hasIpcRecoveryInput) {
-    const committed = lastCommittedCursor[virtualChatJid] || EMPTY_CURSOR;
+    const committed = messageCursorForRead(
+      lastAgentTimestamp[virtualChatJid],
+      lastCommittedCursor[virtualChatJid],
+      true,
+    );
     missedMessages = getMessagesSince(virtualChatJid, committed);
     const discarded = queue.discardRecoveredAgentIpcInput(
       group.folder,
@@ -7744,6 +7861,8 @@ async function processAgentConversation(
         });
         queue.clearIpcRecoveryReplay(virtualChatJid);
       }
+      recoveryGroups.delete(virtualChatJid);
+      clearAgentDeliveryRetry(virtualChatJid);
       logger.info(
         {
           chatJid,
@@ -7757,6 +7876,8 @@ async function processAgentConversation(
     }
   }
   if (missedMessages.length === 0) {
+    recoveryGroups.delete(virtualChatJid);
+    clearAgentDeliveryRetry(virtualChatJid);
     queue.clearIpcRecoveryReplay(virtualChatJid);
     // Spawn agents are fire-and-forget: if no messages are found (race condition
     // or cursor already advanced), mark as error so they don't stay idle forever.
@@ -7857,12 +7978,16 @@ async function processAgentConversation(
             agent.prompt,
           );
         }
+        recoveryGroups.delete(virtualChatJid);
+        clearAgentDeliveryRetry(virtualChatJid);
         queue.clearIpcRecoveryReplay(virtualChatJid);
         return;
       }
       missedMessages = toSend;
     }
   }
+
+  const isRecovery = recoveryGroups.has(virtualChatJid);
 
   // Update agent status → running
   updateAgentStatus(agentId, 'running');
@@ -7879,6 +8004,7 @@ async function processAgentConversation(
   // switch (sticky binding unhealthy/disabled) will clear the existing session
   // inside the runner — otherwise the new provider's first turn loses context.
   if (
+    isRecovery ||
     !sessionId ||
     willClearSessionOnProviderSwitch(effectiveGroup.folder, agentId)
   ) {
@@ -7978,6 +8104,7 @@ async function processAgentConversation(
   // Sub-Agent 路径首条回复后本就不再向 IM 发消息（isFirstReply 门控），挂起
   // 机制在这里同时修复了"后台任务汇总只入库、飞书永远看不到"的消息丢失。
   let heldAgentParts: string[] = [];
+  let agentDeliveryAwaitingContinuation = false;
   let activeAgentWorkflowRuns: NonNullable<StreamEvent['workflowRun']>[] = [];
   let completedAgentWorkflowRuns: NonNullable<StreamEvent['workflowRun']>[] =
     [];
@@ -8122,6 +8249,8 @@ async function processAgentConversation(
       };
       advanceNextPullCursorOnly(virtualChatJid, processedCursor);
       advanceCommittedCursorOnly(virtualChatJid, processedCursor);
+      recoveryGroups.delete(virtualChatJid);
+      clearAgentDeliveryRetry(virtualChatJid);
       queue.clearIpcRecoveryReplay(virtualChatJid);
       cursorCommitted = true;
     }
@@ -8129,6 +8258,8 @@ async function processAgentConversation(
       for (const cursor of delivery.messageCursors) {
         advanceCommittedCursorOnly(delivery.databaseJid, cursor);
       }
+      recoveryGroups.delete(delivery.databaseJid);
+      clearAgentDeliveryRetry(delivery.databaseJid);
       queue.clearIpcRecoveryReplay(delivery.databaseJid);
     }
   };
@@ -8407,6 +8538,12 @@ async function processAgentConversation(
       // don't get killed while the agent is actively working.
       resetIdleTimer();
       return;
+    }
+
+    // Empty-string success results still carry Workflow/continuation state.
+    // Update the durable-delivery gate before the truthy reply-text branch.
+    if (output.status === 'success' && output.result !== null) {
+      agentDeliveryAwaitingContinuation = !shouldCommitDeliveryResult(output);
     }
 
     // Provider quota/limit notice surfaced as a "successful" result — silent
@@ -8698,7 +8835,7 @@ async function processAgentConversation(
             sendImWithFailTracking(imJid, text, localImagePaths);
         }
 
-        commitCursor();
+        if (!agentDeliveryAwaitingContinuation) commitCursor();
         resetIdleTimer();
 
         // Per-turn snapshot cleanup — mirror of the main path (clearStreamingSnapshot
@@ -8875,7 +9012,7 @@ async function processAgentConversation(
     // Only commit cursor if a reply was actually sent.  Without a reply the
     // messages haven't been "processed" — leaving the cursor behind lets the
     // recovery logic pick them up after a restart.
-    if (lastAgentReplyMsgId) {
+    if (lastAgentReplyMsgId && !agentDeliveryAwaitingContinuation) {
       commitCursor();
     }
   } catch (err) {
@@ -8949,8 +9086,13 @@ async function processAgentConversation(
       heldAgentUsage = null;
     }
 
+    // The global shutdown handler persists virtual-JID partials first. Do not
+    // duplicate that row or advance the cursor while the original delivery is
+    // still recoverable on the next service start.
+    const alreadySavedByShutdown = shutdownSavedJids.has(virtualChatJid);
+
     // ── 保存中断内容 ──
-    if (wasInterrupted) {
+    if (wasInterrupted && !alreadySavedByShutdown) {
       const interruptedText = buildInterruptedReply(agentStreamingAccText);
       try {
         const msgId = crypto.randomUUID();
@@ -9001,7 +9143,11 @@ async function processAgentConversation(
     }
 
     // ── 兜底：进程异常退出导致累积文本未持久化 ──
-    if (!cursorCommitted && agentStreamingAccText.trim()) {
+    if (
+      !cursorCommitted &&
+      !alreadySavedByShutdown &&
+      agentStreamingAccText.trim()
+    ) {
       try {
         const partialReply = buildInterruptedReply(agentStreamingAccText);
         const msgId = crypto.randomUUID();
@@ -9075,7 +9221,8 @@ async function processAgentConversation(
             'Partial reply: no replySourceImJid found, skipping IM send',
           );
         }
-        commitCursor();
+        // This is a crash fallback, not a completed delivery. Keep the cursor
+        // behind so startup recovery can replay the original user message.
       } catch (err) {
         logger.warn(
           { err, chatJid, agentId },
@@ -9160,6 +9307,10 @@ async function processAgentConversation(
 
     activeImReplyRoutes.delete(virtualChatJid);
     ipcWatcherManager?.unwatchGroup(effectiveGroup.folder);
+
+    if (!cursorCommitted) {
+      scheduleAgentDeliveryRetry(chatJid, agentId, virtualChatJid);
+    }
   }
 }
 
@@ -9524,12 +9675,10 @@ async function recoverStuckPendingGroups(): Promise<void> {
  */
 function recoverPendingMessages(): void {
   for (const [chatJid, group] of Object.entries(registeredGroups)) {
-    // No committed cursor → this group was never successfully processed.
-    // Skip recovery — the normal 2s message loop will pick up any pending messages.
-    // Using EMPTY_CURSOR here would match ALL historical messages and falsely
-    // trigger session clearing (the bug that caused context reset on restart).
-    const sinceCursor = lastCommittedCursor[chatJid];
-    if (!sinceCursor) continue;
+    // New next-pull-only writes always establish this anchor first. EMPTY is a
+    // conservative fallback for state written by the older per-JID migration:
+    // replaying is preferable to silently skipping an uncommitted delivery.
+    const sinceCursor = lastCommittedCursor[chatJid] || EMPTY_CURSOR;
 
     const pending = getMessagesSince(chatJid, sinceCursor);
     if (pending.length > 0) {
@@ -9589,10 +9738,12 @@ function recoverConversationAgents(): void {
 
       // Check for pending messages on the virtual JID
       const virtualChatJid = `${chatJid}#agent:${agentId}`;
-      const sinceCursor = lastAgentTimestamp[virtualChatJid] || EMPTY_CURSOR;
+      const sinceCursor = lastCommittedCursor[virtualChatJid] || EMPTY_CURSOR;
       const pending = getMessagesSince(virtualChatJid, sinceCursor);
 
       if (pending.length > 0) {
+        recoveryGroups.add(virtualChatJid);
+        deleteSession(agent.group_folder, agentId);
         logger.info(
           { agentId, agentName: agent.name, pendingCount: pending.length },
           'Recovery: re-triggering conversation agent with pending messages',

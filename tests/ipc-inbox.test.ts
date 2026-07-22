@@ -195,16 +195,22 @@ describe('IPC completion/result correlation', () => {
     expect(tracker.advanceResult()).toEqual(['initial']);
   });
 
-  test('a pulled pipe-in is not completed by the older turn result', () => {
+  test('an intermediate Workflow result cannot commit the initial claim', () => {
     const tracker = new IpcCompletionTracker();
-    tracker.trackPiped(['follow-up']);
+    tracker.trackInitial(['workflow']);
+    expect(tracker.advanceResult(false)).toEqual([]);
+    expect(tracker.advanceResult()).toEqual(['workflow']);
+  });
+
+  test('Workflow results can never complete a pipe-in heuristically', () => {
+    const tracker = new IpcCompletionTracker();
     expect(tracker.advanceResult()).toEqual([]);
-    expect(tracker.advanceResult()).toEqual(['follow-up']);
+    expect(tracker.advanceResult()).toEqual([]);
+    expect(tracker.advanceResult()).toEqual([]);
   });
 
   test('an interrupted result never completes a pulled pipe-in', () => {
     const tracker = new IpcCompletionTracker();
-    tracker.trackPiped(['follow-up']);
     expect(tracker.advanceResult(false)).toEqual([]);
     expect(tracker.advanceResult(false)).toEqual([]);
   });

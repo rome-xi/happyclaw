@@ -46,10 +46,11 @@ export function getTerminalEngineError(result: {
 }
 
 /**
- * Correlates IPC consumption with later result generations. Initial claims
- * belong to the first result. A message pulled into an already-active Claude
- * stream is conservatively assigned after one intervening result, because that
- * result can still belong to the older turn.
+ * Correlates initial IPC claims with the first result of their fresh query.
+ * Pipe-ins are deliberately excluded: the Claude SDK exposes consumption but
+ * no causal link from a piped user message to a later Workflow result. They
+ * remain in `pipedMessagesDuringQuery` and are durably requeued after the old
+ * query ends, then enter this tracker as initial claims on the next query.
  */
 export class IpcCompletionTracker {
   private ordinal = 0;
@@ -62,12 +63,6 @@ export class IpcCompletionTracker {
   trackInitial(messageIds: string[]): void {
     for (const messageId of messageIds) {
       this.targets.set(messageId, this.ordinal + 1);
-    }
-  }
-
-  trackPiped(messageIds: string[]): void {
-    for (const messageId of messageIds) {
-      this.targets.set(messageId, this.ordinal + 2);
     }
   }
 

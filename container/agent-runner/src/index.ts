@@ -1698,11 +1698,10 @@ async function runQuery(
         );
       }
       const rejected = engine.pushToActive(pipeText, pipeImages, () => {
-        // A pipe-in is pulled while an older turn is still active. The next
-        // result may belong to that older turn, so require one additional
-        // result boundary before declaring this message completed. This is
-        // conservative: a duplicate is preferable to committing too early.
-        ipcCompletionTracker.trackPiped([msg.messageId]);
+        // Consumption is enough to retire the claim, but not to commit its DB
+        // cursor: Workflow results have no SDK-provided causal link to this
+        // pipe-in. Keep it in pipedMessagesDuringQuery so the old query can
+        // never complete it; it will be requeued as a fresh initial turn.
         acknowledgeIpcMessages([msg]);
       });
       if (rejected.length > 0) {
@@ -1751,19 +1750,7 @@ async function runQuery(
 
   const publishEngineResult = (engineResult: EngineSendResult): void => {
     if (engineResult.newSessionId) newSessionId = engineResult.newSessionId;
-    const completedIpcMessageIds = ipcCompletionTracker.advanceResult(
-      !interruptedDuringQuery && !suppressOutputAfterInterrupt,
-    );
-    if (completedIpcMessageIds.length > 0) {
-      const completed = new Set(completedIpcMessageIds);
-      for (let i = pipedMessagesDuringQuery.length - 1; i >= 0; i--) {
-        if (completed.has(pipedMessagesDuringQuery[i].messageId)) {
-          pipedMessagesDuringQuery.splice(i, 1);
-        }
-      }
-    }
-    resultCount = ipcCompletionTracker.resultCount;
-
+    const pendingBgTasks = emitOutput ? (engineResult.pendingBgTasks ?? 0) : 0;
     const finalText = engineResult.finalText || '';
     const sdkUsage = engineResult.usage
       ? {
@@ -1775,7 +1762,13 @@ async function runQuery(
       emitOutput &&
       !!finalText &&
       isSuspectTruncatedStreamResult(sdkUsage, finalText.length);
-    const pendingBgTasks = emitOutput ? (engineResult.pendingBgTasks ?? 0) : 0;
+    const completedIpcMessageIds = ipcCompletionTracker.advanceResult(
+      !interruptedDuringQuery &&
+        !suppressOutputAfterInterrupt &&
+        pendingBgTasks === 0 &&
+        !suspectTruncated,
+    );
+    resultCount = ipcCompletionTracker.resultCount;
     pendingBackgroundTasks = pendingBgTasks;
 
     if (suspectTruncated) {
@@ -2431,10 +2424,10 @@ async function main(): Promise<void> {
         resumeAt = queryResult.lastAssistantUuid;
       }
 
-      // A normal Claude stream can return immediately after the older turn's
-      // first result. Any pipe-in that did not cross its conservative second
-      // completion boundary must become a fresh durable query now; otherwise
-      // its ACKed claim has no watchdog and can sit idle until process exit.
+      // Claude exposes no causal link between a pipe-in and Workflow results
+      // produced by the already-active turn. Every accepted pipe-in therefore
+      // becomes a fresh durable query after this old query ends; only that
+      // fresh query is allowed to complete its DB delivery.
       if (queryResult.pipedMessagesDuringQuery.length > 0) {
         const piped = queryResult.pipedMessagesDuringQuery;
         log(
