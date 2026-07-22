@@ -136,6 +136,7 @@ import {
   resolveBroadcastFolder,
   resolveTaskRoutingDecision,
 } from './task-routing.js';
+import { mergeCompletedIpcCursor } from './ipc-cursor.js';
 import { resolveImGroupDefaults } from './im-group-defaults.js';
 import {
   applyAutoIsolateContextForGroups,
@@ -570,6 +571,22 @@ function advanceCursors(jid: string, candidate: MessageCursor): void {
     current && isCursorAfter(current, candidate) ? current : candidate;
   lastAgentTimestamp[jid] = target;
   lastCommittedCursor[jid] = target;
+  saveState();
+}
+
+/**
+ * Commit one explicitly completed IPC delivery without inheriting the newer
+ * next-pull cursor. A later queued envelope may already have advanced
+ * lastAgentTimestamp but must remain recoverable until its own result.
+ */
+function advanceCommittedCursorOnly(
+  jid: string,
+  candidate: MessageCursor,
+): void {
+  lastCommittedCursor[jid] = mergeCompletedIpcCursor(
+    lastCommittedCursor[jid],
+    candidate,
+  );
   saveState();
 }
 let messageLoopRunning = false;
@@ -3456,10 +3473,21 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // cursor regardless of lastAgentTimestamp, then remove those duplicate IPC
   // envelopes before booting the replacement. Otherwise the same follow-up is
   // present once in the initial prompt and again in runner boot drainIpcInput.
-  if (group.folder && queue.hasUnconsumedIpcInput(group.folder)) {
+  const requiresIpcRecovery = queue.needsIpcRecoveryReplay(chatJid);
+  const hasIpcRecoveryInput =
+    !!group.folder &&
+    queue.getUnconsumedIpcDatabaseJids(group.folder, chatJid).has(chatJid);
+  if (requiresIpcRecovery || hasIpcRecoveryInput) {
     const committed = lastCommittedCursor[chatJid] || EMPTY_CURSOR;
     missedMessages = getMessagesSince(chatJid, committed);
-    const discarded = queue.discardRecoveredIpcInput(group.folder);
+    const discarded = queue.discardRecoveredIpcInput(
+      group.folder,
+      chatJid,
+      missedMessages.map((message) => ({
+        id: message.id,
+        timestamp: message.timestamp,
+      })),
+    );
     logger.warn(
       {
         chatJid,
@@ -3470,7 +3498,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       'Recovering orphaned IPC input from lastCommittedCursor',
     );
   }
-  if (missedMessages.length === 0) return true;
+  if (missedMessages.length === 0) {
+    queue.clearIpcRecoveryReplay(chatJid);
+    return true;
+  }
 
   // Admin home is shared as web:main, so select runtime owner from the latest
   // active admin sender to avoid writing global memory into another admin's
@@ -3584,6 +3615,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         // route here. Otherwise a stale entry leaks across batches and the
         // next IPC send_message/send_file mirrors to the wrong IM chat.
         activeImReplyRoutes.delete(effectiveGroup.folder);
+        queue.clearIpcRecoveryReplay(chatJid);
         return true;
       }
       missedMessages = toSend;
@@ -3902,12 +3934,24 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   };
 
   const commitCursor = (): void => {
-    if (cursorCommitted) return;
-    advanceCursors(chatJid, {
-      timestamp: lastProcessed.timestamp,
-      id: lastProcessed.id,
-    });
-    cursorCommitted = true;
+    if (!cursorCommitted) {
+      const processedCursor = {
+        timestamp: lastProcessed.timestamp,
+        id: lastProcessed.id,
+      };
+      advanceNextPullCursorOnly(chatJid, processedCursor);
+      advanceCommittedCursorOnly(chatJid, processedCursor);
+      queue.clearIpcRecoveryReplay(chatJid);
+      cursorCommitted = true;
+    }
+    // A warm shared-folder runner may consume messages from sibling DB JIDs.
+    // Commit those exact cursors only when a visible result is persisted.
+    for (const delivery of queue.takeCompletedIpcDeliveries(chatJid)) {
+      for (const cursor of delivery.messageCursors) {
+        advanceCommittedCursorOnly(delivery.databaseJid, cursor);
+      }
+      queue.clearIpcRecoveryReplay(delivery.databaseJid);
+    }
   };
 
   if (effectiveGroup.created_by) {
@@ -4735,6 +4779,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       imagesForAgent,
       messageTaskId,
       currentSourceJid,
+      requiresIpcRecovery || hasIpcRecoveryInput ? chatJid : undefined,
     );
   } finally {
     runEnded = true;
@@ -5263,6 +5308,7 @@ async function runAgent(
   images?: Array<{ data: string; mimeType?: string }>,
   messageTaskId?: string,
   currentSourceJid?: string,
+  ipcRecoveryDatabaseJid?: string,
 ): Promise<{ status: 'success' | 'error' | 'closed'; error?: string }> {
   const isHome = !!group.is_home;
   // For the agent-runner: isMain means this is an admin home container (full privileges)
@@ -5298,8 +5344,17 @@ async function runAgent(
   const wrappedOnOutput = onOutput
     ? async (output: ContainerOutput) => {
         queue.markRunnerActivity(chatJid);
+        if (output.ipcRequeuedMessageIds?.length) {
+          queue.markIpcMessagesRequeued(chatJid, output.ipcRequeuedMessageIds);
+        }
         if (output.ipcMessageIds?.length) {
           queue.markIpcMessagesStarted(chatJid, output.ipcMessageIds);
+        }
+        if (output.ipcCompletedMessageIds?.length) {
+          queue.markIpcMessagesCompleted(
+            chatJid,
+            output.ipcCompletedMessageIds,
+          );
         }
         if (
           (output.status === 'success' && output.result !== null) ||
@@ -5340,6 +5395,7 @@ async function runAgent(
         containerName,
         groupFolder: group.folder,
         displayName: identifier,
+        ipcDatabaseJidFilter: ipcRecoveryDatabaseJid,
         selectedProviderId,
       });
     };
@@ -5358,6 +5414,7 @@ async function runAgent(
           groupFolder: group.folder,
           chatJid,
           currentSourceJid,
+          ipcRecoveryDatabaseJid,
           isMain: isAdminHome,
           isHome,
           isAdminHome,
@@ -5378,6 +5435,7 @@ async function runAgent(
           groupFolder: group.folder,
           chatJid,
           currentSourceJid,
+          ipcRecoveryDatabaseJid,
           isMain: isAdminHome,
           isHome,
           isAdminHome,
@@ -7640,12 +7698,23 @@ async function processAgentConversation(
   // Match main-conversation recovery: after a warm conversation runner
   // crashes, replay from the durable DB cursor and remove its old IPC claim so
   // the replacement runner cannot append the same follow-up a second time.
-  if (group.folder && queue.hasUnconsumedAgentIpcInput(group.folder, agentId)) {
+  const requiresIpcRecovery = queue.needsIpcRecoveryReplay(virtualChatJid);
+  const hasIpcRecoveryInput =
+    !!group.folder &&
+    queue
+      .getUnconsumedIpcDatabaseJids(group.folder, virtualChatJid, agentId)
+      .has(virtualChatJid);
+  if (requiresIpcRecovery || hasIpcRecoveryInput) {
     const committed = lastCommittedCursor[virtualChatJid] || EMPTY_CURSOR;
     missedMessages = getMessagesSince(virtualChatJid, committed);
     const discarded = queue.discardRecoveredAgentIpcInput(
       group.folder,
       agentId,
+      virtualChatJid,
+      missedMessages.map((message) => ({
+        id: message.id,
+        timestamp: message.timestamp,
+      })),
     );
     logger.warn(
       {
@@ -7673,6 +7742,7 @@ async function processAgentConversation(
           timestamp: lastMsg.timestamp,
           id: lastMsg.id,
         });
+        queue.clearIpcRecoveryReplay(virtualChatJid);
       }
       logger.info(
         {
@@ -7687,6 +7757,7 @@ async function processAgentConversation(
     }
   }
   if (missedMessages.length === 0) {
+    queue.clearIpcRecoveryReplay(virtualChatJid);
     // Spawn agents are fire-and-forget: if no messages are found (race condition
     // or cursor already advanced), mark as error so they don't stay idle forever.
     if (isSpawnKind(agent.kind) && agent.status === 'idle') {
@@ -7786,6 +7857,7 @@ async function processAgentConversation(
             agent.prompt,
           );
         }
+        queue.clearIpcRecoveryReplay(virtualChatJid);
         return;
       }
       missedMessages = toSend;
@@ -8043,20 +8115,36 @@ async function processAgentConversation(
   let lastAgentReplyText: string | undefined;
   const lastProcessed = missedMessages[missedMessages.length - 1];
   const commitCursor = (): void => {
-    if (cursorCommitted) return;
-    advanceCursors(virtualChatJid, {
-      timestamp: lastProcessed.timestamp,
-      id: lastProcessed.id,
-    });
-    cursorCommitted = true;
+    if (!cursorCommitted) {
+      const processedCursor = {
+        timestamp: lastProcessed.timestamp,
+        id: lastProcessed.id,
+      };
+      advanceNextPullCursorOnly(virtualChatJid, processedCursor);
+      advanceCommittedCursorOnly(virtualChatJid, processedCursor);
+      queue.clearIpcRecoveryReplay(virtualChatJid);
+      cursorCommitted = true;
+    }
+    for (const delivery of queue.takeCompletedIpcDeliveries(virtualJid)) {
+      for (const cursor of delivery.messageCursors) {
+        advanceCommittedCursorOnly(delivery.databaseJid, cursor);
+      }
+      queue.clearIpcRecoveryReplay(delivery.databaseJid);
+    }
   };
 
   const wrappedOnOutput = async (output: ContainerOutput) => {
     // #547: warm-lifecycle bookkeeping — mark activity, and flag query-idle on
     // a substantive result / interruption so the runner can be kept warm.
     queue.markRunnerActivity(virtualJid);
+    if (output.ipcRequeuedMessageIds?.length) {
+      queue.markIpcMessagesRequeued(virtualJid, output.ipcRequeuedMessageIds);
+    }
     if (output.ipcMessageIds?.length) {
       queue.markIpcMessagesStarted(virtualJid, output.ipcMessageIds);
+    }
+    if (output.ipcCompletedMessageIds?.length) {
+      queue.markIpcMessagesCompleted(virtualJid, output.ipcCompletedMessageIds);
     }
     if (
       (output.status === 'success' && output.result !== null) ||
@@ -8674,6 +8762,10 @@ async function processAgentConversation(
         groupFolder: effectiveGroup.folder,
         displayName: identifier,
         agentId,
+        ipcDatabaseJidFilter:
+          requiresIpcRecovery || hasIpcRecoveryInput
+            ? virtualChatJid
+            : undefined,
         selectedProviderId,
       });
     };
@@ -8690,6 +8782,8 @@ async function processAgentConversation(
       agentId,
       agentName: agent.name,
       images: imagesForAgent,
+      ipcRecoveryDatabaseJid:
+        requiresIpcRecovery || hasIpcRecoveryInput ? virtualChatJid : undefined,
     };
 
     // Write tasks/groups snapshots
@@ -9289,6 +9383,13 @@ async function startMessageLoop(): Promise<void> {
               activeRouteUpdaters.get(group.folder)?.(lastSourceJidForRoute);
             },
             lastSourceJidForRoute,
+            {
+              databaseJid: chatJid,
+              messageCursors: messagesToSend.map((message) => ({
+                id: message.id,
+                timestamp: message.timestamp,
+              })),
+            },
           );
           if (sendResult === 'sent') {
             logger.debug(
@@ -10415,6 +10516,13 @@ function buildOnAgentMessage(): (baseChatJid: string, agentId: string) => void {
               activeHeldCardFinalizers.get(virtualChatJid)?.();
             },
             lastAgentSourceJid,
+            {
+              databaseJid: virtualChatJid,
+              messageCursors: missedMessages.map((message) => ({
+                id: message.id,
+                timestamp: message.timestamp,
+              })),
+            },
           )
         : 'no_active';
       if (sendResult === 'no_active') {
@@ -10422,6 +10530,14 @@ function buildOnAgentMessage(): (baseChatJid: string, agentId: string) => void {
         queue.enqueueTask(virtualChatJid, taskId, async () => {
           await processAgentConversation(homeChatJid, agentId);
         });
+      } else {
+        const lastProcessed = missedMessages[missedMessages.length - 1];
+        if (lastProcessed) {
+          advanceNextPullCursorOnly(virtualChatJid, {
+            timestamp: lastProcessed.timestamp,
+            id: lastProcessed.id,
+          });
+        }
       }
     }
     logger.info(

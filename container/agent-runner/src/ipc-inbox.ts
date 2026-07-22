@@ -7,6 +7,8 @@ export interface IpcMessage {
   images?: Array<{ data: string; mimeType?: string }>;
   taskId?: string;
   sourceJid?: string;
+  databaseJid?: string;
+  messageCursors?: Array<{ id: string; timestamp: string }>;
   claimPath: string;
 }
 
@@ -24,6 +26,62 @@ export function shouldStartFreshIpcTurn(
   hasQueuedMessages: boolean,
 ): boolean {
   return resultCount > 0 && pendingBackgroundTasks === 0 && hasQueuedMessages;
+}
+
+/** Only a provider/SDK init event proves that a fresh request was accepted. */
+export function shouldAcknowledgeQueryEvent(eventType: string): boolean {
+  return eventType === 'init';
+}
+
+/** A provider-level failed result must become a terminal host error. */
+export function getTerminalEngineError(result: {
+  finishReason: string;
+  finalText: string;
+}): string | undefined {
+  if (result.finishReason !== 'error') return undefined;
+  return (
+    result.finalText.trim() ||
+    'Provider query failed before completing the message'
+  );
+}
+
+/**
+ * Correlates IPC consumption with later result generations. Initial claims
+ * belong to the first result. A message pulled into an already-active Claude
+ * stream is conservatively assigned after one intervening result, because that
+ * result can still belong to the older turn.
+ */
+export class IpcCompletionTracker {
+  private ordinal = 0;
+  private readonly targets = new Map<string, number>();
+
+  get resultCount(): number {
+    return this.ordinal;
+  }
+
+  trackInitial(messageIds: string[]): void {
+    for (const messageId of messageIds) {
+      this.targets.set(messageId, this.ordinal + 1);
+    }
+  }
+
+  trackPiped(messageIds: string[]): void {
+    for (const messageId of messageIds) {
+      this.targets.set(messageId, this.ordinal + 2);
+    }
+  }
+
+  advanceResult(allowCompletion = true): string[] {
+    this.ordinal++;
+    if (!allowCompletion) return [];
+    const completed: string[] = [];
+    for (const [messageId, target] of this.targets) {
+      if (target > this.ordinal) continue;
+      completed.push(messageId);
+      this.targets.delete(messageId);
+    }
+    return completed;
+  }
 }
 
 /** Durable queued → inflight → acknowledged lifecycle for runner input. */
@@ -80,8 +138,12 @@ export class IpcInbox {
     }
   }
 
-  /** Atomically claim every queued JSON message without deleting it. */
-  claimAll(): IpcMessage[] {
+  /**
+   * Atomically claim queued JSON messages without deleting them. Recovery
+   * runners may pin claims to one database JID even though sibling channels
+   * share the same folder-level input directory.
+   */
+  claimAll(databaseJidFilter?: string): IpcMessage[] {
     const messages: IpcMessage[] = [];
     try {
       this.ensureDirectories();
@@ -94,6 +156,23 @@ export class IpcInbox {
         const filePath = path.join(this.inputDir, file);
         let claimPath = path.join(this.inflightDir, file);
         try {
+          if (databaseJidFilter) {
+            try {
+              const queued = JSON.parse(fs.readFileSync(filePath, 'utf8')) as {
+                databaseJid?: unknown;
+              };
+              if (
+                typeof queued.databaseJid === 'string' &&
+                queued.databaseJid !== databaseJidFilter
+              ) {
+                continue;
+              }
+            } catch {
+              // Legacy/malformed envelopes have no trustworthy ownership.
+              // Let the selected fallback lane claim them so they cannot
+              // permanently block recovery; exact sibling envelopes remain.
+            }
+          }
           if (fs.existsSync(claimPath)) {
             claimPath = path.join(
               this.inflightDir,
@@ -113,6 +192,20 @@ export class IpcInbox {
               taskId: typeof data.taskId === 'string' ? data.taskId : undefined,
               sourceJid:
                 typeof data.sourceJid === 'string' ? data.sourceJid : undefined,
+              databaseJid:
+                typeof data.databaseJid === 'string'
+                  ? data.databaseJid
+                  : undefined,
+              messageCursors: Array.isArray(data.messageCursors)
+                ? data.messageCursors.filter(
+                    (cursor: unknown) =>
+                      !!cursor &&
+                      typeof cursor === 'object' &&
+                      typeof (cursor as { id?: unknown }).id === 'string' &&
+                      typeof (cursor as { timestamp?: unknown }).timestamp ===
+                        'string',
+                  )
+                : undefined,
               claimPath,
             });
           } else {
@@ -135,25 +228,6 @@ export class IpcInbox {
       );
     }
     return messages;
-  }
-
-  /** Delete durable claims and return only the IDs successfully retired. */
-  acknowledge(messages: IpcMessage[]): string[] {
-    const messageIds: string[] = [];
-    for (const message of messages) {
-      try {
-        fs.unlinkSync(message.claimPath);
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-          this.log(
-            `Failed to acknowledge IPC message ${message.messageId}: ${err}`,
-          );
-          continue;
-        }
-      }
-      messageIds.push(message.messageId);
-    }
-    return messageIds;
   }
 
   /** Put an unaccepted/interrupted claim back into the visible queue. */
@@ -181,6 +255,8 @@ export class IpcInbox {
           images: message.images,
           taskId: message.taskId,
           sourceJid: message.sourceJid,
+          databaseJid: message.databaseJid,
+          messageCursors: message.messageCursors,
         }),
       );
       fs.renameSync(tempPath, destination);

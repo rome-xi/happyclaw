@@ -641,6 +641,10 @@ async function handleWebUserMessage(
       updateRoute?.(group.folder, null);
     },
     chatJid,
+    {
+      databaseJid: chatJid,
+      messageCursors: [{ id: messageId, timestamp }],
+    },
   );
   if (sendResult === 'sent') {
     pipedToActive = true;
@@ -672,7 +676,7 @@ async function handleWebUserMessage(
   // messages. If the agent crashes without processing them, the close handler
   // resets pendingMessages so drainGroup re-reads from DB.
   if (pipedToActive) {
-    deps.setLastAgentTimestamp(chatJid, { timestamp, id: messageId });
+    deps.advanceNextPullCursorOnly(chatJid, { timestamp, id: messageId });
     deps.queue.markIpcInjectedMessage(chatJid);
   }
   deps.advanceGlobalCursor({ timestamp, id: messageId });
@@ -917,6 +921,10 @@ async function handleAgentConversationMessage(
       finalizeHeld?.(virtualChatJid);
     },
     virtualChatJid,
+    {
+      databaseJid: virtualChatJid,
+      messageCursors: [{ id: messageId, timestamp }],
+    },
   );
   if (agentSendResult === 'no_active') {
     if (eagerExpandAgentActive && agentSendContent !== content) {
@@ -945,8 +953,12 @@ async function handleAgentConversationMessage(
         await deps!.processAgentConversation!(chatJid, agentId);
       });
     }
+  } else {
+    deps.advanceNextPullCursorOnly(virtualChatJid, {
+      timestamp,
+      id: messageId,
+    });
   }
-  // 'sent' needs no further action
 }
 
 // --- Static Files ---

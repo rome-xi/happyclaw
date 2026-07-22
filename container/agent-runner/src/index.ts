@@ -50,7 +50,10 @@ import { PREDEFINED_AGENTS } from './agent-definitions.js';
 import { createMcpTools } from './mcp-tools.js';
 import { resolveClaudeProviderRuntime } from './provider-runtime.js';
 import {
+  getTerminalEngineError,
+  IpcCompletionTracker,
   IpcInbox,
+  shouldAcknowledgeQueryEvent,
   shouldStartFreshIpcTurn,
   type IpcMessage,
 } from './ipc-inbox.js';
@@ -85,6 +88,7 @@ const CLAUDE_MODEL = CLAUDE_PROVIDER_RUNTIME.model;
 const IPC_INPUT_DIR = path.join(WORKSPACE_IPC, 'input');
 const IPC_INFLIGHT_DIR = path.join(IPC_INPUT_DIR, 'inflight');
 const ipcInbox = new IpcInbox(IPC_INPUT_DIR, (message) => log(message));
+let ipcDatabaseJidFilter: string | undefined;
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_FALLBACK_POLL_MS = 5000; // 后备轮询间隔（仅防止 inotify 事件丢失）
 
@@ -1042,7 +1046,10 @@ function hasQueuedIpcMessages(): boolean {
 }
 
 function acknowledgeIpcMessages(messages: IpcMessage[]): void {
-  const messageIds = ipcInbox.acknowledge(messages);
+  // The host owns deletion of durable inflight claims. Report only after the
+  // provider/SDK has actually accepted or pulled the message, so a runner
+  // crash before host receipt leaves the claim recoverable.
+  const messageIds = [...new Set(messages.map((message) => message.messageId))];
   if (messageIds.length > 0) {
     writeOutput({ status: 'stream', result: null, ipcMessageIds: messageIds });
   }
@@ -1053,8 +1060,21 @@ function requeueIpcMessage(message: IpcMessage): void {
   ipcInbox.requeue(message);
 }
 
+/** Requeue pulled messages and tell the host to resume ACK watchdog coverage. */
+function requeueIpcMessages(messages: IpcMessage[]): void {
+  if (messages.length === 0) return;
+  for (const message of messages) requeueIpcMessage(message);
+  writeOutput({
+    status: 'stream',
+    result: null,
+    ipcRequeuedMessageIds: [
+      ...new Set(messages.map((message) => message.messageId)),
+    ],
+  });
+}
+
 function drainIpcInput(): IpcDrainResult {
-  return { messages: ipcInbox.claimAll() };
+  return { messages: ipcInbox.claimAll(ipcDatabaseJidFilter) };
 }
 
 /**
@@ -1306,9 +1326,15 @@ async function runQuery(
   const unacknowledgedIpcMessages = new Map<string, IpcMessage>(
     initialIpcMessages.map((message) => [message.claimPath, message]),
   );
-  const acknowledgeQueryStart = () => {
+  const ipcCompletionTracker = new IpcCompletionTracker();
+  const acknowledgeQueryStart = (trackCompletion = true) => {
     const messages = [...unacknowledgedIpcMessages.values()];
     if (messages.length === 0) return;
+    if (trackCompletion) {
+      ipcCompletionTracker.trackInitial(
+        messages.map((message) => message.messageId),
+      );
+    }
     acknowledgeIpcMessages(messages);
     for (const message of messages) {
       unacknowledgedIpcMessages.delete(message.claimPath);
@@ -1671,16 +1697,18 @@ async function runQuery(
           `Pipe-in slash command detected, skipping time prefix: ${msg.text.slice(0, 40)}`,
         );
       }
-      const rejected = engine.pushToActive(pipeText, pipeImages);
+      const rejected = engine.pushToActive(pipeText, pipeImages, () => {
+        // A pipe-in is pulled while an older turn is still active. The next
+        // result may belong to that older turn, so require one additional
+        // result boundary before declaring this message completed. This is
+        // conservative: a duplicate is preferable to committing too early.
+        ipcCompletionTracker.trackPiped([msg.messageId]);
+        acknowledgeIpcMessages([msg]);
+      });
       if (rejected.length > 0) {
         requeueIpcMessage(msg);
       } else {
         pipedMessagesDuringQuery.push(msg);
-        // pushToActive's empty rejection list is the engine's synchronous
-        // acceptance into its live MessageStream. Acknowledge now so a valid
-        // long-running tool (including idle/sleep) is not mistaken for a warm
-        // runner that never started a query.
-        acknowledgeIpcMessages([msg]);
       }
       for (const reason of rejected) {
         emit({
@@ -1704,7 +1732,7 @@ async function runQuery(
     suppressOutputAfterInterrupt = true;
     // The user explicitly cancelled this turn before SDK startup. Retire its
     // durable claims so the host does not watchdog-restart and replay it.
-    acknowledgeQueryStart();
+    acknowledgeQueryStart(false);
     ipcPolling = false;
     ipcQueryWatcher.close();
     return {
@@ -1722,9 +1750,19 @@ async function runQuery(
   let latestSuspectTruncatedTail: string | undefined;
 
   const publishEngineResult = (engineResult: EngineSendResult): void => {
-    acknowledgeQueryStart();
     if (engineResult.newSessionId) newSessionId = engineResult.newSessionId;
-    resultCount++;
+    const completedIpcMessageIds = ipcCompletionTracker.advanceResult(
+      !interruptedDuringQuery && !suppressOutputAfterInterrupt,
+    );
+    if (completedIpcMessageIds.length > 0) {
+      const completed = new Set(completedIpcMessageIds);
+      for (let i = pipedMessagesDuringQuery.length - 1; i >= 0; i--) {
+        if (completed.has(pipedMessagesDuringQuery[i].messageId)) {
+          pipedMessagesDuringQuery.splice(i, 1);
+        }
+      }
+    }
+    resultCount = ipcCompletionTracker.resultCount;
 
     const finalText = engineResult.finalText || '';
     const sdkUsage = engineResult.usage
@@ -1765,6 +1803,10 @@ async function runQuery(
         sourceKind: sourceKindOverride ?? 'sdk_final',
         finalizationReason: suspectTruncated ? 'truncated' : 'completed',
         pendingBgTasks,
+        // Repeat the acceptance IDs on the completion output so the host can
+        // apply ACK-before-complete ordering even if callbacks are concurrent.
+        ipcMessageIds: completedIpcMessageIds,
+        ipcCompletedMessageIds: completedIpcMessageIds,
       });
       containerInput.turnId = generateTurnId();
     }
@@ -1795,10 +1837,6 @@ async function runQuery(
     while (true) {
       const { value, done } = await generator.next();
 
-      // A resolved SDK iterator step (event or final return) is the positive
-      // evidence the host needs before considering claimed IPC durable work.
-      acknowledgeQueryStart();
-
       if (done) {
         finalResult = value as EngineSendResult;
         break;
@@ -1806,6 +1844,13 @@ async function runQuery(
 
       // value 是 StreamEvent
       const evt = value as StreamEvent;
+
+      // OpenAI HTTP failures yield status:error before returning an error
+      // result. Only init (Claude system/init or OpenAI response.created)
+      // proves the request was accepted; error/status events never ACK.
+      if (shouldAcknowledgeQueryEvent(evt.eventType)) {
+        acknowledgeQueryStart();
+      }
 
       if (
         suppressOutputAfterInterrupt &&
@@ -1972,6 +2017,9 @@ async function runQuery(
         };
       }
 
+      const terminalEngineError = getTerminalEngineError(finalResult);
+      if (terminalEngineError) throw new Error(terminalEngineError);
+
       // ClaudeEngine reports every SDK turn through onResult so a Workflow can
       // remain alive between its intermediate and final summaries. OpenAI (and
       // direct engine callers) still use the generator's ordinary return value.
@@ -2123,6 +2171,7 @@ async function main(): Promise<void> {
   try {
     const stdinData = await readStdin();
     containerInput = JSON.parse(stdinData);
+    ipcDatabaseJidFilter = containerInput.ipcRecoveryDatabaseJid;
     log(`Received input for group: ${containerInput.groupFolder}`);
   } catch (err) {
     writeOutput({
@@ -2382,6 +2431,18 @@ async function main(): Promise<void> {
         resumeAt = queryResult.lastAssistantUuid;
       }
 
+      // A normal Claude stream can return immediately after the older turn's
+      // first result. Any pipe-in that did not cross its conservative second
+      // completion boundary must become a fresh durable query now; otherwise
+      // its ACKed claim has no watchdog and can sit idle until process exit.
+      if (queryResult.pipedMessagesDuringQuery.length > 0) {
+        const piped = queryResult.pipedMessagesDuringQuery;
+        log(
+          `Query ended before ${piped.length} piped message(s) completed; re-enqueueing for a fresh query`,
+        );
+        requeueIpcMessages(piped);
+      }
+
       // Session resume 失败（SDK 无法恢复旧会话）：清除 session，以新会话重试
       // 同时从旧会话的 JSONL 转录中提取最近对话历史，注入到 prompt 中，
       // 避免新会话完全丢失上下文（类似 recoveryGroups 机制）。
@@ -2501,17 +2562,6 @@ async function main(): Promise<void> {
         }
         clearInterruptRequested();
         consecutiveCompactions = 0;
-
-        // Claude Code-style 排队行为：被中断的 query 已经消费了 pipe 进来的消息，
-        // 但这些消息尚未得到回复。将它们写回 IPC 目录作为新文件，通过 waitForIpcMessage
-        // 正常路径走下一个 query，避免 MCP server "Already connected" 问题 (#421)。
-        if (queryResult.pipedMessagesDuringQuery.length > 0) {
-          const piped = queryResult.pipedMessagesDuringQuery;
-          log(
-            `Query interrupted; re-enqueueing ${piped.length} queued message(s) to IPC`,
-          );
-          for (const msg of piped) requeueIpcMessage(msg);
-        }
 
         // 等待下一条消息（包括刚重新入队的 piped 消息）
         log('Query interrupted by user, waiting for next message');

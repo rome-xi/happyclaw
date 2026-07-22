@@ -232,6 +232,8 @@ export interface ContainerInput {
    * Used by per-channel MCP tools (discord_*, etc.) to identify the current
    * incoming chat. Undefined when chatJid already encodes the IM source. */
   currentSourceJid?: string;
+  /** During crash recovery, consume only this DB lane from shared-folder IPC. */
+  ipcRecoveryDatabaseJid?: string;
   /** @deprecated Use isHome + isAdminHome instead */
   isMain: boolean;
   turnId?: string;
@@ -275,6 +277,10 @@ export interface ContainerOutput {
   pendingBgTasks?: number;
   /** Internal acknowledgement emitted after the SDK query has actually begun. */
   ipcMessageIds?: string[];
+  /** IPC messages completed by the query generation that produced this result. */
+  ipcCompletedMessageIds?: string[];
+  /** Pulled IPC messages returned to the durable queue for a fresh query. */
+  ipcRequeuedMessageIds?: string[];
 }
 
 interface VolumeMount {

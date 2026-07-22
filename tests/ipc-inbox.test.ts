@@ -4,7 +4,9 @@ import path from 'path';
 import { afterEach, beforeEach, describe, expect, test } from 'vitest';
 
 import {
+  IpcCompletionTracker,
   IpcInbox,
+  shouldAcknowledgeQueryEvent,
   shouldStartFreshIpcTurn,
 } from '../container/agent-runner/src/ipc-inbox.js';
 
@@ -33,7 +35,7 @@ afterEach(() => {
 });
 
 describe('durable IPC inbox lifecycle', () => {
-  test('claim keeps the message durable until explicit acknowledgement', () => {
+  test('claim stays durable until the host retires it', () => {
     const queuedPath = writeMessage('msg-1');
 
     const claimed = inbox.claimAll();
@@ -45,8 +47,7 @@ describe('durable IPC inbox lifecycle', () => {
     expect(fs.existsSync(queuedPath)).toBe(false);
     expect(fs.existsSync(claimed[0].claimPath)).toBe(true);
 
-    expect(inbox.acknowledge(claimed)).toEqual(['msg-1']);
-    expect(fs.existsSync(claimed[0].claimPath)).toBe(false);
+    expect(fs.existsSync(claimed[0].claimPath)).toBe(true);
   });
 
   test('startup recovery returns a crashed claim to the visible queue', () => {
@@ -63,7 +64,7 @@ describe('durable IPC inbox lifecycle', () => {
   test('requeue recreates an already-acknowledged interrupted message once', () => {
     writeMessage('msg-3');
     const [claimed] = inbox.claimAll();
-    inbox.acknowledge([claimed]);
+    fs.unlinkSync(claimed.claimPath); // host ACK retirement
 
     inbox.requeue(claimed);
     inbox.requeue(claimed);
@@ -72,6 +73,65 @@ describe('durable IPC inbox lifecycle', () => {
       .filter((file) => file.endsWith('.json'));
     expect(files).toEqual(['msg-3.json']);
     expect(inbox.claimAll()[0].text).toBe('follow-up');
+  });
+
+  test('claim and requeue preserve DB ownership metadata', () => {
+    const cursor = {
+      id: 'db-message-1',
+      timestamp: '2026-07-22T04:00:00.000Z',
+    };
+    fs.writeFileSync(
+      path.join(inputDir, 'owned.json'),
+      JSON.stringify({
+        type: 'message',
+        messageId: 'owned',
+        text: 'from Feishu',
+        databaseJid: 'feishu:shared-workspace',
+        messageCursors: [cursor],
+      }),
+    );
+    const [claimed] = inbox.claimAll();
+    expect(claimed).toMatchObject({
+      databaseJid: 'feishu:shared-workspace',
+      messageCursors: [cursor],
+    });
+
+    fs.unlinkSync(claimed.claimPath); // host ACK retirement
+    inbox.requeue(claimed);
+    expect(inbox.claimAll()[0]).toMatchObject({
+      databaseJid: 'feishu:shared-workspace',
+      messageCursors: [cursor],
+    });
+  });
+
+  test('recovery claim filter leaves exact sibling JID envelopes queued', () => {
+    for (const [messageId, databaseJid] of [
+      ['feishu-message', 'feishu:shared-workspace'],
+      ['telegram-message', 'telegram:shared-workspace'],
+    ]) {
+      fs.writeFileSync(
+        path.join(inputDir, `${messageId}.json`),
+        JSON.stringify({
+          type: 'message',
+          messageId,
+          text: messageId,
+          databaseJid,
+        }),
+      );
+    }
+
+    expect(inbox.claimAll('feishu:shared-workspace')).toEqual([
+      expect.objectContaining({
+        messageId: 'feishu-message',
+        databaseJid: 'feishu:shared-workspace',
+      }),
+    ]);
+    expect(fs.existsSync(path.join(inputDir, 'telegram-message.json'))).toBe(
+      true,
+    );
+    expect(fs.existsSync(path.join(inputDir, 'feishu-message.json'))).toBe(
+      false,
+    );
   });
 
   test('invalid envelopes are retired rather than blocking the queue', () => {
@@ -93,10 +153,24 @@ describe('durable IPC inbox lifecycle', () => {
     const [claimed] = inbox.claimAll();
     expect(claimed.messageId).toBe('safe-file');
 
-    inbox.acknowledge([claimed]);
+    fs.unlinkSync(claimed.claimPath); // host ACK retirement
     inbox.requeue(claimed);
     expect(fs.existsSync(path.join(inputDir, 'safe-file.json'))).toBe(true);
     expect(fs.existsSync(path.join(root, 'outside.json'))).toBe(false);
+  });
+});
+
+describe('query-start acknowledgement evidence', () => {
+  test('provider init is positive acceptance evidence', () => {
+    expect(shouldAcknowledgeQueryEvent('init')).toBe(true);
+  });
+
+  test('OpenAI HTTP error status never acknowledges the message', () => {
+    expect(shouldAcknowledgeQueryEvent('status')).toBe(false);
+  });
+
+  test('a generator return without init never acknowledges the message', () => {
+    expect(shouldAcknowledgeQueryEvent('result')).toBe(false);
   });
 });
 
@@ -111,5 +185,27 @@ describe('post-result IPC turn routing', () => {
 
   test('pre-result messages continue using active pipe-in', () => {
     expect(shouldStartFreshIpcTurn(0, 0, true)).toBe(false);
+  });
+});
+
+describe('IPC completion/result correlation', () => {
+  test('initial claims complete with the first accepted result', () => {
+    const tracker = new IpcCompletionTracker();
+    tracker.trackInitial(['initial']);
+    expect(tracker.advanceResult()).toEqual(['initial']);
+  });
+
+  test('a pulled pipe-in is not completed by the older turn result', () => {
+    const tracker = new IpcCompletionTracker();
+    tracker.trackPiped(['follow-up']);
+    expect(tracker.advanceResult()).toEqual([]);
+    expect(tracker.advanceResult()).toEqual(['follow-up']);
+  });
+
+  test('an interrupted result never completes a pulled pipe-in', () => {
+    const tracker = new IpcCompletionTracker();
+    tracker.trackPiped(['follow-up']);
+    expect(tracker.advanceResult(false)).toEqual([]);
+    expect(tracker.advanceResult(false)).toEqual([]);
   });
 });

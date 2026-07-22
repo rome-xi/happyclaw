@@ -2,12 +2,41 @@ import { describe, expect, test, vi } from 'vitest';
 
 import {
   ClaudeEngine,
+  MessageStream,
   type ClaudeEngineOptions,
 } from '../container/agent-runner/src/engines/claude-engine.js';
 import type {
   EngineSendResult,
   EngineConfig,
 } from '../container/agent-runner/src/engines/types.js';
+
+describe('Claude MessageStream consumption acknowledgement', () => {
+  test('does not acknowledge on push and acknowledges only when SDK pulls', async () => {
+    const stream = new MessageStream();
+    const onConsumed = vi.fn();
+
+    expect(stream.push('follow-up', undefined, onConsumed)).toEqual([]);
+    expect(onConsumed).not.toHaveBeenCalled();
+
+    const iterator = stream[Symbol.asyncIterator]();
+    const next = await iterator.next();
+    expect(next.done).toBe(false);
+    expect(next.value.message.content).toBe('follow-up');
+    expect(onConsumed).toHaveBeenCalledTimes(1);
+
+    stream.end();
+    await iterator.return?.(undefined);
+  });
+
+  test('rejected pushes never acknowledge', () => {
+    const stream = new MessageStream();
+    const onConsumed = vi.fn();
+    stream.end();
+
+    expect(stream.push('late', undefined, onConsumed)).toHaveLength(1);
+    expect(onConsumed).not.toHaveBeenCalled();
+  });
+});
 
 describe('ClaudeEngine Workflow lifecycle', () => {
   test('keeps the SDK iterator alive, reports both turns, and bills usage deltas', async () => {

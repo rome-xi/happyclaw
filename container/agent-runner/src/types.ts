@@ -18,6 +18,8 @@ export interface ContainerInput {
    * Used by per-channel MCP tools (discord_*, etc.) to identify the current
    * incoming chat. Undefined when chatJid already encodes the IM source. */
   currentSourceJid?: string;
+  /** During crash recovery, consume only this DB lane from shared-folder IPC. */
+  ipcRecoveryDatabaseJid?: string;
   /** @deprecated Use isHome + isAdminHome instead. Kept for backward compatibility with older host processes. */
   isMain?: boolean;
   /** Whether this is the user's home container (admin or member). */
@@ -52,7 +54,15 @@ export interface ContainerOutput {
   turnId?: string;
   sessionId?: string;
   sdkMessageUuid?: string;
-  sourceKind?: 'sdk_final' | 'sdk_send_message' | 'interrupt_partial' | 'overflow_partial' | 'compact_partial' | 'legacy' | 'auto_continue' | 'truncation_continue';
+  sourceKind?:
+    | 'sdk_final'
+    | 'sdk_send_message'
+    | 'interrupt_partial'
+    | 'overflow_partial'
+    | 'compact_partial'
+    | 'legacy'
+    | 'auto_continue'
+    | 'truncation_continue';
   /** 'truncated'：上游断流截断的 partial（usage 双零指纹，runner 会自动续写） */
   finalizationReason?: 'completed' | 'interrupted' | 'error' | 'truncated';
   /** 本 result 发出时仍未 settle 的后台任务数（异步 Agent / backgrounded Bash）。
@@ -62,6 +72,10 @@ export interface ContainerOutput {
   /** Internal host acknowledgement: these IPC messages reached a real SDK
    * query event. Never forwarded as user-visible content. */
   ipcMessageIds?: string[];
+  /** IPC messages completed by the query generation that produced this result. */
+  ipcCompletedMessageIds?: string[];
+  /** Pulled IPC messages returned to the durable queue for a fresh query. */
+  ipcRequeuedMessageIds?: string[];
 }
 
 export interface SessionEntry {
@@ -75,7 +89,11 @@ export interface SessionsIndex {
   entries: SessionEntry[];
 }
 
-export type ImageMediaType = 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
+export type ImageMediaType =
+  | 'image/jpeg'
+  | 'image/png'
+  | 'image/gif'
+  | 'image/webp';
 
 export interface SDKUserMessage {
   type: 'user';
@@ -83,7 +101,17 @@ export interface SDKUserMessage {
     role: 'user';
     content:
       | string
-      | Array<{ type: 'text'; text: string } | { type: 'image'; source: { type: 'base64'; media_type: ImageMediaType; data: string } }>;
+      | Array<
+          | { type: 'text'; text: string }
+          | {
+              type: 'image';
+              source: {
+                type: 'base64';
+                media_type: ImageMediaType;
+                data: string;
+              };
+            }
+        >;
   };
   parent_tool_use_id: null;
   session_id: string;

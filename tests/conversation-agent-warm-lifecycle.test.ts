@@ -32,6 +32,8 @@ function seedRunner(q: GroupQueue, jid: string, opts: SeedOpts = {}) {
     lastActivityAt: opts.lastActivityAt ?? null,
     queryInFlight: opts.queryInFlight ?? false,
     pendingIpcMessageIds: new Set<string>(),
+    ipcDeliveryMetadata: new Map(),
+    completedIpcMessageIds: new Set<string>(),
     ipcAwaitingAckSince: null,
     pendingMessages: false,
     pendingTasks: [],
@@ -41,12 +43,14 @@ function seedRunner(q: GroupQueue, jid: string, opts: SeedOpts = {}) {
     groupFolder: opts.groupFolder ?? 'main',
     agentId: opts.agentId ?? null,
     taskRunId: null,
+    ipcDatabaseJidFilter: null,
     retryCount: 0,
     retryTimer: null,
     restarting: false,
     selectedProviderId: null,
     drainSentinelWritten: false,
     hasIpcInjectedMessages: false,
+    ipcInjectedDatabaseJids: new Set<string>(),
   });
 }
 
@@ -81,6 +85,43 @@ describe('PR #547: conversation agent stays warm after final reply', () => {
     expect(q.hasActiveMainRunnerForMessage(jid)).toBe(true);
   });
 
+  test('recovery-pinned shared runner rejects a sibling DB lane', () => {
+    const q = new GroupQueue();
+    const feishuJid = `feishu:${folder}`;
+    const telegramJid = `telegram:${folder}`;
+    q.setSerializationKeyResolver(() => folder);
+    seedRunner(q, feishuJid, { groupFolder: folder });
+    getState(q, feishuJid).ipcDatabaseJidFilter = feishuJid;
+
+    expect(
+      q.sendMessage(
+        telegramJid,
+        'must wait for its own recovery runner',
+        undefined,
+        undefined,
+        telegramJid,
+        { databaseJid: telegramJid, messageCursors: [] },
+      ),
+    ).toBe('no_active');
+    const inputDir = path.join(ipcDir, 'input');
+    expect(fs.existsSync(inputDir)).toBe(false);
+  });
+
+  test('registering a recovery-pinned runner makes it one-shot', () => {
+    const q = new GroupQueue();
+    const jid = `feishu:${folder}`;
+    seedRunner(q, jid, { groupFolder: folder });
+
+    q.registerProcess(jid, {} as never, {
+      containerName: null,
+      groupFolder: folder,
+      ipcDatabaseJidFilter: jid,
+    });
+
+    expect(fs.existsSync(path.join(ipcDir, 'input', '_drain'))).toBe(true);
+    expect(getState(q, jid).drainSentinelWritten).toBe(true);
+  });
+
   test('a hung post-reply tool call does not strand the runner: next message reuses the warm process', () => {
     const q = new GroupQueue();
     const jid = `web:${folder}`;
@@ -90,7 +131,18 @@ describe('PR #547: conversation agent stays warm after final reply', () => {
     q.markRunnerQueryIdle(jid);
 
     // The next user message is piped into the SAME warm runner via IPC.
-    const result = q.sendMessage(jid, 'follow-up message');
+    const cursor = {
+      id: 'follow-up-db-id',
+      timestamp: '2026-07-22T00:00:00.000Z',
+    };
+    const result = q.sendMessage(
+      jid,
+      'follow-up message',
+      undefined,
+      undefined,
+      jid,
+      { databaseJid: jid, messageCursors: [cursor] },
+    );
     expect(result).toBe('sent');
     // sendMessage flips queryInFlight back to true: the warm runner picked it up.
     expect(getState(q, jid).queryInFlight).toBe(true);
@@ -103,6 +155,8 @@ describe('PR #547: conversation agent stays warm after final reply', () => {
       fs.readFileSync(path.join(inputDir, files[0]), 'utf8'),
     );
     expect(payload.messageId).toBe(files[0].replace(/\.json$/, ''));
+    expect(payload.databaseJid).toBe(jid);
+    expect(payload.messageCursors).toEqual([cursor]);
     expect(
       (getState(q, jid).pendingIpcMessageIds as Set<string>).has(
         payload.messageId,
@@ -126,8 +180,42 @@ describe('PR #547: conversation agent stays warm after final reply', () => {
     expect(q.getStuckPendingGroups(180_000, 30_000)).toEqual([
       expect.objectContaining({ jid }),
     ]);
+    expect(q.takeCompletedIpcDeliveries(jid)).toEqual([]);
 
+    const inputDir = path.join(ipcDir, 'input');
+    const inflightDir = path.join(inputDir, 'inflight');
+    fs.mkdirSync(inflightDir, { recursive: true });
+    const queued = fs
+      .readdirSync(inputDir)
+      .find((file) => file.endsWith('.json'))!;
+    fs.renameSync(path.join(inputDir, queued), path.join(inflightDir, queued));
     q.markIpcMessagesStarted(jid, ids);
+    expect(fs.readdirSync(inflightDir)).toEqual([]);
+    expect(q.takeCompletedIpcDeliveries(jid)).toEqual([]);
+    expect(state.hasIpcInjectedMessages).toBe(true);
+
+    // A pipe-in can be pulled by an older query that returns before the
+    // follow-up's completion boundary. Requeue restores watchdog coverage.
+    q.markIpcMessagesRequeued(jid, ids);
+    expect(state.pendingIpcMessageIds).toEqual(new Set(ids));
+    expect(state.ipcAwaitingAckSince).toEqual(expect.any(Number));
+    state.ipcAwaitingAckSince = Date.now() - 31_000;
+    expect(q.getStuckPendingGroups(180_000, 30_000)).toEqual([
+      expect.objectContaining({ jid }),
+    ]);
+
+    fs.writeFileSync(
+      path.join(inflightDir, `${ids[0]}.json`),
+      JSON.stringify({ type: 'message', messageId: ids[0], text: 'retry' }),
+    );
+    q.markIpcMessagesStarted(jid, ids);
+    expect(state.pendingIpcMessageIds).toEqual(new Set());
+
+    q.markIpcMessagesCompleted(jid, ids);
+    expect(q.takeCompletedIpcDeliveries(jid)).toEqual([
+      { databaseJid: jid, messageCursors: [] },
+    ]);
+    expect(state.hasIpcInjectedMessages).toBe(false);
     expect(state.ipcAwaitingAckSince).toBeNull();
     expect(q.getStuckPendingGroups(180_000, 30_000)).toEqual([]);
   });
@@ -218,31 +306,113 @@ describe('PR #547: conversation agent stays warm after final reply', () => {
 
   test('DB recovery discards duplicate queued and inflight IPC envelopes only', () => {
     const q = new GroupQueue();
+    const databaseJid = `web:${folder}`;
+    const siblingJid = `feishu:${folder}`;
     const inputDir = path.join(ipcDir, 'input');
     const inflightDir = path.join(inputDir, 'inflight');
     fs.mkdirSync(inflightDir, { recursive: true });
-    fs.writeFileSync(path.join(inputDir, 'queued.json'), '{}');
-    fs.writeFileSync(path.join(inflightDir, 'claimed.json'), '{}');
+    const cursor1 = { id: 'db-1', timestamp: '2026-07-22T01:00:00.000Z' };
+    const cursor2 = { id: 'db-2', timestamp: '2026-07-22T01:00:01.000Z' };
+    const cursor3 = { id: 'db-3', timestamp: '2026-07-22T01:00:02.000Z' };
+    fs.writeFileSync(
+      path.join(inputDir, 'queued.json'),
+      JSON.stringify({ databaseJid, messageCursors: [cursor1] }),
+    );
+    fs.writeFileSync(
+      path.join(inflightDir, 'claimed.json'),
+      JSON.stringify({ databaseJid, messageCursors: [cursor2] }),
+    );
+    fs.writeFileSync(
+      path.join(inputDir, 'sibling.json'),
+      JSON.stringify({ databaseJid: siblingJid, messageCursors: [cursor1] }),
+    );
+    fs.writeFileSync(
+      path.join(inputDir, 'not-replayed.json'),
+      JSON.stringify({ databaseJid, messageCursors: [cursor3] }),
+    );
     fs.writeFileSync(path.join(inputDir, '_close'), '');
 
-    expect(q.discardRecoveredIpcInput(folder)).toBe(2);
-    expect(q.hasUnconsumedIpcInput(folder)).toBe(false);
+    expect(
+      q.discardRecoveredIpcInput(folder, databaseJid, [cursor1, cursor2]),
+    ).toBe(2);
+    expect(q.hasUnconsumedIpcInput(folder)).toBe(true);
+    expect(q.getUnconsumedIpcDatabaseJids(folder, databaseJid)).toEqual(
+      new Set([databaseJid, siblingJid]),
+    );
+    expect(fs.existsSync(path.join(inputDir, 'sibling.json'))).toBe(true);
+    expect(fs.existsSync(path.join(inputDir, 'not-replayed.json'))).toBe(true);
     expect(fs.existsSync(path.join(inputDir, '_close'))).toBe(true);
+  });
+
+  test('shared-folder runner exit replays the injected sibling DB lane', async () => {
+    const q = new GroupQueue();
+    const webJid = `web:${folder}`;
+    const feishuJid = `feishu:${folder}`;
+    q.setSerializationKeyResolver(() => folder);
+
+    let resolveSiblingRun!: () => void;
+    const siblingRun = new Promise<void>((resolve) => {
+      resolveSiblingRun = resolve;
+    });
+    q.setProcessMessagesFn(async (jid) => {
+      const state = getState(q, jid);
+      state.groupFolder = folder;
+      if (jid === webJid) {
+        expect(
+          q.sendMessage(
+            feishuJid,
+            'message from Feishu',
+            undefined,
+            undefined,
+            feishuJid,
+            {
+              databaseJid: feishuJid,
+              messageCursors: [
+                { id: 'feishu-db-1', timestamp: '2026-07-22T03:00:00.000Z' },
+              ],
+            },
+          ),
+        ).toBe('sent');
+      } else if (jid === feishuJid) {
+        expect(q.needsIpcRecoveryReplay(feishuJid)).toBe(true);
+        const inputDir = path.join(ipcDir, 'input');
+        for (const file of fs.readdirSync(inputDir)) {
+          if (file.endsWith('.json')) fs.unlinkSync(path.join(inputDir, file));
+        }
+        q.clearIpcRecoveryReplay(feishuJid);
+        resolveSiblingRun();
+      }
+      return true;
+    });
+
+    q.enqueueMessageCheck(webJid);
+    await siblingRun;
   });
 
   test('conversation-agent DB recovery uses its isolated IPC lane', () => {
     const q = new GroupQueue();
     const agentId = 'recover-agent';
+    const databaseJid = `web:${folder}#agent:${agentId}`;
+    const cursor1 = { id: 'agent-1', timestamp: '2026-07-22T02:00:00.000Z' };
+    const cursor2 = { id: 'agent-2', timestamp: '2026-07-22T02:00:01.000Z' };
     const agentInputDir = path.join(ipcDir, 'agents', agentId, 'input');
     fs.mkdirSync(path.join(agentInputDir, 'inflight'), { recursive: true });
-    fs.writeFileSync(path.join(agentInputDir, 'queued.json'), '{}');
+    fs.writeFileSync(
+      path.join(agentInputDir, 'queued.json'),
+      JSON.stringify({ databaseJid, messageCursors: [cursor1] }),
+    );
     fs.writeFileSync(
       path.join(agentInputDir, 'inflight', 'claimed.json'),
-      '{}',
+      JSON.stringify({ databaseJid, messageCursors: [cursor2] }),
     );
 
     expect(q.hasUnconsumedAgentIpcInput(folder, agentId)).toBe(true);
-    expect(q.discardRecoveredAgentIpcInput(folder, agentId)).toBe(2);
+    expect(
+      q.discardRecoveredAgentIpcInput(folder, agentId, databaseJid, [
+        cursor1,
+        cursor2,
+      ]),
+    ).toBe(2);
     expect(q.hasUnconsumedAgentIpcInput(folder, agentId)).toBe(false);
   });
 
