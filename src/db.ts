@@ -4692,7 +4692,7 @@ export function updateAgentContextInfo(
 export function deleteCompletedAgents(beforeTimestamp: string): number {
   const result = db
     .prepare(
-      "DELETE FROM agents WHERE kind IN ('task', 'spawn') AND status IN ('completed', 'error') AND completed_at IS NOT NULL AND completed_at < ?",
+      "DELETE FROM agents WHERE kind IN ('task', 'spawn', 'background') AND status IN ('completed', 'error') AND completed_at IS NOT NULL AND completed_at < ?",
     )
     .run(beforeTimestamp);
   return result.changes;
@@ -4730,10 +4730,9 @@ export function markAllRunningTaskAgentsAsError(
 }
 
 /**
- * Mark stale spawn agents (idle/running) as error at startup.
- * After a process restart, spawn agents that were idle or running can never
- * resume — their in-memory task callbacks are lost. Mark them as error so
- * they don't render as "正在思考..." in the frontend.
+ * Mark stale fire-and-forget agents (spawn/background) as error at startup.
+ * After a process restart, agents that were idle or running can never resume
+ * because their in-memory task callbacks are lost.
  */
 export function markStaleSpawnAgentsAsError(
   summary = '进程重启，并行任务中断',
@@ -4741,7 +4740,7 @@ export function markStaleSpawnAgentsAsError(
   const now = new Date().toISOString();
   const result = db
     .prepare(
-      "UPDATE agents SET status = 'error', completed_at = ?, result_summary = COALESCE(result_summary, ?) WHERE kind = 'spawn' AND status IN ('idle', 'running')",
+      "UPDATE agents SET status = 'error', completed_at = ?, result_summary = COALESCE(result_summary, ?) WHERE kind IN ('spawn', 'background') AND status IN ('idle', 'running')",
     )
     .run(now, summary);
   return result.changes;

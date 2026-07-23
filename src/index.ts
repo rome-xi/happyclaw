@@ -137,6 +137,7 @@ import {
   resolveBroadcastFolder,
   resolveTaskRoutingDecision,
 } from './task-routing.js';
+import { resolveBackgroundJobWorkspaceJid } from './background-job-routing.js';
 import {
   initializeCommittedCursorMap,
   messageCursorForRead,
@@ -2963,6 +2964,7 @@ function createBackgroundJob(params: {
   prompt: string;
   name?: string;
   dispatchedFromAgentJid: string;
+  sourceImJid?: string | null;
 }): BackgroundJobResult {
   const {
     homeChatJid,
@@ -2970,6 +2972,7 @@ function createBackgroundJob(params: {
     userId,
     prompt,
     dispatchedFromAgentJid,
+    sourceImJid,
   } = params;
   const now = new Date().toISOString();
   const agentId = crypto.randomUUID();
@@ -2991,7 +2994,7 @@ function createBackgroundJob(params: {
     created_at: now,
     completed_at: null,
     result_summary: null,
-    last_im_jid: null,
+    last_im_jid: sourceImJid ?? null,
     // Reuse the spawn result-injection path: the final answer surfaces back in
     // the dispatching chat for visibility (the foreground also polls progress).
     spawned_from_jid: dispatchedFromAgentJid,
@@ -3012,6 +3015,7 @@ function createBackgroundJob(params: {
     prompt,
     now,
     false,
+    sourceImJid ? { sourceJid: sourceImJid } : undefined,
   );
   broadcastNewMessage(virtualChatJid, {
     id: messageId,
@@ -3043,6 +3047,7 @@ function createBackgroundJob(params: {
       agentId,
       userId,
       dispatchedFromAgentJid,
+      sourceImJid,
       folder: effectiveGroup.folder,
     },
     'dispatch_background_job: background job created and enqueued',
@@ -6640,7 +6645,9 @@ function serializeBackgroundJob(
     jobId: row.id,
     shortId: row.id.slice(0, 4),
     name: row.name,
-    status: row.status,
+    // DB "idle" means enqueued but not started. Expose the honest lifecycle
+    // name to the model/user instead of implying an inactive worker.
+    status: row.status === 'idle' ? 'queued' : row.status,
     progress: row.progress_summary,
     progressPct: row.progress_pct,
     progressUpdatedAt: row.progress_updated_at,
@@ -7176,25 +7183,40 @@ async function processTaskIpc(
           break;
         }
         const { effectiveGroup } = resolveEffectiveGroup(sourceGroupEntry);
-        // Phase 1-B unlock: prefer the originating chat jid so non-home
-        // workspaces work too. Home workspaces stamp web:{folder} (jid ===
-        // web:{folder}, unchanged behavior); non-home stamp their real jid
-        // (e.g. web:{uuid}), which the old `web:${folder}` guess never matched
-        // — that mismatch left processAgentConversation unable to find the
-        // group and the job stuck idle. Validate the stamped jid actually
-        // belongs to this source workspace before trusting it; otherwise fall
-        // back to the legacy derivation.
-        const stampedJid = data.chatJid;
-        const stampedEntry = stampedJid
-          ? (registeredGroups[stampedJid] ?? getRegisteredGroup(stampedJid))
-          : undefined;
-        const homeChatJid =
-          stampedJid && stampedEntry?.folder === effectiveGroup.folder
-            ? stampedJid
-            : `web:${effectiveGroup.folder}`;
+        const homeChatJid = resolveBackgroundJobHomeJid(
+          data.chatJid,
+          effectiveGroup.folder,
+        );
+        if (!homeChatJid) {
+          writeTaskIpcResult(
+            sourceGroup,
+            ipcAgentId,
+            'dispatch_job_result',
+            requestId,
+            {
+              success: false,
+              error: 'cannot resolve canonical workspace route',
+            },
+          );
+          logger.error(
+            {
+              sourceGroup,
+              stampedJid: data.chatJid,
+              expectedFolder: effectiveGroup.folder,
+            },
+            'dispatch_background_job: workspace route not found',
+          );
+          break;
+        }
         const dispatchedFromAgentJid = ipcAgentId
           ? `${homeChatJid}#agent:${ipcAgentId}`
           : homeChatJid;
+        const sourceImJid = resolveImRoute({
+          ipcAgentId,
+          isHome,
+          chatJid: homeChatJid,
+          sourceGroup,
+        });
         const job = createBackgroundJob({
           homeChatJid,
           effectiveGroup,
@@ -7202,6 +7224,7 @@ async function processTaskIpc(
           prompt,
           name: data.name,
           dispatchedFromAgentJid,
+          sourceImJid,
         });
         writeTaskIpcResult(
           sourceGroup,
@@ -7266,9 +7289,26 @@ async function processTaskIpc(
       const requestId = data.requestId;
       if (!requestId || !SAFE_REQUEST_ID_RE.test(requestId)) break;
       try {
-        const homeChatJid = sourceGroupEntry
-          ? `web:${resolveEffectiveGroup(sourceGroupEntry).effectiveGroup.folder}`
-          : `web:${sourceGroup}`;
+        const expectedFolder = sourceGroupEntry
+          ? resolveEffectiveGroup(sourceGroupEntry).effectiveGroup.folder
+          : sourceGroup;
+        const homeChatJid = resolveBackgroundJobHomeJid(
+          data.chatJid,
+          expectedFolder,
+        );
+        if (!homeChatJid) {
+          writeTaskIpcResult(
+            sourceGroup,
+            ipcAgentId,
+            'get_background_jobs_result',
+            requestId,
+            {
+              success: false,
+              error: 'cannot resolve canonical workspace route',
+            },
+          );
+          break;
+        }
         const dispatchedFrom = ipcAgentId
           ? `${homeChatJid}#agent:${ipcAgentId}`
           : homeChatJid;
@@ -7836,7 +7876,29 @@ async function processAgentConversation(
     registeredGroups = getAllRegisteredGroups();
     group = registeredGroups[chatJid];
   }
-  if (!group) return;
+  if (!group) {
+    const error = '后台任务路由失效：找不到所属工作区';
+    if (
+      isSpawnKind(agent.kind) &&
+      (agent.status === 'idle' || agent.status === 'running')
+    ) {
+      updateAgentStatus(agentId, 'error', error);
+      broadcastAgentStatus(
+        agent.chat_jid,
+        agentId,
+        'error',
+        agent.name,
+        agent.prompt,
+        error,
+        agent.kind,
+      );
+    }
+    logger.error(
+      { chatJid, agentId, kind: agent.kind },
+      'processAgentConversation: workspace route not found',
+    );
+    return;
+  }
 
   const { effectiveGroup } = resolveEffectiveGroup(group);
 
@@ -10400,6 +10462,19 @@ function resolveWorkspaceJid(targetMainJid: string): string | null {
     : null;
 }
 
+function resolveBackgroundJobHomeJid(
+  stampedJid: string | undefined,
+  expectedFolder: string,
+): string | null {
+  return resolveBackgroundJobWorkspaceJid({
+    stampedJid,
+    expectedFolder,
+    getGroup: (jid) => registeredGroups[jid] ?? getRegisteredGroup(jid),
+    getAgentChatJid: (agentId) => getAgent(agentId)?.chat_jid,
+    resolveWorkspaceJid,
+  });
+}
+
 function buildFeishuThreadRouteJid(
   chatJid: string,
   threadId: string,
@@ -11198,7 +11273,7 @@ async function main(): Promise<void> {
   initDatabase();
   logger.info('Database initialized');
 
-  // Clean up stale completed agents (task + spawn, older than 1 hour) to prevent DB bloat
+  // Clean up stale completed agents (task/spawn/background) to prevent DB bloat.
   try {
     const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
     const cleaned = deleteCompletedAgents(oneHourAgo);
@@ -11223,12 +11298,15 @@ async function main(): Promise<void> {
     logger.warn({ err }, 'Failed to mark stale running tasks at startup');
   }
 
-  // Spawn agents (from /sw) lose their in-memory task callbacks on restart.
-  // Mark idle/running spawn agents as error so they don't render as "正在思考...".
+  // Fire-and-forget agents lose their in-memory callbacks on restart.
+  // Mark stale spawn/background jobs as error instead of pretending they run.
   try {
     const marked = markStaleSpawnAgentsAsError();
     if (marked > 0) {
-      logger.warn({ marked }, 'Marked stale spawn agents as error at startup');
+      logger.warn(
+        { marked },
+        'Marked stale spawn/background agents as error at startup',
+      );
     }
   } catch (err) {
     logger.warn({ err }, 'Failed to mark stale spawn agents at startup');
@@ -11890,7 +11968,7 @@ async function main(): Promise<void> {
     60 * 60 * 1000,
   );
 
-  // Periodically clean completed agents (task + spawn, every 10 minutes)
+  // Periodically clean completed agents (task/spawn/background).
   setInterval(
     () => {
       try {

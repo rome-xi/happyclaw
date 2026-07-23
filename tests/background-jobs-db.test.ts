@@ -21,6 +21,7 @@ const {
   listBackgroundAgents,
   getBackgroundJob,
   updateAgentDispatchedFrom,
+  markStaleSpawnAgentsAsError,
 } = await import('../src/db.js');
 
 const dbPath = path.join(tmpStoreDir, 'messages.db');
@@ -31,17 +32,19 @@ function insertAgent(row: {
   chat_jid: string;
   kind: string;
   name?: string;
+  status?: string;
   dispatched_from_agent_jid?: string | null;
 }) {
   wdb
     .prepare(
       `INSERT INTO agents (id, group_folder, chat_jid, name, prompt, status, created_at, kind, dispatched_from_agent_jid)
-       VALUES (@id, 'home-x', @chat_jid, @name, 'p', 'running', @created_at, @kind, @dispatched_from_agent_jid)`,
+       VALUES (@id, 'home-x', @chat_jid, @name, 'p', @status, @created_at, @kind, @dispatched_from_agent_jid)`,
     )
     .run({
       id: row.id,
       chat_jid: row.chat_jid,
       name: row.name ?? row.id,
+      status: row.status ?? 'running',
       created_at: new Date().toISOString(),
       kind: row.kind,
       dispatched_from_agent_jid: row.dispatched_from_agent_jid ?? null,
@@ -145,5 +148,46 @@ describe('Phase-1 background-job progress DB layer', () => {
     // And it becomes discoverable via the mine-only filter.
     const mine = listBackgroundAgents('web:home-x', 'web:home-x#agent:fg2');
     expect(mine.map((j) => j.id)).toContain('bgD');
+  });
+
+  test('startup reconciliation marks stale spawn and background jobs as error', () => {
+    insertAgent({
+      id: 'queued-bg',
+      chat_jid: 'web:home-x',
+      kind: 'background',
+      status: 'idle',
+    });
+    insertAgent({
+      id: 'running-spawn',
+      chat_jid: 'web:home-x',
+      kind: 'spawn',
+    });
+    insertAgent({
+      id: 'idle-conversation',
+      chat_jid: 'web:home-x',
+      kind: 'conversation',
+      status: 'idle',
+    });
+
+    expect(markStaleSpawnAgentsAsError()).toBe(2);
+
+    const rows = wdb
+      .prepare(
+        "SELECT id, status, completed_at FROM agents WHERE id IN ('queued-bg', 'running-spawn', 'idle-conversation')",
+      )
+      .all() as Array<{
+      id: string;
+      status: string;
+      completed_at: string | null;
+    }>;
+    const byId = Object.fromEntries(rows.map((row) => [row.id, row]));
+    expect(byId['queued-bg'].status).toBe('error');
+    expect(byId['queued-bg'].completed_at).toEqual(expect.any(String));
+    expect(byId['running-spawn'].status).toBe('error');
+    expect(byId['running-spawn'].completed_at).toEqual(expect.any(String));
+    expect(byId['idle-conversation']).toMatchObject({
+      status: 'idle',
+      completed_at: null,
+    });
   });
 });
