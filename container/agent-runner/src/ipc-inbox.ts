@@ -18,8 +18,9 @@ function safeMessageId(value: unknown, fallback: string): string {
     : fallback.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 160);
 }
 
-/** A completed foreground result owns no later messages, except while the same
- * SDK stream is intentionally waiting for background-task completion. */
+/** A completed foreground result may yield to a queued, separate IPC turn.
+ * Before that boundary the queued envelope remains on disk and is never piped
+ * into the active SDK stream. */
 export function shouldStartFreshIpcTurn(
   resultCount: number,
   pendingBackgroundTasks: number,
@@ -46,35 +47,34 @@ export function getTerminalEngineError(result: {
 }
 
 /**
- * Correlates initial IPC claims with the first result of their fresh query.
- * Pipe-ins are deliberately excluded: the Claude SDK exposes consumption but
- * no causal link from a piped user message to a later Workflow result. They
- * remain in `pipedMessagesDuringQuery` and are durably requeued after the old
- * query ends, then enter this tracker as initial claims on the next query.
+ * Owns completion IDs for one logical user turn, including every truncation,
+ * compaction, and automatic continuation query in that turn. IDs stay pending
+ * across intermediate results and are released together by the first healthy
+ * terminal result.
  */
 export class IpcCompletionTracker {
   private ordinal = 0;
-  private readonly targets = new Map<string, number>();
+  private readonly pendingMessageIds = new Set<string>();
 
   get resultCount(): number {
     return this.ordinal;
   }
 
+  get hasPending(): boolean {
+    return this.pendingMessageIds.size > 0;
+  }
+
   trackInitial(messageIds: string[]): void {
     for (const messageId of messageIds) {
-      this.targets.set(messageId, this.ordinal + 1);
+      this.pendingMessageIds.add(messageId);
     }
   }
 
   advanceResult(allowCompletion = true): string[] {
     this.ordinal++;
     if (!allowCompletion) return [];
-    const completed: string[] = [];
-    for (const [messageId, target] of this.targets) {
-      if (target > this.ordinal) continue;
-      completed.push(messageId);
-      this.targets.delete(messageId);
-    }
+    const completed = [...this.pendingMessageIds];
+    this.pendingMessageIds.clear();
     return completed;
   }
 }

@@ -4,6 +4,7 @@ import path from 'path';
 
 import { GroupQueue } from '../src/group-queue.js';
 import { DATA_DIR } from '../src/config.js';
+import { IpcCompletionTracker } from '../container/agent-runner/src/ipc-inbox.js';
 
 // Regression coverage for PR #547: conversation agents must stay WARM after a
 // final reply (reclaimed by IDLE_TIMEOUT), instead of being closed every turn.
@@ -144,10 +145,12 @@ describe('PR #547: conversation agent stays warm after final reply', () => {
       { databaseJid: jid, messageCursors: [cursor] },
     );
     expect(result).toBe('sent');
-    // sendMessage flips queryInFlight back to true: the warm runner picked it up.
+    // sendMessage flips queryInFlight back to true: durable follow-up work is
+    // pending, but the active SDK query must not consume it.
     expect(getState(q, jid).queryInFlight).toBe(true);
 
-    // The IPC file was written to the warm runner's input dir (reuse, not respawn).
+    // The IPC file stays in the warm runner's input dir until a fresh turn
+    // claims it (process reuse, without active-query pipe-in).
     const inputDir = path.join(ipcDir, 'input');
     const files = fs.readdirSync(inputDir).filter((f) => f.endsWith('.json'));
     expect(files.length).toBe(1);
@@ -168,8 +171,17 @@ describe('PR #547: conversation agent stays warm after final reply', () => {
     const q = new GroupQueue();
     const jid = `web:${folder}`;
     seedRunner(q, jid, { groupFolder: folder, queryInFlight: false });
+    const deliveryCursor = {
+      id: 'continued-db-message',
+      timestamp: '2026-07-23T00:00:00.000Z',
+    };
 
-    expect(q.sendMessage(jid, 'must not be swallowed')).toBe('sent');
+    expect(
+      q.sendMessage(jid, 'must not be swallowed', undefined, undefined, jid, {
+        databaseJid: jid,
+        messageCursors: [deliveryCursor],
+      }),
+    ).toBe('sent');
     const state = getState(q, jid);
     const ids = [...(state.pendingIpcMessageIds as Set<string>)];
     expect(ids).toHaveLength(1);
@@ -194,26 +206,15 @@ describe('PR #547: conversation agent stays warm after final reply', () => {
     expect(q.takeCompletedIpcDeliveries(jid)).toEqual([]);
     expect(state.hasIpcInjectedMessages).toBe(true);
 
-    // A pipe-in can be pulled by an older query that returns before the
-    // follow-up's completion boundary. Requeue restores watchdog coverage.
-    q.markIpcMessagesRequeued(jid, ids);
-    expect(state.pendingIpcMessageIds).toEqual(new Set(ids));
-    expect(state.ipcAwaitingAckSince).toEqual(expect.any(Number));
-    state.ipcAwaitingAckSince = Date.now() - 31_000;
-    expect(q.getStuckPendingGroups(180_000, 30_000)).toEqual([
-      expect.objectContaining({ jid }),
-    ]);
-
-    fs.writeFileSync(
-      path.join(inflightDir, `${ids[0]}.json`),
-      JSON.stringify({ type: 'message', messageId: ids[0], text: 'retry' }),
-    );
-    q.markIpcMessagesStarted(jid, ids);
-    expect(state.pendingIpcMessageIds).toEqual(new Set());
-
-    q.markIpcMessagesCompleted(jid, ids);
+    // Intermediate continuation output carries no completion ID. The final
+    // healthy result from the same logical turn releases it exactly once.
+    const logicalTurn = new IpcCompletionTracker();
+    logicalTurn.trackInitial(ids);
+    expect(logicalTurn.advanceResult(false)).toEqual([]);
+    expect(q.takeCompletedIpcDeliveries(jid)).toEqual([]);
+    q.markIpcMessagesCompleted(jid, logicalTurn.advanceResult(true));
     expect(q.takeCompletedIpcDeliveries(jid)).toEqual([
-      { databaseJid: jid, messageCursors: [] },
+      { databaseJid: jid, messageCursors: [deliveryCursor] },
     ]);
     expect(state.hasIpcInjectedMessages).toBe(false);
     expect(state.ipcAwaitingAckSince).toBeNull();

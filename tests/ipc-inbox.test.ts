@@ -179,12 +179,69 @@ describe('post-result IPC turn routing', () => {
     expect(shouldStartFreshIpcTurn(1, 0, true)).toBe(true);
   });
 
-  test('messages stay on the live stream while background tasks await summary', () => {
+  test('messages remain queued while background tasks await summary', () => {
     expect(shouldStartFreshIpcTurn(1, 1, true)).toBe(false);
   });
 
-  test('pre-result messages continue using active pipe-in', () => {
+  test('pre-result messages remain queued instead of entering the active query', () => {
     expect(shouldStartFreshIpcTurn(0, 0, true)).toBe(false);
+  });
+
+  test('a warm message is claimed only by its fresh turn', () => {
+    const queuedPath = writeMessage('side-effect-once');
+    let toolCalls = 0;
+
+    // Old query is still running: the envelope remains durable and cannot
+    // execute in that query.
+    expect(shouldStartFreshIpcTurn(0, 0, true)).toBe(false);
+    expect(fs.existsSync(queuedPath)).toBe(true);
+
+    // Old query finishes, then exactly one fresh query claims and executes it.
+    expect(shouldStartFreshIpcTurn(1, 0, true)).toBe(true);
+    const [claimed] = inbox.claimAll();
+    toolCalls++;
+    fs.unlinkSync(claimed.claimPath); // host receives the fresh-query ACK
+
+    const tracker = new IpcCompletionTracker();
+    tracker.trackInitial([claimed.messageId]);
+    expect(tracker.advanceResult()).toEqual(['side-effect-once']);
+    expect(tracker.advanceResult()).toEqual([]);
+    expect(inbox.claimAll()).toEqual([]);
+    expect(inbox.recoverInflight()).toBe(0);
+    expect(toolCalls).toBe(1);
+  });
+
+  test('an active-query failure leaves the unclaimed warm message for restart', () => {
+    const queuedPath = writeMessage('restart-once');
+    expect(shouldStartFreshIpcTurn(0, 0, true)).toBe(false);
+    expect(fs.existsSync(queuedPath)).toBe(true);
+
+    const restartedInbox = new IpcInbox(inputDir);
+    const claimed = restartedInbox.claimAll();
+    expect(claimed.map((message) => message.messageId)).toEqual([
+      'restart-once',
+    ]);
+    expect(restartedInbox.claimAll()).toEqual([]);
+  });
+
+  test('a fresh-query crash before SDK init recovers the claim without executing it twice', () => {
+    writeMessage('crash-before-init');
+    const [firstClaim] = inbox.claimAll();
+    expect(fs.existsSync(firstClaim.claimPath)).toBe(true);
+    let toolCalls = 0; // provider init has not happened, so no tool can run
+
+    const restartedInbox = new IpcInbox(inputDir);
+    expect(restartedInbox.recoverInflight()).toBe(1);
+    const [recoveredClaim] = restartedInbox.claimAll();
+    toolCalls++;
+    fs.unlinkSync(recoveredClaim.claimPath); // SDK init ACK reaches host
+
+    const recoveredTurn = new IpcCompletionTracker();
+    recoveredTurn.trackInitial([recoveredClaim.messageId]);
+    expect(recoveredTurn.advanceResult()).toEqual(['crash-before-init']);
+    expect(restartedInbox.recoverInflight()).toBe(0);
+    expect(restartedInbox.claimAll()).toEqual([]);
+    expect(toolCalls).toBe(1);
   });
 });
 
@@ -199,19 +256,38 @@ describe('IPC completion/result correlation', () => {
     const tracker = new IpcCompletionTracker();
     tracker.trackInitial(['workflow']);
     expect(tracker.advanceResult(false)).toEqual([]);
+    expect(tracker.hasPending).toBe(true);
     expect(tracker.advanceResult()).toEqual(['workflow']);
+    expect(tracker.hasPending).toBe(false);
   });
 
-  test('Workflow results can never complete a pipe-in heuristically', () => {
-    const tracker = new IpcCompletionTracker();
-    expect(tracker.advanceResult()).toEqual([]);
-    expect(tracker.advanceResult()).toEqual([]);
-    expect(tracker.advanceResult()).toEqual([]);
-  });
+  test.each(['truncated', 'overflow_partial', 'compact_partial'])(
+    '%s retains the completion ID for the healthy continuation query',
+    () => {
+      const logicalTurn = new IpcCompletionTracker();
+      logicalTurn.trackInitial(['warm-follow-up']);
 
-  test('an interrupted result never completes a pulled pipe-in', () => {
-    const tracker = new IpcCompletionTracker();
-    expect(tracker.advanceResult(false)).toEqual([]);
-    expect(tracker.advanceResult(false)).toEqual([]);
+      // First runQuery emits an intermediate result.
+      expect(logicalTurn.advanceResult(false)).toEqual([]);
+      expect(logicalTurn.hasPending).toBe(true);
+
+      // A separate continuation runQuery shares the same logical-turn tracker.
+      expect(logicalTurn.advanceResult(true)).toEqual(['warm-follow-up']);
+      expect(logicalTurn.hasPending).toBe(false);
+      expect(logicalTurn.advanceResult(true)).toEqual([]);
+    },
+  );
+
+  test('a crash between partial and continuation never records a false completion', () => {
+    const crashedTurn = new IpcCompletionTracker();
+    crashedTurn.trackInitial(['retry-once']);
+    expect(crashedTurn.advanceResult(false)).toEqual([]);
+    expect(crashedTurn.hasPending).toBe(true);
+
+    // The host replays from its committed DB cursor after runner restart.
+    const recoveredTurn = new IpcCompletionTracker();
+    recoveredTurn.trackInitial(['retry-once']);
+    expect(recoveredTurn.advanceResult()).toEqual(['retry-once']);
+    expect(recoveredTurn.advanceResult()).toEqual([]);
   });
 });

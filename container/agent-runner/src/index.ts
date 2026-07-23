@@ -1055,24 +1055,6 @@ function acknowledgeIpcMessages(messages: IpcMessage[]): void {
   }
 }
 
-/** Put an unaccepted/interrupted claim back into the watcher-visible queue. */
-function requeueIpcMessage(message: IpcMessage): void {
-  ipcInbox.requeue(message);
-}
-
-/** Requeue pulled messages and tell the host to resume ACK watchdog coverage. */
-function requeueIpcMessages(messages: IpcMessage[]): void {
-  if (messages.length === 0) return;
-  for (const message of messages) requeueIpcMessage(message);
-  writeOutput({
-    status: 'stream',
-    result: null,
-    ipcRequeuedMessageIds: [
-      ...new Set(messages.map((message) => message.messageId)),
-    ],
-  });
-}
-
 function drainIpcInput(): IpcDrainResult {
   return { messages: ipcInbox.claimAll(ipcDatabaseJidFilter) };
 }
@@ -1293,7 +1275,8 @@ function pruneProcessedHistoryImagesInTranscript(
  * 使用 ClaudeEngine 封装 SDK 调用：
  * - Engine 负责 query() + StreamEventProcessor + 事件翻译
  * - 本函数负责 IPC 轮询、sentinel 检测、系统提示词构建、context_audit 等编排逻辑
- * - 通过 engine.pushToActive() / interruptActive() 等方法操作活动查询
+ * - 当前 query 只处理其启动 prompt；晚到 IPC 留在磁盘队列，下一轮再 claim
+ * - 通过 interruptActive() / endActiveStream() 等方法收口活动查询
  */
 async function runQuery(
   prompt: string,
@@ -1310,6 +1293,7 @@ async function runQuery(
   images?: Array<{ data: string; mimeType?: string }>,
   sourceKindOverride?: ContainerOutput['sourceKind'],
   initialIpcMessages: IpcMessage[] = [],
+  ipcCompletionTracker: IpcCompletionTracker = new IpcCompletionTracker(),
 ): Promise<{
   newSessionId?: string;
   lastAssistantUuid?: string;
@@ -1318,15 +1302,11 @@ async function runQuery(
   unrecoverableTranscriptError?: boolean;
   interruptedDuringQuery: boolean;
   sessionResumeFailed?: boolean;
-  pipedMessagesDuringQuery: IpcMessage[];
   suspectTruncatedTail?: string;
 }> {
-  // Track messages piped into this query.
-  const pipedMessagesDuringQuery: IpcMessage[] = [];
   const unacknowledgedIpcMessages = new Map<string, IpcMessage>(
     initialIpcMessages.map((message) => [message.claimPath, message]),
   );
-  const ipcCompletionTracker = new IpcCompletionTracker();
   const acknowledgeQueryStart = (trackCompletion = true) => {
     const messages = [...unacknowledgedIpcMessages.values()];
     if (messages.length === 0) return;
@@ -1640,15 +1620,17 @@ async function runQuery(
       ipcQueryWatcher.close();
       return;
     }
-    // Once a result has been emitted, a newly-arrived user message belongs to
-    // the next turn. Do not claim/unlink it into a stream that is already
-    // winding down; close the stream and let waitForIpcMessage start a fresh
-    // query immediately.
+    // A queued IPC envelope always belongs to a separate, complete user turn.
+    // Never claim or pipe it into this SDK stream: doing both a pipe-in and a
+    // later fresh query can execute side effects twice. Once the active turn
+    // has a terminal result, close its stream so waitForIpcMessage can claim
+    // the envelope exactly once for the next query.
+    const hasQueuedMessages = hasQueuedIpcMessages();
     if (
       shouldStartFreshIpcTurn(
         resultCount,
         pendingBackgroundTasks,
-        hasQueuedIpcMessages(),
+        hasQueuedMessages,
       )
     ) {
       log('IPC message arrived after result; closing stream for next query');
@@ -1657,66 +1639,9 @@ async function runQuery(
       ipcQueryWatcher.close();
       return;
     }
-    // Side-queries (emitOutput=false) 不消费用户 IPC 消息
-    if (!emitOutput) return;
-
-    // 引擎不支持 pipe-in (如 OpenAIEngine) 时,跳过 IPC 消息注入 —
-    // OpenAI 引擎的语义是每次 sendMessage 一次性请求,不支持中途追加消息.
-    if (typeof engine.pushToActive !== 'function') return;
-
-    if (engine.isActiveStreamEnded?.() === true) {
-      log('Stream already ended, skipping IPC drain');
-      ipcPolling = false;
-      ipcQueryWatcher.close();
-      return;
-    }
-
-    // SDK transport 未就绪时不 pipe 消息
-    if (engine.isActiveTransportReady?.() !== true) return;
-
-    const { messages } = drainIpcInput();
-    for (const msg of messages) {
-      log(
-        `Piping IPC message into active query (${msg.text.length} chars, ${msg.images?.length || 0} images)`,
-      );
-      const pipeImages = msg.images?.map((img) => ({
-        data: img.data,
-        mimeType: img.mimeType || 'image/jpeg',
-      }));
-      // 与初始 user message 一致，给每条 piped 消息前置当前本地时间（#563 CR）。
-      // SDK 透传 slash 命令（如 `/compact <instructions>`）必须以 `/` 开头，
-      // 跳过时间前缀。半路 pipe `/compact` 到运行中 query 的 SDK 行为不确定
-      // （可能与正在生成的 assistant turn 冲突），保留原样透传，让 SDK 自行处理；
-      // 若 SDK 拒绝，会通过 pushToActive 的返回值反馈 rejected reason。
-      const isSlash = isSdkPassthroughSlashCommand(msg.text);
-      const pipeText = isSlash
-        ? msg.text
-        : `[当前时间: ${formatLocalNow()}]\n${msg.text}`;
-      if (isSlash) {
-        log(
-          `Pipe-in slash command detected, skipping time prefix: ${msg.text.slice(0, 40)}`,
-        );
-      }
-      const rejected = engine.pushToActive(pipeText, pipeImages, () => {
-        // Consumption is enough to retire the claim, but not to commit its DB
-        // cursor: Workflow results have no SDK-provided causal link to this
-        // pipe-in. Keep it in pipedMessagesDuringQuery so the old query can
-        // never complete it; it will be requeued as a fresh initial turn.
-        acknowledgeIpcMessages([msg]);
-      });
-      if (rejected.length > 0) {
-        requeueIpcMessage(msg);
-      } else {
-        pipedMessagesDuringQuery.push(msg);
-      }
-      for (const reason of rejected) {
-        emit({
-          status: 'success',
-          result: `⚠️ ${reason}`,
-          newSessionId: undefined,
-        });
-      }
-    }
+    // Pre-result and background-task phases keep the envelope untouched. A
+    // runner crash therefore leaves one queued file for startup recovery.
+    return;
   };
 
   const ipcQueryWatcher = createIpcWatcher(() => {
@@ -1738,7 +1663,6 @@ async function runQuery(
       newSessionId,
       closedDuringQuery,
       interruptedDuringQuery,
-      pipedMessagesDuringQuery,
     };
   }
 
@@ -1766,7 +1690,8 @@ async function runQuery(
       !interruptedDuringQuery &&
         !suppressOutputAfterInterrupt &&
         pendingBgTasks === 0 &&
-        !suspectTruncated,
+        !suspectTruncated &&
+        !hadCompaction,
     );
     resultCount = ipcCompletionTracker.resultCount;
     pendingBackgroundTasks = pendingBgTasks;
@@ -1968,7 +1893,6 @@ async function runQuery(
           lastAssistantUuid,
           closedDuringQuery,
           interruptedDuringQuery,
-          pipedMessagesDuringQuery,
           sessionResumeFailed: true,
         };
       }
@@ -1993,7 +1917,6 @@ async function runQuery(
           closedDuringQuery,
           contextOverflow: true,
           interruptedDuringQuery,
-          pipedMessagesDuringQuery,
         };
       }
 
@@ -2006,7 +1929,6 @@ async function runQuery(
           closedDuringQuery,
           unrecoverableTranscriptError: true,
           interruptedDuringQuery,
-          pipedMessagesDuringQuery,
         };
       }
 
@@ -2023,7 +1945,6 @@ async function runQuery(
         lastAssistantUuid,
         closedDuringQuery,
         interruptedDuringQuery,
-        pipedMessagesDuringQuery,
         suspectTruncatedTail: latestSuspectTruncatedTail,
       };
     }
@@ -2036,7 +1957,6 @@ async function runQuery(
         | undefined,
       closedDuringQuery,
       interruptedDuringQuery,
-      pipedMessagesDuringQuery,
     };
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
@@ -2065,7 +1985,6 @@ async function runQuery(
         closedDuringQuery,
         contextOverflow: true,
         interruptedDuringQuery,
-        pipedMessagesDuringQuery,
       };
     }
 
@@ -2080,7 +1999,6 @@ async function runQuery(
         closedDuringQuery,
         unrecoverableTranscriptError: true,
         interruptedDuringQuery,
-        pipedMessagesDuringQuery,
       };
     }
 
@@ -2094,7 +2012,6 @@ async function runQuery(
           | undefined,
         closedDuringQuery,
         interruptedDuringQuery,
-        pipedMessagesDuringQuery,
       };
     }
 
@@ -2110,7 +2027,6 @@ async function runQuery(
           | undefined,
         closedDuringQuery,
         interruptedDuringQuery,
-        pipedMessagesDuringQuery,
       };
     }
 
@@ -2129,7 +2045,6 @@ async function runQuery(
           | undefined,
         closedDuringQuery,
         interruptedDuringQuery,
-        pipedMessagesDuringQuery,
       };
     }
 
@@ -2353,6 +2268,9 @@ async function main(): Promise<void> {
   // 历史无法直接拼到 auto-continue prompt（因为 fall-through 等下一条 IPC 消息后才重启 query），
   // 需要在下一轮主循环 query 之前消费它，避免新会话完全丢失上下文。
   let pendingHistoryContext: string | null = null;
+  // Completion ownership follows the logical user turn, not an individual
+  // runQuery call. Continuations share this tracker until the next IPC envelope.
+  let logicalTurnIpcCompletionTracker = new IpcCompletionTracker();
   try {
     while (true) {
       pruneProcessedHistoryImagesInTranscript(sessionId);
@@ -2415,6 +2333,7 @@ async function main(): Promise<void> {
         promptImages,
         undefined,
         promptIpcMessages,
+        logicalTurnIpcCompletionTracker,
       );
       if (queryResult.newSessionId) {
         sessionId = queryResult.newSessionId;
@@ -2422,18 +2341,6 @@ async function main(): Promise<void> {
       }
       if (queryResult.lastAssistantUuid) {
         resumeAt = queryResult.lastAssistantUuid;
-      }
-
-      // Claude exposes no causal link between a pipe-in and Workflow results
-      // produced by the already-active turn. Every accepted pipe-in therefore
-      // becomes a fresh durable query after this old query ends; only that
-      // fresh query is allowed to complete its DB delivery.
-      if (queryResult.pipedMessagesDuringQuery.length > 0) {
-        const piped = queryResult.pipedMessagesDuringQuery;
-        log(
-          `Query ended before ${piped.length} piped message(s) completed; re-enqueueing for a fresh query`,
-        );
-        requeueIpcMessages(piped);
       }
 
       // Session resume 失败（SDK 无法恢复旧会话）：清除 session，以新会话重试
@@ -2556,7 +2463,7 @@ async function main(): Promise<void> {
         clearInterruptRequested();
         consecutiveCompactions = 0;
 
-        // 等待下一条消息（包括刚重新入队的 piped 消息）
+        // 等待下一条独立 IPC 消息
         log('Query interrupted by user, waiting for next message');
         const nextMessage = await waitForIpcMessage();
         if (nextMessage === null) {
@@ -2572,6 +2479,7 @@ async function main(): Promise<void> {
         prompt = nextMessage.text;
         promptImages = nextMessage.images;
         promptIpcMessages = nextMessage.ipcMessages;
+        logicalTurnIpcCompletionTracker = new IpcCompletionTracker();
         containerInput.turnId = generateTurnId();
         // See main-loop comment: reset task attribution for this new turn.
         mcpToolsConfig.currentTaskId = nextMessage.taskId ?? null;
@@ -2685,6 +2593,8 @@ async function main(): Promise<void> {
             undefined,
             undefined,
             'auto_continue',
+            [],
+            logicalTurnIpcCompletionTracker,
           );
           if (autoContResult.newSessionId) {
             sessionId = autoContResult.newSessionId;
@@ -2805,6 +2715,8 @@ async function main(): Promise<void> {
           undefined,
           undefined,
           'truncation_continue',
+          [],
+          logicalTurnIpcCompletionTracker,
         );
         if (contResult.newSessionId) {
           sessionId = contResult.newSessionId;
@@ -2893,6 +2805,16 @@ async function main(): Promise<void> {
         });
       }
 
+      // A claimed IPC delivery may leave this logical turn only through a
+      // healthy completion (or the explicit user-interrupt path above). Never
+      // discard its IDs at the next-message boundary: terminate so the host's
+      // durable DB cursor can replay the delivery instead.
+      if (logicalTurnIpcCompletionTracker.hasPending) {
+        throw new Error(
+          'IPC logical turn ended without a healthy completion; retry required',
+        );
+      }
+
       log('Query ended, waiting for next IPC message...');
 
       // Wait for the next message or _close sentinel
@@ -2908,6 +2830,7 @@ async function main(): Promise<void> {
       prompt = nextMessage.text;
       promptImages = nextMessage.images;
       promptIpcMessages = nextMessage.ipcMessages;
+      logicalTurnIpcCompletionTracker = new IpcCompletionTracker();
       containerInput.turnId = generateTurnId();
       // Clear per-turn task attribution: the previous query may have been a
       // scheduled-task turn, but this new IPC message is a regular follow-up

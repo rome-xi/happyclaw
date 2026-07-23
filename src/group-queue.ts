@@ -1077,9 +1077,10 @@ export class GroupQueue {
     }
 
     // queryInFlight=true：当前 query 正在执行，将消息写入 IPC 文件排队。
-    // 当前 query 完成后 waitForIpcMessage() → drainIpcInput() 会合并所有
-    // 待处理的 IPC 消息为一个 prompt，实现自然聚合（如飞书转发+评论场景）。
-    // 不再写 _drain：容器无需退出重启，复用当前进程即可。
+    // runner 不会把它 pipe 进当前 SDK stream；当前逻辑 turn 完成后，
+    // waitForIpcMessage() → drainIpcInput() 才合并为一个新的完整 prompt，
+    // 实现自然聚合（如飞书转发+评论场景），同时避免副作用执行两遍。
+    // 不写 _drain：容器无需退出重启，仍可复用当前进程。
 
     const inputDir = this.resolveIpcInputDir(state);
     try {
