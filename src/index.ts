@@ -776,7 +776,7 @@ const OOM_AUTO_RESET_THRESHOLD = 2;
 // Per-folder reply route updater: lets sendMessage callers update the
 // reply routing of a running processGroupMessages without killing the process.
 // Key is group folder (one active processGroupMessages per folder).
-type ReplyRouteUpdater = (newSourceJid: string | null) => void;
+type ReplyRouteUpdater = (newSourceJid: string | null) => void | Promise<void>;
 const activeRouteUpdaters = new Map<string, ReplyRouteUpdater>();
 
 // Per-folder IM reply route: tracks the current replySourceImJid for each
@@ -838,8 +838,8 @@ function mergeHeldUsage(
 
 // Sub-Agent 路径的挂起卡 finalizer 注册表（key: virtualChatJid）。主路径复用
 // activeRouteUpdaters（用户消息注入时必经），Sub-Agent 注入点不走 route updater，
-// 由 web.ts / 消息循环在注入成功回调里显式触发。
-const activeHeldCardFinalizers = new Map<string, () => void>();
+// 由 web.ts / 消息循环在新 IPC 回合真正开始时显式触发。
+const activeHeldCardFinalizers = new Map<string, () => void | Promise<void>>();
 
 // ── IPC send_message 跨重试去重 ──
 // 错误退避重试会把整个 prompt 从头重跑，agent 在失败前已执行的 send_message
@@ -5451,6 +5451,12 @@ async function runAgent(
   const wrappedOnOutput = onOutput
     ? async (output: ContainerOutput) => {
         queue.markRunnerActivity(chatJid);
+        if (output.ipcTurnStartedMessageIds?.length) {
+          await queue.markIpcMessagesTurnStarted(
+            chatJid,
+            output.ipcTurnStartedMessageIds,
+          );
+        }
         if (output.ipcRequeuedMessageIds?.length) {
           queue.markIpcMessagesRequeued(chatJid, output.ipcRequeuedMessageIds);
         }
@@ -8187,8 +8193,8 @@ async function processAgentConversation(
   }
   // 用户在挂起期间发来新消息 → 先定稿旧卡、开新卡（注入点在 web.ts /
   // 消息循环，经 activeHeldCardFinalizers 以 virtualChatJid 为键触达）。
-  activeHeldCardFinalizers.set(virtualChatJid, () => {
-    void (async () => {
+  activeHeldCardFinalizers.set(virtualChatJid, async () => {
+    try {
       if (heldAgentParts.length === 0) return;
       const txt = heldAgentParts.join(HELD_TURN_DIVIDER);
       heldAgentParts = [];
@@ -8214,12 +8220,12 @@ async function processAgentConversation(
       if (agentStreamingSession && streamingSessionJid) {
         registerStreamingSession(streamingSessionJid, agentStreamingSession);
       }
-    })().catch((err) => {
+    } catch (err) {
       logger.warn(
         { err, chatJid, agentId },
         'Failed to finalize held agent streaming card on new message',
       );
-    });
+    }
   });
 
   // Track idle timer
@@ -8268,6 +8274,12 @@ async function processAgentConversation(
     // #547: warm-lifecycle bookkeeping — mark activity, and flag query-idle on
     // a substantive result / interruption so the runner can be kept warm.
     queue.markRunnerActivity(virtualJid);
+    if (output.ipcTurnStartedMessageIds?.length) {
+      await queue.markIpcMessagesTurnStarted(
+        virtualJid,
+        output.ipcTurnStartedMessageIds,
+      );
+    }
     if (output.ipcRequeuedMessageIds?.length) {
       queue.markIpcMessagesRequeued(virtualJid, output.ipcRequeuedMessageIds);
     }
@@ -9521,7 +9533,7 @@ async function startMessageLoop(): Promise<void> {
           const images = collectMessageImages(chatJid, messagesToSend);
           const imagesForAgent = images.length > 0 ? images : undefined;
 
-          // Determine the IM source JID for route update on successful injection
+          // Determine the IM source JID for route update at fresh-turn start.
           const lastSourceJidForRoute =
             messagesToSend[messagesToSend.length - 1]?.source_jid || chatJid;
 
@@ -9529,10 +9541,10 @@ async function startMessageLoop(): Promise<void> {
             chatJid,
             formatted,
             imagesForAgent,
-            () => {
-              // IPC write succeeded — update reply route for the running agent
-              activeRouteUpdaters.get(group.folder)?.(lastSourceJidForRoute);
-            },
+            // Switch only when this envelope starts a fresh logical turn. The
+            // previous turn may still be streaming after the durable write.
+            () =>
+              activeRouteUpdaters.get(group.folder)?.(lastSourceJidForRoute),
             lastSourceJidForRoute,
             {
               databaseJid: chatJid,
@@ -10662,10 +10674,7 @@ function buildOnAgentMessage(): (baseChatJid: string, agentId: string) => void {
             virtualChatJid,
             formatted,
             imagesForAgent,
-            () => {
-              // 用户消息注入成功 → 挂起中的 agent 卡先定稿轮换
-              activeHeldCardFinalizers.get(virtualChatJid)?.();
-            },
+            () => activeHeldCardFinalizers.get(virtualChatJid)?.(),
             lastAgentSourceJid,
             {
               databaseJid: virtualChatJid,
@@ -11811,12 +11820,9 @@ async function main(): Promise<void> {
       imHealthCheckFailCounts.delete(jid);
     },
     removeImGroupRecord,
-    updateReplyRoute: (folder: string, sourceJid: string | null) => {
-      activeRouteUpdaters.get(folder)?.(sourceJid);
-    },
-    finalizeHeldCard: (key: string) => {
-      activeHeldCardFinalizers.get(key)?.();
-    },
+    updateReplyRoute: (folder: string, sourceJid: string | null) =>
+      activeRouteUpdaters.get(folder)?.(sourceJid),
+    finalizeHeldCard: (key: string) => activeHeldCardFinalizers.get(key)?.(),
     handleSpawnCommand,
     applyAutoIsolateContext: (userId: string, enable: boolean) =>
       applyAutoIsolateContext(userId, enable),

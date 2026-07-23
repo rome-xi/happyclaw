@@ -69,6 +69,10 @@ export interface ContainerOutput {
    * >0 时主进程应把流式卡片保持在「后台任务运行中」而非定稿，后续 turn 的
    * 内容会继续追加到同一张卡。仅 sdk_final 类 result 携带。 */
   pendingBgTasks?: number;
+  /** Internal host signal: these queued IPC messages are now starting a fresh
+   * logical turn. Emitted before provider acceptance so reply routing can
+   * switch without attributing the previous turn's result to the new sender. */
+  ipcTurnStartedMessageIds?: string[];
   /** Internal host acknowledgement: these IPC messages reached a real SDK
    * query event. Never forwarded as user-visible content. */
   ipcMessageIds?: string[];

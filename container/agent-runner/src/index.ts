@@ -2315,6 +2315,9 @@ async function main(): Promise<void> {
           },
           newSessionId: sessionId,
           turnId: containerInput.turnId,
+          ipcTurnStartedMessageIds: [
+            ...new Set(promptIpcMessages.map((message) => message.messageId)),
+          ],
         });
       }
 

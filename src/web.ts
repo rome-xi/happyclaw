@@ -635,11 +635,9 @@ async function handleWebUserMessage(
     chatJid,
     formatted,
     images,
-    () => {
-      // IPC write succeeded — update reply route for home groups.
-      // Web messages have no IM source, so clear the IM route.
-      updateRoute?.(group.folder, null);
-    },
+    // Web messages have no IM source, so clear the IM route when this
+    // envelope actually starts its fresh logical turn.
+    () => updateRoute?.(group.folder, null),
     chatJid,
     {
       databaseJid: chatJid,
@@ -916,10 +914,7 @@ async function handleAgentConversationMessage(
     virtualChatJid,
     formatted,
     agentImages,
-    () => {
-      // 用户消息注入成功 → 挂起中的 agent 卡先定稿轮换
-      finalizeHeld?.(virtualChatJid);
-    },
+    () => finalizeHeld?.(virtualChatJid),
     virtualChatJid,
     {
       databaseJid: virtualChatJid,

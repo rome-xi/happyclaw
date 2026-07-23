@@ -42,6 +42,13 @@ interface GroupState {
    * query event. Kept separate from pendingMessages because the warm runner is
    * expected to consume these without spawning a second process. */
   pendingIpcMessageIds: Set<string>;
+  /** Pending IPC messages that have reached a fresh turn and are therefore
+   * subject to the short provider-acceptance ACK deadline. Messages queued
+   * behind an active turn deliberately stay out of this set. */
+  ipcAckEligibleMessageIds: Set<string>;
+  /** Route/card transitions delayed until the queued message actually starts
+   * its own logical turn. Keyed by durable IPC message ID for exactly-once use. */
+  ipcTurnStartCallbacks: Map<string, () => void | Promise<void>>;
   /** Delivery ownership retained after ACK until its own result completes. */
   ipcDeliveryMetadata: Map<string, IpcDeliveryMetadata>;
   /** ACKed IPC messages explicitly completed by a later query result. */
@@ -129,6 +136,8 @@ export class GroupQueue {
         lastActivityAt: null,
         queryInFlight: false,
         pendingIpcMessageIds: new Set(),
+        ipcAckEligibleMessageIds: new Set(),
+        ipcTurnStartCallbacks: new Map(),
         ipcDeliveryMetadata: new Map(),
         completedIpcMessageIds: new Set(),
         ipcAwaitingAckSince: null,
@@ -460,6 +469,55 @@ export class GroupQueue {
   }
 
   /**
+   * A queued IPC envelope has crossed the logical-turn boundary. Route/card
+   * ownership changes here (not at file-write time), and only now does the
+   * short SDK-start watchdog apply to messages queued behind a running turn.
+   */
+  async markIpcMessagesTurnStarted(
+    groupJid: string,
+    messageIds: string[],
+  ): Promise<void> {
+    const state = this.resolveActiveState(groupJid);
+    if (!state?.active || messageIds.length === 0) return;
+    state.pendingIpcMessageIds ??= new Set<string>();
+    state.ipcAckEligibleMessageIds ??= new Set<string>();
+    state.ipcTurnStartCallbacks ??= new Map<
+      string,
+      () => void | Promise<void>
+    >();
+
+    const callbacks: Array<{
+      messageId: string;
+      callback: () => void | Promise<void>;
+    }> = [];
+    let armedWatchdog = false;
+    for (const messageId of messageIds) {
+      if (!state.pendingIpcMessageIds.has(messageId)) continue;
+      if (!state.ipcAckEligibleMessageIds.has(messageId)) {
+        state.ipcAckEligibleMessageIds.add(messageId);
+        armedWatchdog = true;
+      }
+      const callback = state.ipcTurnStartCallbacks.get(messageId);
+      if (callback) {
+        state.ipcTurnStartCallbacks.delete(messageId);
+        callbacks.push({ messageId, callback });
+      }
+    }
+    if (armedWatchdog) state.ipcAwaitingAckSince ??= Date.now();
+
+    for (const { messageId, callback } of callbacks) {
+      try {
+        await callback();
+      } catch (err) {
+        logger.warn(
+          { groupJid, messageId, err },
+          'IPC turn-start callback failed',
+        );
+      }
+    }
+  }
+
+  /**
    * Apply an agent-runner acknowledgement only after provider acceptance for a
    * fresh query, or after Claude's SDK has pulled a pipe-in message. This closes
    * the consume-before-start hole without changing the warm-runner lifecycle.
@@ -468,11 +526,13 @@ export class GroupQueue {
     const state = this.resolveActiveState(groupJid);
     if (!state?.active || messageIds.length === 0) return;
     state.pendingIpcMessageIds ??= new Set<string>();
+    state.ipcAckEligibleMessageIds ??= new Set<string>();
     const retired = this.retireAcknowledgedIpcClaims(state, messageIds);
     for (const messageId of retired) {
       state.pendingIpcMessageIds.delete(messageId);
+      state.ipcAckEligibleMessageIds.delete(messageId);
     }
-    if (state.pendingIpcMessageIds.size === 0) {
+    if (state.ipcAckEligibleMessageIds.size === 0) {
       state.ipcAwaitingAckSince = null;
     }
   }
@@ -489,23 +549,27 @@ export class GroupQueue {
   }
 
   /**
-   * Re-arm the host watchdog after the runner puts an ACKed claim back on disk.
-   * The next query will claim and ACK it again. Delivery ownership deliberately
-   * stays unchanged so only that later query result can commit its DB cursor.
+   * When the runner puts an ACKed claim back on disk, pause the short watchdog
+   * until the next fresh-turn signal arms it again. Delivery ownership stays
+   * unchanged so only that later query result can commit its DB cursor.
    */
   markIpcMessagesRequeued(groupJid: string, messageIds: string[]): void {
     const state = this.resolveActiveState(groupJid);
     if (!state?.active || messageIds.length === 0) return;
     state.pendingIpcMessageIds ??= new Set<string>();
+    state.ipcAckEligibleMessageIds ??= new Set<string>();
     state.completedIpcMessageIds ??= new Set<string>();
-    let rearmed = false;
+    let requeued = false;
     for (const messageId of messageIds) {
       if (!state.ipcDeliveryMetadata.has(messageId)) continue;
       state.completedIpcMessageIds.delete(messageId);
       state.pendingIpcMessageIds.add(messageId);
-      rearmed = true;
+      state.ipcAckEligibleMessageIds.delete(messageId);
+      requeued = true;
     }
-    if (rearmed) state.ipcAwaitingAckSince = Date.now();
+    if (requeued && state.ipcAckEligibleMessageIds.size === 0) {
+      state.ipcAwaitingAckSince = null;
+    }
   }
 
   /**
@@ -801,7 +865,7 @@ export class GroupQueue {
       const isConversationAgent =
         state.activeRunnerIsTask && state.agentId !== null;
       if (state.activeRunnerIsTask && !isConversationAgent) continue;
-      const awaitingIpcAck = (state.pendingIpcMessageIds?.size ?? 0) > 0;
+      const awaitingIpcAck = (state.ipcAckEligibleMessageIds?.size ?? 0) > 0;
       if (!state.pendingMessages && !awaitingIpcAck) continue;
       if (state.agentId !== null && !isConversationAgent) continue;
       if (state.restarting) continue;
@@ -1033,7 +1097,7 @@ export class GroupQueue {
     groupJid: string,
     text: string,
     images?: Array<{ data: string; mimeType?: string }>,
-    onInjected?: () => void,
+    onTurnStarted?: () => void | Promise<void>,
     sourceJid?: string,
     delivery?: IpcDeliveryMetadata,
   ): SendMessageResult {
@@ -1082,6 +1146,7 @@ export class GroupQueue {
     // 实现自然聚合（如飞书转发+评论场景），同时避免副作用执行两遍。
     // 不写 _drain：容器无需退出重启，仍可复用当前进程。
 
+    const wasQueryInFlight = state.queryInFlight;
     const inputDir = this.resolveIpcInputDir(state);
     try {
       fs.mkdirSync(inputDir, { recursive: true });
@@ -1106,6 +1171,14 @@ export class GroupQueue {
       state.queryInFlight = true;
       state.pendingIpcMessageIds ??= new Set<string>();
       state.pendingIpcMessageIds.add(messageId);
+      state.ipcAckEligibleMessageIds ??= new Set<string>();
+      state.ipcTurnStartCallbacks ??= new Map<
+        string,
+        () => void | Promise<void>
+      >();
+      if (onTurnStarted) {
+        state.ipcTurnStartCallbacks.set(messageId, onTurnStarted);
+      }
       state.ipcDeliveryMetadata ??= new Map<string, IpcDeliveryMetadata>();
       state.ipcDeliveryMetadata.set(
         messageId,
@@ -1114,11 +1187,16 @@ export class GroupQueue {
           messageCursors: [],
         },
       );
-      state.ipcAwaitingAckSince ??= Date.now();
+      // An idle warm runner should claim promptly, so retain the short
+      // no-child watchdog. A message queued behind a live query becomes
+      // eligible only when the runner announces its fresh turn.
+      if (!wasQueryInFlight) {
+        state.ipcAckEligibleMessageIds.add(messageId);
+        state.ipcAwaitingAckSince ??= Date.now();
+      }
       state.hasIpcInjectedMessages = true;
       state.ipcInjectedDatabaseJids ??= new Set<string>();
       state.ipcInjectedDatabaseJids.add(databaseJid);
-      onInjected?.();
       return 'sent';
     } catch (err) {
       // 不静默：磁盘满 / 权限错 / inode 耗尽这些根因不应该被伪装成
@@ -1713,6 +1791,8 @@ export class GroupQueue {
       state.ipcDeliveryMetadata?.clear();
       state.completedIpcMessageIds?.clear();
       state.pendingIpcMessageIds?.clear();
+      state.ipcAckEligibleMessageIds?.clear();
+      state.ipcTurnStartCallbacks?.clear();
       state.ipcAwaitingAckSince = null;
       state.lastActivityAt = null;
       state.queryInFlight = false;
@@ -1844,6 +1924,8 @@ export class GroupQueue {
       state.ipcDeliveryMetadata?.clear();
       state.completedIpcMessageIds?.clear();
       state.pendingIpcMessageIds?.clear();
+      state.ipcAckEligibleMessageIds?.clear();
+      state.ipcTurnStartCallbacks?.clear();
       state.ipcAwaitingAckSince = null;
       state.lastActivityAt = null;
       state.queryInFlight = false;

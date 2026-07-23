@@ -33,6 +33,8 @@ function seedRunner(q: GroupQueue, jid: string, opts: SeedOpts = {}) {
     lastActivityAt: opts.lastActivityAt ?? null,
     queryInFlight: opts.queryInFlight ?? false,
     pendingIpcMessageIds: new Set<string>(),
+    ipcAckEligibleMessageIds: new Set<string>(),
+    ipcTurnStartCallbacks: new Map(),
     ipcDeliveryMetadata: new Map(),
     completedIpcMessageIds: new Set<string>(),
     ipcAwaitingAckSince: null,
@@ -221,6 +223,50 @@ describe('PR #547: conversation agent stays warm after final reply', () => {
     expect(q.getStuckPendingGroups(180_000, 30_000)).toEqual([]);
   });
 
+  test('active-turn follow-up switches route and starts ACK deadline only at its fresh turn', async () => {
+    const q = new GroupQueue();
+    const jid = `web:${folder}`;
+    seedRunner(q, jid, { groupFolder: folder, queryInFlight: true });
+    let turnStarts = 0;
+
+    expect(
+      q.sendMessage(jid, 'wait behind the current workflow', undefined, () => {
+        turnStarts++;
+      }),
+    ).toBe('sent');
+    const state = getState(q, jid);
+    const ids = [...(state.pendingIpcMessageIds as Set<string>)];
+    expect(ids).toHaveLength(1);
+    expect(turnStarts).toBe(0);
+    expect(state.ipcAckEligibleMessageIds).toEqual(new Set());
+    expect(state.ipcAwaitingAckSince).toBeNull();
+    expect(q.getStuckPendingGroups(180_000, 30_000)).toEqual([]);
+
+    await q.markIpcMessagesTurnStarted(jid, ids);
+    expect(turnStarts).toBe(1);
+    expect(state.ipcAckEligibleMessageIds).toEqual(new Set(ids));
+    expect(state.ipcAwaitingAckSince).toEqual(expect.any(Number));
+
+    // Duplicate turn-start markers are idempotent and do not rerun routing.
+    await q.markIpcMessagesTurnStarted(jid, ids);
+    expect(turnStarts).toBe(1);
+    state.ipcAwaitingAckSince = Date.now() - 31_000;
+    expect(q.getStuckPendingGroups(180_000, 30_000)).toEqual([
+      expect.objectContaining({ jid }),
+    ]);
+
+    const inputDir = path.join(ipcDir, 'input');
+    const inflightDir = path.join(inputDir, 'inflight');
+    fs.mkdirSync(inflightDir, { recursive: true });
+    const queued = fs
+      .readdirSync(inputDir)
+      .find((file) => file.endsWith('.json'))!;
+    fs.renameSync(path.join(inputDir, queued), path.join(inflightDir, queued));
+    q.markIpcMessagesStarted(jid, ids);
+    expect(state.ipcAckEligibleMessageIds).toEqual(new Set());
+    expect(state.ipcAwaitingAckSince).toBeNull();
+  });
+
   test('conversation-agent task lane is watchdog-visible, while scheduled tasks remain excluded', () => {
     const q = new GroupQueue();
     const conversationJid = `web:${folder}#agent:conversation-1`;
@@ -231,6 +277,7 @@ describe('PR #547: conversation agent stays warm after final reply', () => {
     });
     const conversationState = getState(q, conversationJid);
     conversationState.pendingIpcMessageIds = new Set(['agent-follow-up']);
+    conversationState.ipcAckEligibleMessageIds = new Set(['agent-follow-up']);
     conversationState.ipcAwaitingAckSince = Date.now() - 31_000;
 
     const scheduledJid = `web:${folder}#task:scheduled-1`;
@@ -240,6 +287,7 @@ describe('PR #547: conversation agent stays warm after final reply', () => {
     });
     const scheduledState = getState(q, scheduledJid);
     scheduledState.pendingIpcMessageIds = new Set(['not-a-user-lane']);
+    scheduledState.ipcAckEligibleMessageIds = new Set(['not-a-user-lane']);
     scheduledState.ipcAwaitingAckSince = Date.now() - 31_000;
 
     expect(q.getStuckPendingGroups(180_000, 30_000)).toEqual([
