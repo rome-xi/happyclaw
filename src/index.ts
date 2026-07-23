@@ -260,6 +260,7 @@ import { persistPluginExpansion } from './plugin-expander-store.js';
 process.env.TZ = process.env.TZ || TIMEZONE;
 
 const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const COMPLETED_AGENT_RETENTION_MS = 24 * 60 * 60 * 1000; // 24 hours
 const execFileAsync = promisify(execFile);
 const DEFAULT_MAIN_JID = 'web:main';
 const DEFAULT_MAIN_NAME = 'Main';
@@ -11275,8 +11276,10 @@ async function main(): Promise<void> {
 
   // Clean up stale completed agents (task/spawn/background) to prevent DB bloat.
   try {
-    const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
-    const cleaned = deleteCompletedAgents(oneHourAgo);
+    const retentionCutoff = new Date(
+      Date.now() - COMPLETED_AGENT_RETENTION_MS,
+    ).toISOString();
+    const cleaned = deleteCompletedAgents(retentionCutoff);
     if (cleaned > 0) {
       logger.info({ cleaned }, 'Cleaned up stale completed agents');
     }
@@ -11972,10 +11975,10 @@ async function main(): Promise<void> {
   setInterval(
     () => {
       try {
-        const tenMinutesAgo = new Date(
-          Date.now() - 10 * 60 * 1000,
+        const retentionCutoff = new Date(
+          Date.now() - COMPLETED_AGENT_RETENTION_MS,
         ).toISOString();
-        const cleaned = deleteCompletedAgents(tenMinutesAgo);
+        const cleaned = deleteCompletedAgents(retentionCutoff);
         if (cleaned > 0) {
           logger.info(
             { cleaned },

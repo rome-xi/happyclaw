@@ -1254,6 +1254,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
           error: null,
         };
       });
+      // The first page may come from the PWA's stale-while-revalidate cache.
+      // Immediately reconcile through the uncached incremental endpoint so a
+      // completed IM reply cannot remain invisible until the next poll/reload.
+      if (!loadMore) {
+        await get().refreshMessages(jid);
+      }
     } catch (err) {
       set({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -1270,7 +1276,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
     try {
       // Fetch messages newer than the last one we have
       const params = new URLSearchParams({ limit: '50' });
-      if (lastTs) params.set('after', lastTs);
+      // Keep `after` present even for an empty chat. The service worker excludes
+      // this endpoint from SWR caching; the server treats an empty value as an
+      // ordinary latest-page request and the merge below restores chronology.
+      params.set('after', lastTs || '');
 
       const data = await api.get<{ messages: Message[] }>(
         `/api/groups/${encodeURIComponent(jid)}/messages?${params}`
