@@ -43,6 +43,8 @@ type StreamingState =
   | 'idle'
   | 'creating'
   | 'streaming'
+  | 'completing'
+  | 'aborting'
   | 'completed'
   | 'aborted'
   | 'error';
@@ -103,6 +105,10 @@ export class TelegramStreamingEditController {
   // Last content pushed to Telegram (incl. aux prefix) — skip no-op edits to
   // conserve the edit rate budget.
   private lastPushedContent: string | null = null;
+  // Telegram edits can be delayed by flood-control retries. Serialize every
+  // edit so an older in-flight streaming update can never land after the final
+  // clean reply and overwrite it.
+  private editChain: Promise<void> = Promise.resolve();
 
   constructor(
     transport: TelegramStreamingTransport,
@@ -132,11 +138,22 @@ export class TelegramStreamingEditController {
   }
 
   async complete(finalText: string): Promise<void> {
-    if (this.state === 'completed' || this.state === 'aborted') return;
+    if (
+      this.state === 'completed' ||
+      this.state === 'aborted' ||
+      this.state === 'completing' ||
+      this.state === 'aborting'
+    ) {
+      return;
+    }
+    // Block late text/tool events before the first await. Telegram may keep an
+    // edit request alive for several seconds while honoring retry_after.
+    this.state = 'completing';
     this.accumulatedText = finalText;
     this.clearTimers();
 
     if (!finalText.trim()) {
+      await this.editChain.catch(() => {});
       this.state = 'completed';
       return;
     }
@@ -180,8 +197,20 @@ export class TelegramStreamingEditController {
   }
 
   async abort(reason?: string): Promise<void> {
-    if (this.state === 'completed' || this.state === 'aborted') return;
+    if (
+      this.state === 'completed' ||
+      this.state === 'aborted' ||
+      this.state === 'completing' ||
+      this.state === 'aborting'
+    ) {
+      return;
+    }
+    this.state = 'aborting';
     this.clearTimers();
+
+    if (this.messageCreationPromise) {
+      await this.messageCreationPromise.catch(() => {});
+    }
 
     const displayText = this.accumulatedText
       ? this.accumulatedText + `\n\n⚠️ 已中断: ${reason ?? '用户取消'}`
@@ -195,7 +224,7 @@ export class TelegramStreamingEditController {
     try {
       const lastId = this.messageIds[this.messageIds.length - 1];
       const truncated = displayText.slice(-TG_MSG_LIMIT);
-      await this.transport.editMessage(lastId, truncated, false);
+      await this.enqueueEdit(lastId, truncated, false, true);
     } catch (err: any) {
       logger.debug(
         { err: err?.message },
@@ -419,23 +448,25 @@ export class TelegramStreamingEditController {
       return;
     }
 
-    this.state = 'creating';
+    if (this.state !== 'completing' && this.state !== 'aborting') {
+      this.state = 'creating';
+    }
     this.messageCreationPromise = (async () => {
       try {
         const id = await this.transport.createMessage('💭 思考中...');
         if (id == null) {
-          this.state = 'error';
+          if (this.state === 'creating') this.state = 'error';
           return;
         }
         this.messageIds.push(id);
-        this.state = 'streaming';
+        if (this.state === 'creating') this.state = 'streaming';
         if (this.onCardCreated) this.onCardCreated(String(id));
       } catch (err: any) {
         logger.warn(
           { err: err?.message },
           'Telegram initial streaming message creation failed',
         );
-        this.state = 'error';
+        if (this.state === 'creating') this.state = 'error';
       } finally {
         this.messageCreationPromise = null;
       }
@@ -519,12 +550,33 @@ export class TelegramStreamingEditController {
 
   /** Edit the last message in the chain (plain text, mid-stream). */
   private async editLast(content: string): Promise<void> {
-    if (this.messageIds.length === 0) return;
+    if (!this.isActive() || this.messageIds.length === 0) return;
     const payload = content || '​';
     if (payload === this.lastPushedContent) return;
     const lastId = this.messageIds[this.messageIds.length - 1];
-    await this.transport.editMessage(lastId, payload, false);
+    await this.enqueueEdit(lastId, payload, false);
     this.lastPushedContent = payload;
+  }
+
+  private enqueueEdit(
+    messageId: number,
+    text: string,
+    asHtml: boolean,
+    terminal = false,
+  ): Promise<void> {
+    const next = this.editChain
+      .catch(() => {
+        // A failed live update must not prevent the clean final update.
+      })
+      .then(() => {
+        // Once terminal delivery starts, discard live updates that were queued
+        // behind a slow retry instead of delaying the final reply with stale
+        // intermediate frames.
+        if (!terminal && !this.isActive()) return;
+        return this.transport.editMessage(messageId, text, asHtml);
+      });
+    this.editChain = next;
+    return next;
   }
 
   /**
@@ -538,7 +590,7 @@ export class TelegramStreamingEditController {
     for (let i = 0; i < chunks.length; i++) {
       if (i < this.messageIds.length) {
         try {
-          await this.transport.editMessage(this.messageIds[i], chunks[i], true);
+          await this.enqueueEdit(this.messageIds[i], chunks[i], true, true);
         } catch (err: any) {
           logger.warn(
             { err: err?.message, index: i },
@@ -573,10 +625,7 @@ export class TelegramStreamingEditController {
     try {
       await this.fallbackSend(text);
     } catch (err: any) {
-      logger.warn(
-        { err: err?.message },
-        'Telegram fallback send also failed',
-      );
+      logger.warn({ err: err?.message }, 'Telegram fallback send also failed');
     }
   }
 }
