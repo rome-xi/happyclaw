@@ -94,6 +94,10 @@ const MEMBER_ID = 'bob';
 const OUTSIDER_ID = 'charlie';
 const GROUP_JID = 'web:messages-acl-group';
 const GROUP_FOLDER = 'messages-acl-group';
+const ALIAS_JID = 'feishu:messages-acl-alias';
+const FOREIGN_GROUP_JID = 'web:messages-acl-foreign';
+const FOREIGN_GROUP_FOLDER = 'messages-acl-foreign';
+const FOREIGN_AGENT_ID = 'messages-acl-foreign-agent';
 
 // Record queue.stopGroup calls so the owner path can assert a real reset.
 const stopGroupCalls: Array<{ jid: string; opts?: { force?: boolean } }> = [];
@@ -146,6 +150,20 @@ async function postMessage(
   return { status: res.status, body: await res.json().catch(() => ({})) };
 }
 
+async function getStreamingSnapshot(
+  chatJid = GROUP_JID,
+  agentId?: string,
+): Promise<{ status: number; body: any; cacheControl: string | null }> {
+  const params = new URLSearchParams({ chatJid });
+  if (agentId) params.set('agentId', agentId);
+  const res = await app.request(`/api/streaming-snapshot?${params.toString()}`);
+  return {
+    status: res.status,
+    body: await res.json().catch(() => ({})),
+    cacheControl: res.headers.get('cache-control'),
+  };
+}
+
 beforeAll(() => {
   fs.mkdirSync(path.join(tmpDataDir, 'db'), { recursive: true });
   fs.mkdirSync(path.join(tmpDataDir, 'groups'), { recursive: true });
@@ -163,9 +181,115 @@ beforeEach(() => {
   }
   try {
     db.deleteRegisteredGroup(GROUP_JID);
+    db.deleteRegisteredGroup(ALIAS_JID);
+    db.deleteRegisteredGroup(FOREIGN_GROUP_JID);
+    db.deleteAgent(FOREIGN_AGENT_ID);
   } catch {
     /* ignore */
   }
+  web.clearStreamingSnapshot(GROUP_JID);
+});
+
+describe('GET /api/streaming-snapshot — authenticated ACL fallback', () => {
+  test('owner receives the active bounded stream snapshot', async () => {
+    seedTestGroup();
+    asUser(OWNER_ID);
+    web.broadcastStreamEvent(GROUP_JID, {
+      eventType: 'thinking_delta',
+      text: 'visible-to-members-only',
+      turnId: 'turn-http-fallback',
+    } as any);
+
+    const { status, body, cacheControl } = await getStreamingSnapshot();
+    expect(status).toBe(200);
+    expect(cacheControl).toBe('no-store');
+    expect(body.active).toBe(true);
+    expect(body.snapshot.thinkingText).toContain('visible-to-members-only');
+    expect(body.snapshot.updatedAt).toEqual(expect.any(Number));
+  });
+
+  test('shared member is allowed but outsider is denied', async () => {
+    seedTestGroup();
+    web.broadcastStreamEvent(GROUP_JID, {
+      eventType: 'status',
+      statusText: '生成中',
+    } as any);
+
+    asUser(MEMBER_ID);
+    expect((await getStreamingSnapshot()).status).toBe(200);
+
+    asUser(OUTSIDER_ID);
+    const denied = await getStreamingSnapshot();
+    expect(denied.status).toBe(403);
+    expect(denied.body.snapshot).toBeUndefined();
+  });
+
+  test('unknown group is not disclosed', async () => {
+    asUser(OWNER_ID);
+    const { status, body } = await getStreamingSnapshot('web:missing');
+    expect(status).toBe(404);
+    expect(body.snapshot).toBeUndefined();
+  });
+
+  test('normalization cannot use an accessible IM alias to read an inaccessible home snapshot', async () => {
+    db.setRegisteredGroup(GROUP_JID, {
+      name: 'Private Home',
+      folder: GROUP_FOLDER,
+      added_at: new Date().toISOString(),
+      executionMode: 'container',
+      created_by: OWNER_ID,
+      is_home: true,
+    } as any);
+    db.setRegisteredGroup(ALIAS_JID, {
+      name: 'Member IM Alias',
+      folder: GROUP_FOLDER,
+      added_at: new Date().toISOString(),
+      executionMode: 'container',
+      created_by: MEMBER_ID,
+      is_home: false,
+    } as any);
+    web.broadcastStreamEvent(GROUP_JID, {
+      eventType: 'thinking_delta',
+      text: 'owner-private-snapshot',
+    } as any);
+
+    asUser(MEMBER_ID);
+    const denied = await getStreamingSnapshot(ALIAS_JID);
+    expect(denied.status).toBe(403);
+    expect(denied.body.snapshot).toBeUndefined();
+  });
+
+  test('agent snapshots are scoped to the normalized target workspace', async () => {
+    seedTestGroup();
+    db.setRegisteredGroup(FOREIGN_GROUP_JID, {
+      name: 'Foreign Workspace',
+      folder: FOREIGN_GROUP_FOLDER,
+      added_at: new Date().toISOString(),
+      executionMode: 'container',
+      created_by: OWNER_ID,
+      is_home: false,
+    } as any);
+    db.createAgent({
+      id: FOREIGN_AGENT_ID,
+      group_folder: FOREIGN_GROUP_FOLDER,
+      chat_jid: FOREIGN_GROUP_JID,
+      name: 'Foreign conversation',
+      prompt: '',
+      status: 'idle',
+      kind: 'conversation',
+      created_by: OWNER_ID,
+      created_at: new Date().toISOString(),
+      completed_at: null,
+      result_summary: null,
+      last_im_jid: null,
+      spawned_from_jid: null,
+    });
+
+    asUser(OWNER_ID);
+    const denied = await getStreamingSnapshot(GROUP_JID, FOREIGN_AGENT_ID);
+    expect(denied.status).toBe(404);
+    expect(denied.body.snapshot).toBeUndefined();
+  });
 });
 
 afterEach(() => {

@@ -40,6 +40,7 @@ const SIDEBAR_TABS = [
 ];
 
 const POLL_INTERVAL_MS = 2000;
+const STREAM_SNAPSHOT_POLL_INTERVAL_MS = 2000;
 const TERMINAL_MIN_HEIGHT = 150;
 const TERMINAL_DEFAULT_HEIGHT = 300;
 const TERMINAL_MAX_RATIO = 0.7;
@@ -54,7 +55,6 @@ interface ChatViewProps {
   onBack?: () => void;
   headerLeft?: React.ReactNode;
 }
-
 export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
   const { mode: displayMode, toggle: toggleDisplayMode } = useDisplayMode();
   const { theme, toggle: toggleTheme } = useTheme();
@@ -106,6 +106,8 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
   const handleStreamEvent = useChatStore(s => s.handleStreamEvent);
   const handleWsNewMessage = useChatStore(s => s.handleWsNewMessage);
   const handleStreamSnapshot = useChatStore(s => s.handleStreamSnapshot);
+  const clearStreaming = useChatStore(s => s.clearStreaming);
+  const clearAgentStreaming = useChatStore(s => s.clearAgentStreaming);
 
   const agents = useChatStore(s => s.agents[groupJid] ?? EMPTY_AGENTS);
   const activeAgentTab = useChatStore(s => s.activeAgentTab[groupJid] ?? null);
@@ -412,6 +414,87 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
     // agent_status 已提升到 AppLayout 全局监听
     return () => { unsub1(); unsub2(); unsub3(); unsub4(); };
   }, [groupJid, handleStreamEvent, handleWsNewMessage, handleStreamSnapshot]);
+
+  // WebSocket remains the primary low-latency channel. When the upgrade is
+  // unavailable, poll the same bounded server snapshot so thinking/tool state
+  // remains visible. Stop immediately on reconnect to avoid competing writers.
+  useEffect(() => {
+    let active = true;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let requestInFlight = false;
+    const activeSnapshotKeys = new Set<string>();
+
+    const schedule = () => {
+      if (!active || wsManager.isConnected() || document.hidden) return;
+      timer = setTimeout(pollSnapshot, STREAM_SNAPSHOT_POLL_INTERVAL_MS);
+    };
+
+    const pollSnapshot = async () => {
+      if (!active || requestInFlight || wsManager.isConnected()) return;
+      requestInFlight = true;
+      try {
+        const agentId = useChatStore.getState().activeAgentTab[groupJid];
+        const params = new URLSearchParams({ chatJid: groupJid });
+        if (agentId) params.set('agentId', agentId);
+        const data = await api.get<{
+          active: boolean;
+          snapshot: import('../../stores/chat').StreamSnapshotData | null;
+        }>(`/api/streaming-snapshot?${params.toString()}`);
+        if (
+          active &&
+          !wsManager.isConnected() &&
+          data.active &&
+          data.snapshot
+        ) {
+          activeSnapshotKeys.add(agentId || '__main__');
+          handleStreamSnapshot(groupJid, data.snapshot, agentId || undefined);
+        } else if (active && !wsManager.isConnected() && !data.active) {
+          const key = agentId || '__main__';
+          const store = useChatStore.getState();
+          const hasRestoredStreaming = agentId
+            ? !!store.agentStreaming[agentId]
+            : !!store.streaming[groupJid];
+          if (activeSnapshotKeys.delete(key) || hasRestoredStreaming) {
+            if (agentId) clearAgentStreaming(agentId);
+            else clearStreaming(groupJid);
+          }
+        }
+      } catch {
+        // Message polling and WS reconnect continue independently. Avoid a
+        // toast storm when the fallback endpoint is temporarily unavailable.
+      } finally {
+        requestInFlight = false;
+        schedule();
+      }
+    };
+
+    const startFallback = () => {
+      if (timer) clearTimeout(timer);
+      timer = null;
+      void pollSnapshot();
+    };
+    const stopFallback = () => {
+      if (timer) clearTimeout(timer);
+      timer = null;
+    };
+    const handleVisibility = () => {
+      if (document.hidden) stopFallback();
+      else if (!wsManager.isConnected()) startFallback();
+    };
+
+    const unsubConnected = wsManager.on('connected', stopFallback);
+    const unsubDisconnected = wsManager.on('disconnected', startFallback);
+    document.addEventListener('visibilitychange', handleVisibility);
+    if (!wsManager.isConnected()) startFallback();
+
+    return () => {
+      active = false;
+      stopFallback();
+      unsubConnected();
+      unsubDisconnected();
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
+  }, [groupJid, handleStreamSnapshot, clearStreaming, clearAgentStreaming]);
 
   const [scrollTrigger, setScrollTrigger] = useState(0);
 

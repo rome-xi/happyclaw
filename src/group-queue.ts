@@ -9,6 +9,18 @@ import { getSystemSettings } from './runtime-config.js';
 import { logger } from './logger.js';
 export type SendMessageResult = 'sent' | 'no_active';
 
+export interface IpcMessageCursor {
+  id: string;
+  timestamp: string;
+}
+
+export interface IpcDeliveryMetadata {
+  /** JID whose durable message rows must be replayed after a crash. */
+  databaseJid: string;
+  /** Exact DB rows represented by this formatted IPC envelope. */
+  messageCursors: IpcMessageCursor[];
+}
+
 interface QueuedTask {
   id: string;
   groupJid: string;
@@ -26,6 +38,22 @@ interface GroupState {
   lastActivityAt: number | null;
   /** True while the runner is inside an active query turn. */
   queryInFlight: boolean;
+  /** IPC messages written by the host but not yet acknowledged by a real SDK
+   * query event. Kept separate from pendingMessages because the warm runner is
+   * expected to consume these without spawning a second process. */
+  pendingIpcMessageIds: Set<string>;
+  /** Pending IPC messages that have reached a fresh turn and are therefore
+   * subject to the short provider-acceptance ACK deadline. Messages queued
+   * behind an active turn deliberately stay out of this set. */
+  ipcAckEligibleMessageIds: Set<string>;
+  /** Route/card transitions delayed until the queued message actually starts
+   * its own logical turn. Keyed by durable IPC message ID for exactly-once use. */
+  ipcTurnStartCallbacks: Map<string, () => void | Promise<void>>;
+  /** Delivery ownership retained after ACK until its own result completes. */
+  ipcDeliveryMetadata: Map<string, IpcDeliveryMetadata>;
+  /** ACKed IPC messages explicitly completed by a later query result. */
+  completedIpcMessageIds: Set<string>;
+  ipcAwaitingAckSince: number | null;
   pendingMessages: boolean;
   pendingTasks: QueuedTask[];
   process: ChildProcess | null;
@@ -35,6 +63,8 @@ interface GroupState {
   agentId: string | null;
   /** Isolated task run ID — used for tasks-run/{taskRunId}/ IPC namespace. */
   taskRunId: string | null;
+  /** Recovery runners consume only this DB lane from a shared IPC directory. */
+  ipcDatabaseJidFilter: string | null;
   retryCount: number;
   retryTimer: ReturnType<typeof setTimeout> | null;
   restarting: boolean;
@@ -48,6 +78,8 @@ interface GroupState {
    *  re-read those messages.  The close handler uses this flag to force pendingMessages
    *  so drainGroup triggers a fresh run. */
   hasIpcInjectedMessages: boolean;
+  /** Durable DB lanes injected into this shared runner during its lifetime. */
+  ipcInjectedDatabaseJids: Set<string>;
   /**
    * HappyClaw user id that started the current run (idle→active), or null when
    * unknown (IM / task / agent / drain runs, or no initiator supplied). The
@@ -68,6 +100,8 @@ export class GroupQueue {
   private activeHostProcessCount = 0;
   private waitingGroups = new Set<string>();
   private contextOverflowGroups = new Set<string>(); // 跟踪发生上下文溢出的 group
+  /** DB lanes that must replay from lastCommittedCursor after runner loss. */
+  private ipcRecoveryDatabaseJids = new Set<string>();
   // 记录最近一次 stopGroup 的时间戳（毫秒）。runForGroup finally 块会用它来
   // 决定是否跳过自动 drainGroup —— stopGroup 中清空 pendingMessages 之后，
   // hasIpcInjectedMessages 重新置 pendingMessages=true，会让用户的 'stop' 之后
@@ -101,6 +135,12 @@ export class GroupQueue {
         activeRunnerIsTask: false,
         lastActivityAt: null,
         queryInFlight: false,
+        pendingIpcMessageIds: new Set(),
+        ipcAckEligibleMessageIds: new Set(),
+        ipcTurnStartCallbacks: new Map(),
+        ipcDeliveryMetadata: new Map(),
+        completedIpcMessageIds: new Set(),
+        ipcAwaitingAckSince: null,
         pendingMessages: false,
         pendingTasks: [],
         process: null,
@@ -109,12 +149,14 @@ export class GroupQueue {
         groupFolder: null,
         agentId: null,
         taskRunId: null,
+        ipcDatabaseJidFilter: null,
         retryCount: 0,
         retryTimer: null,
         restarting: false,
         selectedProviderId: null,
         drainSentinelWritten: false,
         hasIpcInjectedMessages: false,
+        ipcInjectedDatabaseJids: new Set(),
         currentRunInitiator: null,
       };
       this.groups.set(groupJid, state);
@@ -401,14 +443,237 @@ export class GroupQueue {
 
   /**
    * Mark that a message was IPC-injected into the running agent.
-   * The caller (web.ts) has already advanced the per-group cursor for this
-   * message.  If the agent crashes without processing it, the close handler
-   * uses this flag to force pendingMessages so drainGroup re-reads from DB.
+   * The caller has already advanced the next-pull cursor for this message. If
+   * the agent crashes without completing it, the close handler uses its DB
+   * lane to force a replay from lastCommittedCursor.
    */
-  markIpcInjectedMessage(groupJid: string): void {
+  markIpcInjectedMessage(groupJid: string, databaseJid = groupJid): void {
     const state = this.resolveActiveState(groupJid);
     if (!state?.active) return;
     state.hasIpcInjectedMessages = true;
+    state.ipcInjectedDatabaseJids ??= new Set<string>();
+    state.ipcInjectedDatabaseJids.add(databaseJid);
+  }
+
+  needsIpcRecoveryReplay(databaseJid: string): boolean {
+    return this.ipcRecoveryDatabaseJids.has(databaseJid);
+  }
+
+  clearIpcRecoveryReplay(databaseJid: string): void {
+    this.ipcRecoveryDatabaseJids.delete(databaseJid);
+  }
+
+  private enqueueIpcRecovery(databaseJid: string): void {
+    this.ipcRecoveryDatabaseJids.add(databaseJid);
+    this.enqueueMessageCheck(databaseJid);
+  }
+
+  /**
+   * A queued IPC envelope has crossed the logical-turn boundary. Route/card
+   * ownership changes here (not at file-write time), and only now does the
+   * short SDK-start watchdog apply to messages queued behind a running turn.
+   */
+  async markIpcMessagesTurnStarted(
+    groupJid: string,
+    messageIds: string[],
+  ): Promise<void> {
+    const state = this.resolveActiveState(groupJid);
+    if (!state?.active || messageIds.length === 0) return;
+    state.pendingIpcMessageIds ??= new Set<string>();
+    state.ipcAckEligibleMessageIds ??= new Set<string>();
+    state.ipcTurnStartCallbacks ??= new Map<
+      string,
+      () => void | Promise<void>
+    >();
+
+    const callbacks: Array<{
+      messageId: string;
+      callback: () => void | Promise<void>;
+    }> = [];
+    let armedWatchdog = false;
+    for (const messageId of messageIds) {
+      if (!state.pendingIpcMessageIds.has(messageId)) continue;
+      if (!state.ipcAckEligibleMessageIds.has(messageId)) {
+        state.ipcAckEligibleMessageIds.add(messageId);
+        armedWatchdog = true;
+      }
+      const callback = state.ipcTurnStartCallbacks.get(messageId);
+      if (callback) {
+        state.ipcTurnStartCallbacks.delete(messageId);
+        callbacks.push({ messageId, callback });
+      }
+    }
+    if (armedWatchdog) state.ipcAwaitingAckSince ??= Date.now();
+
+    for (const { messageId, callback } of callbacks) {
+      try {
+        await callback();
+      } catch (err) {
+        logger.warn(
+          { groupJid, messageId, err },
+          'IPC turn-start callback failed',
+        );
+      }
+    }
+  }
+
+  /**
+   * Apply an agent-runner acknowledgement only after provider acceptance for a
+   * fresh query, or after Claude's SDK has pulled a pipe-in message. This closes
+   * the consume-before-start hole without changing the warm-runner lifecycle.
+   */
+  markIpcMessagesStarted(groupJid: string, messageIds: string[]): void {
+    const state = this.resolveActiveState(groupJid);
+    if (!state?.active || messageIds.length === 0) return;
+    state.pendingIpcMessageIds ??= new Set<string>();
+    state.ipcAckEligibleMessageIds ??= new Set<string>();
+    const retired = this.retireAcknowledgedIpcClaims(state, messageIds);
+    for (const messageId of retired) {
+      state.pendingIpcMessageIds.delete(messageId);
+      state.ipcAckEligibleMessageIds.delete(messageId);
+    }
+    if (state.ipcAckEligibleMessageIds.size === 0) {
+      state.ipcAwaitingAckSince = null;
+    }
+  }
+
+  markIpcMessagesCompleted(groupJid: string, messageIds: string[]): void {
+    const state = this.resolveActiveState(groupJid);
+    if (!state?.active || messageIds.length === 0) return;
+    state.completedIpcMessageIds ??= new Set<string>();
+    for (const messageId of messageIds) {
+      if (state.ipcDeliveryMetadata.has(messageId)) {
+        state.completedIpcMessageIds.add(messageId);
+      }
+    }
+  }
+
+  /**
+   * When the runner puts an ACKed claim back on disk, pause the short watchdog
+   * until the next fresh-turn signal arms it again. Delivery ownership stays
+   * unchanged so only that later query result can commit its DB cursor.
+   */
+  markIpcMessagesRequeued(groupJid: string, messageIds: string[]): void {
+    const state = this.resolveActiveState(groupJid);
+    if (!state?.active || messageIds.length === 0) return;
+    state.pendingIpcMessageIds ??= new Set<string>();
+    state.ipcAckEligibleMessageIds ??= new Set<string>();
+    state.completedIpcMessageIds ??= new Set<string>();
+    let requeued = false;
+    for (const messageId of messageIds) {
+      if (!state.ipcDeliveryMetadata.has(messageId)) continue;
+      state.completedIpcMessageIds.delete(messageId);
+      state.pendingIpcMessageIds.add(messageId);
+      state.ipcAckEligibleMessageIds.delete(messageId);
+      requeued = true;
+    }
+    if (requeued && state.ipcAckEligibleMessageIds.size === 0) {
+      state.ipcAwaitingAckSince = null;
+    }
+  }
+
+  /**
+   * Return only deliveries explicitly tied to a completed query generation.
+   * SDK pull/ACK alone is insufficient: an older result or interrupt can race
+   * after a follow-up was pulled but before that follow-up was answered.
+   */
+  takeCompletedIpcDeliveries(groupJid: string): IpcDeliveryMetadata[] {
+    const state = this.resolveActiveState(groupJid);
+    if (!state?.active) return [];
+    state.ipcDeliveryMetadata ??= new Map<string, IpcDeliveryMetadata>();
+    state.completedIpcMessageIds ??= new Set<string>();
+    const deliveries: IpcDeliveryMetadata[] = [];
+    for (const messageId of [...state.completedIpcMessageIds]) {
+      if (state.pendingIpcMessageIds.has(messageId)) continue;
+      const delivery = state.ipcDeliveryMetadata.get(messageId);
+      if (!delivery) {
+        state.completedIpcMessageIds.delete(messageId);
+        continue;
+      }
+      deliveries.push(delivery);
+      state.ipcDeliveryMetadata.delete(messageId);
+      state.completedIpcMessageIds.delete(messageId);
+    }
+    const remainingJids = new Set(
+      [...state.ipcDeliveryMetadata.values()].map(
+        (delivery) => delivery.databaseJid,
+      ),
+    );
+    for (const databaseJid of [...state.ipcInjectedDatabaseJids]) {
+      if (!remainingJids.has(databaseJid)) {
+        state.ipcInjectedDatabaseJids.delete(databaseJid);
+      }
+    }
+    if (state.ipcDeliveryMetadata.size === 0) {
+      state.hasIpcInjectedMessages = false;
+    }
+    return deliveries;
+  }
+
+  /**
+   * The runner only reports consumption; the host owns durable claim deletion.
+   * This ordering means a runner crash before the output reaches the host leaves
+   * the claim recoverable. A host crash after deletion still replays from the
+   * uncommitted DB cursor, preferring a duplicate over silent loss.
+   */
+  private retireAcknowledgedIpcClaims(
+    state: ActiveGroupState,
+    messageIds: string[],
+  ): Set<string> {
+    const requested = new Set(messageIds);
+    const retired = new Set<string>();
+    const failed = new Set<string>();
+    const inflightDir = path.join(this.resolveIpcInputDir(state), 'inflight');
+    let files: string[];
+    try {
+      files = fs
+        .readdirSync(inflightDir)
+        .filter((file) => file.endsWith('.json'));
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return requested;
+      logger.warn(
+        { groupFolder: state.groupFolder, err },
+        'Failed to list IPC claims while applying runner acknowledgement',
+      );
+      return retired;
+    }
+
+    for (const file of files) {
+      const claimPath = path.join(inflightDir, file);
+      let messageId = file.replace(/\.json$/, '');
+      try {
+        const data = JSON.parse(fs.readFileSync(claimPath, 'utf8')) as {
+          messageId?: unknown;
+        };
+        if (typeof data.messageId === 'string') messageId = data.messageId;
+      } catch (err) {
+        if (requested.has(messageId)) failed.add(messageId);
+        continue;
+      }
+      if (!requested.has(messageId)) continue;
+      try {
+        fs.unlinkSync(claimPath);
+        retired.add(messageId);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+          retired.add(messageId);
+        } else {
+          failed.add(messageId);
+          logger.warn(
+            { groupFolder: state.groupFolder, messageId, err },
+            'Failed to retire acknowledged IPC claim',
+          );
+        }
+      }
+    }
+
+    // A duplicate acknowledgement or legacy runner may reference a claim that
+    // is already absent. Treat absence as retired, but never clear an ID whose
+    // matching claim was unreadable or failed deletion.
+    for (const messageId of requested) {
+      if (!failed.has(messageId)) retired.add(messageId);
+    }
+    return retired;
   }
 
   markRunnerQueryIdle(groupJid: string): void {
@@ -430,21 +695,187 @@ export class GroupQueue {
     return this.hasRemainingIpcMessages(groupFolder, null, null);
   }
 
+  hasUnconsumedAgentIpcInput(groupFolder: string, agentId: string): boolean {
+    if (!groupFolder || !agentId) return false;
+    return this.hasRemainingIpcMessages(groupFolder, agentId, null);
+  }
+
+  /**
+   * Remove main-conversation IPC envelopes after their durable DB rows have
+   * been selected for crash recovery. The database is the recovery source of
+   * truth; leaving the same envelopes for the new runner would append the
+   * follow-up a second time during its boot drain.
+   */
+  discardRecoveredIpcInput(
+    groupFolder: string,
+    databaseJid: string,
+    recoveredCursors: IpcMessageCursor[],
+  ): number {
+    if (!groupFolder || !databaseJid) return 0;
+    const inputDir = path.join(DATA_DIR, 'ipc', groupFolder, 'input');
+    return this.discardRecoveredIpcEnvelopes(
+      inputDir,
+      databaseJid,
+      recoveredCursors,
+      { groupFolder },
+    );
+  }
+
+  discardRecoveredAgentIpcInput(
+    groupFolder: string,
+    agentId: string,
+    databaseJid: string,
+    recoveredCursors: IpcMessageCursor[],
+  ): number {
+    if (!groupFolder || !agentId) return 0;
+    const inputDir = path.join(
+      DATA_DIR,
+      'ipc',
+      groupFolder,
+      'agents',
+      agentId,
+      'input',
+    );
+    return this.discardRecoveredIpcEnvelopes(
+      inputDir,
+      databaseJid,
+      recoveredCursors,
+      { groupFolder, agentId },
+    );
+  }
+
+  /** List durable DB lanes represented by queued/inflight envelopes. */
+  getUnconsumedIpcDatabaseJids(
+    groupFolder: string,
+    fallbackJid: string,
+    agentId?: string | null,
+  ): Set<string> {
+    const inputDir = agentId
+      ? path.join(DATA_DIR, 'ipc', groupFolder, 'agents', agentId, 'input')
+      : path.join(DATA_DIR, 'ipc', groupFolder, 'input');
+    const jids = new Set<string>();
+    for (const envelope of this.readIpcEnvelopes(inputDir)) {
+      jids.add(envelope.databaseJid || fallbackJid);
+    }
+    return jids;
+  }
+
+  private readIpcEnvelopes(inputDir: string): Array<{
+    path: string;
+    databaseJid?: string;
+    messageCursors: IpcMessageCursor[];
+  }> {
+    const envelopes: Array<{
+      path: string;
+      databaseJid?: string;
+      messageCursors: IpcMessageCursor[];
+    }> = [];
+    for (const dir of [inputDir, path.join(inputDir, 'inflight')]) {
+      let files: string[];
+      try {
+        files = fs.readdirSync(dir);
+      } catch {
+        continue;
+      }
+      for (const file of files) {
+        if (!file.endsWith('.json')) continue;
+        const envelopePath = path.join(dir, file);
+        try {
+          const data = JSON.parse(fs.readFileSync(envelopePath, 'utf8')) as {
+            databaseJid?: unknown;
+            messageCursors?: unknown;
+          };
+          const messageCursors = Array.isArray(data.messageCursors)
+            ? data.messageCursors.filter(
+                (cursor): cursor is IpcMessageCursor =>
+                  !!cursor &&
+                  typeof cursor === 'object' &&
+                  typeof (cursor as IpcMessageCursor).id === 'string' &&
+                  typeof (cursor as IpcMessageCursor).timestamp === 'string',
+              )
+            : [];
+          envelopes.push({
+            path: envelopePath,
+            databaseJid:
+              typeof data.databaseJid === 'string'
+                ? data.databaseJid
+                : undefined,
+            messageCursors,
+          });
+        } catch {
+          // Invalid envelopes are runner-owned; schedule the fallback lane so
+          // a replacement runner can quarantine them, but keep ownership
+          // unknown so DB recovery never deletes them as a sibling's message.
+          envelopes.push({
+            path: envelopePath,
+            messageCursors: [],
+          });
+        }
+      }
+    }
+    return envelopes;
+  }
+
+  private discardRecoveredIpcEnvelopes(
+    inputDir: string,
+    databaseJid: string,
+    recoveredCursors: IpcMessageCursor[],
+    context: { groupFolder: string; agentId?: string },
+  ): number {
+    const recovered = new Set(
+      recoveredCursors.map((cursor) => `${cursor.timestamp}\0${cursor.id}`),
+    );
+    let removed = 0;
+    for (const envelope of this.readIpcEnvelopes(inputDir)) {
+      // Legacy/unattributed envelopes stay durable and may be replayed twice;
+      // deleting an envelope owned by a sibling JID would silently lose it.
+      if (envelope.databaseJid !== databaseJid) continue;
+      if (envelope.messageCursors.length === 0) continue;
+      if (
+        !envelope.messageCursors.every((cursor) =>
+          recovered.has(`${cursor.timestamp}\0${cursor.id}`),
+        )
+      ) {
+        continue;
+      }
+      try {
+        fs.unlinkSync(envelope.path);
+        removed++;
+      } catch (err) {
+        logger.warn(
+          { ...context, databaseJid, err },
+          'Failed to discard DB-recovered IPC envelope',
+        );
+      }
+    }
+    return removed;
+  }
+
   getStuckPendingGroups(
     idleThresholdMs: number,
+    ipcAckThresholdMs = idleThresholdMs,
   ): Array<{ jid: string; idleMs: number }> {
     const now = Date.now();
     const stuck: Array<{ jid: string; idleMs: number }> = [];
     for (const [jid, state] of this.groups.entries()) {
       if (!state.active) continue;
-      if (state.activeRunnerIsTask) continue;
-      if (!state.pendingMessages) continue;
-      if (state.agentId !== null) continue;
+      // Scheduled tasks are not user-message consumers. Conversation agents
+      // are implemented on the task lane, however, and must remain visible to
+      // the IPC ACK watchdog when a warm follow-up stalls.
+      const isConversationAgent =
+        state.activeRunnerIsTask && state.agentId !== null;
+      if (state.activeRunnerIsTask && !isConversationAgent) continue;
+      const awaitingIpcAck = (state.ipcAckEligibleMessageIds?.size ?? 0) > 0;
+      if (!state.pendingMessages && !awaitingIpcAck) continue;
+      if (state.agentId !== null && !isConversationAgent) continue;
       if (state.restarting) continue;
-      const lastActivityAt = state.lastActivityAt ?? 0;
-      if (lastActivityAt <= 0) continue;
-      const idleMs = now - lastActivityAt;
-      if (idleMs < idleThresholdMs) continue;
+      const referenceTime = awaitingIpcAck
+        ? state.ipcAwaitingAckSince
+        : state.lastActivityAt;
+      if (!referenceTime || referenceTime <= 0) continue;
+      const idleMs = now - referenceTime;
+      const threshold = awaitingIpcAck ? ipcAckThresholdMs : idleThresholdMs;
+      if (idleMs < threshold) continue;
       stuck.push({ jid, idleMs });
     }
     return stuck;
@@ -607,6 +1038,7 @@ export class GroupQueue {
       displayName?: string;
       agentId?: string;
       taskRunId?: string;
+      ipcDatabaseJidFilter?: string;
       selectedProviderId?: string | null;
     },
   ): void {
@@ -617,7 +1049,13 @@ export class GroupQueue {
     if (opts.groupFolder) state.groupFolder = opts.groupFolder;
     state.agentId = opts.agentId || null;
     state.taskRunId = opts.taskRunId || null;
+    state.ipcDatabaseJidFilter = opts.ipcDatabaseJidFilter || null;
     state.selectedProviderId = opts.selectedProviderId ?? null;
+    if (state.ipcDatabaseJidFilter && !state.drainSentinelWritten) {
+      state.drainSentinelWritten = this.writeDrainSentinel(
+        state as ActiveGroupState,
+      );
+    }
   }
 
   /**
@@ -659,11 +1097,28 @@ export class GroupQueue {
     groupJid: string,
     text: string,
     images?: Array<{ data: string; mimeType?: string }>,
-    onInjected?: () => void,
+    onTurnStarted?: () => void | Promise<void>,
     sourceJid?: string,
+    delivery?: IpcDeliveryMetadata,
   ): SendMessageResult {
     const state = this.resolveActiveState(groupJid);
     if (!state) return 'no_active';
+
+    const databaseJid = delivery?.databaseJid || groupJid;
+    if (
+      state.ipcDatabaseJidFilter &&
+      state.ipcDatabaseJidFilter !== databaseJid
+    ) {
+      logger.debug(
+        {
+          groupJid,
+          databaseJid,
+          recoveryDatabaseJid: state.ipcDatabaseJidFilter,
+        },
+        'Recovery runner is pinned to another DB lane; deferring message',
+      );
+      return 'no_active';
+    }
 
     // If the active runner is a scheduled task (not a user-message handler),
     // do NOT pipe user messages into it.  The task container has no knowledge
@@ -686,23 +1141,62 @@ export class GroupQueue {
     }
 
     // queryInFlight=true：当前 query 正在执行，将消息写入 IPC 文件排队。
-    // 当前 query 完成后 waitForIpcMessage() → drainIpcInput() 会合并所有
-    // 待处理的 IPC 消息为一个 prompt，实现自然聚合（如飞书转发+评论场景）。
-    // 不再写 _drain：容器无需退出重启，复用当前进程即可。
+    // runner 不会把它 pipe 进当前 SDK stream；当前逻辑 turn 完成后，
+    // waitForIpcMessage() → drainIpcInput() 才合并为一个新的完整 prompt，
+    // 实现自然聚合（如飞书转发+评论场景），同时避免副作用执行两遍。
+    // 不写 _drain：容器无需退出重启，仍可复用当前进程。
 
+    const wasQueryInFlight = state.queryInFlight;
     const inputDir = this.resolveIpcInputDir(state);
     try {
       fs.mkdirSync(inputDir, { recursive: true });
-      const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}.json`;
+      const messageId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+      const filename = `${messageId}.json`;
       const filepath = path.join(inputDir, filename);
       const tempPath = `${filepath}.tmp`;
       fs.writeFileSync(
         tempPath,
-        JSON.stringify({ type: 'message', text, images, sourceJid }),
+        JSON.stringify({
+          type: 'message',
+          messageId,
+          createdAt: Date.now(),
+          text,
+          images,
+          sourceJid,
+          databaseJid,
+          messageCursors: delivery?.messageCursors || [],
+        }),
       );
       fs.renameSync(tempPath, filepath);
       state.queryInFlight = true;
-      onInjected?.();
+      state.pendingIpcMessageIds ??= new Set<string>();
+      state.pendingIpcMessageIds.add(messageId);
+      state.ipcAckEligibleMessageIds ??= new Set<string>();
+      state.ipcTurnStartCallbacks ??= new Map<
+        string,
+        () => void | Promise<void>
+      >();
+      if (onTurnStarted) {
+        state.ipcTurnStartCallbacks.set(messageId, onTurnStarted);
+      }
+      state.ipcDeliveryMetadata ??= new Map<string, IpcDeliveryMetadata>();
+      state.ipcDeliveryMetadata.set(
+        messageId,
+        delivery ?? {
+          databaseJid: groupJid,
+          messageCursors: [],
+        },
+      );
+      // An idle warm runner should claim promptly, so retain the short
+      // no-child watchdog. A message queued behind a live query becomes
+      // eligible only when the runner announces its fresh turn.
+      if (!wasQueryInFlight) {
+        state.ipcAckEligibleMessageIds.add(messageId);
+        state.ipcAwaitingAckSince ??= Date.now();
+      }
+      state.hasIpcInjectedMessages = true;
+      state.ipcInjectedDatabaseJids ??= new Set<string>();
+      state.ipcInjectedDatabaseJids.add(databaseJid);
       return 'sent';
     } catch (err) {
       // 不静默：磁盘满 / 权限错 / inode 耗尽这些根因不应该被伪装成
@@ -772,13 +1266,18 @@ export class GroupQueue {
     groupJid: string,
     state: GroupState,
     context: string,
-  ): void {
-    if (!state.groupFolder) return;
+  ): boolean {
+    if (!state.groupFolder) return false;
+    // restartGroup owns recovery while a watchdog/administrator restart is in
+    // progress. Re-enqueuing from the exiting runner's finally block would
+    // start a replacement before restartGroup has finished waiting, causing
+    // the replacement to be mistaken for the old process and killed again.
+    if (state.restarting) return false;
     // 与 runForGroup finally 的逻辑保持一致：刚被 stopGroup 标记的 folder 不
     // 应该在这里重新点亮 pendingMessages，否则 stopGroup 之后的 drainGroup 路径
     // 会拉起一个新 runner。
     if (this.isRecentlyStopped(state.groupFolder)) {
-      return;
+      return false;
     }
     try {
       if (
@@ -788,24 +1287,34 @@ export class GroupQueue {
           state.taskRunId,
         )
       )
-        return;
+        return false;
 
       if (state.agentId && this.onUnconsumedAgentIpcFn) {
         logger.warn(
           { groupJid, agentId: state.agentId },
           `Unconsumed IPC messages found after ${context}, re-enqueuing`,
         );
+        this.ipcRecoveryDatabaseJids.add(groupJid);
         this.onUnconsumedAgentIpcFn(groupJid, state.agentId);
+        return true;
       } else if (!state.taskRunId) {
-        state.pendingMessages = true;
-        logger.warn(
-          { groupJid },
-          `Unconsumed IPC messages found after ${context}, marking pending`,
+        const recoveryJids = this.getUnconsumedIpcDatabaseJids(
+          state.groupFolder,
+          groupJid,
         );
+        for (const databaseJid of recoveryJids) {
+          this.enqueueIpcRecovery(databaseJid);
+        }
+        logger.warn(
+          { groupJid, recoveryJids: [...recoveryJids] },
+          `Unconsumed IPC messages found after ${context}, re-enqueuing DB lanes`,
+        );
+        return recoveryJids.size > 0;
       }
     } catch (err) {
       logger.warn({ groupJid, err }, 'Failed to check remaining IPC messages');
     }
+    return false;
   }
 
   private hasRemainingIpcMessages(
@@ -820,7 +1329,9 @@ export class GroupQueue {
         : path.join(DATA_DIR, 'ipc', groupFolder, 'input');
     try {
       const files = fs.readdirSync(inputDir);
-      return files.some((f) => f.endsWith('.json'));
+      if (files.some((f) => f.endsWith('.json'))) return true;
+      const inflightDir = path.join(inputDir, 'inflight');
+      return fs.readdirSync(inflightDir).some((f) => f.endsWith('.json'));
     } catch {
       return false;
     }
@@ -1052,6 +1563,9 @@ export class GroupQueue {
     const activeRunner = this.findActiveRunnerFor(groupJid);
     const targetJid = activeRunner || groupJid;
     const state = this.getGroup(targetJid);
+    const restartingAgentId = state.agentId;
+    const restartingGroupFolder = state.groupFolder;
+    const restartingDatabaseJids = new Set(state.ipcInjectedDatabaseJids ?? []);
 
     if (state.restarting) {
       logger.warn(
@@ -1131,12 +1645,36 @@ export class GroupQueue {
         );
         throw new Error(`Failed to restart container for group ${targetJid}`);
       }
-
-      // Trigger a fresh container start
-      logger.info({ groupJid: targetJid }, 'Restarting container');
-      this.enqueueMessageCheck(groupJid);
     } finally {
       state.restarting = false;
+    }
+
+    // Trigger recovery only after the old runner is fully inactive and the
+    // restart guard has been released. Conversation-agent runners are task
+    // lane jobs, so they must be re-enqueued through their dedicated callback
+    // rather than the main-message queue.
+    logger.info(
+      { groupJid: targetJid, conversationAgent: !!restartingAgentId },
+      'Restarting runner',
+    );
+    if (restartingAgentId) {
+      this.ipcRecoveryDatabaseJids.add(targetJid);
+      this.onUnconsumedAgentIpcFn?.(targetJid, restartingAgentId);
+    } else {
+      if (restartingGroupFolder) {
+        for (const databaseJid of this.getUnconsumedIpcDatabaseJids(
+          restartingGroupFolder,
+          groupJid,
+        )) {
+          restartingDatabaseJids.add(databaseJid);
+        }
+      }
+      if (restartingDatabaseJids.size === 0) {
+        restartingDatabaseJids.add(groupJid);
+      }
+      for (const databaseJid of restartingDatabaseJids) {
+        this.enqueueIpcRecovery(databaseJid);
+      }
     }
   }
 
@@ -1229,10 +1767,16 @@ export class GroupQueue {
       // Honor stopGroup's intent by skipping this re-arm if a stop was issued
       // for this folder in the last RECENTLY_STOPPED_WINDOW_MS.
       if (state.hasIpcInjectedMessages && !isStopRequested) {
-        state.pendingMessages = true;
+        const recoveryJids =
+          state.ipcInjectedDatabaseJids?.size > 0
+            ? [...state.ipcInjectedDatabaseJids]
+            : [groupJid];
+        for (const databaseJid of recoveryJids) {
+          this.enqueueIpcRecovery(databaseJid);
+        }
         logger.debug(
-          { groupJid },
-          'IPC-injected messages detected, marking pending for safety re-check',
+          { groupJid, recoveryCount: recoveryJids.length },
+          'IPC-injected DB lanes detected, scheduling safety re-check',
         );
       } else if (state.hasIpcInjectedMessages && isStopRequested) {
         logger.info(
@@ -1243,6 +1787,13 @@ export class GroupQueue {
       state.active = false;
       state.drainSentinelWritten = false;
       state.hasIpcInjectedMessages = false;
+      state.ipcInjectedDatabaseJids?.clear();
+      state.ipcDeliveryMetadata?.clear();
+      state.completedIpcMessageIds?.clear();
+      state.pendingIpcMessageIds?.clear();
+      state.ipcAckEligibleMessageIds?.clear();
+      state.ipcTurnStartCallbacks?.clear();
+      state.ipcAwaitingAckSince = null;
       state.lastActivityAt = null;
       state.queryInFlight = false;
       state.process = null;
@@ -1251,6 +1802,7 @@ export class GroupQueue {
       state.groupFolder = null;
       state.agentId = null;
       state.taskRunId = null;
+      state.ipcDatabaseJidFilter = null;
       state.currentRunInitiator = null;
       this.activeCount--;
       if (isHostMode) {
@@ -1334,6 +1886,7 @@ export class GroupQueue {
       logger.error({ groupJid, taskId: task.id, err }, 'Error running task');
     } finally {
       // Clean up stale sentinel files before clearing groupFolder/agentId
+      let recoveryScheduled = false;
       if (state.groupFolder) {
         try {
           this.cleanupIpcSentinels(
@@ -1344,11 +1897,36 @@ export class GroupQueue {
         } catch (err) {
           logger.warn({ groupJid, err }, 'Failed to clean up IPC sentinels');
         }
-        this.recoverUnconsumedIpc(groupJid, state, 'task exit');
+        recoveryScheduled = this.recoverUnconsumedIpc(
+          groupJid,
+          state,
+          'task exit',
+        );
+      }
+      if (
+        !recoveryScheduled &&
+        state.agentId &&
+        state.hasIpcInjectedMessages &&
+        !state.restarting &&
+        this.onUnconsumedAgentIpcFn
+      ) {
+        // The host may already have retired the consumed claim, but the DB
+        // cursor is not committed until a reply is persisted. Re-check the
+        // agent DB lane after any premature task-runner exit.
+        this.ipcRecoveryDatabaseJids.add(groupJid);
+        this.onUnconsumedAgentIpcFn(groupJid, state.agentId);
       }
       state.active = false;
       state.activeRunnerIsTask = false;
       state.drainSentinelWritten = false;
+      state.hasIpcInjectedMessages = false;
+      state.ipcInjectedDatabaseJids?.clear();
+      state.ipcDeliveryMetadata?.clear();
+      state.completedIpcMessageIds?.clear();
+      state.pendingIpcMessageIds?.clear();
+      state.ipcAckEligibleMessageIds?.clear();
+      state.ipcTurnStartCallbacks?.clear();
+      state.ipcAwaitingAckSince = null;
       state.lastActivityAt = null;
       state.queryInFlight = false;
       state.process = null;
@@ -1356,6 +1934,7 @@ export class GroupQueue {
       state.displayName = null;
       state.groupFolder = null;
       state.agentId = null;
+      state.ipcDatabaseJidFilter = null;
       state.taskRunId = null;
       this.activeCount--;
       if (isHostMode) {
@@ -1431,6 +2010,7 @@ export class GroupQueue {
     if (this.shuttingDown) return;
 
     const state = this.getGroup(groupJid);
+    if (state.restarting) return;
     const activeRunner = this.findActiveRunnerFor(groupJid);
     if (activeRunner && activeRunner !== groupJid) {
       this.waitingGroups.add(groupJid);

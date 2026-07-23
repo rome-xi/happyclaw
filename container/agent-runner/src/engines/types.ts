@@ -243,6 +243,7 @@ export interface AgentEngine {
   pushToActive?(
     text: string,
     images?: Array<{ data: string; mimeType: string }>,
+    onConsumed?: () => void,
   ): string[];
 
   /** 中断当前活动查询。 */

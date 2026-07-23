@@ -2451,6 +2451,18 @@ export function setRouterState(key: string, value: string): void {
   ).run(key, value);
 }
 
+/** Persist related router-state keys atomically (notably pull + commit cursors). */
+export function setRouterStateBatch(
+  entries: Array<{ key: string; value: string }>,
+): void {
+  const stmt = db.prepare(
+    'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
+  );
+  db.transaction((rows: Array<{ key: string; value: string }>) => {
+    for (const row of rows) stmt.run(row.key, row.value);
+  })(entries);
+}
+
 export function deleteRouterState(key: string): void {
   db.prepare('DELETE FROM router_state WHERE key = ?').run(key);
 }

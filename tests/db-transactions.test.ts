@@ -24,6 +24,8 @@ const {
   createBillingPlan,
   getBillingPlan,
   deleteBillingPlan,
+  getRouterState,
+  setRouterStateBatch,
 } = await import('../src/db.js');
 
 // Reach into the same DB file via a separate connection for read-only verifications.
@@ -49,6 +51,29 @@ beforeEach(() => {
     'DELETE FROM monthly_usage; DELETE FROM daily_usage; DELETE FROM user_subscriptions; DELETE FROM billing_plans; DELETE FROM users;',
   );
   wb.close();
+});
+
+describe('setRouterStateBatch', () => {
+  test('writes related cursor state in one transaction', () => {
+    setRouterStateBatch([
+      { key: 'cursor_committed_test', value: 'before' },
+      { key: 'cursor_next_test', value: 'after' },
+    ]);
+    expect(getRouterState('cursor_committed_test')).toBe('before');
+    expect(getRouterState('cursor_next_test')).toBe('after');
+  });
+
+  test('rolls back every key if a later write fails', () => {
+    setRouterStateBatch([{ key: 'cursor_atomic_test', value: 'old' }]);
+    expect(() =>
+      setRouterStateBatch([
+        { key: 'cursor_atomic_test', value: 'new' },
+        { key: 'cursor_invalid_test', value: null as unknown as string },
+      ]),
+    ).toThrow();
+    expect(getRouterState('cursor_atomic_test')).toBe('old');
+    expect(getRouterState('cursor_invalid_test')).toBeUndefined();
+  });
 });
 
 describe('incrementUsageBoth (R2 fix: atomic monthly + daily)', () => {

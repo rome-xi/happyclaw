@@ -74,14 +74,18 @@ interface SDKUserMessage {
 // ── MessageStream: push-based async iterable ──
 // 从 index.ts 提取，供 SDK query() 消费用户消息流。
 
-class MessageStream {
-  private queue: SDKUserMessage[] = [];
+export class MessageStream {
+  private queue: Array<{
+    message: SDKUserMessage;
+    onConsumed?: () => void;
+  }> = [];
   private waiting: (() => void) | null = null;
   private done = false;
 
   push(
     text: string,
     images?: Array<{ data: string; mimeType: string }>,
+    onConsumed?: () => void,
   ): string[] {
     if (this.done) {
       return [
@@ -107,10 +111,13 @@ class MessageStream {
     }
 
     this.queue.push({
-      type: 'user',
-      message: { role: 'user', content },
-      parent_tool_use_id: null,
-      session_id: '',
+      message: {
+        type: 'user',
+        message: { role: 'user', content },
+        parent_tool_use_id: null,
+        session_id: '',
+      },
+      onConsumed,
     });
     this.waiting?.();
     return [];
@@ -128,7 +135,12 @@ class MessageStream {
   async *[Symbol.asyncIterator](): AsyncGenerator<SDKUserMessage> {
     while (true) {
       while (this.queue.length > 0) {
-        yield this.queue.shift()!;
+        const queued = this.queue.shift()!;
+        // AsyncIterator.next() has now been requested by the SDK. Notify the
+        // runner before yielding the message; the runner reports consumption
+        // and the host then retires the durable inflight claim.
+        queued.onConsumed?.();
+        yield queued.message;
       }
       if (this.done) return;
       await new Promise<void>((r) => {
@@ -1046,11 +1058,12 @@ export class ClaudeEngine implements AgentEngine {
   pushToActive(
     text: string,
     images?: Array<{ data: string; mimeType: string }>,
+    onConsumed?: () => void,
   ): string[] {
     for (const [, active] of this.activeQueries) {
       if (!active.messageStream.ended) {
         if (!active.transportReady) return ['SDK transport not ready yet'];
-        return active.messageStream.push(text, images);
+        return active.messageStream.push(text, images, onConsumed);
       }
     }
     return ['No active query'];

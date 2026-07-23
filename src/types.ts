@@ -497,6 +497,7 @@ export type WsMessageOut =
         isThinking?: boolean;
         activeHook?: { hookName: string; hookEvent: string } | null;
         turnId?: string;
+        updatedAt?: number;
       };
     };
 

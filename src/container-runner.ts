@@ -237,6 +237,8 @@ export interface ContainerInput {
    * Used by per-channel MCP tools (discord_*, etc.) to identify the current
    * incoming chat. Undefined when chatJid already encodes the IM source. */
   currentSourceJid?: string;
+  /** During crash recovery, consume only this DB lane from shared-folder IPC. */
+  ipcRecoveryDatabaseJid?: string;
   /** @deprecated Use isHome + isAdminHome instead */
   isMain: boolean;
   turnId?: string;
@@ -278,6 +280,14 @@ export interface ContainerOutput {
   /** 本 result 发出时仍未 settle 的后台任务数（异步 Agent / backgrounded Bash）。
    * >0 时主进程把流式卡片保持在「后台任务运行中」而非定稿。 */
   pendingBgTasks?: number;
+  /** Queued IPC messages whose fresh logical turn is now starting. */
+  ipcTurnStartedMessageIds?: string[];
+  /** Internal acknowledgement emitted after the SDK query has actually begun. */
+  ipcMessageIds?: string[];
+  /** IPC messages completed by the query generation that produced this result. */
+  ipcCompletedMessageIds?: string[];
+  /** Pulled IPC messages returned to the durable queue for a fresh query. */
+  ipcRequeuedMessageIds?: string[];
 }
 
 interface VolumeMount {

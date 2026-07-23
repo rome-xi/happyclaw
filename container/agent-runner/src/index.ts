@@ -49,6 +49,14 @@ import {
 import { PREDEFINED_AGENTS } from './agent-definitions.js';
 import { createMcpTools } from './mcp-tools.js';
 import { resolveClaudeProviderRuntime } from './provider-runtime.js';
+import {
+  getTerminalEngineError,
+  IpcCompletionTracker,
+  IpcInbox,
+  shouldAcknowledgeQueryEvent,
+  shouldStartFreshIpcTurn,
+  type IpcMessage,
+} from './ipc-inbox.js';
 
 // ── AgentEngine 引擎层 ──
 import { ClaudeEngine } from './engines/claude-engine.js';
@@ -78,6 +86,9 @@ const CLAUDE_PROVIDER_RUNTIME = resolveClaudeProviderRuntime(process.env);
 const CLAUDE_MODEL = CLAUDE_PROVIDER_RUNTIME.model;
 
 const IPC_INPUT_DIR = path.join(WORKSPACE_IPC, 'input');
+const IPC_INFLIGHT_DIR = path.join(IPC_INPUT_DIR, 'inflight');
+const ipcInbox = new IpcInbox(IPC_INPUT_DIR, (message) => log(message));
+let ipcDatabaseJidFilter: string | undefined;
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_FALLBACK_POLL_MS = 5000; // 后备轮询间隔（仅防止 inotify 事件丢失）
 
@@ -1020,51 +1031,32 @@ function shouldDrain(): boolean {
  * Returns messages found (with optional images), or empty array.
  */
 interface IpcDrainResult {
-  messages: Array<{
-    text: string;
-    images?: Array<{ data: string; mimeType?: string }>;
-    taskId?: string;
-    sourceJid?: string;
-  }>;
+  messages: IpcMessage[];
+}
+
+/** Recover claims left by a crashed previous runner before accepting new work. */
+function recoverIpcInflight(): void {
+  const recovered = ipcInbox.recoverInflight();
+  if (recovered > 0)
+    log(`Recovered ${recovered} unacknowledged IPC message(s)`);
+}
+
+function hasQueuedIpcMessages(): boolean {
+  return ipcInbox.hasQueuedMessages();
+}
+
+function acknowledgeIpcMessages(messages: IpcMessage[]): void {
+  // The host owns deletion of durable inflight claims. Report only after the
+  // provider/SDK has actually accepted or pulled the message, so a runner
+  // crash before host receipt leaves the claim recoverable.
+  const messageIds = [...new Set(messages.map((message) => message.messageId))];
+  if (messageIds.length > 0) {
+    writeOutput({ status: 'stream', result: null, ipcMessageIds: messageIds });
+  }
 }
 
 function drainIpcInput(): IpcDrainResult {
-  const result: IpcDrainResult = { messages: [] };
-  try {
-    const files = fs
-      .readdirSync(IPC_INPUT_DIR)
-      .filter((f) => f.endsWith('.json'))
-      .sort();
-
-    for (const file of files) {
-      const filePath = path.join(IPC_INPUT_DIR, file);
-      try {
-        const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-        fs.unlinkSync(filePath);
-        if (data.type === 'message' && data.text) {
-          result.messages.push({
-            text: data.text,
-            images: data.images,
-            taskId: typeof data.taskId === 'string' ? data.taskId : undefined,
-            sourceJid:
-              typeof data.sourceJid === 'string' ? data.sourceJid : undefined,
-          });
-        }
-      } catch (err) {
-        log(
-          `Failed to process input file ${file}: ${err instanceof Error ? err.message : String(err)}`,
-        );
-        try {
-          fs.unlinkSync(filePath);
-        } catch {
-          /* ignore */
-        }
-      }
-    }
-  } catch (err) {
-    log(`IPC drain error: ${err instanceof Error ? err.message : String(err)}`);
-  }
-  return result;
+  return { messages: ipcInbox.claimAll(ipcDatabaseJidFilter) };
 }
 
 /**
@@ -1142,6 +1134,7 @@ function waitForIpcMessage(): Promise<{
   images?: Array<{ data: string; mimeType?: string }>;
   taskId?: string;
   sourceJid?: string;
+  ipcMessages: IpcMessage[];
 } | null> {
   return new Promise((resolve) => {
     let resolved = false;
@@ -1198,6 +1191,7 @@ function waitForIpcMessage(): Promise<{
           images: allImages.length > 0 ? allImages : undefined,
           taskId: combinedTaskId,
           sourceJid: combinedSourceJid,
+          ipcMessages: messages,
         });
         return;
       }
@@ -1281,7 +1275,8 @@ function pruneProcessedHistoryImagesInTranscript(
  * 使用 ClaudeEngine 封装 SDK 调用：
  * - Engine 负责 query() + StreamEventProcessor + 事件翻译
  * - 本函数负责 IPC 轮询、sentinel 检测、系统提示词构建、context_audit 等编排逻辑
- * - 通过 engine.pushToActive() / interruptActive() 等方法操作活动查询
+ * - 当前 query 只处理其启动 prompt；晚到 IPC 留在磁盘队列，下一轮再 claim
+ * - 通过 interruptActive() / endActiveStream() 等方法收口活动查询
  */
 async function runQuery(
   prompt: string,
@@ -1297,6 +1292,8 @@ async function runQuery(
   disallowedTools?: string[],
   images?: Array<{ data: string; mimeType?: string }>,
   sourceKindOverride?: ContainerOutput['sourceKind'],
+  initialIpcMessages: IpcMessage[] = [],
+  ipcCompletionTracker: IpcCompletionTracker = new IpcCompletionTracker(),
 ): Promise<{
   newSessionId?: string;
   lastAssistantUuid?: string;
@@ -1305,27 +1302,31 @@ async function runQuery(
   unrecoverableTranscriptError?: boolean;
   interruptedDuringQuery: boolean;
   sessionResumeFailed?: boolean;
-  pipedMessagesDuringQuery: Array<{
-    text: string;
-    images?: Array<{ data: string; mimeType?: string }>;
-    taskId?: string;
-    sourceJid?: string;
-  }>;
   suspectTruncatedTail?: string;
 }> {
-  // Track messages piped into this query.
-  const pipedMessagesDuringQuery: Array<{
-    text: string;
-    images?: Array<{ data: string; mimeType?: string }>;
-    taskId?: string;
-    sourceJid?: string;
-  }> = [];
+  const unacknowledgedIpcMessages = new Map<string, IpcMessage>(
+    initialIpcMessages.map((message) => [message.claimPath, message]),
+  );
+  const acknowledgeQueryStart = (trackCompletion = true) => {
+    const messages = [...unacknowledgedIpcMessages.values()];
+    if (messages.length === 0) return;
+    if (trackCompletion) {
+      ipcCompletionTracker.trackInitial(
+        messages.map((message) => message.messageId),
+      );
+    }
+    acknowledgeIpcMessages(messages);
+    for (const message of messages) {
+      unacknowledgedIpcMessages.delete(message.claimPath);
+    }
+  };
   let newSessionId: string | undefined;
   let closedDuringQuery = false;
   let interruptedDuringQuery = false;
   let suppressOutputAfterInterrupt = false;
   let visibleOutputStarted = false;
   let resultCount = 0;
+  let pendingBackgroundTasks = 0;
   let postResultInterruptRequested = false;
 
   // ── 图片预处理（过滤超大图 + 解析 MIME）──
@@ -1619,56 +1620,28 @@ async function runQuery(
       ipcQueryWatcher.close();
       return;
     }
-    // Side-queries (emitOutput=false) 不消费用户 IPC 消息
-    if (!emitOutput) return;
-
-    // 引擎不支持 pipe-in (如 OpenAIEngine) 时,跳过 IPC 消息注入 —
-    // OpenAI 引擎的语义是每次 sendMessage 一次性请求,不支持中途追加消息.
-    if (typeof engine.pushToActive !== 'function') return;
-
-    if (engine.isActiveStreamEnded?.() === true) {
-      log('Stream already ended, skipping IPC drain');
+    // A queued IPC envelope always belongs to a separate, complete user turn.
+    // Never claim or pipe it into this SDK stream: doing both a pipe-in and a
+    // later fresh query can execute side effects twice. Once the active turn
+    // has a terminal result, close its stream so waitForIpcMessage can claim
+    // the envelope exactly once for the next query.
+    const hasQueuedMessages = hasQueuedIpcMessages();
+    if (
+      shouldStartFreshIpcTurn(
+        resultCount,
+        pendingBackgroundTasks,
+        hasQueuedMessages,
+      )
+    ) {
+      log('IPC message arrived after result; closing stream for next query');
+      engine.endActiveStream?.();
       ipcPolling = false;
       ipcQueryWatcher.close();
       return;
     }
-
-    // SDK transport 未就绪时不 pipe 消息
-    if (engine.isActiveTransportReady?.() !== true) return;
-
-    const { messages } = drainIpcInput();
-    for (const msg of messages) {
-      log(
-        `Piping IPC message into active query (${msg.text.length} chars, ${msg.images?.length || 0} images)`,
-      );
-      pipedMessagesDuringQuery.push(msg);
-      const pipeImages = msg.images?.map((img) => ({
-        data: img.data,
-        mimeType: img.mimeType || 'image/jpeg',
-      }));
-      // 与初始 user message 一致，给每条 piped 消息前置当前本地时间（#563 CR）。
-      // SDK 透传 slash 命令（如 `/compact <instructions>`）必须以 `/` 开头，
-      // 跳过时间前缀。半路 pipe `/compact` 到运行中 query 的 SDK 行为不确定
-      // （可能与正在生成的 assistant turn 冲突），保留原样透传，让 SDK 自行处理；
-      // 若 SDK 拒绝，会通过 pushToActive 的返回值反馈 rejected reason。
-      const isSlash = isSdkPassthroughSlashCommand(msg.text);
-      const pipeText = isSlash
-        ? msg.text
-        : `[当前时间: ${formatLocalNow()}]\n${msg.text}`;
-      if (isSlash) {
-        log(
-          `Pipe-in slash command detected, skipping time prefix: ${msg.text.slice(0, 40)}`,
-        );
-      }
-      const rejected = engine.pushToActive(pipeText, pipeImages);
-      for (const reason of rejected) {
-        emit({
-          status: 'success',
-          result: `⚠️ ${reason}`,
-          newSessionId: undefined,
-        });
-      }
-    }
+    // Pre-result and background-task phases keep the envelope untouched. A
+    // runner crash therefore leaves one queued file for startup recovery.
+    return;
   };
 
   const ipcQueryWatcher = createIpcWatcher(() => {
@@ -1681,13 +1654,15 @@ async function runQuery(
     log('Interrupt sentinel detected before query start, skipping query');
     interruptedDuringQuery = true;
     suppressOutputAfterInterrupt = true;
+    // The user explicitly cancelled this turn before SDK startup. Retire its
+    // durable claims so the host does not watchdog-restart and replay it.
+    acknowledgeQueryStart(false);
     ipcPolling = false;
     ipcQueryWatcher.close();
     return {
       newSessionId,
       closedDuringQuery,
       interruptedDuringQuery,
-      pipedMessagesDuringQuery,
     };
   }
 
@@ -1699,8 +1674,7 @@ async function runQuery(
 
   const publishEngineResult = (engineResult: EngineSendResult): void => {
     if (engineResult.newSessionId) newSessionId = engineResult.newSessionId;
-    resultCount++;
-
+    const pendingBgTasks = emitOutput ? (engineResult.pendingBgTasks ?? 0) : 0;
     const finalText = engineResult.finalText || '';
     const sdkUsage = engineResult.usage
       ? {
@@ -1712,7 +1686,15 @@ async function runQuery(
       emitOutput &&
       !!finalText &&
       isSuspectTruncatedStreamResult(sdkUsage, finalText.length);
-    const pendingBgTasks = emitOutput ? (engineResult.pendingBgTasks ?? 0) : 0;
+    const completedIpcMessageIds = ipcCompletionTracker.advanceResult(
+      !interruptedDuringQuery &&
+        !suppressOutputAfterInterrupt &&
+        pendingBgTasks === 0 &&
+        !suspectTruncated &&
+        !hadCompaction,
+    );
+    resultCount = ipcCompletionTracker.resultCount;
+    pendingBackgroundTasks = pendingBgTasks;
 
     if (suspectTruncated) {
       latestSuspectTruncatedTail = finalText.slice(-200);
@@ -1739,6 +1721,10 @@ async function runQuery(
         sourceKind: sourceKindOverride ?? 'sdk_final',
         finalizationReason: suspectTruncated ? 'truncated' : 'completed',
         pendingBgTasks,
+        // Repeat the acceptance IDs on the completion output so the host can
+        // apply ACK-before-complete ordering even if callbacks are concurrent.
+        ipcMessageIds: completedIpcMessageIds,
+        ipcCompletedMessageIds: completedIpcMessageIds,
       });
       containerInput.turnId = generateTurnId();
     }
@@ -1776,6 +1762,13 @@ async function runQuery(
 
       // value 是 StreamEvent
       const evt = value as StreamEvent;
+
+      // OpenAI HTTP failures yield status:error before returning an error
+      // result. Only init (Claude system/init or OpenAI response.created)
+      // proves the request was accepted; error/status events never ACK.
+      if (shouldAcknowledgeQueryEvent(evt.eventType)) {
+        acknowledgeQueryStart();
+      }
 
       if (
         suppressOutputAfterInterrupt &&
@@ -1900,7 +1893,6 @@ async function runQuery(
           lastAssistantUuid,
           closedDuringQuery,
           interruptedDuringQuery,
-          pipedMessagesDuringQuery,
           sessionResumeFailed: true,
         };
       }
@@ -1925,7 +1917,6 @@ async function runQuery(
           closedDuringQuery,
           contextOverflow: true,
           interruptedDuringQuery,
-          pipedMessagesDuringQuery,
         };
       }
 
@@ -1938,9 +1929,11 @@ async function runQuery(
           closedDuringQuery,
           unrecoverableTranscriptError: true,
           interruptedDuringQuery,
-          pipedMessagesDuringQuery,
         };
       }
+
+      const terminalEngineError = getTerminalEngineError(finalResult);
+      if (terminalEngineError) throw new Error(terminalEngineError);
 
       // ClaudeEngine reports every SDK turn through onResult so a Workflow can
       // remain alive between its intermediate and final summaries. OpenAI (and
@@ -1952,7 +1945,6 @@ async function runQuery(
         lastAssistantUuid,
         closedDuringQuery,
         interruptedDuringQuery,
-        pipedMessagesDuringQuery,
         suspectTruncatedTail: latestSuspectTruncatedTail,
       };
     }
@@ -1965,7 +1957,6 @@ async function runQuery(
         | undefined,
       closedDuringQuery,
       interruptedDuringQuery,
-      pipedMessagesDuringQuery,
     };
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
@@ -1994,7 +1985,6 @@ async function runQuery(
         closedDuringQuery,
         contextOverflow: true,
         interruptedDuringQuery,
-        pipedMessagesDuringQuery,
       };
     }
 
@@ -2009,7 +1999,6 @@ async function runQuery(
         closedDuringQuery,
         unrecoverableTranscriptError: true,
         interruptedDuringQuery,
-        pipedMessagesDuringQuery,
       };
     }
 
@@ -2023,7 +2012,6 @@ async function runQuery(
           | undefined,
         closedDuringQuery,
         interruptedDuringQuery,
-        pipedMessagesDuringQuery,
       };
     }
 
@@ -2039,7 +2027,6 @@ async function runQuery(
           | undefined,
         closedDuringQuery,
         interruptedDuringQuery,
-        pipedMessagesDuringQuery,
       };
     }
 
@@ -2058,7 +2045,6 @@ async function runQuery(
           | undefined,
         closedDuringQuery,
         interruptedDuringQuery,
-        pipedMessagesDuringQuery,
       };
     }
 
@@ -2093,6 +2079,7 @@ async function main(): Promise<void> {
   try {
     const stdinData = await readStdin();
     containerInput = JSON.parse(stdinData);
+    ipcDatabaseJidFilter = containerInput.ipcRecoveryDatabaseJid;
     log(`Received input for group: ${containerInput.groupFolder}`);
   } catch (err) {
     writeOutput({
@@ -2203,6 +2190,7 @@ async function main(): Promise<void> {
     disableMemoryLayer,
   );
   fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
+  fs.mkdirSync(IPC_INFLIGHT_DIR, { recursive: true });
 
   // Clean up stale sentinels from previous container runs.
   // Note: _drain is NOT cleaned here — the host's cleanupIpcSentinels() in
@@ -2216,6 +2204,7 @@ async function main(): Promise<void> {
     /* ignore */
   }
   cleanupStartupInterruptSentinel();
+  recoverIpcInflight();
 
   // Build initial prompt (drain any pending IPC messages too)
   let prompt = containerInput.prompt;
@@ -2234,6 +2223,7 @@ async function main(): Promise<void> {
     prompt = scheduledTaskPrefix + '\n\n' + prompt;
   }
   const pendingDrain = drainIpcInput();
+  let promptIpcMessages = pendingDrain.messages;
   if (pendingDrain.messages.length > 0) {
     log(
       `Draining ${pendingDrain.messages.length} pending IPC messages into initial prompt`,
@@ -2278,6 +2268,9 @@ async function main(): Promise<void> {
   // 历史无法直接拼到 auto-continue prompt（因为 fall-through 等下一条 IPC 消息后才重启 query），
   // 需要在下一轮主循环 query 之前消费它，避免新会话完全丢失上下文。
   let pendingHistoryContext: string | null = null;
+  // Completion ownership follows the logical user turn, not an individual
+  // runQuery call. Continuations share this tracker until the next IPC envelope.
+  let logicalTurnIpcCompletionTracker = new IpcCompletionTracker();
   try {
     while (true) {
       pruneProcessedHistoryImagesInTranscript(sessionId);
@@ -2308,6 +2301,26 @@ async function main(): Promise<void> {
         `Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`,
       );
 
+      if (promptIpcMessages.length > 0) {
+        // Make the new turn visible immediately (including Feishu card setup),
+        // while the durable claim remains unacknowledged until the first SDK
+        // iterator event below.
+        writeOutput({
+          status: 'stream',
+          result: null,
+          streamEvent: {
+            eventType: 'status',
+            agentScope: 'system',
+            statusText: '生成中',
+          },
+          newSessionId: sessionId,
+          turnId: containerInput.turnId,
+          ipcTurnStartedMessageIds: [
+            ...new Set(promptIpcMessages.map((message) => message.messageId)),
+          ],
+        });
+      }
+
       const queryResult = await runQuery(
         prompt,
         sessionId,
@@ -2321,6 +2334,9 @@ async function main(): Promise<void> {
         DEFAULT_ALLOWED_TOOLS,
         undefined,
         promptImages,
+        undefined,
+        promptIpcMessages,
+        logicalTurnIpcCompletionTracker,
       );
       if (queryResult.newSessionId) {
         sessionId = queryResult.newSessionId;
@@ -2410,6 +2426,7 @@ async function main(): Promise<void> {
 
       // 成功执行后重置溢出重试计数器
       overflowRetryCount = 0;
+      promptIpcMessages = [];
 
       // If _close was consumed during the query, exit immediately.
       // Don't emit a session-update marker (it would reset the host's
@@ -2449,37 +2466,7 @@ async function main(): Promise<void> {
         clearInterruptRequested();
         consecutiveCompactions = 0;
 
-        // Claude Code-style 排队行为：被中断的 query 已经消费了 pipe 进来的消息，
-        // 但这些消息尚未得到回复。将它们写回 IPC 目录作为新文件，通过 waitForIpcMessage
-        // 正常路径走下一个 query，避免 MCP server "Already connected" 问题 (#421)。
-        if (queryResult.pipedMessagesDuringQuery.length > 0) {
-          const piped = queryResult.pipedMessagesDuringQuery;
-          log(
-            `Query interrupted; re-enqueueing ${piped.length} queued message(s) to IPC`,
-          );
-          for (const msg of piped) {
-            const filename = `${Date.now()}-requeue-${Math.random().toString(36).slice(2, 8)}.json`;
-            const filepath = path.join(IPC_INPUT_DIR, filename);
-            const tempPath = `${filepath}.tmp`;
-            try {
-              fs.writeFileSync(
-                tempPath,
-                JSON.stringify({
-                  type: 'message',
-                  text: msg.text,
-                  images: msg.images,
-                  taskId: msg.taskId,
-                  sourceJid: msg.sourceJid,
-                }),
-              );
-              fs.renameSync(tempPath, filepath);
-            } catch (err) {
-              log(`Failed to re-enqueue piped message: ${err}`);
-            }
-          }
-        }
-
-        // 等待下一条消息（包括刚重新入队的 piped 消息）
+        // 等待下一条独立 IPC 消息
         log('Query interrupted by user, waiting for next message');
         const nextMessage = await waitForIpcMessage();
         if (nextMessage === null) {
@@ -2494,6 +2481,8 @@ async function main(): Promise<void> {
         }
         prompt = nextMessage.text;
         promptImages = nextMessage.images;
+        promptIpcMessages = nextMessage.ipcMessages;
+        logicalTurnIpcCompletionTracker = new IpcCompletionTracker();
         containerInput.turnId = generateTurnId();
         // See main-loop comment: reset task attribution for this new turn.
         mcpToolsConfig.currentTaskId = nextMessage.taskId ?? null;
@@ -2607,6 +2596,8 @@ async function main(): Promise<void> {
             undefined,
             undefined,
             'auto_continue',
+            [],
+            logicalTurnIpcCompletionTracker,
           );
           if (autoContResult.newSessionId) {
             sessionId = autoContResult.newSessionId;
@@ -2727,6 +2718,8 @@ async function main(): Promise<void> {
           undefined,
           undefined,
           'truncation_continue',
+          [],
+          logicalTurnIpcCompletionTracker,
         );
         if (contResult.newSessionId) {
           sessionId = contResult.newSessionId;
@@ -2815,6 +2808,16 @@ async function main(): Promise<void> {
         });
       }
 
+      // A claimed IPC delivery may leave this logical turn only through a
+      // healthy completion (or the explicit user-interrupt path above). Never
+      // discard its IDs at the next-message boundary: terminate so the host's
+      // durable DB cursor can replay the delivery instead.
+      if (logicalTurnIpcCompletionTracker.hasPending) {
+        throw new Error(
+          'IPC logical turn ended without a healthy completion; retry required',
+        );
+      }
+
       log('Query ended, waiting for next IPC message...');
 
       // Wait for the next message or _close sentinel
@@ -2829,6 +2832,8 @@ async function main(): Promise<void> {
       );
       prompt = nextMessage.text;
       promptImages = nextMessage.images;
+      promptIpcMessages = nextMessage.ipcMessages;
+      logicalTurnIpcCompletionTracker = new IpcCompletionTracker();
       containerInput.turnId = generateTurnId();
       // Clear per-turn task attribution: the previous query may have been a
       // scheduled-task turn, but this new IPC message is a regular follow-up
